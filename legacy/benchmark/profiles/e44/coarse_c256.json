@@ -1,0 +1,39 @@
+{
+ "model": "/workspace/models/Qwen/Qwen3-8B",
+ "concurrency": 256,
+ "ilen": 1024,
+ "olen": 34,
+ "eager": false,
+ "gpu_mem_util": 0.85,
+ "setup_s": 21.35042452812195,
+ "timings": [
+  {
+   "rep": 0,
+   "prefill_s": 10.566068887710571,
+   "total_s": 12.50145697593689,
+   "decode_steps": 33,
+   "step_ms": 58.64812388564601,
+   "decode_tok_s": 4365.016014820133
+  },
+  {
+   "rep": 1,
+   "prefill_s": 10.65485143661499,
+   "total_s": 12.578185319900513,
+   "decode_steps": 33,
+   "step_ms": 58.28284494804613,
+   "decode_tok_s": 4392.373094144611
+  },
+  {
+   "rep": 2,
+   "prefill_s": 10.695566654205322,
+   "total_s": 12.606653928756714,
+   "decode_steps": 33,
+   "step_ms": 57.911735592466414,
+   "decode_tok_s": 4420.5202517415555
+  }
+ ],
+ "step_ms_median": 58.28284494804613,
+ "profiled_total_s": 12.652865886688232,
+ "trace": "benchmark/profiles/e41/coarse_c256.trace.json",
+ "n_events_pyapi": 27204
+}

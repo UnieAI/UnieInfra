@@ -1,0 +1,836 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import torch
+from tokenspeed_kernel.ops.attention.flash_attn import flash_attn_varlen_func
+from tokenspeed_kernel.ops.attention.flash_mla import (
+    flash_mla_with_kvcache,
+    get_mla_metadata,
+)
+from tokenspeed_kernel.ops.attention.flashinfer import (
+    BatchMLAPagedAttentionWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
+)
+
+from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.chunk import (
+    build_chunked_prefill_metadata_arrays,
+)
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+)
+from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.flashinfer_config import get_flashinfer_workspace_size
+
+PAGE_SIZE = 64
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+
+@dataclass
+class FlashMLADecodeMetadata:
+    num_extends: int = 0
+    flashmla_metadata: tuple | None = None
+    num_splits: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
+
+
+@dataclass
+class _PrefillMetadata:
+    prefill_wrapper: BatchMLAPagedAttentionWrapper
+    use_ragged: bool
+
+
+@dataclass
+class _ChunkedPrefillMetadata:
+    extend_prefix_lens: torch.Tensor
+    extend_prefix_lens_cpu: torch.Tensor
+    extend_seq_lens: torch.Tensor
+    extend_seq_lens_cpu: torch.Tensor
+    req_pool_indices: torch.Tensor
+    cum_extend_seq_lens: torch.Tensor
+    max_extend_seq_len: int
+    chunked_loop_num: int
+    chunk_kv_indices_list: list
+    chunked_seq_len: torch.Tensor
+    cu_chunked_seq_len: torch.Tensor
+    max_chunk_len_per_loop: list
+
+
+# Shared across all flashinfer prefill wrappers used by FlashMLABackend.
+_global_workspace_buffer = None
+
+
+class FlashMLABackend(AttentionBackend):
+    """FlashMLA attention backend for TokenSpeed scheduling.
+
+    Uses the FlashMLA kernel for decode (any q_len); uses FlashInfer's MLA
+    prefill wrappers for the EXTEND path.
+    """
+
+    def __init__(self, config: MLAConfig):
+        super().__init__(config)
+
+        # Parse constants
+        self.max_context_len = config.context_len
+        self.kv_cache_quant_method = config.kv_cache_quant_method
+        self.cache_dtype = config.kv_cache_dtype
+
+        # MLA-specific dimensions
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.kv_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim
+        self.scaling = config.scaling
+        self.softmax_scale = config.scaling
+        self.data_type = config.kv_cache_dtype
+        self.q_data_type = config.dtype
+        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_q_heads = config.num_attention_heads // config.attn_tp_size
+
+        # FlashMLA-specific
+        self.draft_token_num = 0
+
+        if self.kv_cache_quant_method == "per_token_head":
+            raise NotImplementedError(
+                "FlashMLABackend no longer supports "
+                "kv_cache_quant_method='per_token_head'."
+            )
+        if self.cache_dtype == torch.float8_e4m3fn:
+            raise NotImplementedError(
+                "FlashMLABackend no longer supports dense FP8 KV cache. "
+                "Use a non-FP8 KV cache."
+            )
+
+        # Workspace buffer + flashinfer prefill wrappers (EXTEND path only).
+        global _global_workspace_buffer
+        if _global_workspace_buffer is None:
+            _global_workspace_buffer = torch.empty(
+                get_flashinfer_workspace_size(),
+                dtype=torch.uint8,
+                device=config.device,
+            )
+        self.workspace_buffer = _global_workspace_buffer
+
+        max_bs = config.max_bs
+        self.kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=config.device
+        )
+        self.qo_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=config.device
+        )
+
+        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
+        self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
+            self.workspace_buffer,
+            backend="auto",
+        )
+        self.indices_updater_prefill = _PrefillIndicesUpdater(config, self)
+
+        # Metadata state. Decode and prefill metadata are split so MIXED batches
+        # can carry both simultaneously (decode-half + prefill-half sub-contexts
+        # dispatch to their respective metadata).
+        self.forward_decode_metadata: FlashMLADecodeMetadata | None = None
+        self.forward_prefill_metadata: _PrefillMetadata | None = None
+        self.chunked_prefill_metadata: _ChunkedPrefillMetadata | None = None
+        self.last_seq_lens_sum: int | None = None
+
+    # ------------------------------------------------------------------
+    # Metadata init
+    # ------------------------------------------------------------------
+
+    def init_forward_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        req_to_page: torch.Tensor = None,
+        extend_with_prefix: bool = False,
+        extend_prefix_lens: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        if forward_mode.is_extend_or_mixed():
+            self._init_prefill_metadata(
+                req_pool_indices=req_pool_indices[:num_extends],
+                seq_lens=seq_lens[:num_extends],
+                req_to_page=req_to_page,
+                extend_with_prefix=extend_with_prefix,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
+                extend_seq_lens=kwargs.pop("extend_seq_lens"),
+                extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
+            )
+        # Under is_draft, also fill decode_metadata under any forward_mode so
+        # the drafter's multi-step loop has metadata. Wrapper pre-writes
+        # draft_seq_lens before calling here, so `seq_lens` aliases the
+        # drafter's live buffer for step-1+ advances.
+        if (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_mixed()
+            or (forward_mode.is_extend() and self.is_draft)
+        ):
+            self._init_decode_metadata(
+                bs, num_extends, req_pool_indices, seq_lens, req_to_page
+            )
+
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        assert self.forward_decode_metadata is not None
+        prev = self.forward_decode_metadata.num_extends
+        self.forward_decode_metadata.num_extends = num_extends
+        try:
+            yield
+        finally:
+            self.forward_decode_metadata.num_extends = prev
+
+    def _init_decode_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_to_page: torch.Tensor,
+    ):
+        if req_to_page is not None:
+            block_table = req_to_page[req_pool_indices]
+        else:
+            block_table = None
+
+        # When spec-dec is active (self.spec_num_tokens > 1), advance per-row
+        # seq_lens by the worst-case verify width so the tile planner covers
+        # the longest path.
+        if self.spec_num_tokens > 1:
+            plan_seq_lens = seq_lens + self.draft_token_num
+            num_heads_plan = self.draft_token_num * self.num_q_heads
+        else:
+            plan_seq_lens = seq_lens
+            num_heads_plan = self.num_q_heads
+
+        mla_metadata, num_splits = get_mla_metadata(
+            plan_seq_lens.to(torch.int32),
+            num_heads_plan,
+            1,
+        )
+        self.forward_decode_metadata = FlashMLADecodeMetadata(
+            num_extends=num_extends,
+            flashmla_metadata=mla_metadata,
+            num_splits=num_splits,
+            block_table=block_table,
+        )
+
+    def _init_prefill_metadata(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_to_page: torch.Tensor,
+        extend_with_prefix: bool,
+        extend_prefix_lens: torch.Tensor | None,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+    ):
+        # EXTEND path — flashinfer ragged/paged prefill.
+        if extend_prefix_lens is None:
+            raise RuntimeError(
+                "FlashMLABackend.init_forward_metadata requires "
+                "extend_prefix_lens in extend mode."
+            )
+        seq_lens_cpu = seq_lens.cpu()
+        seq_lens_sum = seq_lens_cpu.sum().item()
+        self.last_seq_lens_sum = seq_lens_sum
+
+        extend_no_prefix = not extend_with_prefix
+        use_ragged = (
+            not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
+        )
+
+        self.indices_updater_prefill.update(
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            extend_prefix_lens,
+            req_to_page=req_to_page,
+            prefill_wrapper_paged=self.prefill_wrapper_paged,
+            use_ragged=use_ragged,
+        )
+        self.forward_prefill_metadata = _PrefillMetadata(
+            self.prefill_wrapper_paged, use_ragged
+        )
+
+        num_extends = extend_seq_lens.shape[0]
+        cum_extend_seq_lens = torch.zeros(
+            num_extends + 1, device=self.device, dtype=torch.int32
+        )
+        torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
+        max_extend_seq_len = extend_seq_lens_cpu.max().item()
+        (
+            chunked_loop_num,
+            chunk_kv_indices_list,
+            chunked_seq_len,
+            cu_chunked_seq_len,
+            max_chunk_len_per_loop,
+        ) = build_chunked_prefill_metadata_arrays(
+            extend_prefix_lens,
+            extend_prefix_lens_cpu,
+            req_to_page,
+            req_pool_indices,
+            PAGE_SIZE,
+        )
+        self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            req_pool_indices=req_pool_indices,
+            cum_extend_seq_lens=cum_extend_seq_lens,
+            max_extend_seq_len=max_extend_seq_len,
+            chunked_loop_num=chunked_loop_num,
+            chunk_kv_indices_list=chunk_kv_indices_list,
+            chunked_seq_len=chunked_seq_len,
+            cu_chunked_seq_len=cu_chunked_seq_len,
+            max_chunk_len_per_loop=max_chunk_len_per_loop,
+        )
+
+    # ------------------------------------------------------------------
+    # CUDA graph (decode only, any q_len)
+    # ------------------------------------------------------------------
+
+    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
+        del seq_lens_buf  # flashmla allocates its own buffers.
+        max_context_len = self.max_context_len + PAGE_SIZE - 1
+        # 4 PAGES are reserved for speculation
+        cuda_graph_kv_indices = torch.full(
+            (max_bs, (max_context_len + 4 * PAGE_SIZE) // PAGE_SIZE),
+            1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        if self.draft_token_num:
+            (
+                self.cuda_graph_mla_metadata,
+                self.cuda_graph_num_splits,
+            ) = get_mla_metadata(
+                torch.ones(
+                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+                ),
+                self.draft_token_num * self.num_q_heads,
+                1,
+            )
+        else:
+            (
+                self.cuda_graph_mla_metadata,
+                self.cuda_graph_num_splits,
+            ) = get_mla_metadata(
+                torch.ones(
+                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+                ),
+                self.num_q_heads,
+                1,
+            )
+        self.cuda_graph_kv_indices = cuda_graph_kv_indices
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+    ):
+        block_table = self.cuda_graph_kv_indices[:bs]
+        is_target_verify = (
+            forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and self.spec_num_tokens > 1
+        )
+        is_draft_extend = (
+            forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and self.spec_num_tokens > 1
+        )
+
+        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
+            mla_metadata, num_splits = get_mla_metadata(
+                seq_lens.to(torch.int32),
+                self.num_q_heads,
+                1,
+            )
+            self.cuda_graph_mla_metadata.copy_(mla_metadata)
+            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            self.cuda_graph_kv_indices[:bs].copy_(block_table)
+            self.forward_decode_metadata = FlashMLADecodeMetadata(
+                num_extends=0,
+                flashmla_metadata=self.cuda_graph_mla_metadata,
+                num_splits=self.cuda_graph_num_splits[: bs + 1],
+                block_table=self.cuda_graph_kv_indices[:bs, :],
+            )
+        elif is_target_verify or is_draft_extend:
+            seq_lens = seq_lens + self.draft_token_num
+            mla_metadata, num_splits = get_mla_metadata(
+                seq_lens.to(torch.int32),
+                self.draft_token_num * self.num_q_heads,
+                1,
+            )
+            self.cuda_graph_mla_metadata.copy_(mla_metadata)
+            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            self.cuda_graph_kv_indices[:bs].copy_(block_table)
+            self.forward_decode_metadata = FlashMLADecodeMetadata(
+                num_extends=0,
+                flashmla_metadata=self.cuda_graph_mla_metadata,
+                num_splits=self.cuda_graph_num_splits[: bs + 1],
+                block_table=self.cuda_graph_kv_indices[:bs],
+            )
+        else:
+            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode = None,
+        req_to_page: torch.Tensor = None,
+        **kwargs,
+    ):
+        if forward_mode is None or not forward_mode.is_decode_or_idle():
+            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
+
+        req_pool_indices = req_pool_indices[:bs]
+        if req_to_page is not None:
+            block_table = req_to_page[req_pool_indices]
+        else:
+            block_table = self.cuda_graph_kv_indices[:bs]
+        seq_lens = seq_lens[:bs]
+
+        is_target_verify = not self.is_draft and self.spec_num_tokens > 1
+        is_draft_extend = self.is_draft and self.spec_num_tokens > 1
+
+        if self.spec_num_tokens == 1:
+            mla_metadata, num_splits = get_mla_metadata(
+                seq_lens.to(torch.int32),
+                self.num_q_heads,
+                1,
+            )
+        elif is_target_verify or is_draft_extend:
+            seq_lens = seq_lens + self.draft_token_num
+            mla_metadata, num_splits = get_mla_metadata(
+                seq_lens.to(torch.int32),
+                self.draft_token_num * self.num_q_heads,
+                1,
+            )
+        else:
+            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
+
+        self.cuda_graph_mla_metadata.copy_(mla_metadata)
+        self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+        self.cuda_graph_kv_indices[:bs].copy_(block_table)
+        self.forward_decode_metadata.num_extends = 0
+        self.forward_decode_metadata.flashmla_metadata = self.cuda_graph_mla_metadata
+        self.forward_decode_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+        self.forward_decode_metadata.block_table = self.cuda_graph_kv_indices[:bs]
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        save_kv_cache: bool = True,
+        seq_lens: torch.Tensor | None = None,
+        forward_mode: ForwardMode | None = None,
+        **kwargs,
+    ):
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        is_target_verify = (
+            forward_mode is not None
+            and forward_mode.is_decode_or_idle()
+            and not self.is_draft
+            and q_len_per_req > 1
+        )
+        is_draft_extend = (
+            forward_mode is not None
+            and forward_mode.is_decode_or_idle()
+            and self.is_draft
+            and q_len_per_req > 1
+        )
+
+        if forward_mode is None or forward_mode.is_extend():
+            # Prefill: dispatch to ragged (MHA-style) or absorbed (MQA) path.
+            if self.forward_prefill_metadata.use_ragged:
+                return self._forward_normal_extend(q, k, v, layer, save_kv_cache)
+            else:
+                return self._forward_absorbed_extend(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    save_kv_cache,
+                )
+
+        assert is_target_verify or is_draft_extend
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                token_to_kv_pool.set_kv_buffer(layer, out_cache_loc, k, v)
+
+        metadata = self.forward_decode_metadata
+        num_extends = metadata.num_extends
+        bs = (
+            q.shape[0]
+            if is_draft_extend
+            else metadata.block_table.shape[0] - num_extends
+        )
+        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+        assert (
+            layer.tp_q_head_num == self.num_q_heads
+        ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
+        reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
+
+        o, _ = flash_mla_with_kvcache(
+            q=reshape_q,
+            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+            block_table=metadata.block_table[num_extends : num_extends + bs],
+            cache_seqlens=seq_lens.to(torch.int32) + self.draft_token_num,
+            head_dim_v=self.kv_lora_rank,
+            tile_scheduler_metadata=metadata.flashmla_metadata,
+            num_splits=metadata.num_splits,
+            softmax_scale=layer.scaling,
+            causal=True,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def forward_extend_chunked(
+        self,
+        q,
+        k,
+        v,
+        scaling,
+        logits_soft_cap=None,
+        *,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        max_q_len,
+        max_kv_len,
+        seq_lens,
+        batch_size,
+        causal,
+        out: torch.Tensor | None = None,
+    ):
+        if causal:
+            step_counter = getattr(self, "step_counter", None)
+            if step_counter is not None:
+                step_counter.record_cache()
+        head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # flash_attn_varlen_func has no `out=` parameter; copy into the
+        # caller-provided buffer at the end when requested.
+        output, lse, *_ = flash_attn_varlen_func(
+            q=q.view(-1, self.num_local_heads, head_dim),
+            k=k.view(-1, self.num_local_heads, head_dim).to(q.dtype),
+            v=v.view(-1, self.num_local_heads, self.v_head_dim).to(q.dtype),
+            cu_seqlens_q=cum_seq_lens_q,
+            cu_seqlens_k=cum_seq_lens_kv,
+            max_seqlen_q=max_q_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scaling,
+            causal=causal,
+            return_attn_probs=True,
+        )
+        if out is not None:
+            out.copy_(output.view(out.shape))
+            output = out
+        # lse must be transposed when using fa3.
+        return output, lse.T.contiguous()
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        save_kv_cache: bool = True,
+        seq_lens: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # Multi-token decode (target verify or drafter compound) reuses
+        # the multi-token kernel path in forward_extend.
+        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        if q_len_per_req > 1:
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                seq_lens=seq_lens,
+                forward_mode=ForwardMode.DECODE,
+                **kwargs,
+            )
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    out_cache_loc,
+                    k,
+                    v,
+                )
+        bs = q.shape[0]
+        metadata = self.forward_decode_metadata
+        num_extends = metadata.num_extends
+        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        assert (
+            layer.tp_q_head_num == self.num_q_heads
+        ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
+        reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
+        cache_lens = seq_lens
+
+        o, _ = flash_mla_with_kvcache(
+            q=reshape_q,
+            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+            block_table=metadata.block_table[num_extends : num_extends + bs],
+            cache_seqlens=cache_lens.to(torch.int32),
+            head_dim_v=self.kv_lora_rank,
+            tile_scheduler_metadata=metadata.flashmla_metadata,
+            num_splits=metadata.num_splits,
+            softmax_scale=layer.scaling,
+            causal=True,
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    # ------------------------------------------------------------------
+    # EXTEND prefill helpers
+    # ------------------------------------------------------------------
+
+    def _forward_normal_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        save_kv_cache: bool = True,
+    ):
+        assert not save_kv_cache
+
+        o = self.prefill_wrapper_ragged.forward(
+            q,
+            k.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+            causal=True,
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_absorbed_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        save_kv_cache: bool = True,
+    ):
+        # q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
+        # flashinfer prefill_wrapper.run() requires q_nope / q_pe split, so
+        # slice views here (free) before handing off to the kernel.
+        assert k is not None
+
+        if save_kv_cache:
+            token_to_kv_pool.set_mla_kv_buffer(
+                layer,
+                out_cache_loc,
+                k[..., : layer.v_head_dim],
+                k[..., layer.v_head_dim :],
+            )
+
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        q_nope = q[..., : layer.v_head_dim]
+        q_pe = q[..., layer.v_head_dim :]
+        o = q_nope.new_empty(q_nope.shape)
+
+        k_buf = token_to_kv_pool.get_key_buffer(layer.layer_id).to(q_nope.dtype)
+        o = self.forward_prefill_metadata.prefill_wrapper.run(
+            q_nope,
+            q_pe,
+            k_buf[:, :, : layer.v_head_dim],
+            k_buf[:, :, layer.v_head_dim :],
+            out=o,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+class _PrefillIndicesUpdater:
+    """Plans FlashInfer MLA prefill wrappers for the EXTEND path."""
+
+    def __init__(self, config: MLAConfig, attn_backend: FlashMLABackend):
+        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.kv_cache_quant_method = config.kv_cache_quant_method
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.scaling = config.scaling
+        self.data_type = config.kv_cache_dtype
+        self.q_data_type = config.dtype
+        self.attn_backend = attn_backend
+
+        self.kv_indptr = attn_backend.kv_indptr
+        self.qo_indptr = attn_backend.qo_indptr
+        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+
+    def update(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        req_to_page: torch.Tensor = None,
+        prefill_wrapper_paged: BatchMLAPagedAttentionWrapper = None,
+        use_ragged: bool = False,
+    ):
+        if use_ragged:
+            paged_kernel_lens = prefix_lens
+            paged_kernel_lens_sum = 0
+        else:
+            paged_kernel_lens = seq_lens
+            paged_kernel_lens_sum = seq_lens_sum
+
+        self._call_begin_forward(
+            self.prefill_wrapper_ragged,
+            prefill_wrapper_paged,
+            req_pool_indices,
+            paged_kernel_lens,
+            paged_kernel_lens_sum,
+            seq_lens,
+            prefix_lens,
+            self.kv_indptr,
+            self.qo_indptr,
+            use_ragged,
+            req_to_page=req_to_page,
+        )
+
+    def _call_begin_forward(
+        self,
+        wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
+        wrapper_paged: BatchMLAPagedAttentionWrapper,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        use_ragged: bool,
+        req_to_page: torch.Tensor = None,
+    ):
+        bs = len(seq_lens)
+        sm_scale = self.scaling
+
+        assert len(seq_lens) == len(req_pool_indices)
+        torch.cumsum(paged_kernel_lens, dim=0, out=kv_indptr[1 : bs + 1])
+        kv_indptr = kv_indptr[: bs + 1]
+        if wrapper_paged._use_cuda_graph:
+            kv_indices = wrapper_paged._kv_indices_buf
+        else:
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+        if req_to_page is not None:
+            create_flashinfer_kv_indices_triton[(bs,)](
+                req_to_page,
+                req_pool_indices,
+                paged_kernel_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                req_to_page.shape[1],
+            )
+        torch.cumsum(seq_lens - prefix_lens, dim=0, out=qo_indptr[1 : bs + 1])
+        qo_indptr = qo_indptr[: bs + 1]
+
+        if use_ragged:
+            wrapper_ragged.begin_forward(
+                qo_indptr=qo_indptr,
+                kv_indptr=qo_indptr,
+                num_qo_heads=self.num_local_heads,
+                num_kv_heads=self.num_local_heads,
+                head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                head_dim_vo=self.v_head_dim,
+                q_data_type=self.q_data_type,
+            )
+        else:
+            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+            wrapper_paged.plan(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_len_arr,
+                self.num_local_heads,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                1,
+                True,
+                sm_scale,
+                self.q_data_type,
+                self.data_type,
+            )
+
+
+register_backend("flashmla", {AttentionArch.MLA}, FlashMLABackend)

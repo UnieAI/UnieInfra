@@ -1,0 +1,114 @@
+[
+  {
+    "shape": "gate_up_proj",
+    "M": 32,
+    "cublas_rel_err": 0.0016628921730443835,
+    "triton_rel_err": 0.001662886468693614,
+    "pass": true
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 64,
+    "cublas_rel_err": 0.0016626811120659113,
+    "triton_rel_err": 0.0016626769211143255,
+    "pass": true
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 128,
+    "cublas_rel_err": 0.0016600171802565455,
+    "triton_rel_err": 0.0016600171802565455,
+    "pass": true
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 256,
+    "cublas_rel_err": 0.001660795882344246,
+    "triton_rel_err": 0.001660795882344246,
+    "pass": true
+  },
+  {
+    "shape": "down_proj",
+    "M": 32,
+    "cublas_rel_err": 0.002447932492941618,
+    "triton_rel_err": 0.0016578228678554296,
+    "pass": true
+  },
+  {
+    "shape": "down_proj",
+    "M": 64,
+    "cublas_rel_err": 0.0024473515804857016,
+    "triton_rel_err": 0.001657574437558651,
+    "pass": true
+  },
+  {
+    "shape": "down_proj",
+    "M": 128,
+    "cublas_rel_err": 0.002882176311686635,
+    "triton_rel_err": 0.001659288420341909,
+    "pass": true
+  },
+  {
+    "shape": "down_proj",
+    "M": 256,
+    "cublas_rel_err": 0.0028841274324804544,
+    "triton_rel_err": 0.0016562159871682525,
+    "pass": true
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 32,
+    "cublas_rel_err": 0.0016572914319112897,
+    "triton_rel_err": 0.0016572914319112897,
+    "pass": true
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 64,
+    "cublas_rel_err": 0.001658579334616661,
+    "triton_rel_err": 0.0016585736302658916,
+    "pass": true
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 128,
+    "cublas_rel_err": 0.002383721061050892,
+    "triton_rel_err": 0.0016590666491538286,
+    "pass": true
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 256,
+    "cublas_rel_err": 0.0016606764402240515,
+    "triton_rel_err": 0.0016606764402240515,
+    "pass": true
+  },
+  {
+    "shape": "o_proj",
+    "M": 32,
+    "cublas_rel_err": 0.0016570392763242126,
+    "triton_rel_err": 0.0016570347361266613,
+    "pass": true
+  },
+  {
+    "shape": "o_proj",
+    "M": 64,
+    "cublas_rel_err": 0.001663487171754241,
+    "triton_rel_err": 0.001663487171754241,
+    "pass": true
+  },
+  {
+    "shape": "o_proj",
+    "M": 128,
+    "cublas_rel_err": 0.002365340944379568,
+    "triton_rel_err": 0.0016644761199131608,
+    "pass": true
+  },
+  {
+    "shape": "o_proj",
+    "M": 256,
+    "cublas_rel_err": 0.0024512431118637323,
+    "triton_rel_err": 0.0016612611943855882,
+    "pass": true
+  }
+]

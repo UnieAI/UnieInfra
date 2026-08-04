@@ -1,0 +1,364 @@
+--- a/python/tokenspeed/runtime/configs/flat_memory_plan.py
++++ b/python/tokenspeed/runtime/configs/flat_memory_plan.py
+@@ -28,6 +28,19 @@
+ covers them (vLLM align). plan_tensors then pairs physical slot j with
+ the j-th layer of every group over a single page-id space and sizes each
+ slab by its own packed row from the budget.
++
++Two granularities, not one
++--------------------------
++``block_size`` (P) is the ATTENTION page: how many tokens of KV history one
++block id carries. ``state_interval`` (N) is the STATE SNAPSHOT stride: how
++many tokens pass between two retained recurrent-state snapshots. The flat
++layout gives every block id a row in every slab -- one KV page per
++full-attention layer AND one recurrent state per state layer -- so a
++request of T tokens draws ``ceil(T/P)`` block ids for its attention group
++and ``~T/N`` more for its state group, and EVERY one of those ids costs a
++full block row. capacity_model() is the single place that arithmetic is
++written down; see HybridCapacity for the consequences of moving either
++knob.
+ """
+ 
+ from __future__ import annotations
+@@ -174,6 +187,115 @@
+     return geo.block_size
+ 
+ 
++def state_snapshot_interval(*, block_size, requested_interval):
++    """Effective recurrent-state snapshot stride N, in tokens.
++
++    N is the number of tokens between two RETAINED state snapshots. It is
++    always a positive multiple of ``block_size`` because the C++ coordinator
++    folds every group's keys onto a common base grid
++    (``MakeFoldedGroupKeys``: ``m = group_block_size / base_block_size``) and
++    asserts ``spec.block_size % base == 0``. N == block_size reproduces
++    today's behaviour exactly (one snapshot per attention page).
++
++    Args:
++        block_size: The attention page size P in tokens (already equalized).
++        requested_interval: The user's ``--mamba-track-interval``; None, 0 or
++            anything <= block_size means "one snapshot per page" (N = P).
++
++    Returns:
++        int: N -- the smallest multiple of ``block_size`` that is >= both
++        ``block_size`` and ``requested_interval``.
++
++    Raises:
++        ValueError: block_size <= 0, or requested_interval is negative.
++    """
++    if block_size <= 0:
++        raise ValueError(f"block_size must be > 0, got {block_size}")
++    if requested_interval is None:
++        return block_size
++    requested = int(requested_interval)
++    if requested < 0:
++        raise ValueError(f"requested_interval must be >= 0, got {requested}")
++    if requested <= block_size:
++        return block_size
++    return block_size * math.ceil(requested / block_size)
++
++
++@dataclass(frozen=True)
++class HybridCapacity:
++    """Closed-form device-capacity model for one state-hybrid page geometry.
++
++    Every field is bytes-exact against ``plan_component_tensors`` for the
++    same components; the only modelled quantity is how many block ids a
++    given token count pins, which is ``compute_paged_cache_group_page_counts``
++    with the per-request constants dropped.
++
++    Attributes:
++        block_size: Attention page P in tokens.
++        state_interval: Retained-snapshot stride N in tokens (N % P == 0).
++        kv_bytes_per_block: Sum over history layers of P * bytes-per-slot.
++        state_bytes_per_block: Sum over state layers of the constant row.
++        block_bytes: kv_bytes_per_block + state_bytes_per_block -- what ONE
++            block id costs, regardless of which group holds it.
++    """
++
++    block_size: int
++    state_interval: int
++    kv_bytes_per_block: int
++    state_bytes_per_block: int
++
++    @property
++    def block_bytes(self):
++        return self.kv_bytes_per_block + self.state_bytes_per_block
++
++    @property
++    def blocks_per_token(self):
++        """Block ids pinned per token of resident context: 1/P for the
++        attention group plus 1/N for the state group's retained snapshots.
++        Both groups draw from the SAME BlockPool (one shared free list, see
++        KvCacheCoordinator's "one shared BlockPool"), so the two add."""
++        return 1.0 / self.block_size + 1.0 / self.state_interval
++
++    @property
++    def bytes_per_token(self):
++        """Device bytes one token of resident context costs."""
++        return self.blocks_per_token * self.block_bytes
++
++    def tokens_for(self, budget_bytes):
++        """Resident context tokens a byte budget supports under this geometry."""
++        return int(budget_bytes / self.bytes_per_token)
++
++    def num_blocks_for(self, budget_bytes):
++        """Block ids a byte budget buys (= plan_component_tensors' num_blocks
++        for the same components, modulo any reserved draft rows)."""
++        return int(budget_bytes // self.block_bytes)
++
++
++def capacity_model(components, *, block_size, state_interval=None):
++    """Build the HybridCapacity for a component list at a given geometry.
++
++    Args:
++        components: ComponentSpecs from components_from_layers.
++        block_size: Attention page P in tokens.
++        state_interval: Retained-snapshot stride; None -> P (today's
++            one-snapshot-per-page behaviour).
++
++    Returns:
++        HybridCapacity.
++    """
++    interval = state_snapshot_interval(
++        block_size=block_size, requested_interval=state_interval
++    )
++    kv_bytes = sum(c.bytes_per_slot for c in components) * block_size
++    state_bytes = sum(c.const_bytes for c in components)
++    return HybridCapacity(
++        block_size=block_size,
++        state_interval=interval,
++        kv_bytes_per_block=kv_bytes,
++        state_bytes_per_block=state_bytes,
++    )
++
++
+ @dataclass(frozen=True)
+ class LayerBinding:
+     slot: int
+--- a/python/tokenspeed/runtime/configs/paged_cache_spec.py
++++ b/python/tokenspeed/runtime/configs/paged_cache_spec.py
+@@ -189,6 +189,104 @@
+     return max(counts.values())
+ 
+ 
++def state_group_page_sizes(
++    *,
++    layer_types: Sequence[str],
++    page_size: int,
++    state_page_size: int | None,
++) -> dict[str, int]:
++    """``page_sizes`` entries that put the state groups on their own grid.
++
++    This is how ``--mamba-track-interval`` reaches the geometry: the state
++    group's page size IS the retained-snapshot stride N. The scheduler's
++    ``MambaStateManager`` is ``SwaManager(spec.block_size, window=2)`` with
++    ``RegistersAlignedFinalPageOnly``, so it publishes a snapshot only at
++    multiples of the group's own block size -- raising that block size to N
++    is exactly "snapshot every N tokens" and needs no new C++.
++
++    Resolve N with ``flat_memory_plan.state_snapshot_interval`` first; this
++    function only validates and fans it out to the state labels present.
++
++    Args:
++        layer_types: Per-layer paged-cache labels.
++        page_size: The scheduler's base page size P (attention granularity).
++        state_page_size: N in tokens, a positive multiple of ``page_size``;
++            None or a value equal to ``page_size`` returns ``{}`` (today's
++            uniform geometry, byte-identical to not passing page_sizes).
++
++    Returns:
++        ``{group_id: N}`` for every state-family label present, or ``{}``.
++
++    Raises:
++        ValueError: N is not a positive multiple of ``page_size``.
++    """
++    if state_page_size is None or int(state_page_size) == int(page_size):
++        return {}
++    n = int(state_page_size)
++    if n <= 0 or n % int(page_size):
++        raise ValueError(
++            f"state_page_size {n} must be a positive multiple of page_size "
++            f"{page_size} (the coordinator folds group keys on the gcd grid)"
++        )
++    return {label: n for label in dict.fromkeys(layer_types) if label in STATE_LAYER_TYPES}
++
++
++def layer_page_sizes(
++    *,
++    layer_types: Sequence[str],
++    sliding_window_tokens: int | Sequence[int | None] | None,
++    page_size: int,
++    page_sizes: Mapping[str, int] | None = None,
++) -> list[int]:
++    """Per-layer page size in raw tokens -- the per-layer geometry a KV pool
++    or attention backend needs to index its own group's block table.
++
++    Companion to ``layer_group_ids``: element i is the page size of layer i's
++    paged-cache group, which is ``page_sizes[group_id]`` when the model puts
++    that group on its own grid (heterogeneous block sizes: Inkling's
++    full=256/swa=128, or a GDN state group at the mamba track interval) and
++    ``page_size`` otherwise.
++
++    Args:
++        layer_types / sliding_window_tokens: As for ``layer_group_ids``.
++        page_size: Base page size in tokens.
++        page_sizes: Per-group overrides, as for
++            ``group_specs_from_layer_types``.
++
++    Returns:
++        list[int]: one page size per layer, aligned with ``layer_types``.
++    """
++    sizes = dict(page_sizes or {})
++    return [
++        int(sizes.get(gid, page_size))
++        for gid in layer_group_ids(
++            layer_types=layer_types, sliding_window_tokens=sliding_window_tokens
++        )
++    ]
++
++
++def state_page_size(specs: Sequence[PagedCacheGroupSpec], default: int) -> int:
++    """Raw tokens per page of the published state group (the snapshot stride).
++
++    The single accessor consumers must use instead of the pool's global
++    ``page_size``: with ``--mamba-track-interval`` the state group's page is
++    coarser, and indexing its block table at the attention page size would
++    silently read the wrong snapshot row.
++
++    Args:
++        specs: The pool's ``paged_cache_group_specs``.
++        default: Fallback when no state group is published (pure attention,
++            or a radix ext that publishes nothing).
++
++    Returns:
++        int: ``rows_per_page * entry_stride_tokens`` of the first state group.
++    """
++    for spec in specs or ():
++        if getattr(spec, "family", "history") == "state":
++            return int(spec.rows_per_page) * int(spec.entry_stride_tokens)
++    return int(default)
++
++
+ def _flat_kv_backend(attn_backend: object) -> object:
+     """The backend whose KV-table consumption matters for flat safety: the
+     backend itself, or a composite's full-attention sub-backend (hybrid's
+@@ -690,8 +788,11 @@
+     "group_specs_from_layer_types",
+     "hybrid_slab_group_size",
+     "layer_group_ids",
++    "layer_page_sizes",
+     "publish_paged_cache_groups",
+     "preflight_kimi_k3_flat_consumers",
+     "scheduler_ext_flat_kvcache",
++    "state_group_page_sizes",
++    "state_page_size",
+     "validate_flat_scheduler_config",
+ ]
+--- a/python/tokenspeed/runtime/layers/attention/registry.py
++++ b/python/tokenspeed/runtime/layers/attention/registry.py
+@@ -29,14 +29,17 @@
+ from tokenspeed_kernel.platform import current_platform
+ 
+ from tokenspeed.runtime.configs.flat_memory_plan import (
++    capacity_model,
+     components_from_layers,
+     equalized_block_size,
+     plan_component_tensors,
+     state_const_bytes,
++    state_snapshot_interval,
+ )
+ from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
+ from tokenspeed.runtime.configs.paged_cache_spec import (
+     hybrid_slab_group_size,
++    state_group_page_sizes,
+     scheduler_ext_flat_kvcache,
+ )
+ from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+@@ -971,6 +974,57 @@
+             )
+             server_args.block_size = equalized_block_size_value
+             config.page_size = equalized_block_size_value
++        # --mamba-track-interval: retained-snapshot stride N for the state
++        # group. N == block_size (the default, since 256 < 832) reproduces
++        # the previous geometry byte-for-byte; a larger N puts the state
++        # group on its own coarser grid so it pins ~T/N block ids instead of
++        # ~T/P. The price is prefix-hit granularity: the coordinator aligns
++        # every hit DOWN to the groups' lcm (SweepThenConverge), which
++        # becomes N. See docs/log.md E-numbered entry.
++        state_page_size_value = state_snapshot_interval(
++            block_size=server_args.block_size,
++            requested_interval=getattr(server_args, "mamba_track_interval", None),
++        )
++        gdn_state_page_sizes = state_group_page_sizes(
++            layer_types=list(config.layer_types),
++            page_size=server_args.block_size,
++            state_page_size=state_page_size_value,
++        )
++        if gdn_state_page_sizes:
++            merged = dict(getattr(config, "group_page_sizes", None) or {})
++            merged.update(gdn_state_page_sizes)
++            config.group_page_sizes = merged
++            cap_before = capacity_model(
++                components_from_layers(
++                    layer_types=list(config.layer_types),
++                    kv_bytes_per_slot=config.cache_cell_size(),
++                    state_const_bytes=gdn_state_bytes,
++                ),
++                block_size=server_args.block_size,
++            )
++            cap_after = capacity_model(
++                components_from_layers(
++                    layer_types=list(config.layer_types),
++                    kv_bytes_per_slot=config.cache_cell_size(),
++                    state_const_bytes=gdn_state_bytes,
++                ),
++                block_size=server_args.block_size,
++                state_interval=state_page_size_value,
++            )
++            logger.info(
++                "GDN state snapshot stride: %d tokens (attention page %d, "
++                "requested --mamba-track-interval %s); resident cost "
++                "%.0f -> %.0f bytes/token (%.2fx capacity), prefix-cache hit "
++                "granularity coarsens %d -> %d tokens",
++                state_page_size_value,
++                server_args.block_size,
++                getattr(server_args, "mamba_track_interval", None),
++                cap_before.bytes_per_token,
++                cap_after.bytes_per_token,
++                cap_before.bytes_per_token / cap_after.bytes_per_token,
++                server_args.block_size,
++                state_page_size_value,
++            )
+     draft_attn_config = None
+     if draft_model_config:
+         draft_attn_config = _create_attn_config(
+--- a/python/tokenspeed/runtime/layers/attention/backends/hybrid_linear_attn.py
++++ b/python/tokenspeed/runtime/layers/attention/backends/hybrid_linear_attn.py
+@@ -50,7 +50,10 @@
+ )
+ 
+ from tokenspeed.runtime.configs.flat_cache_runtime import flat_cache_debug_enabled
+-from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
++from tokenspeed.runtime.configs.paged_cache_spec import (
++    LINEAR_ATTENTION,
++    state_page_size,
++)
+ from tokenspeed.runtime.execution.breakable_cuda_graph import (
+     break_point,
+     current_forward_ctx,
+@@ -763,7 +766,13 @@
+         self.flat_state_active = bool(getattr(kv_pool, "state_slabs", None)) and any(
+             str(spec.group_id) == _STATE_GROUP_ID for spec in specs
+         )
+-        self._flat_state_page_size = int(getattr(kv_pool, "page_size", 1))
++        # The STATE group's own page size, not the pool's global one: under
++        # --mamba-track-interval the state group sits on a coarser grid
++        # (paged_cache_spec.state_group_page_sizes), and indexing its block
++        # table at the attention page size would read the wrong snapshot row.
++        self._flat_state_page_size = state_page_size(
++            specs, int(getattr(kv_pool, "page_size", 1))
++        )
+ 
+     def _state_page_bounds(
+         self,

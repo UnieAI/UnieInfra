@@ -1,0 +1,7 @@
+# legacy/ is an archive recovered from a working tree, not a build directory.
+# The repository-root ignore rules are upstream's and are tuned for a live
+# source tree; applied here they would silently drop experiment records that
+# exist nowhere else -- profiles, traces, generated reports. Re-include
+# everything, scoped to this directory so the root file stays untouched and
+# `git rebase upstream/main` never has to resolve it.
+!*

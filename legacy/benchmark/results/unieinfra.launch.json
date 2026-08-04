@@ -1,0 +1,6 @@
+{"engine":"unieinfra","model":"/workspace/models/Qwen/Qwen3-8B","served_model_name":"bench-model","port":8003,
+ "gpu_ids":"3","num_gpus":1,"gpu_model":"NVIDIA RTX PRO 6000 Blackwell Server Edition",
+ "dtype":"bfloat16","gpu_memory_utilization":0.90,"max_model_len":8192,
+ "attention_backend":"triton","tp_size":1,"container":"unieinfra-dev",
+ "max_num_seqs":"","max_cudagraph_capture_size":"",
+ "extra_args":"--chunked-prefill-size 2048 --enable-mixed-batch"}

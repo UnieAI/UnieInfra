@@ -1,0 +1,90 @@
+[
+  {
+    "shape": "gate_up_proj",
+    "M": 128,
+    "weight_mib": 192.0,
+    "rotation_buffers": 4,
+    "eager_hot": 200.4297637939453,
+    "eager_cold": 200.65760612487793,
+    "graph_hot": 200.5631923675537,
+    "graph_cold": 199.52000379562378,
+    "spread": 1.0057016956075213
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 256,
+    "weight_mib": 192.0,
+    "rotation_buffers": 4,
+    "eager_hot": 207.8927993774414,
+    "eager_cold": 208.5976004600525,
+    "graph_hot": 208.23040008544922,
+    "graph_cold": 207.11359977722168,
+    "spread": 1.0071651532512933
+  },
+  {
+    "shape": "down_proj",
+    "M": 128,
+    "weight_mib": 96.0,
+    "rotation_buffers": 7,
+    "eager_hot": 57.575998306274414,
+    "eager_cold": 57.24959969520569,
+    "graph_hot": 58.502399921417236,
+    "graph_cold": 87.01714106968471,
+    "spread": 1.5199606902574005
+  },
+  {
+    "shape": "down_proj",
+    "M": 256,
+    "weight_mib": 96.0,
+    "rotation_buffers": 7,
+    "eager_hot": 87.94431686401367,
+    "eager_cold": 87.33599781990051,
+    "graph_hot": 87.48160004615784,
+    "graph_cold": 95.47062601361957,
+    "spread": 1.0931417559400172
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 128,
+    "weight_mib": 48.0,
+    "rotation_buffers": 14,
+    "eager_hot": 30.88927984237671,
+    "eager_cold": 31.296800076961517,
+    "graph_hot": 29.08799946308136,
+    "graph_cold": 41.62377289363316,
+    "spread": 1.430960315660837
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 256,
+    "weight_mib": 48.0,
+    "rotation_buffers": 14,
+    "eager_hot": 141.29216194152832,
+    "eager_cold": 142.01279878616333,
+    "graph_hot": 142.53439903259277,
+    "graph_cold": 144.2884581429618,
+    "spread": 1.0212063865416217
+  },
+  {
+    "shape": "o_proj",
+    "M": 128,
+    "weight_mib": 32.0,
+    "rotation_buffers": 16,
+    "eager_hot": 21.206719875335693,
+    "eager_cold": 21.931199729442596,
+    "graph_hot": 21.12639993429184,
+    "graph_cold": 30.07279932498932,
+    "spread": 1.4234701330336887
+  },
+  {
+    "shape": "o_proj",
+    "M": 256,
+    "weight_mib": 32.0,
+    "rotation_buffers": 16,
+    "eager_hot": 39.12703990936279,
+    "eager_cold": 39.60479944944382,
+    "graph_hot": 39.19999897480011,
+    "graph_cold": 37.83679902553558,
+    "spread": 1.046727008347483
+  }
+]

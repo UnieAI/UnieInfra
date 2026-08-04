@@ -1,0 +1,45 @@
+# Reference sources for kernel porting, archived under legacy/.
+#
+# These are read-only upstreams that kernels were surveyed and ported *from*;
+# nothing in the maintained tree imports them at runtime. They are recorded here
+# so a port is reproducible -- "the TRT-LLM placeholder-block code this was taken
+# from is commit X" -- not because the build needs them.
+#
+# The maintained tree (everything outside legacy/) has no submodules by design:
+# it must stay rebaseable onto upstream tokenspeed, and a submodule is a second
+# repository to keep in sync.
+#
+# Restore any of them with:  git submodule update --init legacy/third_party/<name>
+[submodule "legacy/third_party/vllm"]
+	path = legacy/third_party/vllm
+	url = https://github.com/vllm-project/vllm.git
+[submodule "legacy/third_party/sglang"]
+	path = legacy/third_party/sglang
+	url = https://github.com/sgl-project/sglang.git
+[submodule "legacy/third_party/lmdeploy"]
+	path = legacy/third_party/lmdeploy
+	url = https://github.com/InternLM/lmdeploy.git
+[submodule "legacy/third_party/TensorRT-LLM"]
+	path = legacy/third_party/TensorRT-LLM
+	url = https://github.com/NVIDIA/TensorRT-LLM.git
+[submodule "legacy/third_party/tilert"]
+	path = legacy/third_party/tilert
+	url = https://github.com/tile-ai/TileRT.git
+[submodule "legacy/third_party/modular"]
+	path = legacy/third_party/modular
+	url = https://github.com/modular/modular.git
+[submodule "legacy/third_party/JetSpec"]
+	path = legacy/third_party/JetSpec
+	url = https://github.com/hao-ai-lab/JetSpec.git
+[submodule "legacy/third_party/FastVideo"]
+	path = legacy/third_party/FastVideo
+	url = https://github.com/hao-ai-lab/FastVideo.git
+[submodule "legacy/third_party/kernel-design-agents"]
+	path = legacy/third_party/kernel-design-agents
+	url = https://github.com/mit-han-lab/kernel-design-agents.git
+[submodule "legacy/third_party/ncu-report-skill"]
+	path = legacy/third_party/ncu-report-skill
+	url = https://github.com/mit-han-lab/ncu-report-skill.git
+[submodule "legacy/third_party/mlsys2026-flashinfer-contest"]
+	path = legacy/third_party/mlsys2026-flashinfer-contest
+	url = https://github.com/mit-han-lab/mlsys2026-flashinfer-contest.git

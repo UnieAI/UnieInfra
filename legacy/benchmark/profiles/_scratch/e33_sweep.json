@@ -1,0 +1,130 @@
+{
+  "qkv_proj/M1": {
+    "M": 1,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 41.135542733328684,
+    "best_us": 35.06799893719809,
+    "config": {
+      "block_n": 1,
+      "block_k": 2048,
+      "split_k": 1,
+      "num_warps": 2,
+      "num_stages": 2,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  },
+  "qkv_proj/M2": {
+    "M": 2,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 37.08411284855434,
+    "best_us": 36.49800164358957,
+    "config": {
+      "block_n": 1,
+      "block_k": 1024,
+      "split_k": 1,
+      "num_warps": 2,
+      "num_stages": 1,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  },
+  "qkv_proj/M4": {
+    "M": 4,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 37.11040019989014,
+    "best_us": 37.162572145462036,
+    "config": {
+      "block_n": 2,
+      "block_k": 2048,
+      "split_k": 1,
+      "num_warps": 2,
+      "num_stages": 2,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  },
+  "qkv_proj/M8": {
+    "M": 8,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 37.28411538260324,
+    "best_us": 44.928001505987986,
+    "config": {
+      "block_n": 1,
+      "block_k": 1024,
+      "split_k": 1,
+      "num_warps": 2,
+      "num_stages": 2,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  },
+  "o_proj/M1": {
+    "M": 1,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 28.79999876022339,
+    "best_us": 24.743249639868736,
+    "config": {
+      "block_n": 1,
+      "block_k": 1024,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 2,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  },
+  "o_proj/M2": {
+    "M": 2,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 28.79979908466339,
+    "best_us": 24.746999144554138,
+    "config": {
+      "block_n": 1,
+      "block_k": 1024,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 2,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  },
+  "o_proj/M4": {
+    "M": 4,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 28.866401314735413,
+    "best_us": 26.072250679135323,
+    "config": {
+      "block_n": 1,
+      "block_k": 1024,
+      "split_k": 1,
+      "num_warps": 2,
+      "num_stages": 1,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  },
+  "o_proj/M8": {
+    "M": 8,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 28.760799765586853,
+    "best_us": 30.90975061058998,
+    "config": {
+      "block_n": 2,
+      "block_k": 1024,
+      "split_k": 1,
+      "num_warps": 2,
+      "num_stages": 2,
+      "stream_b": true
+    },
+    "configs_tried": 228
+  }
+}

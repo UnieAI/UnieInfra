@@ -1,0 +1,74 @@
+[
+  {
+    "shape": "gate_up_proj",
+    "M": 128,
+    "weight_mib": 192.0,
+    "hot_us": 201.10719203948975,
+    "cold_us": 199.83999729156494,
+    "ratio": 0.9936989088501819,
+    "rotation_buffers": 4
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 256,
+    "weight_mib": 192.0,
+    "hot_us": 209.35680866241455,
+    "cold_us": 207.79519081115723,
+    "ratio": 0.9925408786022555,
+    "rotation_buffers": 4
+  },
+  {
+    "shape": "down_proj",
+    "M": 128,
+    "weight_mib": 96.0,
+    "hot_us": 56.569600105285645,
+    "cold_us": 87.01988628932408,
+    "ratio": 1.5382800325150836,
+    "rotation_buffers": 7
+  },
+  {
+    "shape": "down_proj",
+    "M": 256,
+    "weight_mib": 96.0,
+    "hot_us": 87.92319893836975,
+    "cold_us": 95.29691423688617,
+    "ratio": 1.0838654119453168,
+    "rotation_buffers": 7
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 128,
+    "weight_mib": 48.0,
+    "hot_us": 29.228800535202026,
+    "cold_us": 41.60411357879639,
+    "ratio": 1.4233944882100111,
+    "rotation_buffers": 14
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 256,
+    "weight_mib": 48.0,
+    "hot_us": 142.23999977111816,
+    "cold_us": 144.47040557861328,
+    "ratio": 1.015680580786587,
+    "rotation_buffers": 14
+  },
+  {
+    "shape": "o_proj",
+    "M": 128,
+    "weight_mib": 32.0,
+    "hot_us": 21.087999641895294,
+    "cold_us": 30.08280098438263,
+    "ratio": 1.426536489720792,
+    "rotation_buffers": 16
+  },
+  {
+    "shape": "o_proj",
+    "M": 256,
+    "weight_mib": 32.0,
+    "hot_us": 39.14879858493805,
+    "cold_us": 37.907201051712036,
+    "ratio": 0.9682851689424845,
+    "rotation_buffers": 16
+  }
+]

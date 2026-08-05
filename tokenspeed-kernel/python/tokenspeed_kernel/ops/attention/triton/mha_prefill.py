@@ -89,6 +89,19 @@ def _fwd_kernel(
 
     cur_seq_extend_start_idx = tl.load(cu_seqlens_q + cur_seq)
     cur_seq_len_extend = tl.load(cu_seqlens_q + cur_seq + 1) - cur_seq_extend_start_idx
+
+    # The grid's M dimension is sized from the batch's *longest* query segment,
+    # so a shorter sequence gets blocks whose every query index is out of range.
+    # Their `mask_m` is all-false and they store nothing, but without this exit
+    # they still walk the whole KV loop below -- a full `tl.dot` per BLOCK_N
+    # tile -- before discovering that.
+    #
+    # Wasted padding when query lengths are uniform; much worse on a mixed
+    # prefill+decode batch, where every seqlen_q == 1 decode row re-scans its
+    # entire cache ceil(max_seqlen_q / BLOCK_M) times.
+    if cur_block_m * BLOCK_M >= cur_seq_len_extend:
+        return
+
     if HAS_KV_CACHE:
         cur_seq_len = tl.load(cache_seqlens + cur_seq)
     else:

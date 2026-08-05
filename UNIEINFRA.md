@@ -74,7 +74,7 @@ fixed on its own.
 
 | path | what |
 |---|---|
-| `python/`, `tokenspeed-kernel/`, `tokenspeed-scheduler/`, … | upstream tokenspeed, unmodified |
+| `python/`, `tokenspeed-kernel/`, `tokenspeed-scheduler/`, … | upstream tokenspeed, plus the handful of commits listed by `git log upstream/main..main` |
 | `unieinfra/` | UnieAI plugins and tooling |
 | `legacy/` | everything from before this restructure — see `legacy/README.md` |
 

@@ -142,11 +142,18 @@ listed here back onto `local-tokenspeed/main`.
 | `pr/runtime-discover-plugins` | A1 | `d97efd1c` | ready — 3 tests, verified failing without the fix |
 | `pr/kernel-small-fixes` | A4 (3 of 6) | `57312157` `b93a8a8e` `4119f79c` | ready — proton optional; MHA prefill early-return; cutlass MoE scales |
 | `pr/runtime-small-fixes` | A4 (2 of 6) | `3eb83e9d` `b12febcc` | ready — Qwen3 KV scales; smg Prometheus port |
+| `pr/kernel-fp8-kv` | #22 | `996b05f4` | ready — 16 tests; 1.92x KV capacity end to end |
+| `pr/runtime-fp8-kv` | #22 | `996b05f4` `b8a392f8` | ready — **stacked on `pr/kernel-fp8-kv`**, not independent |
 
 Split by package because upstream reviews by area: `pr/kernel-small-fixes`
 touches only `tokenspeed-kernel/`, `pr/runtime-small-fixes` only
 `python/tokenspeed/`. Each branch's tests were re-run at its own tip, not just
 on `main` — 3, 4 and 66 passing respectively.
+
+`pr/runtime-fp8-kv` is the one exception to "each branch is a self-contained
+PR": it carries the kernel commit too, because without the widened signatures
+selection finds no kernel for a bf16 query over an fp8 cache and the server
+fails to start. Send it after `pr/kernel-fp8-kv` lands, or as a stacked PR.
 
 **A1** — `ModelRunner.__init__` calls `discover_plugins()` before `load_model()`.
 Tests cover the call, the ordering, and that a second worker still calls it.

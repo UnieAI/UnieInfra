@@ -6555,3 +6555,57 @@ existed, and the one consumer added later read it as "budget unknown, assume
 large" — which is the safe reading of a missing value and the wrong reading of a
 broken one. When a capability check does not change behaviour, check that the
 value it reads is not a default.
+
+### E48b — the code behind E45's +10.3% is not in the preserved tree
+
+Porting the two-granularity KV work to the re-forked tree landed the
+state-snapshot machinery (`state_snapshot_interval`, `state_page_size`,
+`state_group_page_sizes`, `layer_page_sizes`) and it is live -- the new grain
+check fires, warning that `chunked_prefill_size=8192` is not a multiple of the
+state-snapshot page grain and using 7488 instead.
+
+It did **not** reproduce E45's capacity result. `num_device_pages` is still 149.
+
+E45 quotes this startup line from `tokenspeed:sm120-tree`:
+
+```
+Placeholder blocks ON: ... (259 history ids, 129 state ids, ratio 0.5000 derived,
+  demand-matched P/N = 0.5000)
+```
+
+Searching for it:
+
+| where | result |
+|---|---|
+| the re-forked tree | absent |
+| `legacy/divergence/unieai-python.diff` | 0 occurrences of "placeholder" |
+| the preserved pre-restructure working tree (`UnieInfra-old`) | only in `log.md` itself |
+| all 76 commits of the old repository (`git log -S`) | none |
+
+Placeholder blocks themselves are an **upstream** feature -- `scheduler.h`,
+`operations/forward.cpp`, `fsm/forward_states.h` -- which is consistent with
+`tokenspeed-scheduler` having zero UnieAI divergence. What is missing is the
+python side that derived the ratio and turned it on.
+
+So the string exists in exactly one place: the log entry claiming the
+measurement. The code that produced it was never committed and is not in the
+working tree that was preserved. `tokenspeed:sm120-tree` was built by copying 10
+files from the tree at that moment; at least one of them no longer exists.
+
+**This puts a question mark on E45 Result 1 that this entry cannot remove.** The
+measurement may well have been real -- the capacity arithmetic in E45 is
+self-consistent and the `#running-req: 24 -> 32` observation is hard to fake --
+but it is no longer reproducible from anything in the repository, and +10.3%
+should not be quoted as a banked win until it is.
+
+Next step is not to re-port but to re-derive: placeholder blocks exist upstream,
+so find how the scheduler expects the ratio to be supplied and drive it from the
+already-ported `state_snapshot_interval`.
+
+### Hazard for whoever reads this next
+
+**A result whose code was never committed is a result you do not have.** E45 was
+measured from an image built by copying files out of a working tree. The image
+is gone, the tree moved on, and the only surviving trace of the mechanism is the
+sentence claiming it worked. Build the artefact from a commit, or record the
+diff in the entry.

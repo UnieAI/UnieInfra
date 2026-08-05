@@ -93,7 +93,11 @@ if platform.is_nvidia:
                 scores, k=getattr(w, "top_k"), dim=-1, sorted=False
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
+            # ``token_final_scales`` must stay float32: the cutlass fused-MoE
+            # kernel rejects a half/bfloat16 scale tensor. The engine's
+            # precomputed-topk path already hands us float32; this branch only
+            # runs for direct callers that let the kernel do its own routing.
+            topk_weights = topk_weights.to(torch.float32)
         # Tune new shapes during startup only, frozen once serving (see ops.tuning).
         with nullcontext() if autotune_frozen() else flashinfer_autotune():
             return cutlass_fused_moe(

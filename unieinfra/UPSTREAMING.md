@@ -127,13 +127,26 @@ solved. Re-read each diff against current upstream before writing anything.
 
 ## Status
 
-Branches are cut from `local-tokenspeed/main` and carry no UnieInfra content, so
-each is a self-contained PR to `lightseekorg/tokenspeed`. None is pushed yet.
+The work itself lives on `main`. The `pr/*` branches below are *views* of it:
+each is cut from `local-tokenspeed/main` and carries only the cherry-picked
+commits for its item, so each is a self-contained PR to
+`lightseekorg/tokenspeed` with no UnieInfra content in it. None is pushed yet.
 
-| branch | item | state |
-|---|---|---|
-| `pr/runtime-discover-plugins` | A1 | ready — 3 tests, verified failing without the fix |
-| `pr/kernel-small-fixes` | A4 (2 of 6) | ready — proton optional; MHA prefill early-return |
+Re-cut them after any rebase — they are derived, not authoritative. An earlier
+pair of branches was lost in the re-fork (`1dd493da`) while this table still
+claimed they existed; if that happens again, `git cherry-pick -x` the commits
+listed here back onto `local-tokenspeed/main`.
+
+| branch | item | commits | state |
+|---|---|---|---|
+| `pr/runtime-discover-plugins` | A1 | `d97efd1c` | ready — 3 tests, verified failing without the fix |
+| `pr/kernel-small-fixes` | A4 (3 of 6) | `57312157` `b93a8a8e` `4119f79c` | ready — proton optional; MHA prefill early-return; cutlass MoE scales |
+| `pr/runtime-small-fixes` | A4 (2 of 6) | `3eb83e9d` `b12febcc` | ready — Qwen3 KV scales; smg Prometheus port |
+
+Split by package because upstream reviews by area: `pr/kernel-small-fixes`
+touches only `tokenspeed-kernel/`, `pr/runtime-small-fixes` only
+`python/tokenspeed/`. Each branch's tests were re-run at its own tip, not just
+on `main` — 3, 4 and 66 passing respectively.
 
 **A1** — `ModelRunner.__init__` calls `discover_plugins()` before `load_model()`.
 Tests cover the call, the ordering, and that a second worker still calls it.
@@ -150,6 +163,28 @@ output bitwise identical on all five shapes. `test/ops/test_attention.py` has
 the same pass/fail set before and after — 12 pre-existing failures on this card
 in the flashinfer and cuda paths, none in triton.
 
+**A4.3** — `cutlass_unquant.py` promotes its self-computed routing weights to
+float32; the cutlass fused-MoE kernel rejects a half/bfloat16
+`token_final_scales`. The engine's precomputed-topk path was already float32,
+which is why this never fired in serving. Verified failing before the fix on
+both fp16 and bf16 activations, with the precomputed-topk cases passing in both
+states as controls.
+
+**A4.4** — `qwen3.py` skips `.k_scale`/`.v_scale` entries with no matching
+parameter, as `qwen3_moe.py` already does. Verified failing on all six scale
+spellings; an ordinary-weight case and a non-scale missing name pass in both
+states, so the skip provably swallows nothing else.
+
+Noted while testing, not fixed: `"v_proj" in "qkv_proj"` is true, so a
+checkpoint key already spelled `qkv_proj.k_scale` is mangled to `qkqkv_proj` by
+the stacked-params rewrite before any skip sees it. Same for `qkv_proj.bias`.
+Pre-existing in the mapping loop, and separate from A4.
+
+**A4.5** — `serve_smg.py` honours `TOKENSPEED_SMG_PROMETHEUS_PORT`. Unset or
+empty leaves the randomised default untouched; an explicit `--prometheus-port`
+still wins; an unparsable value raises rather than silently handing back a
+random port the operator would then fail to scrape.
+
 ### Not yet sent, and why
 
 `runtime/layers/dense/fp8.py` is the one A4 item deliberately left out. It
@@ -158,10 +193,6 @@ group-quant helper because "the TRT-LLM per-token op returns malformed scales on
 sm_120". That is a real bug report, but the fix changes the code path for every
 architecture and the fork carries no measurement of what it costs on datacenter
 parts. It needs its own PR with numbers, or a narrower gate.
-
-`runtime/models/qwen3.py` (skip absent `.k_scale`/`.v_scale`) and
-`cli/serve_smg.py` (`TOKENSPEED_SMG_PROMETHEUS_PORT`) are both small and
-uncontroversial; they simply have not been done yet.
 
 ---
 

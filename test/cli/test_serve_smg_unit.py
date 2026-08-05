@@ -47,6 +47,7 @@ from tokenspeed.cli.serve_smg import (
     INKLING_TOOL_CALL_PARSER,
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
+    SMG_PROMETHEUS_PORT_ENV,
     _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
@@ -212,6 +213,42 @@ def test_gateway_args_preserve_user_prometheus_port():
     )
 
     assert gateway_args == ["--prometheus-port", "29000"]
+
+
+def test_gateway_args_prometheus_port_pinned_by_env():
+    with patch.dict(os.environ, {SMG_PROMETHEUS_PORT_ENV: "29001"}):
+        gateway_args = _gateway_args_with_default_prometheus_port(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--prometheus-port", "29001"]
+
+
+def test_gateway_args_explicit_prometheus_port_beats_env():
+    with patch.dict(os.environ, {SMG_PROMETHEUS_PORT_ENV: "29001"}):
+        gateway_args = _gateway_args_with_default_prometheus_port(
+            ["--prometheus-port", "29000"]
+        )
+
+    assert gateway_args == ["--prometheus-port", "29000"]
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_gateway_args_blank_prometheus_env_keeps_random_port(value):
+    """An empty pin is not a pin: the pre-existing randomised default stands."""
+    with patch.dict(os.environ, {SMG_PROMETHEUS_PORT_ENV: value}):
+        gateway_args = _gateway_args_with_default_prometheus_port(["--model", "/tmp/x"])
+
+    assert gateway_args[:3] == ["--model", "/tmp/x", "--prometheus-port"]
+    assert gateway_args[3].isdigit()
+    assert 1 <= int(gateway_args[3]) <= 65535
+
+
+@pytest.mark.parametrize("value", ["not-a-port", "0", "65536", "-1"])
+def test_gateway_args_invalid_prometheus_env_is_reported(value):
+    """A misconfigured pin fails loudly. Silently falling back would leave the
+    operator scraping a port nothing is listening on."""
+    with patch.dict(os.environ, {SMG_PROMETHEUS_PORT_ENV: value}):
+        with pytest.raises(ValueError, match=SMG_PROMETHEUS_PORT_ENV):
+            _gateway_args_with_default_prometheus_port(["--model", "/tmp/x"])
 
 
 def test_smg_disable_flags_appended_when_absent():

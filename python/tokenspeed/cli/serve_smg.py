@@ -62,6 +62,9 @@ INKLING_ATTENTION_BACKEND = "fa4"
 KIMI_K3_REASONING_PARSER = "kimi_k3"
 KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+# Optional pin for smg's Prometheus exporter port. Unset -> a fresh free port
+# per launch (the pre-existing behaviour).
+SMG_PROMETHEUS_PORT_ENV = "TOKENSPEED_SMG_PROMETHEUS_PORT"
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
 # smg routing policy for ``ts serve``. Distinct from DEFAULT_REASONING_PARSER,
@@ -211,6 +214,30 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
 
 
+def _pinned_prometheus_port() -> int | None:
+    """Return the port pinned by ``TOKENSPEED_SMG_PROMETHEUS_PORT``, if any.
+
+    Returns ``None`` when the variable is unset or empty, which leaves the
+    randomised default in place. A value that is not a valid TCP port is a
+    configuration error and is reported as one: silently falling back would
+    leave the operator scraping a port nothing is listening on.
+    """
+    pinned = os.environ.get(SMG_PROMETHEUS_PORT_ENV, "").strip()
+    if not pinned:
+        return None
+    try:
+        port = int(pinned)
+    except ValueError as exc:
+        raise ValueError(
+            f"{SMG_PROMETHEUS_PORT_ENV}={pinned!r} is not an integer port"
+        ) from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(
+            f"{SMG_PROMETHEUS_PORT_ENV}={pinned!r} is outside the port range 1-65535"
+        )
+    return port
+
+
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
     """Bind the smg Prometheus exporter to a freshly allocated free port.
 
@@ -224,10 +251,17 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     free port per launch (like the engine and control ports) avoids every
     collision; callers that need a stable scrape target can still pass an
     explicit ``--prometheus-port``.
+
+    ``TOKENSPEED_SMG_PROMETHEUS_PORT`` pins the port without an explicit CLI
+    flag, for deployments that scrape smg directly. The randomised default is
+    unchanged when it is unset, so this does not alter any existing launch.
     """
     if "--prometheus-port" in gateway_args:
         return gateway_args
-    return [*gateway_args, "--prometheus-port", str(get_free_port())]
+    port = _pinned_prometheus_port()
+    if port is None:
+        port = get_free_port()
+    return [*gateway_args, "--prometheus-port", str(port)]
 
 
 def _user_model_id(gateway_args: list[str]) -> str | None:

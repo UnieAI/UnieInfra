@@ -1,5 +1,15 @@
 default_stages: [pre-commit, pre-push, manual]
 
+# UnieAI-local. `legacy/` is a frozen copy of the pre-restructure repository,
+# kept so the old fork's divergence stays readable and re-applicable. Two
+# reasons it must not be touched by the hooks:
+#   - it holds unified diffs and patches (`legacy/divergence/*.diff`,
+#     `legacy/patches/*.patch`). A context line in that format is " " + content,
+#     so a blank context line is a single space -- exactly what
+#     trailing-whitespace strips, silently corrupting the patch.
+#   - reformatting an archive destroys its fidelity to what was actually run.
+exclude: '^legacy/'
+
 default_language_version:
   python: python3.12
 

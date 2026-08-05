@@ -313,6 +313,30 @@ def _fwd_kernel(
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
 
+# sm_80/sm_90/sm_100 opt into 160-228 KB of shared memory per block; sm_86,
+# sm_89 and sm_120 only ~100 KB. The prefill tiles below are sized off that
+# split, so it has to be measured rather than derived from the arch version --
+# sm_120 sorts above sm_90 by version and below it by budget.
+_LARGE_SHARED_MEMORY_BYTES = 128 * 1024
+
+
+def _has_large_shared_memory(platform) -> bool:
+    """Whether the device has a datacenter-sized per-block shared-memory budget.
+
+    Args:
+        platform: The active ``PlatformInfo``.
+
+    Returns:
+        ``True`` when the device can opt into at least
+        ``_LARGE_SHARED_MEMORY_BYTES``. A budget of ``0`` means the platform
+        layer could not determine one; that also returns ``True`` so a detection
+        gap never silently narrows the tiles already validated on datacenter
+        GPUs.
+    """
+    budget = platform.max_shared_memory_per_sm
+    return budget == 0 or budget >= _LARGE_SHARED_MEMORY_BYTES
+
+
 def prefill_attention_fwd(
     q_extend,
     k_extend,
@@ -368,14 +392,23 @@ def prefill_attention_fwd(
         num_warps = 4
 
     else:
-        if platform.is_hopper_plus:
+        # Ask the device for its shared-memory budget rather than inferring it
+        # from the arch family. The budget does not follow the version ordering:
+        # sm_86/sm_89 have ~100 KB against sm_80's 160 KB, and sm_120 (RTX PRO /
+        # workstation Blackwell) is `is_hopper_plus` by version while carrying
+        # the same ~100 KB as sm_89. Selecting the datacenter tile there asks
+        # for 114,688 bytes against a 101,376-byte limit and the launch aborts
+        # with OutOfResources.
+        small_smem = not _has_large_shared_memory(platform)
+
+        if platform.is_hopper_plus and not small_smem:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif platform.is_ampere_plus:
-            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if platform.arch_version.minor == 9 or platform.arch_version.minor == 6:
+            if small_smem:
+                # sm_86/sm_89, and sm_120 which lands here for the same reason.
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (64, 128)
                 elif Lq <= 256:

@@ -254,9 +254,49 @@ Before the change the same command does not start at all —
 `NoKernelFoundError: No kernel found for attention.mha_decode_with_kvcache
 (k_cache=dense[storage=torch.float8_e4m3fn], ...) with solution 'triton'`.
 
-Still unmeasured: throughput against the 208.0 baseline at C=32 / ILEN=4096 on
-Qwen3.5-27B. Capacity is not throughput, and the baseline is what the gap is
-stated in.
+#### Throughput: +19.0%
+
+Qwen3.5-27B, GPU 1 alone, C=32 / ILEN=4096 / OLEN=256, max_model_len 8192, GMU
+0.85, 600 s per arm with early convergence disabled. **Both arms pin
+`--attention-backend triton`** and differ only in `--kv-cache-dtype`. That is
+deliberate: E48's 208.0 baseline ran with *no* `--attention-backend`, so
+comparing triton+fp8 against it would fold a backend change into the fp8 delta.
+
+| arm | tok/s | per-period sd |
+|---|---|---|
+| triton + bf16 | 206.5 | 2.2–2.8% |
+| triton + fp8_e4m3 | **245.8** | 0.1% |
+
+**+19.0%**, and the run was repeated with the arm order reversed: both orders
+give 206.5 -> 245.8, +19.0%, to one decimal.
+
+Capacity is 1.92x but throughput is +19% because KV was not the binding
+constraint at this operating point. C=32 fixes the number of in-flight requests,
+so a bigger pool cannot widen the batch; and decode at 27B is dominated by
+reading ~54 GB of weights per step, which fp8 KV does not touch. The gain is
+mostly removed capacity thrash. Expect more where KV *is* the constraint — high
+concurrency, or alongside speculative decoding, which shrinks the pool.
+
+##### Two ways this measurement lies if taken at face value
+
+**The harness's own number is phase-biased.** It reports the mean of the last 3
+windows; the fp8 arm sits in a strict period-5 limit cycle
+(`410 0 410 38 371` on the server counter), so that mean lands wherever the run
+happened to stop. It reported 272.0. Three windows earlier the same run would
+have read 230. Block by whole periods: 25 windows = 5 periods, and the block
+means are then stationary to 0.1% even though the cycle's *shape* drifts across
+the run.
+
+**The completion-side counter is not a second opinion.** `server_tok_s` is
+completed-requests x OLEN, and it reads 247.3 / 260.6 on the two fp8 runs — a 5%
+disagreement with itself, because completions arrive in bursts and the window
+boundary cuts them differently. Only the streamed-token counter reproduces. Note
+also `reqs_done` is cumulative, not per-window; summing that column overstates
+throughput ~16x.
+
+The fp8 arm's window spread is 162% (10 to 407 tok/s). The period means are
+stationary, so the average is sound, but this is not a steady state in the
+ordinary sense — doubling the pool changed the scheduling dynamics.
 
 ### The two left, in the order they should be done
 

@@ -128,8 +128,14 @@ def unieinfra_bmm_fp8_scaled_sm120(
         reference = KernelRegistry.get().get_impl("torch_bmm_fp8_scaled")
         if reference is not None:
             return reference(
-                A, B, A_scales, B_scales, out_dtype, alpha=None,
-                block_size=None, out=out,
+                A,
+                B,
+                A_scales,
+                B_scales,
+                out_dtype,
+                alpha=None,
+                block_size=None,
+                out=out,
             )
 
     # cuBLASLt FP8 requires the TN layout: A row-major [M, K], B column-major

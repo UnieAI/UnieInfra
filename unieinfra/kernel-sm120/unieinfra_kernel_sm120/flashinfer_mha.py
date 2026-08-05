@@ -387,8 +387,15 @@ def _make_slot(
 
     with torch.inference_mode(False):
         return _make_slot_buffers(
-            flashinfer, device, batch, max_seqlen_q, max_pages_per_seq,
-            causal, num_qo_heads, num_kv_heads, head_dim,
+            flashinfer,
+            device,
+            batch,
+            max_seqlen_q,
+            max_pages_per_seq,
+            causal,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
         )
 
 
@@ -412,7 +419,9 @@ def _make_slot_buffers(
         device=device,
     )
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
-    kv_indices = torch.zeros(batch * max_pages_per_seq, dtype=torch.int32, device=device)
+    kv_indices = torch.zeros(
+        batch * max_pages_per_seq, dtype=torch.int32, device=device
+    )
     last_page_len = torch.ones(batch, dtype=torch.int32, device=device)
 
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -651,10 +660,9 @@ def _paged_kv_layout(
     torch.cumsum(pages_per_seq, dim=0, out=kv_indptr[1:])
 
     max_pages = page_table.shape[1]
-    keep = (
-        torch.arange(max_pages, device=page_table.device).unsqueeze(0)
-        < pages_per_seq.unsqueeze(1)
-    )
+    keep = torch.arange(max_pages, device=page_table.device).unsqueeze(
+        0
+    ) < pages_per_seq.unsqueeze(1)
     kv_indices = page_table[keep].to(torch.int32)
 
     # A sequence occupying a whole number of pages ends on a full last page,
@@ -703,9 +711,7 @@ def _absorb_query_padding(
         [qo_indptr, torch.tensor([q.shape[0]], dtype=torch.int32, device=dev)]
     )
     kv_indptr = torch.cat([kv_indptr, (kv_indptr[-1] + 1).reshape(1)])
-    kv_indices = torch.cat(
-        [kv_indices, torch.zeros(1, dtype=torch.int32, device=dev)]
-    )
+    kv_indices = torch.cat([kv_indices, torch.zeros(1, dtype=torch.int32, device=dev)])
     last_page_len = torch.cat(
         [last_page_len, torch.ones(1, dtype=torch.int32, device=dev)]
     )
@@ -775,12 +781,21 @@ def flashinfer_paged_mha_extend(
     # every argument the schedule depends on, so a mismatch falls through to
     # planning inline rather than reusing a schedule built for other shapes.
     plan_key = (
-        cu_seqlens_q.data_ptr(), int(cu_seqlens_q.shape[0]),
-        page_table.data_ptr(), tuple(page_table.shape),
+        cu_seqlens_q.data_ptr(),
+        int(cu_seqlens_q.shape[0]),
+        page_table.data_ptr(),
+        tuple(page_table.shape),
         cache_seqlens.data_ptr(),
-        page_size, num_qo_heads, num_kv_heads, head_dim,
-        int(q.shape[0]), bool(is_causal), float(softmax_scale),
-        q.dtype, k_cache.dtype, bool(return_lse),
+        page_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        int(q.shape[0]),
+        bool(is_causal),
+        float(softmax_scale),
+        q.dtype,
+        k_cache.dtype,
+        bool(return_lse),
     )
     wrapper = _planned_extend_wrapper(plan_key)
 
@@ -1060,8 +1075,10 @@ def prepare_paged_mha_extend(
             [kv_indices, torch.zeros(1, dtype=torch.int32, device=kv_indices.device)]
         )
         last_page_len = torch.cat(
-            [last_page_len,
-             torch.ones(1, dtype=torch.int32, device=last_page_len.device)]
+            [
+                last_page_len,
+                torch.ones(1, dtype=torch.int32, device=last_page_len.device),
+            ]
         )
 
     # Size the split-KV scratch for THIS shape before planning. Extend carries
@@ -1081,10 +1098,18 @@ def prepare_paged_mha_extend(
         _workspace(page_table.device, need), "NHD"
     )
     wrapper.plan(
-        qo_indptr, kv_indptr, kv_indices, last_page_len,
-        num_q_heads, num_kv_heads, head_dim, page_size,
-        causal=is_causal, sm_scale=softmax_scale,
-        q_data_type=q_dtype, kv_data_type=kv_dtype,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=is_causal,
+        sm_scale=softmax_scale,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
     )
     _extend_plan = {
         "wrapper": wrapper,
@@ -1092,12 +1117,21 @@ def prepare_paged_mha_extend(
         # any of these is not the step that was prepared, and must not silently
         # reuse a schedule built for different shapes.
         "key": (
-            cu_seqlens_q.data_ptr(), int(cu_seqlens_q.shape[0]),
-            page_table.data_ptr(), tuple(page_table.shape),
+            cu_seqlens_q.data_ptr(),
+            int(cu_seqlens_q.shape[0]),
+            page_table.data_ptr(),
+            tuple(page_table.shape),
             cache_seqlens.data_ptr(),
-            page_size, num_q_heads, num_kv_heads, head_dim,
-            total_q, bool(is_causal), float(softmax_scale),
-            q_dtype, kv_dtype, bool(return_lse),
+            page_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            total_q,
+            bool(is_causal),
+            float(softmax_scale),
+            q_dtype,
+            kv_dtype,
+            bool(return_lse),
         ),
     }
 

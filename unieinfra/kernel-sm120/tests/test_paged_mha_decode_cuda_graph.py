@@ -17,10 +17,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.attention import mha_decode_with_kvcache
 from tokenspeed_kernel.plugins import discover_plugins
-
 from unieinfra_kernel_sm120 import flashinfer_mha as fim
 
 discover_plugins()
@@ -57,9 +55,11 @@ def _batch(device: torch.device, batch: int, max_seqlen_q: int, seed: int, min_l
     page_table = torch.randint(
         0, NUM_PAGES, (batch, MAX_PAGES), generator=g, dtype=torch.int32
     ).to(device)
-    seq_lens = torch.randint(
-        min_len, MAX_SEQ, (batch,), generator=g, dtype=torch.int32
-    ).clamp_min(max_seqlen_q).to(device)
+    seq_lens = (
+        torch.randint(min_len, MAX_SEQ, (batch,), generator=g, dtype=torch.int32)
+        .clamp_min(max_seqlen_q)
+        .to(device)
+    )
     return q, page_table, seq_lens
 
 
@@ -109,8 +109,7 @@ def _capture(q, k, v, page_table, seq_lens, max_seqlen_q):
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability(0) != (12, 0),
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (12, 0),
     reason="requires an sm_120 device",
 )
 
@@ -125,7 +124,9 @@ def device():
 def test_matches_triton_eager(device, batch, max_seqlen_q):
     """Agreement with the in-tree kernel this displaces, through the dispatch."""
     k, v = _caches(device)
-    q, page_table, seq_lens = _batch(device, batch, max_seqlen_q, batch * 10 + max_seqlen_q)
+    q, page_table, seq_lens = _batch(
+        device, batch, max_seqlen_q, batch * 10 + max_seqlen_q
+    )
     ref = _decode("triton", q, k, v, page_table, seq_lens, max_seqlen_q)
     got = _decode(SOLUTION, q, k, v, page_table, seq_lens, max_seqlen_q)
     assert _cosine(ref, got) > COS_BAR

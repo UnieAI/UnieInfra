@@ -122,10 +122,18 @@ NUM_STAGES_DEFAULT = 1
 # that space is silently unreachable. Selection here is therefore driven by the
 # device's *reported* opt-in shared memory, never by the architecture name.
 _SMEM_BYTES = {
-    (16, 1): 34816, (16, 2): 53764, (16, 3): 105480,
-    (32, 1): 36864, (32, 2): 57860, (32, 3): 111624,
-    (64, 1): 40960, (64, 2): 66052, (64, 3): 123912,
-    (128, 1): 32768, (128, 2): 74244, (128, 3): 140296,
+    (16, 1): 34816,
+    (16, 2): 53764,
+    (16, 3): 105480,
+    (32, 1): 36864,
+    (32, 2): 57860,
+    (32, 3): 111624,
+    (64, 1): 40960,
+    (64, 2): 66052,
+    (64, 3): 123912,
+    (128, 1): 32768,
+    (128, 2): 74244,
+    (128, 3): 140296,
 }
 
 # Fused-vs-split gate. The fused kernel's only parallelism is
@@ -338,8 +346,12 @@ def _pick_config(device: torch.device) -> tuple[int, int, int]:
     limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
     # Preference order is measured, best first. Every entry is correct; they
     # differ only in speed and in how much shared memory they ask for.
-    for bv, nw, ns in ((BV_DEFAULT, NUM_WARPS_DEFAULT, NUM_STAGES_DEFAULT),
-                       (32, 4, 1), (32, 2, 1), (16, 4, 1)):
+    for bv, nw, ns in (
+        (BV_DEFAULT, NUM_WARPS_DEFAULT, NUM_STAGES_DEFAULT),
+        (32, 4, 1),
+        (32, 2, 1),
+        (16, 4, 1),
+    ):
         if _SMEM_BYTES[(bv, ns)] <= limit:
             return bv, nw, ns
     raise RuntimeError(
@@ -468,7 +480,11 @@ def unieinfra_gdn_chunk_prefill_sm120(
     # rather than raising is a safety net for a caller that bypasses selection.
     if num_seqs < FUSED_MIN_SEQS or output_h:
         return triton_gdn_chunk_prefill(
-            q, k, v, g, beta,
+            q,
+            k,
+            v,
+            g,
+            beta,
             scale=scale,
             initial_state=initial_state,
             cu_seqlens=cu_seqlens,
@@ -585,7 +601,6 @@ def register_gdn() -> None:
     )(unieinfra_gdn_chunk_prefill_sm120)
 
     logger.info(
-        "unieinfra-kernel-sm120: registered fused GDN chunk prefill at "
-        "priority %d",
+        "unieinfra-kernel-sm120: registered fused GDN chunk prefill at " "priority %d",
         int(Priority.PLUGIN),
     )

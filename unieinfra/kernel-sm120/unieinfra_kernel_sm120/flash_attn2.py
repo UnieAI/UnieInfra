@@ -201,9 +201,7 @@ def _uniform_cu_seqlens(
     key = (device, batch, seqlen_q)
     cached = _cu_seqlens_cache.get(key)
     if cached is None:
-        cached = torch.arange(
-            batch + 1, dtype=torch.int32, device=device
-        ) * seqlen_q
+        cached = torch.arange(batch + 1, dtype=torch.int32, device=device) * seqlen_q
         _cu_seqlens_cache[key] = cached
     return cached
 

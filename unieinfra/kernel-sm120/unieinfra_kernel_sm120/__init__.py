@@ -29,11 +29,13 @@ def register() -> None:
     discovery takes the host process down with it.
     """
     import torch
-    from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.platform import (
+        ArchVersion,
+        CapabilityRequirement,
+        current_platform,
+    )
     from tokenspeed_kernel.registry import Priority, register_kernel
     from tokenspeed_kernel.signature import format_signatures
-
     from unieinfra_kernel_sm120.flashinfer_mha import flashinfer_paged_mha_decode
 
     platform = current_platform()
@@ -84,7 +86,7 @@ def register() -> None:
     logger.info(
         "unieinfra-kernel-sm120: registered FlashInfer paged MHA decode at "
         "priority %d (extend deliberately unregistered, see E36)",
-        int(Priority.PLUGIN)
+        int(Priority.PLUGIN),
     )
 
     # The remaining families live in their own modules so that separate work can
@@ -106,5 +108,7 @@ def register() -> None:
             logger.warning(
                 "unieinfra-kernel-sm120: %s.%s failed; its kernels are "
                 "unavailable and selection will fall back in tree",
-                module_name, entry_point, exc_info=True,
+                module_name,
+                entry_point,
+                exc_info=True,
             )

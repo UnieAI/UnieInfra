@@ -134,6 +134,18 @@ if platform.is_nvidia and platform.is_hopper_plus:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            # Upper bound, because `min_arch_version` alone is an open-ended
+            # version comparison that every newer part satisfies. This one is
+            # backed by TllmGenFmhaRunner, whose kernels are prebuilt for
+            # datacenter Blackwell; on sm_120 it passes selection and then dies
+            # with "Unsupported architecture" from
+            # flashinfer/trtllm/fmha/fmhaRunner.cuh at the first extend.
+            #
+            # A capability would be better than a version range -- what these
+            # kernels actually need is tcgen05/TMEM, which sm_120 does not have
+            # -- but `_get_cuda_sm_features` has no feature for it, so the bound
+            # is the honest expression of what is known today.
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -222,6 +234,20 @@ if platform.is_nvidia and platform.is_hopper_plus:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # XQA is compiled with TOKENS_PER_PAGE as a template parameter and
+            # rejects anything else outright (flashinfer/jit/xqa.py). Callers
+            # already pass page_size to select_kernel, so declaring it here is
+            # what keeps this kernel from winning selection for a page size it
+            # cannot serve and then raising from inside JIT compilation.
+            #
+            # Hybrid attention/linear-attention models are the case that hits
+            # this: their attention page size is derived from the linear-state
+            # row rather than chosen, so it is routinely none of these four.
+            "page_size": frozenset({16, 32, 64, 128}),
+            # The same file also requires head_dim to be a multiple of 16 in
+            # [16, 256]. Not declared here: traits take a finite set, and
+            # enumerating 16 values would go stale against the rule. It has not
+            # bitten yet because every model tried has a head_dim XQA accepts.
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),

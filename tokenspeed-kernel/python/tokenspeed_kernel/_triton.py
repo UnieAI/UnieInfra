@@ -30,12 +30,25 @@ import sys
 
 import tokenspeed_triton as triton
 import tokenspeed_triton.experimental.gluon.language as gl
-import tokenspeed_triton.profiler as proton
 from tokenspeed_triton import language as tl
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.language.core import _aggregate as aggregate
 from tokenspeed_triton.language.extra import libdevice
 from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+
+# Proton is optional: some tokenspeed-triton builds ship without the profiler
+# submodule. `profiling.py` is already written for that -- it does
+# `_HAS_PROTON = proton is not None` and guards every use -- but importing it
+# unconditionally here meant that branch could never be reached and a build
+# lacking the submodule raised ModuleNotFoundError at import time instead.
+#
+# The failure is invisible in serving, which does not reach this module, and
+# fatal in any standalone use: importing a kernel module directly pulls
+# `tokenspeed_kernel` and therefore this file.
+try:
+    import tokenspeed_triton.profiler as proton
+except ModuleNotFoundError:
+    proton = None
 
 __all__ = [
     "aggregate",

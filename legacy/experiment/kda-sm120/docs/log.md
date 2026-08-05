@@ -6455,3 +6455,103 @@ achieved bandwidth next to every kernel timing; it costs nothing and it is the
 cheapest available check that the working set is not sitting in cache. This is
 the same class of error as E45's short arms -- an instrument that flatters the
 arm you were hoping for.
+
+## E48 — sm_120 runs on the re-forked tree after three gating bugs, and is **16.2% behind vLLM** without the work still in `legacy/`
+
+**Context.** UnieInfra was re-forked from upstream tokenspeed with a shared
+ancestor; the sm_120 work from the old fork was deliberately left in `legacy/`
+to be re-expressed. This is the first measurement of what upstream alone does on
+this card, and therefore the honest baseline for everything that gets ported
+back.
+
+### Getting it to start: three bugs, each found by running it
+
+Upstream tokenspeed does not start on sm_120 with Qwen3.5. Each failure was
+found by launching and reading the traceback, one at a time.
+
+**1. XQA decode wins selection for a page size it cannot compile.**
+`flashinfer_trtllm_mha_decode_with_kvcache` declares traits for sliding window,
+sinks, logit cap and LSE, but not for page size. XQA compiles `TOKENS_PER_PAGE`
+as a template parameter and accepts only 16/32/64/128. Callers already pass
+`page_size` to `select_kernel`, so the constraint simply was not declared:
+
+```
+ValueError: Invalid page_size: 576, only 16, 32, 64, 128 are supported
+```
+
+Hybrid attention/linear-attention models are what hit this — their attention
+page size is derived from the linear-state row rather than chosen.
+
+**2. TRT-LLM-gen FMHA wins selection on an arch it was not built for.**
+`flashinfer_trtllm_mha_extend_with_kvcache` gates on
+`min_arch_version=ArchVersion(10, 0)` — an open-ended comparison that every newer
+part satisfies. sm_120 passes it, then dies at the first extend with
+`Unsupported architecture` from `fmhaRunner.cuh`. Bounded above at sm_103.
+
+**3. The Triton prefill tile does not fit, and the check that should have caught
+it was dead code.** The tile ladder branches on arch family, with a carve-out for
+sm_86/sm_89 keyed on `arch_version.minor == 9 or == 6`. sm_120 is
+`is_hopper_plus` by version and takes the datacenter tile, but has sm_89's
+budget:
+
+```
+OutOfResources: shared memory, Required: 114688, Hardware limit: 101376
+```
+
+The obvious fix — ask the device for its budget — did not work, because
+`PlatformInfo.max_shared_memory_per_sm` read
+`getattr(props, "max_shared_memory_per_block", 0)` and **torch has no attribute
+by that name**, so the field was 0 on every CUDA device ever. Nothing else read
+it, which is why it was never noticed. The real name is
+`shared_memory_per_block_optin`; it reports 101,376 here, exactly the limit in
+Triton's own message.
+
+That last one is the interesting one. A capability *test* existed, a capability
+*field* existed, and the value flowing through them was a silent zero.
+
+### The baseline
+
+Qwen3.5-27B bf16, GPU 1 alone, C=32 / ILEN=4096 / OLEN=256, max_model_len 8192,
+GMU 0.85. Both arms 600 s fixed-duration with early convergence disabled
+(`STABLE_NEEDED=999 TOL=0.0001`), scored on the last 200 s, run back to back in
+one session on the same card.
+
+| arm | completions tok/s | server tok/s | window spread |
+|---|---|---|---|
+| TokenSpeed (re-forked tree) | **208.0** | 206.0 | 17.7% |
+| vLLM 0.26 | **248.1** | 248.0 | 24.7% |
+
+**TokenSpeed is 16.2% behind.** vLLM's 248.1 lands within 0.2% of the 247.5 that
+E47 measured at this shape in a different session, which is the best available
+check that the harness and the setup are the same as before.
+
+vLLM needed `--max-num-seqs 256`; its default of 1024 exceeds the Mamba cache
+blocks (516) this model leaves and it refuses to capture CUDA graphs.
+
+### What the gap is made of
+
+`num_device_pages=149`, `block_size=832`, and the log never mentions placeholder
+blocks — the tree has none of the capacity work. The window sequence is the
+giveaway: `238 188 219 184 220 183 227`, alternating high and low at 17.7%
+spread. E45 identified exactly that pattern as capacity thrash and showed
+`r = P/N` collapsing it to 0.07%.
+
+So the ordered gap, from what has already been measured elsewhere:
+
+| | measured | where |
+|---|---|---|
+| `r = P/N` placeholder-block coupling | +10.3% | E45, `legacy/divergence` (A6) |
+| FA2 extend kernel for sm_120 | not isolated | `legacy/`, E-earlier |
+| w4a16 decode GEMMs | 2.3-3.3x on the GEMM | E47, not yet wired into the engine |
+
++10.3% on 208 is ~229, still short of 248. Beating vLLM needs more than
+re-porting; it needs at least one of the kernel-level wins to reach the engine.
+
+### Hazard for whoever reads this next
+
+**A zero from a detection layer is indistinguishable from a real answer.**
+`max_shared_memory_per_sm` was 0 on every device for as long as the field has
+existed, and the one consumer added later read it as "budget unknown, assume
+large" — which is the safe reading of a missing value and the wrong reading of a
+broken one. When a capability check does not change behaviour, check that the
+value it reads is not a default.

@@ -6609,3 +6609,58 @@ measured from an image built by copying files out of a working tree. The image
 is gone, the tree moved on, and the only surviving trace of the mechanism is the
 sentence claiming it worked. Build the artefact from a commit, or record the
 diff in the entry.
+
+## E49 — w4a16 costs **+7.2% perplexity** on Qwen3.5-27B without calibration, and that is the number to beat, not to quote
+
+**What was measured.** The quantization *scheme*, not the kernel: weights are
+quantized and dequantized in place and the model runs bf16 throughout, so this
+is separable from E46's kernel correctness (28/28 against a dequant reference).
+Scheme matches what the TurboMind kernel consumes -- asymmetric int4, grouped
+along the input dimension, group_size 128, `scale = (max-min)/15`.
+496 of 497 `nn.Linear` quantized; embeddings, lm_head and norms left in bf16.
+
+| corpus | ppl bf16 | ppl w4a16 | delta |
+|---|---|---|---|
+| 17,396 tokens of natural technical prose | 17.4763 | 18.7346 | **+7.20%** |
+| ~~one paragraph x12~~ | ~~1.6401~~ | ~~1.8345~~ | ~~+11.85%~~ |
+
+Greedy continuations agreed on 1 of 3 prompts.
+
+**The first corpus was wrong and is struck.** It was a single paragraph repeated
+twelve times, which is trivially predictable -- ppl 1.64 -- and a relative delta
+measured on a corpus the model has effectively memorised says nothing about real
+text. Caught before quoting it. The rule is the same one that keeps biting in
+this log: check that the instrument can express the thing being measured.
+
+### What the 7.2% is and is not
+
+It is **round-to-nearest with no calibration**: no AWQ activation-aware channel
+scaling, no GPTQ error compensation, no calibration set at all. Published int4
+g128 results with either technique land nearer 1-3% on this kind of corpus.
+
+So +7.2% is the floor of the quality range, not the number a deployment would
+see -- and the TurboMind kernel consumes **AWQ-format** weights specifically, so
+the calibration step is part of the intended pipeline rather than an optional
+extra. Quoting 7.2% as "the cost of w4a16" would understate the method by
+roughly the width of the technique it omits.
+
+It is also not free to find out: calibration needs a representative dataset and
+a pass over the model, and the result depends on that dataset.
+
+### Standing on the throughput side
+
+E47 measured the kernel at 2.3-3.3x on decode GEMMs and 0.77x at M=128, with a
+3.76x ceiling from weight bytes. Neither number is in the engine yet: no
+quantized Qwen3.5-27B checkpoint exists on this box, and the kernel is still in
+`legacy/patches/` rather than registered as a tokenspeed-kernel op.
+
+### Order that follows from this
+
+1. AWQ-calibrate Qwen3.5-27B and re-measure ppl. If calibration does not bring
+   it under ~3%, the throughput win is not worth taking on a quality-sensitive
+   deployment and the rest of this is moot.
+2. Only then wire the kernel in as `unieinfra/kernel-sm120` `gemm/turbomind`,
+   and measure end-to-end against the E48 baseline (208.0 vs vLLM 248.1).
+
+Doing those in the other order would produce a fast engine whose output quality
+nobody has agreed to.

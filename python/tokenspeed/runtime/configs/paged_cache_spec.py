@@ -229,9 +229,7 @@ def state_group_page_sizes(
             f"{page_size} (the coordinator folds group keys on the gcd grid)"
         )
     return {
-        label: n
-        for label in dict.fromkeys(layer_types)
-        if label in STATE_LAYER_TYPES
+        label: n for label in dict.fromkeys(layer_types) if label in STATE_LAYER_TYPES
     }
 
 

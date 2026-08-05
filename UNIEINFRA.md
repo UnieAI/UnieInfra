@@ -7,23 +7,36 @@ UnieAI-specific work kept strictly out of the upstream tree.
 New file at the repository root by design: adding a file never conflicts on
 rebase, whereas editing upstream's `README.md` would conflict on every one.
 
-## The one rule
+## The rule
 
-**Never edit a file that came from upstream.**
+**Prefer a plugin. When you must edit an upstream file, keep the edit small,
+single-purpose, and exportable as a patch.**
 
 Upstream lands roughly 2-3 commits a day across `tokenspeed-kernel/` and
-`python/tokenspeed/`. Every upstream file this repository edits becomes a
-conflict that has to be re-resolved on every rebase, forever. The previous
-arrangement had no shared git ancestor with upstream at all, so nothing could be
-rebased and the divergence was invisible until someone diffed two working trees
-by hand — by then it was 3381 lines across 33 files in `tokenspeed-kernel` alone.
+`python/tokenspeed/`. Every upstream line this repository changes is a line that
+can conflict on rebase. That is affordable at the current size and was not
+affordable before — the previous arrangement had **no shared git ancestor** with
+upstream, so nothing could be rebased and the divergence was invisible until
+someone diffed two working trees by hand. By then it was 3381 lines across 33
+files in `tokenspeed-kernel` alone, tangled with four months of upstream drift
+that no tool could tell apart from it.
 
-UnieAI work therefore has exactly two legitimate homes:
+What keeps that from happening again is not abstinence, it is visibility:
 
-1. **`unieinfra/` — out-of-tree plugins.** Registered through
-   `tokenspeed_kernel`'s entry-point contract, so upstream never has to know
-   they exist. `unieinfra/kernel-sm120/` is the working example: its
-   `pyproject.toml` declares
+```sh
+git log --oneline upstream/main..main            # every UnieAI commit
+git diff --stat upstream/main..main -- python tokenspeed-kernel   # every upstream line touched
+```
+
+Both of those were impossible before and are one command now. Check them; if the
+second one is growing without anyone deciding it should, that is the signal.
+
+### Order of preference
+
+1. **`unieinfra/` — out-of-tree plugin.** Registered through
+   `tokenspeed_kernel`'s entry-point contract, so upstream never has to know it
+   exists and there is nothing to rebase. `unieinfra/kernel-sm120/` is the
+   working example: its `pyproject.toml` declares
 
    ```toml
    [project.entry-points."tokenspeed_kernel.plugins"]
@@ -34,13 +47,28 @@ UnieAI work therefore has exactly two legitimate homes:
    `PLUGIN` priority band, which outranks upstream's own kernels without
    touching them.
 
-2. **A pull request to upstream.** Anything that is not UnieAI-specific — an
-   architecture gate that omits `sm_120`, a kernel that is admissible but
-   broken, a build break — belongs upstream. Carrying it here means paying for
-   it on every rebase and never getting it reviewed.
+2. **An edit to an upstream file, as one self-contained commit.** Allowed, and
+   sometimes the only option — a plugin cannot fix a bug inside an upstream
+   kernel. Requirements, so the commit stays cheap to carry and cheap to send:
 
-If something genuinely cannot be expressed either way, that is worth a
-discussion before it is written, not a patch to an upstream file.
+   - one concern per commit, with the reasoning in the message, so a rebase
+     conflict can be resolved by someone who was not there;
+   - a test, so the next upstream change that breaks it says so;
+   - no drive-by reformatting — every unrelated line is a future conflict for
+     nothing.
+
+   Such a commit is a PR that has not been sent yet. `git format-patch
+   upstream/main..main -- <paths>` exports it whenever that becomes worthwhile.
+
+3. **A pull request to upstream**, for anything not UnieAI-specific. Not a
+   prerequisite for shipping — carry it here and send it when convenient — but
+   the only way to stop paying for it. `unieinfra/UPSTREAMING.md` tracks what is
+   worth sending and why.
+
+The failure mode to watch for is not "we edited an upstream file". It is an
+upstream edit that nobody wrote down, so nobody knows whether it is a local
+workaround, a bug fix that belongs upstream, or something upstream has since
+fixed on its own.
 
 ## Layout
 
@@ -58,9 +86,14 @@ git rebase upstream/main
 ```
 
 `upstream` is `lightseekorg/tokenspeed`; `origin` is `UnieAI/UnieInfra`. Because
-this repository descends from upstream's history, a rebase only stops on files
-UnieAI actually changed — and if the rule above is being followed, that is
-`unieinfra/`, `legacy/`, and this file, none of which upstream touches.
+this repository descends from upstream's history, a rebase replays UnieAI's
+commits one at a time and stops only where an upstream change and a UnieAI
+change touch the same lines. `unieinfra/`, `legacy/` and this file never
+conflict, because upstream does not have them.
+
+When a rebase does stop, read the conflicting commit's message before resolving
+it — and check whether upstream has since fixed the thing it was working
+around, in which case the answer is to drop the commit rather than merge it.
 
 `local-tokenspeed` and `legacy-origin` are convenience remotes pointing at local
 checkouts (a fast mirror, and the pre-restructure repository whose 76 commits

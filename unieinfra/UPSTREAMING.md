@@ -305,16 +305,61 @@ ordinary sense — doubling the pool changed the scheduling dynamics.
    is rounding waste and only 149 pages exist. That is the 17.7% window
    oscillation. The machinery to fix it is already ported; the exact call site
    and the hazard are recorded on the task.
-2. **w4a16 (#21)** — note TokenSpeed already ships a w4a16 path
-   (`compressed_tensors_wNa16`, `get_min_capability()` = 90, so sm_120 passes),
-   and `marlin.so` exports only `gptq_marlin_repack`. Check whether that path
-   actually works before assuming the ported TurboMind kernel is needed.
-   Quantization is never automatic — TurboMind repacks the layout at load time
-   but the int4 weights have to be produced first, and E49 measured +7.2%
-   perplexity for the uncalibrated scheme.
+2. **w4a16 (#21)** — see below. The "check the existing path first" advice has
+   now been followed and the answer is that there is no existing path.
 
 Neither is a wiring job. Each is a day-scale change with a real verification
 step, and each can fail silently if the verification is skipped. #22 is the
 cautionary case in both directions: budgeted as day-scale kernel work, it turned
 out to be two declarations — and the first capacity measurement of it was off by
 3x in the wrong direction because two engines shared a process.
+
+### w4a16 (#21) — there is nothing to reuse but the repacker
+
+This document used to say "TokenSpeed already ships a w4a16 path
+(`compressed_tensors_wNa16`, `get_min_capability()` = 90, so sm_120 passes)" and
+advised checking it before porting a kernel. Checked. It does not work, and not
+for an sm_120 reason — it does not work anywhere.
+
+**Python layer: `CompressedTensorsWNA16` cannot execute.** The module uses ten
+names it never imports —
+
+```
+MarlinLinearLayerConfig     marlin_make_workspace       marlin_repeat_scales_on_all_ranks
+apply_gptq_marlin_linear    marlin_permute_scales       marlin_sort_g_idx
+check_marlin_supports_shape marlin_make_empty_g_idx     marlin_zero_points
+marlin_is_k_full
+```
+
+— across `create_weights`, `process_weights_after_loading` and `apply_weights`,
+so the first call raises `NameError`. `get_min_capability()` is never reached in
+a working state, which makes the "= 90, so sm_120 passes" observation moot. The
+file is byte-identical to `local-tokenspeed/main`, so this is an upstream defect,
+not fork damage. Worth an upstream issue.
+
+**Kernel layer: the GEMM does not exist.** `marlin.so` exports exactly two
+symbols, `gptq_marlin_repack` and its FFI wrapper — verified with `nm -D`. In
+source, `flashinfer_marlin_binding.cu` (25 lines) binds only the repacker, and
+`tokenspeed_marlin.cuh` (78 lines) contains no `__global__` kernel at all. The
+repacker rearranges a layout for a GEMM that was never brought over.
+
+**Registry: no other route.** `BASE_QUANTIZATION_METHODS` is fp8, mxfp8,
+w8a8_fp8, compressed-tensors, nvfp4, mxfp4, modelopt_mixed. There is no `gptq`
+and no `awq`, so `compressed-tensors` is the only path to int4 weight-only, and
+it leads to the dead scheme above.
+
+So w4a16 needs all three of: a GEMM (port TurboMind's, per section B, or write
+one), the missing Python glue, and int4 weights — and
+`legacy/patches/turbomind-w4a16-sm120.patch` patches *TurboMind*, an external
+project, not this tree. It is not an alternative to consider; it or an
+equivalent is a prerequisite.
+
+Quantization is still never automatic: the int4 weights have to be produced
+first, no local checkpoint has them (every model under `/workspace/models` is
+bf16, NVFP4 or MXFP4), and E49 measured +7.2% perplexity for the uncalibrated
+scheme. Against the measured 2.3–3.3x decode GEMM win but 0.77x at M=128, that
+makes the operating point, not the kernel, the thing to settle first.
+
+This is the opposite lesson to #22. There the work was budgeted as a kernel port
+and turned out to be two declarations; here it was described as possibly just
+wiring and turns out to need a kernel that is not in the tree.

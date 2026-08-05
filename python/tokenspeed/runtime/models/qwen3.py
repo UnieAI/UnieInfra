@@ -55,6 +55,14 @@ from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
+# ModelOpt checkpoints that declare ``kv_cache_quant_algo`` carry per-layer KV
+# scales next to the k/v projections. They are only materialised as parameters
+# when the KV cache is actually quantised, so skip them when the model has no
+# matching parameter -- exactly as ``qwen3_moe.py`` already does. Without this,
+# loading an NVFP4 (or FP8-KV) checkpoint dies with a ``KeyError`` on
+# ``...qkv_proj.k_scale`` before the first forward.
+_KV_CACHE_SCALE_SUFFIXES = (".k_scale", "_k_scale", ".v_scale", "_v_scale")
+
 
 class Qwen3MLP(nn.Module):
     def __init__(
@@ -511,6 +519,8 @@ class Qwen3ForCausalLM(BaseCausalLM):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if name.endswith(_KV_CACHE_SCALE_SUFFIXES) and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -518,6 +528,8 @@ class Qwen3ForCausalLM(BaseCausalLM):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name.endswith(_KV_CACHE_SCALE_SUFFIXES) and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

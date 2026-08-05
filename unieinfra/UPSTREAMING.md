@@ -209,22 +209,56 @@ capable, a declaration excludes it:
 | XQA decode | page_size constraint never declared | fixed |
 | TRT-LLM FMHA | version comparison with no upper bound | fixed |
 | Triton prefill tile | shared-memory budget read from a field that was 0 on every device | fixed |
-| fp8 KV | Triton decode declares only fp16/bf16, **and has no fp8 dequant at all** | open, #22 |
+| fp8 KV | Triton decode and extend both declare only fp16/bf16 | fixed, #22 |
 
-The first three are why a server starts at all. The fourth is not a declaration
-fix: `mha_decode.py` accepts `k_scale`/`v_scale` and ignores them.
+All four are why a server starts at all. The fourth was **also** a declaration
+fix, contrary to what this table said before: it claimed `mha_decode.py` "has no
+fp8 dequant at all", and that was wrong. The dequant is there --
+`qk = tl.dot(q, k.to(q.dtype))` -- and running the kernel on an fp8 cache,
+bypassing selection, scored cosine 0.9996 against a bf16 reference. Nothing had
+ever handed it an fp8 cache because `format_signatures` puts one dtype on every
+role, so the registration could only ever match a cache that matched the query.
+The `k_scale`/`v_scale` arguments it ignores belong to the mxfp8 block-scaled
+path, not to per-tensor fp8, which carries no scales at all.
 
-### The three that would close the gap, in the order they should be done
+### fp8 KV (#22) — done, 1.92x KV capacity
+
+`996b05f4` adds the mixed-role signatures (a high-precision query over an fp8
+cache) to Triton decode **and** extend; `b8a392f8` stops the runtime casting the
+query down to the cache dtype on that path.
+
+Measured on Qwen3.5-0.8B, `--attention-backend triton`, one arm per process —
+running both engines in a single process gives a *wrong* answer, because the
+first pool is still resident when the second is sized (37.7 GB free vs 14.2 GB,
+which reported fp8 as 0.68x):
+
+| arm | KV tokens |
+|---|---|
+| bf16 | 1,271,808 |
+| fp8_e4m3 | **2,438,208** (1.92x) |
+
+Under 2x because the non-KV allocation is fixed. Quality is unchanged: 4/5 on
+checkable short answers, the same score and the same single miss as bf16 (a
+truncated thinking preamble, not a wrong answer). Scored rather than compared
+token-for-token, since fp8 KV is lossy and identical tokens are not what success
+looks like.
+
+Before the change the same command does not start at all —
+`NoKernelFoundError: No kernel found for attention.mha_decode_with_kvcache
+(k_cache=dense[storage=torch.float8_e4m3fn], ...) with solution 'triton'`.
+
+Still unmeasured: throughput against the 208.0 baseline at C=32 / ILEN=4096 on
+Qwen3.5-27B. Capacity is not throughput, and the baseline is what the gap is
+stated in.
+
+### The two left, in the order they should be done
 
 1. **Capacity (#12)** — the largest and best understood. The attention page P is
    inflated 64 -> 832 to cover a GDN state row, so 12.8% of every request's KV
    is rounding waste and only 149 pages exist. That is the 17.7% window
    oscillation. The machinery to fix it is already ported; the exact call site
    and the hazard are recorded on the task.
-2. **fp8 KV (#22)** — implement the dequant in the Triton decode kernel. No
-   checkpoint needed and it does not touch model quality, which is why it should
-   come before w4a16.
-3. **w4a16 (#21)** — note TokenSpeed already ships a w4a16 path
+2. **w4a16 (#21)** — note TokenSpeed already ships a w4a16 path
    (`compressed_tensors_wNa16`, `get_min_capability()` = 90, so sm_120 passes),
    and `marlin.so` exports only `gptq_marlin_repack`. Check whether that path
    actually works before assuming the ported TurboMind kernel is needed.
@@ -232,5 +266,8 @@ fix: `mha_decode.py` accepts `k_scale`/`v_scale` and ignores them.
    but the int4 weights have to be produced first, and E49 measured +7.2%
    perplexity for the uncalibrated scheme.
 
-None of these is a wiring job. Each is a day-scale change with a real
-verification step, and each can fail silently if the verification is skipped.
+Neither is a wiring job. Each is a day-scale change with a real verification
+step, and each can fail silently if the verification is skipped. #22 is the
+cautionary case in both directions: budgeted as day-scale kernel work, it turned
+out to be two declarations — and the first capacity measurement of it was off by
+3x in the wrong direction because two engines shared a process.

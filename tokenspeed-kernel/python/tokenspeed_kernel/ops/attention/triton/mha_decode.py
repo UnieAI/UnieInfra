@@ -24,9 +24,31 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 _MIN_BLOCK_KV = 32
+
+# A high-precision query attending over an fp8 paged KV cache. The kernel loads
+# the cache at its storage dtype and converts it up to the query dtype
+# (`k.to(q.dtype)`), so the query sets the accumulate precision and quantizing
+# it too would only lose accuracy -- and, since the output buffer is
+# `empty_like(q)`, would hand the attention output back in e4m3 as well.
+#
+# Spelled out as mixed-role signatures because `format_signatures` puts one
+# dtype on every role. Same shape as the gfx950 gluon MLA decode registration.
+_Q_OVER_FP8_KV_SIGNATURES = frozenset(
+    format_signature(
+        q=dense_tensor_format(q_dtype),
+        k_cache=dense_tensor_format(kv_dtype),
+        v_cache=dense_tensor_format(kv_dtype),
+    )
+    for q_dtype in (torch.float16, torch.bfloat16)
+    for kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+)
 
 
 @triton.jit
@@ -843,7 +865,8 @@ def decode_attention_fwd(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    )
+    | _Q_OVER_FP8_KV_SIGNATURES,
     priority=Priority.PORTABLE,
     traits={
         "sliding_window": frozenset({False, True}),

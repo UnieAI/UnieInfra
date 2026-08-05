@@ -162,3 +162,44 @@ parts. It needs its own PR with numbers, or a narrower gate.
 `runtime/models/qwen3.py` (skip absent `.k_scale`/`.v_scale`) and
 `cli/serve_smg.py` (`TOKENSPEED_SMG_PROMETHEUS_PORT`) are both small and
 uncontroversial; they simply have not been done yet.
+
+---
+
+## Where the sm_120 performance work stands (2026-08-05)
+
+Baseline, same harness both arms, 600 s fixed duration, 200 s tail, one session:
+**TokenSpeed 208.0 vs vLLM 248.1** at C=32 / ILEN=4096 on Qwen3.5-27B (log E48).
+
+Everything tried since has hit the same shape of problem — the hardware is
+capable, a declaration excludes it:
+
+| | | |
+|---|---|---|
+| XQA decode | page_size constraint never declared | fixed |
+| TRT-LLM FMHA | version comparison with no upper bound | fixed |
+| Triton prefill tile | shared-memory budget read from a field that was 0 on every device | fixed |
+| fp8 KV | Triton decode declares only fp16/bf16, **and has no fp8 dequant at all** | open, #22 |
+
+The first three are why a server starts at all. The fourth is not a declaration
+fix: `mha_decode.py` accepts `k_scale`/`v_scale` and ignores them.
+
+### The three that would close the gap, in the order they should be done
+
+1. **Capacity (#12)** — the largest and best understood. The attention page P is
+   inflated 64 -> 832 to cover a GDN state row, so 12.8% of every request's KV
+   is rounding waste and only 149 pages exist. That is the 17.7% window
+   oscillation. The machinery to fix it is already ported; the exact call site
+   and the hazard are recorded on the task.
+2. **fp8 KV (#22)** — implement the dequant in the Triton decode kernel. No
+   checkpoint needed and it does not touch model quality, which is why it should
+   come before w4a16.
+3. **w4a16 (#21)** — note TokenSpeed already ships a w4a16 path
+   (`compressed_tensors_wNa16`, `get_min_capability()` = 90, so sm_120 passes),
+   and `marlin.so` exports only `gptq_marlin_repack`. Check whether that path
+   actually works before assuming the ported TurboMind kernel is needed.
+   Quantization is never automatic — TurboMind repacks the layout at load time
+   but the int4 weights have to be produced first, and E49 measured +7.2%
+   perplexity for the uncalibrated scheme.
+
+None of these is a wiring job. Each is a day-scale change with a real
+verification step, and each can fail silently if the verification is skipped.

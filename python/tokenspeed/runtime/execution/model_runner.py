@@ -24,6 +24,7 @@ import inspect
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.plugins import discover_plugins
 
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
@@ -93,6 +94,20 @@ class ModelRunner:
 
         global_server_args_dict_update(server_args)
         initialize_moe_config(server_args)
+
+        # Load out-of-tree kernel plugins before the model is built, so their
+        # kernels are in the registry by the time anything calls select_kernel.
+        #
+        # tokenspeed_kernel.plugins documents that loading is explicit -- "the
+        # host application must call discover_plugins()" -- and until now no
+        # host did, so installing a plugin package had no effect on the engine.
+        # This is the call that makes the documented contract work end to end.
+        #
+        # Safe to reach more than once: a process builds a ModelRunner per
+        # worker (draft and target), and discover_plugins() skips plugins it has
+        # already loaded. It also catches and warns on a failing plugin's
+        # register(), so a broken third-party package cannot take down startup.
+        discover_plugins()
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver

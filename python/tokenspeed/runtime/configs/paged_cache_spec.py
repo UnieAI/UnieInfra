@@ -189,6 +189,108 @@ def hybrid_slab_group_size(
     return max(counts.values())
 
 
+def state_group_page_sizes(
+    *,
+    layer_types: Sequence[str],
+    page_size: int,
+    state_page_size: int | None,
+) -> dict[str, int]:
+    """``page_sizes`` entries that put the state groups on their own grid.
+
+    This is how ``--mamba-track-interval`` reaches the geometry: the state
+    group's page size IS the retained-snapshot stride N. The scheduler's
+    ``MambaStateManager`` is ``SwaManager(spec.block_size, window=2)`` with
+    ``RegistersAlignedFinalPageOnly``, so it publishes a snapshot only at
+    multiples of the group's own block size -- raising that block size to N
+    is exactly "snapshot every N tokens" and needs no new C++.
+
+    Resolve N with ``flat_memory_plan.state_snapshot_interval`` first; this
+    function only validates and fans it out to the state labels present.
+
+    Args:
+        layer_types: Per-layer paged-cache labels.
+        page_size: The scheduler's base page size P (attention granularity).
+        state_page_size: N in tokens, a positive multiple of ``page_size``;
+            None or a value equal to ``page_size`` returns ``{}`` (today's
+            uniform geometry, byte-identical to not passing page_sizes).
+
+    Returns:
+        ``{group_id: N}`` for every state-family label present, or ``{}``.
+
+    Raises:
+        ValueError: N is not a positive multiple of ``page_size``.
+    """
+    if state_page_size is None or int(state_page_size) == int(page_size):
+        return {}
+    n = int(state_page_size)
+    if n <= 0 or n % int(page_size):
+        raise ValueError(
+            f"state_page_size {n} must be a positive multiple of page_size "
+            f"{page_size} (the coordinator folds group keys on the gcd grid)"
+        )
+    return {
+        label: n
+        for label in dict.fromkeys(layer_types)
+        if label in STATE_LAYER_TYPES
+    }
+
+
+def layer_page_sizes(
+    *,
+    layer_types: Sequence[str],
+    sliding_window_tokens: int | Sequence[int | None] | None,
+    page_size: int,
+    page_sizes: Mapping[str, int] | None = None,
+) -> list[int]:
+    """Per-layer page size in raw tokens -- the per-layer geometry a KV pool
+    or attention backend needs to index its own group's block table.
+
+    Companion to ``layer_group_ids``: element i is the page size of layer i's
+    paged-cache group, which is ``page_sizes[group_id]`` when the model puts
+    that group on its own grid (heterogeneous block sizes: Inkling's
+    full=256/swa=128, or a GDN state group at the mamba track interval) and
+    ``page_size`` otherwise.
+
+    Args:
+        layer_types / sliding_window_tokens: As for ``layer_group_ids``.
+        page_size: Base page size in tokens.
+        page_sizes: Per-group overrides, as for
+            ``group_specs_from_layer_types``.
+
+    Returns:
+        list[int]: one page size per layer, aligned with ``layer_types``.
+    """
+    sizes = dict(page_sizes or {})
+    return [
+        int(sizes.get(gid, page_size))
+        for gid in layer_group_ids(
+            layer_types=layer_types, sliding_window_tokens=sliding_window_tokens
+        )
+    ]
+
+
+def state_page_size(specs: Sequence[PagedCacheGroupSpec], default: int) -> int:
+    """Raw tokens per page of the published state group (the snapshot stride).
+
+    The single accessor consumers must use instead of the pool's global
+    ``page_size``: with ``--mamba-track-interval`` the state group's page is
+    coarser, and indexing its block table at the attention page size would
+    silently read the wrong snapshot row.
+
+    Args:
+        specs: The pool's ``paged_cache_group_specs``.
+        default: Fallback when no state group is published (pure attention,
+            or a radix ext that publishes nothing).
+
+    Returns:
+        int: ``rows_per_page * entry_stride_tokens`` of the first state group.
+    """
+    for spec in specs or ():
+        if getattr(spec, "family", "history") == "state":
+            return int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+    return int(default)
+
+
 def _flat_kv_backend(attn_backend: object) -> object:
     """The backend whose KV-table consumption matters for flat safety: the
     backend itself, or a composite's full-attention sub-backend (hybrid's
@@ -690,8 +792,11 @@ __all__ = [
     "group_specs_from_layer_types",
     "hybrid_slab_group_size",
     "layer_group_ids",
+    "layer_page_sizes",
     "publish_paged_cache_groups",
     "preflight_kimi_k3_flat_consumers",
     "scheduler_ext_flat_kvcache",
+    "state_group_page_sizes",
+    "state_page_size",
     "validate_flat_scheduler_config",
 ]

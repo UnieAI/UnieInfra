@@ -50,7 +50,10 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
 )
 
 from tokenspeed.runtime.configs.flat_cache_runtime import flat_cache_debug_enabled
-from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    LINEAR_ATTENTION,
+    state_page_size,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
@@ -763,7 +766,14 @@ class MambaAttnBackend(AttentionBackend):
         self.flat_state_active = bool(getattr(kv_pool, "state_slabs", None)) and any(
             str(spec.group_id) == _STATE_GROUP_ID for spec in specs
         )
-        self._flat_state_page_size = int(getattr(kv_pool, "page_size", 1))
+        # The STATE group's own page size, not the pool's global one: under
+        # --mamba-track-interval the state group sits on a coarser grid
+        # (paged_cache_spec.state_group_page_sizes), and indexing its block
+        # table at the attention page size would read the wrong snapshot row.
+        # Falls back to the pool page size when no state group is published.
+        self._flat_state_page_size = state_page_size(
+            specs, int(getattr(kv_pool, "page_size", 1))
+        )
 
     def _state_page_bounds(
         self,

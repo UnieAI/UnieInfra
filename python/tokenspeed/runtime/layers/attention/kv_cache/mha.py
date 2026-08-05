@@ -124,6 +124,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self._kv_alloc_head_count = (
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
+        self._validate_layer_kv_head_counts()
         self._layer_types = tuple(layer_types or ())
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._slab_group_size = hybrid_slab_group_size(
@@ -191,6 +192,50 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # Slab aliasing is only safe under the single-BlockPool ownership the
         # published groups configure.
         assert self._slab_group_size is None or self.paged_cache_group_specs
+
+    def _validate_layer_kv_head_counts(self) -> None:
+        """Reject hetero head counts the row reinterpretation cannot express.
+
+        ``_layer_row_view`` re-counts a byte-uniform slab row as
+        ``head_num / heads_l`` narrower rows. That is only a re-count when
+        the division is exact; otherwise a "row" straddles two slab rows and
+        every write past the first lands in the wrong token -- the same class
+        of silent corruption this guard exists to end, so it must be a hard
+        error at construction, not a shape surprise in the first forward.
+        """
+        counts = self._layer_kv_head_counts
+        if counts is None:
+            return
+        if len(counts) != self.layer_num:
+            raise ValueError(
+                f"layer_kv_head_counts has {len(counts)} entries but the pool "
+                f"has {self.layer_num} layers"
+            )
+        if min(counts) <= 0:
+            raise ValueError(f"layer_kv_head_counts must be positive, got {counts!r}")
+        alloc = self._kv_alloc_head_count or max(counts)
+        if max(counts) > alloc:
+            raise ValueError(
+                f"layer_kv_head_counts max {max(counts)} exceeds the "
+                f"allocation width kv_alloc_head_count={alloc}: the slab rows "
+                "are sized at the allocation width, so no layer may serve "
+                "more."
+            )
+        for layer_id, served in enumerate(counts):
+            if self.head_num * served % alloc:
+                raise ValueError(
+                    f"layer {layer_id} serves {served} of {alloc} pre-TP KV "
+                    f"heads, which does not shard onto {self.head_num} heads "
+                    "per rank (head_num * served must divide the allocation "
+                    "width). Reduce the TP degree or fix the head counts."
+                )
+            heads_l = self.head_num * served // alloc
+            if heads_l <= 0 or self.head_num % heads_l:
+                raise ValueError(
+                    f"layer {layer_id} reinterprets a {self.head_num}-head "
+                    f"slab row as {heads_l}-head rows, which is not an exact "
+                    "re-count; a layer row would straddle two slab rows."
+                )
 
     def _slab_pair_index(self) -> list[int]:
         """Map layer_id -> slab index: the i-th layer of every group binds
@@ -548,6 +593,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         count; a layer serving fewer heads reinterprets the same bytes as
         ``rows * (head_num / heads_l)`` rows of ``heads_l`` heads (full
         layers: 2x the token rows per slot — the zero-padding contract).
+
+        Layers whose CHECKPOINT head dim differs from the pool's (Gemma 4:
+        4 x 512 full layers against 16 x 256 sliding) ride this same path
+        re-counted in the pool's head dim (4 x 512 == 8 x 256, identical
+        bytes in identical order); see
+        ``kv_cache.utils.normalize_layer_kv_geometry``. The attention
+        backend re-views this tensor at the layer's real
+        ``(tp_k_head_num, qk_head_dim)``, so the row WIDTH is the contract
+        here, not the head split.
         """
         if self._layer_kv_head_counts is None:
             return buf
@@ -555,6 +609,76 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         if heads_l == self.head_num:
             return buf
         return buf.reshape(-1, heads_l, self.head_dim)
+
+    def _layer_row_elems(self, layer_id: int) -> int:
+        """Elements per token row in the layer's view (its per-token KV width)."""
+        return self._layer_heads_per_rank(layer_id) * self.head_dim
+
+    def _assert_store_row_geometry(
+        self,
+        layer_id: int,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_dst: torch.Tensor,
+        v_dst: torch.Tensor,
+    ) -> None:
+        """Refuse a KV store whose per-token width is not the row it lands in.
+
+        ``store_kv_cache`` copies ``src.numel() // n_tokens`` elements per
+        token and takes the destination row stride from ``dst.stride(0)``.
+        Nothing in that kernel compares the two: a narrower source SUCCEEDS,
+        filling the head of each row and leaving the tail at whatever the
+        row held before (zeros on a fresh pool, ANOTHER LAYER'S KV once
+        paired layers alias a slab). No exception, no shape error, and the
+        model then generates confidently wrong tokens -- observed on
+        Gemma 4, whose full-attention layers are 4 x 512 = 2048 elements
+        while the pool row is 16 x 256 = 4096.
+
+        A wider source is just as bad in the other direction: it runs off
+        the end of its row into the next token's.
+
+        This is the invariant that must never be silent, so it is checked
+        here on the pool (which owns the row geometry) rather than in the
+        kernel, and it is checked on the SAME views the store targets.
+        """
+        n_tokens = cache_k.shape[0]
+        if n_tokens == 0:
+            return
+        row_elems = k_dst.numel() // k_dst.shape[0]
+        for side, src in (("K", cache_k), ("V", cache_v)):
+            per_token = src.numel() // n_tokens
+            if per_token != row_elems:
+                layer_type = (
+                    self._layer_types[layer_id]
+                    if layer_id < len(self._layer_types)
+                    else "?"
+                )
+                hetero = (
+                    f"layer_kv_head_counts={self._layer_kv_head_counts!r}"
+                    if self._layer_kv_head_counts is not None
+                    else "layer_kv_head_counts is None (heterogeneous KV is "
+                    "OFF: every layer is assumed to serve the pool's "
+                    "head_num x head_dim)"
+                )
+                raise ValueError(
+                    f"KV store geometry mismatch on layer {layer_id} "
+                    f"({layer_type!r}): the {side} tensor carries {per_token} "
+                    f"elements per token but the pool row for this layer is "
+                    f"{row_elems} elements "
+                    f"(pool head_num={self.head_num}, head_dim={self.head_dim}, "
+                    f"per-rank heads for this layer="
+                    f"{self._layer_heads_per_rank(layer_id)}). Writing anyway "
+                    "would silently truncate or overrun the row. "
+                    f"{hetero}. A model with per-layer KV geometry must "
+                    "publish it (see kv_cache.utils."
+                    "normalize_layer_kv_geometry)."
+                )
+        if v_dst.numel() // v_dst.shape[0] != row_elems:
+            raise ValueError(
+                f"KV store geometry mismatch on layer {layer_id}: K rows are "
+                f"{row_elems} elements but V rows are "
+                f"{v_dst.numel() // v_dst.shape[0]}"
+            )
 
     def _layer_heads_per_rank(self, layer_id: int) -> int:
         counts = self._layer_kv_head_counts
@@ -691,11 +815,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
         # Locs are in per-layer view rows: the store must target the same view get_key_buffer serves
+        k_dst = self._layer_row_view(self.k_buffer[layer_id], layer_id)
+        v_dst = self._layer_row_view(self.v_buffer[layer_id], layer_id)
+        self._assert_store_row_geometry(layer_id, cache_k, cache_v, k_dst, v_dst)
         store_kv_cache(
             cache_k,
             cache_v,
-            self._layer_row_view(self.k_buffer[layer_id], layer_id),
-            self._layer_row_view(self.v_buffer[layer_id], layer_id),
+            k_dst,
+            v_dst,
             loc,
             enable_pdl=pdl_enabled(),
         )
@@ -870,11 +997,21 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         # Byte views: triton can't mask-fill fp8; locs are per-layer view rows (target the served view)
+        k_dst = self._layer_row_view(self.k_buffer[layer_id], layer_id).view(
+            torch.uint8
+        )
+        v_dst = self._layer_row_view(self.v_buffer[layer_id], layer_id).view(
+            torch.uint8
+        )
+        k_src = cache_k.view(torch.uint8)
+        v_src = cache_v.view(torch.uint8)
+        # Byte counts on both sides (fp8 data is 1 byte/element).
+        self._assert_store_row_geometry(layer_id, k_src, v_src, k_dst, v_dst)
         store_kv_cache(
-            cache_k.view(torch.uint8),
-            cache_v.view(torch.uint8),
-            self._layer_row_view(self.k_buffer[layer_id], layer_id).view(torch.uint8),
-            self._layer_row_view(self.v_buffer[layer_id], layer_id).view(torch.uint8),
+            k_src,
+            v_src,
+            k_dst,
+            v_dst,
             loc,
             enable_pdl=pdl_enabled(),
         )
@@ -931,11 +1068,16 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             return False
         if self.head_dim != 128:
             return False
+        k_dst = self._layer_row_view(self.k_buffer[layer_id], layer_id)
+        v_dst = self._layer_row_view(self.v_buffer[layer_id], layer_id)
+        # k/v are bf16 here and the destination is fp8: compare ELEMENTS, which
+        # is what the fused quantize-store copies per token.
+        self._assert_store_row_geometry(layer_id, k, v, k_dst, v_dst)
         quantize_store_kv_mxfp8(
             k,
             v,
-            self._layer_row_view(self.k_buffer[layer_id], layer_id),
-            self._layer_row_view(self.v_buffer[layer_id], layer_id),
+            k_dst,
+            v_dst,
             self.k_scale_buffer[layer_id],
             self.v_scale_buffer[layer_id],
             loc,

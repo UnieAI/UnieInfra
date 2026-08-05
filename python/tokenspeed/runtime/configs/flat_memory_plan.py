@@ -28,6 +28,19 @@ equalizer move: constant rows inflate P until the widest linear row
 covers them (vLLM align). plan_tensors then pairs physical slot j with
 the j-th layer of every group over a single page-id space and sizes each
 slab by its own packed row from the budget.
+
+Two granularities, not one
+--------------------------
+``block_size`` (P) is the ATTENTION page: how many tokens of KV history one
+block id carries. ``state_interval`` (N) is the STATE SNAPSHOT stride: how
+many tokens pass between two retained recurrent-state snapshots. The flat
+layout gives every block id a row in every slab -- one KV page per
+full-attention layer AND one recurrent state per state layer -- so a
+request of T tokens draws ``ceil(T/P)`` block ids for its attention group
+and ``~T/N`` more for its state group, and EVERY one of those ids costs a
+full block row. capacity_model() is the single place that arithmetic is
+written down; see HybridCapacity for the consequences of moving either
+knob.
 """
 
 from __future__ import annotations
@@ -172,6 +185,115 @@ def equalized_block_size(
         alignment=alignment if alignment is not None else block_size,
     )
     return geo.block_size
+
+
+def state_snapshot_interval(*, block_size, requested_interval):
+    """Effective recurrent-state snapshot stride N, in tokens.
+
+    N is the number of tokens between two RETAINED state snapshots. It is
+    always a positive multiple of ``block_size`` because the C++ coordinator
+    folds every group's keys onto a common base grid
+    (``MakeFoldedGroupKeys``: ``m = group_block_size / base_block_size``) and
+    asserts ``spec.block_size % base == 0``. N == block_size reproduces
+    today's behaviour exactly (one snapshot per attention page).
+
+    Args:
+        block_size: The attention page size P in tokens (already equalized).
+        requested_interval: The user's ``--mamba-track-interval``; None, 0 or
+            anything <= block_size means "one snapshot per page" (N = P).
+
+    Returns:
+        int: N -- the smallest multiple of ``block_size`` that is >= both
+        ``block_size`` and ``requested_interval``.
+
+    Raises:
+        ValueError: block_size <= 0, or requested_interval is negative.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}")
+    if requested_interval is None:
+        return block_size
+    requested = int(requested_interval)
+    if requested < 0:
+        raise ValueError(f"requested_interval must be >= 0, got {requested}")
+    if requested <= block_size:
+        return block_size
+    return block_size * math.ceil(requested / block_size)
+
+
+@dataclass(frozen=True)
+class HybridCapacity:
+    """Closed-form device-capacity model for one state-hybrid page geometry.
+
+    Every field is bytes-exact against ``plan_component_tensors`` for the
+    same components; the only modelled quantity is how many block ids a
+    given token count pins, which is ``compute_paged_cache_group_page_counts``
+    with the per-request constants dropped.
+
+    Attributes:
+        block_size: Attention page P in tokens.
+        state_interval: Retained-snapshot stride N in tokens (N % P == 0).
+        kv_bytes_per_block: Sum over history layers of P * bytes-per-slot.
+        state_bytes_per_block: Sum over state layers of the constant row.
+        block_bytes: kv_bytes_per_block + state_bytes_per_block -- what ONE
+            block id costs, regardless of which group holds it.
+    """
+
+    block_size: int
+    state_interval: int
+    kv_bytes_per_block: int
+    state_bytes_per_block: int
+
+    @property
+    def block_bytes(self):
+        return self.kv_bytes_per_block + self.state_bytes_per_block
+
+    @property
+    def blocks_per_token(self):
+        """Block ids pinned per token of resident context: 1/P for the
+        attention group plus 1/N for the state group's retained snapshots.
+        Both groups draw from the SAME BlockPool (one shared free list, see
+        KvCacheCoordinator's "one shared BlockPool"), so the two add."""
+        return 1.0 / self.block_size + 1.0 / self.state_interval
+
+    @property
+    def bytes_per_token(self):
+        """Device bytes one token of resident context costs."""
+        return self.blocks_per_token * self.block_bytes
+
+    def tokens_for(self, budget_bytes):
+        """Resident context tokens a byte budget supports under this geometry."""
+        return int(budget_bytes / self.bytes_per_token)
+
+    def num_blocks_for(self, budget_bytes):
+        """Block ids a byte budget buys (= plan_component_tensors' num_blocks
+        for the same components, modulo any reserved draft rows)."""
+        return int(budget_bytes // self.block_bytes)
+
+
+def capacity_model(components, *, block_size, state_interval=None):
+    """Build the HybridCapacity for a component list at a given geometry.
+
+    Args:
+        components: ComponentSpecs from components_from_layers.
+        block_size: Attention page P in tokens.
+        state_interval: Retained-snapshot stride; None -> P (today's
+            one-snapshot-per-page behaviour).
+
+    Returns:
+        HybridCapacity.
+    """
+    interval = state_snapshot_interval(
+        block_size=block_size, requested_interval=state_interval
+    )
+    kv_bytes = sum(c.bytes_per_slot for c in components) * block_size
+    state_bytes = sum(c.const_bytes for c in components)
+    return HybridCapacity(
+        block_size=block_size,
+        state_interval=interval,
+        kv_bytes_per_block=kv_bytes,
+        state_bytes_per_block=state_bytes,
+    )
 
 
 @dataclass(frozen=True)

@@ -29,15 +29,18 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
+    capacity_model,
     components_from_layers,
     equalized_block_size,
     plan_component_tensors,
     state_const_bytes,
+    state_snapshot_interval,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
     hybrid_slab_group_size,
     scheduler_ext_flat_kvcache,
+    state_group_page_sizes,
 )
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -138,6 +141,15 @@ _HYBRID_MLA_KDA_ARCHITECTURES = {
 _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
+}
+
+# Gemma 4: per-layer KV GEOMETRY (not just head count) -- sliding layers are
+# num_key_value_heads x head_dim, full layers num_global_key_value_heads x
+# global_head_dim. Rides the same hetero-KV slot layout as Inkling; see
+# _apply_gemma4_hetero_kv.
+_GEMMA4_ARCHITECTURES = {
+    "Gemma4ForConditionalGeneration",
+    "Gemma4ForCausalLM",
 }
 
 
@@ -708,6 +720,87 @@ def _apply_inkling_hetero_kv(config, model_config) -> None:
     config.layer_kv_head_counts = counts
 
 
+def gemma4_layer_kv_geometry(text_config) -> list[tuple[int, int]]:
+    """Per-layer ``(kv_heads, head_dim)`` for a Gemma 4 text config, PRE-TP.
+
+    Full-attention layers use ``num_global_key_value_heads`` x
+    ``global_head_dim``; sliding layers ``num_key_value_heads`` x
+    ``head_dim``. Both are read from the checkpoint config -- there is no
+    default that is right for both variants (31B: 16x256 / 4x512;
+    26B-A4B: 8x256 / 2x512).
+    """
+    swa = (
+        int(text_config.num_key_value_heads),
+        int(text_config.head_dim),
+    )
+    full = (
+        int(getattr(text_config, "num_global_key_value_heads", swa[0])),
+        int(getattr(text_config, "global_head_dim", None) or text_config.head_dim),
+    )
+    return [
+        full if label == "full_attention" else swa for label in text_config.layer_types
+    ]
+
+
+def _apply_gemma4_hetero_kv(config, model_config) -> bool:
+    """Enable heterogeneous KV for Gemma 4, or leave the pool uniform.
+
+    Gemma 4's full-attention layers carry HALF the KV bytes per token of its
+    sliding layers (31B: 4x512 = 2048 vs 16x256 = 4096). Without this, the
+    pool allocates every row at the sliding width and the full layers'
+    stores are silently truncated into it -- half of every full-attention K
+    and V lost, no exception (the store kernel copies src-width elements at
+    the dst row stride and never compares the two). The pool now REFUSES
+    that write, so this must run for Gemma 4 to serve at all.
+
+    Returns True when hetero KV was applied (the geometry is genuinely
+    non-uniform), False when every layer already shares one geometry and the
+    plain uniform pool is correct.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.utils import (
+        normalize_layer_kv_geometry,
+    )
+
+    tc = model_config.hf_config.get_text_config()
+    geometry = gemma4_layer_kv_geometry(tc)
+    if len(set(geometry)) < 2:
+        return False
+    if not scheduler_ext_flat_kvcache():
+        # The per-group page sizes this layout needs are only honoured by the
+        # flat scheduler ext (the radix path has one page size for the whole
+        # pool), so publishing them here would produce write locs in the wrong
+        # units. Leave the pool uniform: the pool's store guard then refuses
+        # the first full-attention write with a precise message instead of
+        # this layout corrupting rows.
+        logger.warning(
+            "Gemma 4 needs heterogeneous KV (%s per layer) but the installed "
+            "tokenspeed_scheduler ext is not flat-built; the uniform KV pool "
+            "cannot represent the full-attention geometry and will refuse "
+            "those writes. Rebuild the ext with TOKENSPEED_FLAT_KVCACHE.",
+            sorted(set(geometry)),
+        )
+        return False
+    alloc, counts = normalize_layer_kv_geometry(geometry)
+    ratio = alloc // min(counts)
+    # Byte-uniform slots: the widest layer's page is the base block, the
+    # narrower full layers page at `ratio` x that many token rows over the
+    # same bytes (identical to the Inkling layout, one label instead of six).
+    config.slot_tokens = config.page_size * ratio
+    config.group_page_sizes = {"full_attention": config.page_size * ratio}
+    config.layer_kv_head_counts = counts
+    logger.info(
+        "Gemma 4 hetero KV: per-layer geometry %s -> alloc %d heads x %d, "
+        "layer head counts %s, slot %d tokens, full_attention page %d",
+        sorted(set(geometry)),
+        alloc,
+        min(d for _, d in geometry),
+        sorted(set(counts)),
+        config.slot_tokens,
+        config.group_page_sizes["full_attention"],
+    )
+    return True
+
+
 def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int, int]:
     """Publish per-label kvconv (+ optional hiddenconv) paged groups.
 
@@ -971,6 +1064,57 @@ def create_attn_components(
             )
             server_args.block_size = equalized_block_size_value
             config.page_size = equalized_block_size_value
+        # --mamba-track-interval: retained-snapshot stride N for the state
+        # group. N == block_size (the default, since 256 < 832) reproduces
+        # the previous geometry byte-for-byte; a larger N puts the state
+        # group on its own coarser grid so it pins ~T/N block ids instead of
+        # ~T/P. The price is prefix-hit granularity: the coordinator aligns
+        # every hit DOWN to the groups' lcm (SweepThenConverge), which
+        # becomes N. See docs/log.md E-numbered entry.
+        state_page_size_value = state_snapshot_interval(
+            block_size=server_args.block_size,
+            requested_interval=getattr(server_args, "mamba_track_interval", None),
+        )
+        gdn_state_page_sizes = state_group_page_sizes(
+            layer_types=list(config.layer_types),
+            page_size=server_args.block_size,
+            state_page_size=state_page_size_value,
+        )
+        if gdn_state_page_sizes:
+            merged = dict(getattr(config, "group_page_sizes", None) or {})
+            merged.update(gdn_state_page_sizes)
+            config.group_page_sizes = merged
+            cap_before = capacity_model(
+                components_from_layers(
+                    layer_types=list(config.layer_types),
+                    kv_bytes_per_slot=config.cache_cell_size(),
+                    state_const_bytes=gdn_state_bytes,
+                ),
+                block_size=server_args.block_size,
+            )
+            cap_after = capacity_model(
+                components_from_layers(
+                    layer_types=list(config.layer_types),
+                    kv_bytes_per_slot=config.cache_cell_size(),
+                    state_const_bytes=gdn_state_bytes,
+                ),
+                block_size=server_args.block_size,
+                state_interval=state_page_size_value,
+            )
+            logger.info(
+                "GDN state snapshot stride: %d tokens (attention page %d, "
+                "requested --mamba-track-interval %s); resident cost "
+                "%.0f -> %.0f bytes/token (%.2fx capacity), prefix-cache hit "
+                "granularity coarsens %d -> %d tokens",
+                state_page_size_value,
+                server_args.block_size,
+                getattr(server_args, "mamba_track_interval", None),
+                cap_before.bytes_per_token,
+                cap_after.bytes_per_token,
+                cap_before.bytes_per_token / cap_after.bytes_per_token,
+                server_args.block_size,
+                state_page_size_value,
+            )
     draft_attn_config = None
     if draft_model_config:
         draft_attn_config = _create_attn_config(
@@ -1342,6 +1486,9 @@ def create_attn_components(
             _apply_inkling_hetero_kv(config, model_config)
             # Must run AFTER the hetero fields exist on the config.
             max_num_tokens = _floor_tokens_to_layout_grid(max_num_tokens, config)
+        elif any(a in _GEMMA4_ARCHITECTURES for a in architectures):
+            if _apply_gemma4_hetero_kv(config, model_config):
+                max_num_tokens = _floor_tokens_to_layout_grid(max_num_tokens, config)
         if paged_sconv:
             _conv_bt, _hbt = _publish_inkling_conv_groups(
                 config, model_config, server_args

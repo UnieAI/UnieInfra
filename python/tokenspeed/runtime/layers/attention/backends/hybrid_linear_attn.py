@@ -2614,6 +2614,20 @@ class HybridLinearAttnBackend(AttentionBackend):
     # buffers) exist on those paths.
     uses_flat_cache_groups: bool = True
 
+    # The linear-attention half cannot serve a MIXED batch. Its state-page
+    # gather assumes every sequence contributes the same number of rows, so a
+    # plan holding prefill and decode together fails inside
+    # ``MambaAttnBackend._flat_state_pages``:
+    #
+    #   RuntimeError: Size does not match at dimension 0 expected index [2, 1]
+    #   to be no larger than self [1, 3] apart from dimension 1
+    #
+    # The full-attention half *can* (see `MHAAttnBackend.supports_mixed_batch`),
+    # so the hybrid is only as capable as its weaker half. Declaring it here
+    # turns `--enable-mixed-batch` on a hybrid model into a refusal at startup
+    # rather than a crash on the first batch that happens to mix.
+    supports_mixed_batch: bool = False
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,

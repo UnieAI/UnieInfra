@@ -250,6 +250,22 @@ class EventLoop:
             num_total_pages=num_total_pages,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
+        # Refuse here rather than on the first batch that happens to mix. With
+        # mixed batching on, the C++ scheduler emits plans holding prefill and
+        # decode ops together; a backend that cannot serve MIXED discovers that
+        # only when such a plan arrives, which is minutes into a run and
+        # surfaces as a shape error deep inside a state gather rather than as
+        # the configuration mistake it is.
+        if server_args.enable_mixed_batch and not getattr(
+            attn_backend, "supports_mixed_batch", True
+        ):
+            raise ValueError(
+                "--enable-mixed-batch requires an attention backend that can "
+                f"serve mixed batches; {type(attn_backend).__name__} declares "
+                "supports_mixed_batch = False. Drop the flag, or run a model "
+                "whose backend supports MIXED."
+            )
+
         self.model_executor = create_model_executor(
             server_args=server_args,
             config=model_executor_config,

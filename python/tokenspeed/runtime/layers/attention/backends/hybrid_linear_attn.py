@@ -791,6 +791,30 @@ class MambaAttnBackend(AttentionBackend):
         after = seq_lens[:bs]
         if forward_mode.is_decode_or_idle():
             before = after - 1
+        elif forward_mode.is_mixed():
+            # A MIXED plan advances its two segments by different amounts, so
+            # neither branch below is right for the whole batch. The layout is
+            # the one MHA builds (see MHAExtendMetadata.mixed_decode_rows):
+            # rows [0, num_extends) are the extend segment and carry a prefix,
+            # rows [num_extends, bs) are the decode tail and advance by one.
+            #
+            # num_extends is read off `extend_prefix_lens`, which in a MIXED
+            # batch describes the extend segment alone. Slicing it to `bs` --
+            # what the extend branch does -- is what produced
+            #   RuntimeError: Size does not match at dimension 0 expected index
+            #   [2, 1] to be no larger than self [1, 3] apart from dimension 1
+            # from the gather downstream, because `before` came out shorter
+            # than the batch.
+            extend_prefix_lens = kwargs.get("extend_prefix_lens")
+            num_extends = (
+                0 if extend_prefix_lens is None else int(extend_prefix_lens.shape[0])
+            )
+            before = torch.empty_like(after)
+            if num_extends:
+                before[:num_extends] = extend_prefix_lens[:num_extends].to(
+                    device=after.device, dtype=after.dtype
+                )
+            before[num_extends:] = after[num_extends:] - 1
         else:
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
             if extend_prefix_lens is not None:
@@ -2614,18 +2638,16 @@ class HybridLinearAttnBackend(AttentionBackend):
     # buffers) exist on those paths.
     uses_flat_cache_groups: bool = True
 
-    # The linear-attention half cannot serve a MIXED batch. Its state-page
-    # gather assumes every sequence contributes the same number of rows, so a
-    # plan holding prefill and decode together fails inside
-    # ``MambaAttnBackend._flat_state_pages``:
+    # Still False: the linear half is one fix short of serving a MIXED batch.
+    # `MambaAttnBackend._state_page_bounds` now segments correctly, so the shape
+    # error is gone, but the state-group block table itself arrives sized to the
+    # extend segment while GDN state advances for *every* request, decode rows
+    # included. Gathering past the end of it is an illegal memory access inside
+    # the Triton kernel -- worse than the old crash, because it aborts the
+    # process rather than raising.
     #
-    #   RuntimeError: Size does not match at dimension 0 expected index [2, 1]
-    #   to be no larger than self [1, 3] apart from dimension 1
-    #
-    # The full-attention half *can* (see `MHAAttnBackend.supports_mixed_batch`),
-    # so the hybrid is only as capable as its weaker half. Declaring it here
-    # turns `--enable-mixed-batch` on a hybrid model into a refusal at startup
-    # rather than a crash on the first batch that happens to mix.
+    # Flip to True only together with a full-batch state table; the guard in
+    # `EventLoop.__init__` reads this and nothing else.
     supports_mixed_batch: bool = False
 
     def __init__(

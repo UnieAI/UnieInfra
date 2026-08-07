@@ -6664,3 +6664,97 @@ quantized Qwen3.5-27B checkpoint exists on this box, and the kernel is still in
 
 Doing those in the other order would produce a fast engine whose output quality
 nobody has agreed to.
+
+## E52 — the capacity plan was wrong, bf16 SSM state buys nothing, and mixed batch needs code that does not exist
+
+Three things were tried on top of the fp8-KV result (E-prev: 245.8 tok/s, +19.0%).
+Two are negative results and one corrects an earlier analysis. Standing against
+vLLM at C=32/ILEN=4096 is now **245.8 vs 248.1, −0.9%**.
+
+### The #12 plan would have made things 13x worse
+
+The task said: stop `equalized_block_size` inflating the attention page P from 64
+to 832, since P is only that large to cover a 3.2 MB GDN state row, and the
+`state_group_page_sizes` machinery is now ported. That analysis was wrong, and
+reading the allocator is what showed it:
+
+```python
+self.num_pages_with_null = self.size // self.page_size + 1
+self.state_slabs = [(zeros((num_pages_with_null, *conv_shape)),
+                     zeros((num_pages_with_null, *ssm_shape)))]
+```
+
+**One full state row is allocated per page id.** At P=832 that is 149 rows. At
+P=64 it would be ~1937 rows x 3.2 MB = **6.2 GB instead of 478 MB**. The
+inflation is not waste bookkeeping — it is what bounds state memory. The 14.7%
+KV rounding waste is the price paid for that, deliberately.
+
+`flat_state_slabs.py` says so in a comment that should have been read first:
+"the flat plan packs [conv|ssm] state rows and KV rows into **one page-id
+space**". Decoupling P from the state row means giving state its own id space,
+which is the placeholder-block work E48b established is lost.
+
+### bf16 SSM state: no gain, so not adopted
+
+`--mamba-ssm-dtype bfloat16` halves the state row, which pulls P back from 1600
+(where fp8 KV pushes it — halving `kv_bytes_per_slot` doubles
+`ceil(state_bytes / kv_bytes_per_slot)`) down to 832, and doubles the page count
+from 149 to 294.
+
+| config | P | pages | requests that fit at ILEN=4096 |
+|---|---|---|---|
+| bf16 KV, fp32 SSM | 832 | 149 | 24 |
+| fp8 KV, fp32 SSM | 1600 | ~150 | 49 |
+| fp8 KV, bf16 SSM | 832 | 294 | 49 |
+
+Both fp8 configurations fit 49 requests — one via coarser pages, one via more of
+them. Measured: **246.4 vs 245.8 tok/s**, i.e. the same number. It changes the
+precision of the recurrent state for nothing, so it is not adopted.
+
+### Mixed batch: the MHA half ports, the GDN half does not exist
+
+Upstream's MHA backend asserts `not forward_mode.is_mixed()`. The fork's 14
+hunks apply clean and lift that. But the run then dies in the *linear* half:
+
+```
+RuntimeError: Size does not match at dimension 0 expected index [2, 1] to be no
+larger than self [1, 3] apart from dimension 1     # _flat_state_pages
+```
+
+`MambaAttnBackend` gathers state rows assuming every sequence contributes the
+same number. Searching for the fix: `hybrid_linear_attn.py`'s whole divergence
+is 31 lines and already applied; the diff's 67 "mixed" hits are
+`validate_mixed_batch_backend`, a **guard** that rejects incapable backends, not
+an implementation. Upstream has no `is_mixed` handling there either.
+
+**So this is the second measured result whose code is gone**, after E48b. E45
+reported 140 successful `Mix batch` rounds; nothing in the repository can produce
+one on this model.
+
+What landed instead: the backend declares `supports_mixed_batch = False` and
+`EventLoop.__init__` refuses the flag. Before, the server started, accepted
+requests, completed none, and scored 0 tok/s in all 20 windows of a 600 s arm
+before the cause was visible.
+
+### Where the remaining ~10% actually is
+
+The fp8-KV arm oscillates between two levels rather than sitting at its mean:
+
+```
+199 212 204 212 265 273 273 273 273 273 272 247 211 211 212 212 273 273 273 273
+```
+
+Bimodal, 211 vs 273, 25.1% spread. **The high mode already beats vLLM by 10%.**
+The tail mean is whichever phase the window lands in, which is also why 245.8 and
+246.4 should not be read as different.
+
+Capacity is no longer the cause — 49 requests fit against C=32. The remaining
+candidate is the prefill/decode alternation, which is what mixed batch would
+address, and which now needs the GDN state gather written rather than ported.
+
+### Hazard for whoever reads this next
+
+**Read the allocator before trusting a geometry argument.** The case for #12 was
+arithmetically clean, cited the right constant, and was backwards, because it
+reasoned about page *size* without checking what is allocated *per page*. The
+comment naming the constraint was eleven lines from the code being changed.

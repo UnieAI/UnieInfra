@@ -71,6 +71,14 @@ class AttentionBackend(ABC):
     # False for flat-capable backends whose spec-verify path is not wired yet.
     flat_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
+    # Whether this backend can serve a ``ForwardMode.MIXED`` batch (prefill
+    # chunks and decode rows in one forward). Backends that set this False must
+    # reject MIXED in ``init_forward_metadata``; the engine refuses to start
+    # with ``--enable-mixed-batch`` on such a backend rather than crashing the
+    # scheduler on the first mixed iteration. May be narrowed per instance (MHA
+    # opts out under speculative decoding) -- the startup guard reads it off the
+    # constructed backend, not off the class.
+    supports_mixed_batch: bool = True
 
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device

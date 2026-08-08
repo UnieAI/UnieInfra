@@ -6962,3 +6962,57 @@ each half a view, per TRT-LLM, for anything that must be a tensor.
 Not surveyed: tileRT, which an earlier entry established ships no CUDA or C++
 source at all — pure Python shims over `libtilert_*.so` — so it has no
 implementation to read.
+
+## E55 — profile of a decode step: GEMM 85%, GDN decode kernel 8%, all fusion targets together ~2%
+
+torch profiler against the live server (the engine's own `/start_profile`;
+`ncu` hardware counters are blocked here by `RmProfilingAdminOnly`).
+Qwen3.5-27B, shipping config (`--attention-backend triton --kv-cache-dtype
+fp8_e4m3`), batch 32 decode. 3387 ms of GPU kernel time, 98 distinct kernels.
+
+| | share |
+|---|---|
+| GEMM / linear | **~85%** |
+| **GDN decode kernel** | **8.0%** |
+| fused add-RMSNorm | 1.0% |
+| SiLU act-and-mul | 0.7% |
+| splitK reduce | 0.6% |
+| causal conv1d update | 0.4% |
+| chunk gated delta rule | 0.4% |
+| everything else | ~4% |
+
+### This corrects E54b's fusion claim
+
+E54b listed three fusions the other engines have and we lack. **Two of the three
+we already have** and the trace names them:
+`flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel` and
+`flashinfer::activation::act_and_mul_kernel<bfloat16, silu>`. Only conv1d is
+unfused, and it is **0.4%** of the step.
+
+TurboMind's dedicated `bench_conv1d_silu.cc` is real and its defaults
+(`batch_size=32, seq_len=1`) are exactly this operating point, so their reason
+is sound for their model. It does not follow that the same op is worth the same
+here: on this model at this batch, **every fusion target added together is about
+2%**. Their choices are a strong prior about *what is worth fusing*, not a
+measurement of *our* profile.
+
+### Two findings worth more than the fusion work
+
+**The largest non-GEMM kernel is GDN decode, at 8.0%** —
+`kernel_cutlass_gdn_decode_kernel_small_batch_pretranspose`, 3072 launches.
+That is the 48-of-64 layers nobody had profiled. It is twenty times the size of
+the conv1d fusion that was about to be written.
+
+**Every GEMM is `cutlass_80_tensorop_bf16_s16816gemm`** — sm_80-generation
+CUTLASS running on sm_120. 85% of the step is spent in kernels compiled for an
+architecture two generations back. Whether a newer CUTLASS tile helps here is
+unmeasured; sm_120 has no `wgmma`, so it is not automatic that a Hopper/Blackwell
+tile applies, but nobody has checked which tiles the dispatcher has available.
+
+### Hazard for whoever reads this next
+
+**Two of the three "missing" fusions were already in the binary.** They were
+listed from reading the other engines' source and grepping ours for filenames --
+`silu_fuse_block_quant` looked like the wrong kind of fusion, so it was assumed
+the right kind was absent. One trace named both. Grep the *trace*, not the
+source tree, before claiming an op is unfused.

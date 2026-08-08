@@ -6758,3 +6758,72 @@ address, and which now needs the GDN state gather written rather than ported.
 arithmetically clean, cited the right constant, and was backwards, because it
 reasoned about page *size* without checking what is allocated *per page*. The
 comment naming the constraint was eleven lines from the code being changed.
+
+## E53 — GDN mixed batch needs a forward split, not index fixes; two of three blockers cleared
+
+Continuing #23. Three failures, each found by running the flag rather than by
+reading, each revealing the next.
+
+### 1. `_state_page_bounds` — batch-uniform mode branch (fixed, 8ecb4b24)
+
+Branched on `forward_mode` for the whole batch: decode subtracted one from every
+row, extend read `extend_prefix_lens[:bs]`. A MIXED plan advances its segments by
+different amounts and `extend_prefix_lens` covers only the extend segment, so the
+extend branch also produced a `before` shorter than the batch.
+
+Segmented on the layout MHA already builds: rows `[0, num_extends)` carry a
+prefix, `[num_extends, bs)` advance by one, with `num_extends` read off
+`extend_prefix_lens.shape[0]` rather than new plumbing.
+
+### 2. `init_forward_metadata` — same bug, second site (fixed, 69a5f7c5)
+
+`query_start_loc` is built for the whole batch from `extend_start_loc` /
+`extend_seq_lens` / `extend_prefix_lens`, all extend-segment-sized:
+
+```
+RuntimeError: The size of tensor a (6) must match the size of tensor b (3)
+```
+
+Both branches now default every row to one query token and overwrite the first
+`num_extends`.
+
+### 3. `_mask_fresh_initial_state` — not an index bug (open)
+
+```
+RuntimeError: The size of tensor a (2) must match the size of tensor b (6)
+```
+
+`recurrent_state` has 2 rows — the extend segment — against a 6-row
+`has_initial_states`. **The linear half runs the whole mixed batch down its
+extend path, decode rows included.**
+
+This is the structural difference from MHA, which handles MIXED by *splitting*:
+`_forward_mixed` gives each segment the kernel built for it, which is why
+`MHAExtendMetadata` carries `mixed_decode_rows` and a sibling
+`MHADecodeMetadata`. The linear half has no equivalent. Writing one is the
+remaining work; there are 23 references to the extend arrays in this file and
+patching them one at a time would only move the failure.
+
+### A correction to E52's guess
+
+E52 said blocker 2 was the state block table arriving extend-sized. Wrong: both
+construction paths build it with `num_requests=bs`, and instrumenting the gather
+confirmed full-batch tables (`rows=(3, 1)` at `bs=3`). The illegal memory access
+came from the *bounds*, not the table. The guess was plausible because MHA does
+slice its own copy (`rows = num_extends if is_mixed else bs`) — but that is MHA's
+private metadata, not the kwarg the linear half reads.
+
+### State
+
+`supports_mixed_batch` stays False; the startup guard keeps refusing the flag.
+Standing throughput is unchanged at **245.8 vs vLLM 248.1**, and the bimodal
+211/273 oscillation — whose high mode beats vLLM by 10% — is still the target
+that mixed batch was meant to address.
+
+### Hazard for whoever reads this next
+
+**Two index fixes in a row can look like a trend and be a coincidence.** After
+the second one it was tempting to keep slicing; the third failure was a
+different kind of thing, and only reading what the shapes *meant* (2 = extend
+rows, 6 = batch) showed the path itself was wrong. Count the remaining call
+sites before assuming the next fix is the last one.

@@ -70,6 +70,29 @@ upstream edit that nobody wrote down, so nobody knows whether it is a local
 workaround, a bug fix that belongs upstream, or something upstream has since
 fixed on its own.
 
+## Process for optimization work
+
+Follow in order. `AGENTS.local.md` carries the same list so it is loaded into
+every session; this copy is the one that is shared and versioned.
+
+1. **Decide what to do.**
+2. **Survey how every inference engine implements it** — vLLM, TRT-LLM, SGLang,
+   TurboMind, tileRT. All of them, not one: they disagree, and the disagreements
+   are the finding. On GDN mixed batching, vLLM and TurboMind split decode-first
+   while TRT-LLM and SGLang split prefill-first, which is how the order turned
+   out to be a choice rather than a requirement; TurboMind alone passes offsets
+   instead of materialising slices, removing a whole class of alignment bug.
+   Reading one engine surfaces none of that, and skipping the step has cost this
+   project five debug cycles on one feature (log E54).
+3. **Port and test. The result must not be worse than the other frameworks.**
+   The acceptance bar is a measured comparison against them, not "it runs".
+4. **Then iterate on optimization.**
+5. **Write it up as a report.** The deliverable is not the code alone.
+
+Reference checkouts are in `legacy/third_party/` (sparse; see
+`legacy/.gitmodules`). tileRT ships no CUDA or C++ source, so there is nothing
+to read there.
+
 ## Layout
 
 | path | what |

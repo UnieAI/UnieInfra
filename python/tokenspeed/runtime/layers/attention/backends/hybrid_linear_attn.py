@@ -1390,9 +1390,7 @@ class MambaAttnBackend(AttentionBackend):
                             break
 
                 if extend_start_loc is not None and extend_seq_lens is not None:
-                    extend_lens = torch.ones(
-                        bs, dtype=torch.int32, device=self.device
-                    )
+                    extend_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
                     extend_lens[:num_extends] = extend_seq_lens[:num_extends].to(
                         torch.int32
                     )
@@ -1410,8 +1408,7 @@ class MambaAttnBackend(AttentionBackend):
                             bs, dtype=torch.int32, device=self.device
                         )
                         extend_lens[:num_extends] = (
-                            seq_lens[:num_extends]
-                            - extend_prefix_lens[:num_extends]
+                            seq_lens[:num_extends] - extend_prefix_lens[:num_extends]
                         ).to(torch.int32)
                     else:
                         # No prefix: all tokens are new
@@ -1501,23 +1498,27 @@ class MambaAttnBackend(AttentionBackend):
 
                 page_size = getattr(self.pool, "page_size", 1)
                 final_lens = prefix + extend_lens
-                last_inserted_lens = (final_lens // page_size) * page_size
-                track_lens = last_inserted_lens - prefix
+                # Mirror of the C++ `MambaCheckpointPublishDepth`: one page
+                # BELOW the last page this chunk inserts. The two must agree
+                # exactly -- C++ attaches the slot to the radix node at this
+                # depth, so a state harvested anywhere else would be filed
+                # under a depth it does not describe, and a later hit would
+                # resume from the wrong recurrent state. Silent, and wrong.
+                #
+                # One page below, because a match can never reach the chunk's
+                # own end: an exact repeat must leave a token to compute, and a
+                # diverging prefix splits the node inside that last page.
+                # Measured on Qwen3.5-27B: publishing at the end gave
+                # `#cached-token: 0` on every shape.
+                publish_lens = (final_lens // page_size) * page_size - page_size
+                track_lens = publish_lens - prefix
                 track_inside = (
                     checkpoint_mask & (track_lens > 0) & (track_lens < extend_lens)
                 )
                 track_mask = track_inside & ((track_lens % FLA_CHUNK_SIZE) == 0)
-                # C++ attaches the checkpoint slot to the last KV page inserted
-                # for this chunk. When a chunk has an intermediate branch and
-                # ends exactly on a page boundary, the final state must win.
-                final_mask = (
-                    checkpoint_mask
-                    & (final_lens >= page_size)
-                    & ((final_lens % page_size) == 0)
-                )
-                if final_mask.any():
-                    track_ssm_final_src = mamba_cache_indices[final_mask]
-                    track_ssm_final_dst = track_indices[final_mask]
+                # The publish depth is now strictly inside the extend, so the
+                # state always comes from the chunked scan's intermediate
+                # checkpoints; the chunk's final state is never the one filed.
 
                 if track_mask.any():
                     (

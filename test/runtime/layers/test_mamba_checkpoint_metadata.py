@@ -110,7 +110,17 @@ def test_simple_mamba_pool_current_input_map_uses_rank_local_req_pool_range():
     assert pool.total_size == 48 + 22 * 3
 
 
-def test_extend_tracks_final_page_boundary_when_branch_checkpoint_is_inside():
+def test_extend_publishes_one_page_below_the_chunk_end():
+    """A chunk ending on a page boundary publishes one page BELOW it, not at it.
+
+    The chunk's own end is the one depth a later match can never reach: an
+    exact repeat must leave a token to compute, and a diverging prefix splits
+    the node inside that last page. Publishing at the end measured
+    `#cached-token: 0` on Qwen3.5-27B for every shape tried.
+
+    seq 320 / prefix 192 / page 64 -> publish at 320-64 = 256, i.e. 64 tokens
+    into this chunk, which is the chunked scan's first checkpoint.
+    """
     backend = _new_backend(page_size=64)
 
     backend.init_forward_metadata(
@@ -126,12 +136,22 @@ def test_extend_tracks_final_page_boundary_when_branch_checkpoint_is_inside():
 
     metadata = backend.forward_metadata
 
-    assert metadata.track_ssm_h_dst is None
-    assert metadata.track_ssm_final_src.tolist() == [2]
-    assert metadata.track_ssm_final_dst.tolist() == [5]
+    assert metadata.track_ssm_h_src.tolist() == [0]
+    assert metadata.track_ssm_h_src_fla.tolist() == [1]
+    assert metadata.track_ssm_h_dst.tolist() == [5]
+    # The chunk's final state is never the one filed now: the publish depth is
+    # always strictly inside the extend, so it comes from the scan's
+    # intermediate checkpoints.
+    assert metadata.track_ssm_final_src is None
+    assert metadata.track_ssm_final_dst is None
 
 
-def test_extend_tracks_only_branch_boundary_when_final_boundary_is_not_aligned():
+def test_extend_publishes_below_an_unaligned_chunk_end():
+    """Same rule when the chunk ends mid-page: floor to a page, then back one.
+
+    seq 319 / prefix 192 / page 64 -> floor(319/64)*64 = 256, minus one page
+    = 192, which is the prefix itself, so there is nothing new to publish.
+    """
     backend = _new_backend(page_size=64)
 
     backend.init_forward_metadata(
@@ -147,11 +167,11 @@ def test_extend_tracks_only_branch_boundary_when_final_boundary_is_not_aligned()
 
     metadata = backend.forward_metadata
 
-    assert metadata.track_ssm_h_dst.tolist() == [5]
+    assert metadata.track_ssm_h_dst is None
     assert metadata.track_ssm_final_dst is None
 
 
-def test_extend_tracks_last_inserted_page_boundary_when_branch_is_earlier():
+def test_extend_publishes_one_page_below_a_multi_page_chunk():
     backend = _new_backend(page_size=64)
 
     backend.init_forward_metadata(
@@ -167,13 +187,22 @@ def test_extend_tracks_last_inserted_page_boundary_when_branch_is_earlier():
 
     metadata = backend.forward_metadata
 
-    assert metadata.track_ssm_h_src.tolist() == [1]
-    assert metadata.track_ssm_h_src_fla.tolist() == [2]
+    # seq 350 / prefix 192 -> floor(350/64)*64 = 320, minus one page = 256,
+    # i.e. 64 tokens into this chunk.
+    assert metadata.track_ssm_h_src.tolist() == [0]
+    assert metadata.track_ssm_h_src_fla.tolist() == [1]
     assert metadata.track_ssm_h_dst.tolist() == [5]
     assert metadata.track_ssm_final_dst is None
 
 
-def test_extend_tracks_last_inserted_page_boundary_without_branch_hint():
+def test_extend_publishes_nothing_when_the_chunk_spans_under_two_pages():
+    """seq 350 / prefix 256 -> publish depth 256 == the prefix: nothing new.
+
+    A chunk this short has no reachable boundary of its own to offer. Harmless
+    at the shipping `chunked_prefill_size` (8192), where a prompt is one chunk
+    and the publish depth is far above the prefix; it only bites for chunks
+    narrower than two pages.
+    """
     backend = _new_backend(page_size=64)
 
     backend.init_forward_metadata(
@@ -189,8 +218,8 @@ def test_extend_tracks_last_inserted_page_boundary_without_branch_hint():
 
     metadata = backend.forward_metadata
 
-    assert metadata.track_ssm_h_src.tolist() == [0]
-    assert metadata.track_ssm_h_src_fla.tolist() == [1]
+    assert metadata.track_ssm_h_src is None
+    assert metadata.track_ssm_h_dst is None
 
 
 def test_extend_skips_unaligned_inserted_page_boundary():

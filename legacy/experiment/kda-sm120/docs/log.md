@@ -7038,3 +7038,33 @@ filename, propose work on it, then find the answer already recorded. The other
 two, both today: two of three "missing" fusions were named in the very trace
 being analysed, and the state-page geometry plan was contradicted by a comment
 eleven lines from the code it would have changed.
+
+### E55b — the GDN roofline estimate is wrong and is not usable
+
+Attempted the cheap verification before touching the GDN decode kernel: estimate
+the recurrent-state traffic per step and compare against measured time.
+
+Assumed per request per layer: an fp32 SSM state of
+`num_v_heads x key_dim x value_dim = 48 x 128 x 128 x 4 B = 3.15 MB` (the shape
+`h0_source: Tensor([151, 48, 128, 128], float32)` from an earlier kernel error),
+plus a small conv window, read and written once per step. At batch 32 across 48
+linear layers that is **9.85 GB per decode step**.
+
+Measured: 271 ms over 3072 launches = 64 steps = 4.23 ms per step, which implies
+**2327 GB/s, or 159% of the ~1460 GB/s this card can sustain.**
+
+Impossible, so the traffic model is wrong — not the measurement. Candidates not
+yet checked: the state may not be fully read *and* written each step; the slab
+may not be per-layer; fp32 may apply to only part of it; the kernel may touch
+only a subset of pages.
+
+**Recorded rather than corrected because the number is unusable either way.** A
+roofline that says a kernel exceeds its memory system is the same error class
+this log already carries a hazard note for (E47: a GB/s above HBM peak means the
+working set is cached, not that the kernel is fast) — here it means the byte
+count is wrong.
+
+To resolve it, read the actual tensor extents the kernel is launched with rather
+than deriving them from the model config, then recompute. Until then **the GDN
+decode kernel's 8.0% is still unattributed: it is not known whether it is close
+to its roofline or far from it**, and no work should be planned on it.

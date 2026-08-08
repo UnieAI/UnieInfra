@@ -6827,3 +6827,85 @@ the second one it was tempting to keep slicing; the third failure was a
 different kind of thing, and only reading what the shapes *meant* (2 = extend
 rows, 6 = batch) showed the path itself was wrong. Count the remaining call
 sites before assuming the next fix is the last one.
+
+## E54 — how vLLM and TRT-LLM serve a mixed batch on a recurrent layer, and why our split is in the wrong place
+
+Written after five failed attempts at `--enable-mixed-batch` on Qwen3.5-27B,
+each fixing the previous failure and finding the next. Surveying first would
+have cost less than the fifth attempt.
+
+### Both engines split. Neither splits where we did.
+
+**vLLM** (`model_executor/layers/mamba/mamba_mixer2.py`):
+
+```python
+hidden_states_B_C_d, hidden_states_B_C_p = torch.split(
+    hidden_states_B_C[:num_actual_tokens], [num_decode_tokens, num_prefill_tokens], dim=0)
+```
+then `mamba_chunk_scan_combined_varlen` for prefill against
+`selective_state_update` for decode. Metadata is built prefill-only, marked with
+a `_p` suffix throughout (`has_initial_states_p`, `seq_idx_p`,
+`cu_chunk_seqlen_p`).
+
+**TRT-LLM** (`_torch/modules/mamba/mamba2_mixer.py`):
+
+```python
+seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
+batch_split_size  = [num_prefills, num_decodes]
+state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
+```
+
+Three things fall out of the comparison:
+
+1. **The split lives in the mixer**, i.e. the model layer, in both. Ours is in
+   the attention backend. The layer owns the tensors; the backend does not, and
+   every failure in E53 and after was the backend reaching for something it does
+   not own -- query-length arrays, the kernel's output buffer, the state gather.
+
+2. **Two axes, not one.** Per-token tensors split by `seqlen_split_size`,
+   per-request tensors by `batch_split_size`. Our `MambaForwardMetadata.segment`
+   (per-request) and `_slice_token_kwargs` (per-token) are the same decomposition
+   and can be kept.
+
+3. **TRT-LLM preallocates the output and splits *that*:**
+
+   ```python
+   # Preallocate output tensor to avoid memcpy cost for merging prefill
+   # and decode outputs
+   preallocated_ssm_out = torch.empty([zxbcdt.shape[0], nheads * head_dim], ...)
+   preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
+       preallocated_ssm_out, seqlen_split_size)
+   ```
+
+   Each half writes into its own view of one buffer. That removes the
+   `torch.cat` we ended with, and it is the pattern to copy.
+
+**Order differs between them and matters here.** vLLM puts decode first,
+TRT-LLM prefill first. TokenSpeed's own scheduler and `MHAAttnBackend` put
+extend first (`rows [0, num_extends)`, `mixed_decode_rows` after), so TRT-LLM's
+order is the one to follow -- adopting vLLM's would mean reordering the whole
+batch convention for one layer type.
+
+### What was kept from the failed attempt
+
+`146c4175` lands the machinery, disabled. Correct and expensive to find:
+
+- **`.contiguous()` is a no-op on a leading-dimension slice.** PyTorch already
+  considers such a slice contiguous, so the call returns the same view and the
+  data pointer keeps its byte offset; the recurrent kernels reject it with
+  `Misaligned Tensor data on argument #9` (the output buffer). `.clone()` is
+  required, and only for a segment that does not start at zero. TRT-LLM's
+  preallocate-and-split sidesteps this entirely, which is a second reason to
+  prefer it.
+- Per-token kwargs must be selected **by shape, not by name**: the recurrent
+  forward takes a growing set of them and a name list goes stale silently, where
+  a missed entry is a wrong answer rather than an error.
+
+### Hazard for whoever reads this next
+
+**Surveying is cheapest before the first attempt, not after the fifth.** The
+instruction to look at how the other engines do it was given and half-followed:
+vLLM was read, the split-into-two-halves shape was taken from it, and the part
+that mattered -- *where* the split lives -- was not. Five serve-crash-read cycles
+followed. The structural question ("who owns these tensors") was answerable in
+one file read.

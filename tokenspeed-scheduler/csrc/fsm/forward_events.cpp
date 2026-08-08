@@ -89,16 +89,31 @@ void DemoteWrittenBackDevice(tokenspeed::KVPrefixCache* kv_prefix_cache,
     });
 }
 
-bool ShouldPublishMambaCheckpoint(tokenspeed::HybridPrefixCache* hybrid_cache, std::int32_t chunk_begin,
-                                  std::int32_t chunk_size, std::int32_t page_size) {
-    if (hybrid_cache == nullptr || chunk_size <= 0 || page_size <= 0) return false;
+// Depth at which this chunk's recurrent snapshot must be published, or -1.
+//
+// One page BELOW the last page this chunk inserts, not at it. A later match can
+// never reach the inserted terminal's own depth: an exact repeat must leave at
+// least one token to compute, and a diverging prefix (shared document, new
+// question) splits the node somewhere inside that last page. Measured both ways
+// on Qwen3.5-27B -- snapshot at 4096 against a match at 4032, and snapshot at
+// 3008 against a match at 2944 -- and in both cases `augmentMatch` found no
+// ancestor snapshot and discarded a valid multi-thousand-token KV match, so
+// reuse read `#cached-token: 0`.
+//
+// One page of reuse is given up in the best case, which is the price of the
+// snapshot being reachable at all.
+std::int32_t MambaCheckpointPublishDepth(tokenspeed::HybridPrefixCache* hybrid_cache, std::int32_t chunk_begin,
+                                         std::int32_t chunk_size, std::int32_t page_size) {
+    if (hybrid_cache == nullptr || chunk_size <= 0 || page_size <= 0) return -1;
     const std::int32_t final_len = chunk_begin + chunk_size;
-    const std::int32_t last_inserted_len = (final_len / page_size) * page_size;
-    if (last_inserted_len <= chunk_begin) return false;
-    if (last_inserted_len == final_len) return true;
+    const std::int32_t publish_depth = (final_len / page_size) * page_size - page_size;
+    if (publish_depth <= chunk_begin) return -1;
 
-    const std::int32_t track_len = last_inserted_len - chunk_begin;
-    return hybrid_cache->AlignMambaCacheSeqlen(track_len) == track_len;
+    // The GPU harvests this state from the chunked scan's intermediate
+    // checkpoints, which exist only on its own chunk grain.
+    const std::int32_t track_len = publish_depth - chunk_begin;
+    if (hybrid_cache->AlignMambaCacheSeqlen(track_len) != track_len) return -1;
+    return publish_depth;
 }
 
 }  // namespace
@@ -195,9 +210,18 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
         *tokens_for_insert, *prefix_pages, std::move(pages_to_insert));
 
     if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
-        const bool publish = ShouldPublishMambaCheckpoint(hybrid_cache, chunk_begin, chunk_size, page_size);
-        if (publish) {
-            hybrid_cache->InsertMamba(insert_result.last_node, local_mamba_allocator->DetachCheckpoint());
+        const std::int32_t publish_depth =
+            MambaCheckpointPublishDepth(hybrid_cache, chunk_begin, chunk_size, page_size);
+        // SplitAt resolves, or carves out, the ancestor at that exact depth --
+        // Insert leaves one node spanning the whole chunk, so the node a match
+        // will land on usually does not exist yet. Same primitive the
+        // paged-cache snapshot path already uses.
+        TreeNode* attach_node =
+            publish_depth > 0
+                ? hybrid_cache->GetKVPrefixCache().GetRadixTree().SplitAt(insert_result.last_node, publish_depth)
+                : nullptr;
+        if (attach_node != nullptr && !attach_node->HasMamba()) {
+            hybrid_cache->InsertMamba(attach_node, local_mamba_allocator->DetachCheckpoint());
         } else {
             local_mamba_allocator->DetachCheckpoint();
         }

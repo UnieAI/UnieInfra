@@ -6909,3 +6909,56 @@ vLLM was read, the split-into-two-halves shape was taken from it, and the part
 that mattered -- *where* the split lives -- was not. Five serve-crash-read cycles
 followed. The structural question ("who owns these tensors") was answerable in
 one file read.
+
+### E54b — the other three engines, and the best answer of the four
+
+Extending the survey on request. All four engines that implement a recurrent
+layer split a mixed batch. They differ in *where* and in whether they
+materialise the split.
+
+| engine | where the split lives | order | how the halves are addressed |
+|---|---|---|---|
+| vLLM | mixer (`mamba_mixer2.py`) | decode first | `torch.split` on the token dim |
+| TRT-LLM | mixer (`mamba2_mixer.py`) | **prefill first** | `torch.split`, output preallocated and split too |
+| SGLang | mixer (`mamba/mamba.py:518`) | **prefill first** | `torch.split` |
+| TurboMind | layer plan (`GatedDeltaNetLayer.cc`) | decode first | **offsets, no slicing at all** |
+
+**SGLang's hybrid backend has the same gap we do.**
+`hybrid_linear_attn_backend.py` — the file our `hybrid_linear_attn.py` shares a
+lineage with — dispatches `is_decode()` vs else with no mixed branch, exactly
+like ours. Its mixed handling is one level down, in the mixer. That is strong
+confirmation that the backend is the wrong level: the engine we are closest to
+made the same structural choice and put the split elsewhere.
+
+**TurboMind is the most interesting of the four:**
+
+```cpp
+data.decode_count = 0;
+while (data.decode_count < data.batch_size && data.input_lens[data.decode_count] == 1)
+    ++data.decode_count;
+data.prefill_count = data.batch_size - data.decode_count;
+
+if (data.decode_count)  { planning.physical_batch = data.decode_count; ... }
+if (data.prefill_count) { planning.q_offsets.assign(host_offsets.begin() + data.decode_count, ...); }
+```
+
+Two things nobody else does:
+
+- **It never materialises a slice.** Two launch *plans* carry offsets into the
+  same buffers. That removes the concat (TRT-LLM's preallocation also does) *and*
+  the alignment trap that cost two debug cycles here — there is no offset view
+  to misalign, because the offset is an argument rather than a pointer.
+- **It derives the boundary itself**, scanning `input_lens` for the leading run
+  of length-1 rows, instead of trusting a `num_prefills` the scheduler supplies.
+  Self-describing, and it cannot disagree with the batch it was handed.
+
+### What to build, given all four
+
+Split in the layer, prefill-first (TokenSpeed's own convention, matching TRT-LLM
+and SGLang), and pass **offsets rather than slices** wherever the kernel takes a
+base pointer plus a count — TurboMind's shape. Preallocate the output and hand
+each half a view, per TRT-LLM, for anything that must be a tensor.
+
+Not surveyed: tileRT, which an earlier entry established ships no CUDA or C++
+source at all — pure Python shims over `libtilert_*.so` — so it has no
+implementation to read.

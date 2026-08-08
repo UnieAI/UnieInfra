@@ -62,13 +62,26 @@ SUPPORTED_HEAD_DIM = 128
 _chunk_gated_delta_rule = error_fn
 _has_blackwell_prefill = False
 
-if platform.is_blackwell:
+# `is_blackwell` is `arch_version.major == 10`, which excludes sm_120 (major
+# 12) even though flashinfer ships a kernel for it. Gate on "has a kernel for
+# this device" instead of on a family name.
+if platform.is_blackwell_plus:
     try:
-        from flashinfer.gdn_kernels import (
-            _has_blackwell_prefill,
-        )
+        # Ask for the arch-specific kernel this device would dispatch to, rather
+        # than for a version-specific availability flag. flashinfer 0.6.15 ships
+        # `chunk_gated_delta_rule_sm120` and no longer exports the
+        # `_has_blackwell_prefill` symbol this used to import -- and because the
+        # symbol was imported *before* the kernel, its ImportError skipped the
+        # whole block and left `_chunk_gated_delta_rule` as `error_fn`. The
+        # sm_120 kernel was present and working the entire time; nothing said so.
+        from flashinfer import gdn_kernels as _fi_gdn
         from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
 
+        _arch_major = platform.arch_version.major
+        _has_blackwell_prefill = (
+            getattr(_fi_gdn, f"chunk_gated_delta_rule_sm{_arch_major}0", None)
+            is not None
+        )
         _chunk_gated_delta_rule = _fi_chunk
     except ImportError:
         pass
@@ -108,18 +121,42 @@ if platform.is_hopper_plus:
 
 
 def is_available() -> bool:
-    """Whether the sm100 GDN kernel can run on this platform."""
-    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    # flashinfer's gdn_prefill treats compute-capability major 10 as the
-    # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
-    # prefill kernel being present; it raises NotImplementedError otherwise.
-    # Mirror that here so the caller does not commit to a crashing fast-path.
-    return (
-        _chunk_gated_delta_rule is not error_fn
-        and platform.is_blackwell
-        and cuda_major >= 13
-        and _has_blackwell_prefill
-    )
+    """Whether flashinfer's fused GDN chunk-prefill kernel can run here.
+
+    flashinfer dispatches per compute-capability major: sm100/sm103 (B200,
+    B300) and sm120 (RTX PRO 6000) have separate kernels. The sm10x path is
+    additionally gated on CUDA>=13 upstream and raises NotImplementedError
+    otherwise, so that check is kept -- but only for sm10x. sm120 is served by
+    `chunk_gated_delta_rule_sm120`, which was measured working on this box
+    under a CUDA 12.9 torch build: called with the wrapper's own convention
+    (decay in linear space, q/k pre-normalised) it agrees with the Triton
+    chunked scan to max|diff| = 3.1e-4, far inside the 2e-2 the GDN tests use.
+
+    The point of `_has_blackwell_prefill` is "flashinfer has a kernel for this
+    device", which is now answered by probing for the arch-specific symbol
+    rather than by importing a flag that later versions stopped exporting.
+    """
+    if _chunk_gated_delta_rule is error_fn or not _has_blackwell_prefill:
+        return False
+    if platform.arch_version.major == 10:
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        return cuda_major >= 13
+    # sm120: the kernel EXISTS and is CORRECT -- measured against the Triton
+    # chunked scan at max|diff| = 3.1e-4, well inside the 2e-2 the GDN tests
+    # use -- but it is slower, and the gap widens with sequence length. Host
+    # time for one prefill on Qwen3.5-27B (48 GDN layers), steady state with
+    # the JIT compile excluded:
+    #
+    #     tokens |  Triton chunked scan  |  flashinfer sm120 fused
+    #         64 |        51.2 ms        |        66.4 ms   (+30%)
+    #       1024 |        73.2 ms        |       171.1 ms  (+134%)
+    #
+    # Nine Triton launches beat one fused launch here, so the launch count was
+    # never the thing that mattered on this part. Presumably the sm120 variant
+    # lacks the tensor-core/TMA path the sm10x one has. Re-measure before
+    # enabling: the probe above already finds the kernel, so this is the only
+    # line to revisit when flashinfer ships a faster one.
+    return False
 
 
 def is_supported(
@@ -167,9 +204,13 @@ if is_available():
         "gdn_chunk_prefill",
         name="flashinfer_gdn_chunk_prefill",
         solution="flashinfer",
+        # No upper bound: flashinfer dispatches per arch major and ships an
+        # sm120 kernel. A closed range here excluded sm_120 -- a *newer* part --
+        # from a kernel that works on it, which is the failure mode this
+        # repository has hit before with capability tables keyed by family.
+        # `is_available()` above is what decides whether a kernel exists.
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),

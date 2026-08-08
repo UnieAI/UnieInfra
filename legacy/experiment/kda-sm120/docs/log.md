@@ -7003,11 +7003,16 @@ measurement of *our* profile.
 That is the 48-of-64 layers nobody had profiled. It is twenty times the size of
 the conv1d fusion that was about to be written.
 
-**Every GEMM is `cutlass_80_tensorop_bf16_s16816gemm`** — sm_80-generation
-CUTLASS running on sm_120. 85% of the step is spent in kernels compiled for an
-architecture two generations back. Whether a newer CUTLASS tile helps here is
-unmeasured; sm_120 has no `wgmma`, so it is not automatic that a Hopper/Blackwell
-tile applies, but nobody has checked which tiles the dispatcher has available.
+**Every GEMM is `cutlass_80_tensorop_bf16_s16816gemm`, and that is correct.**
+`s16816` is `mma.sync.aligned.m16n8k16`, which is the bf16 tensor-core MMA
+sm_120 has — ptxas accepts it and rejects only `wgmma` and `tcgen05`, verified
+during the TurboMind port and recorded earlier in this log. The `80` names a
+CUTLASS tile family, not an obsolete instruction. There is no newer bf16 MMA on
+this chip to move to.
+
+So the GEMM's 85% is bandwidth-bound, not instruction-bound, and the lever is
+fewer bytes (w4a16) rather than a different kernel — which is where the roadmap
+already had it.
 
 ### Hazard for whoever reads this next
 
@@ -7016,3 +7021,20 @@ listed from reading the other engines' source and grepping ours for filenames --
 `silu_fuse_block_quant` looked like the wrong kind of fusion, so it was assumed
 the right kind was absent. One trace named both. Grep the *trace*, not the
 source tree, before claiming an op is unfused.
+
+### E55 correction — the "two generations back" claim was wrong, and the answer was already in this file
+
+The first version of E55 read the GEMM kernel name as evidence that 85% of the
+step runs on obsolete kernels, and proposed spending 30 minutes checking for
+better tiles. Both were wrong: `s16816` *is* `mma.sync.aligned.m16n8k16`, the
+only bf16 tensor-core MMA sm_120 has, and this log already recorded the ptxas
+verification that sm_120 accepts it and rejects only `wgmma` and `tcgen05`.
+
+The claim was made from a kernel name without checking what the name meant,
+while the check was sitting in the file being appended to.
+
+**Standing habit this is the third instance of:** assert from a name or a
+filename, propose work on it, then find the answer already recorded. The other
+two, both today: two of three "missing" fusions were named in the very trace
+being analysed, and the state-page geometry plan was contradicted by a comment
+eleven lines from the code it would have changed.

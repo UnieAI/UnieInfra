@@ -6,14 +6,29 @@ on the last 200 s, run back to back in one session on the same card.
 
 ## Headline
 
+Scored on the **full post-warmup run**, which is the gate this project's log
+already specifies for an arm that oscillates (E52) — a tail mean is
+phase-biased and cannot resolve better than about ±7% here.
+
 | | tok/s | vs vLLM |
 |---|---|---|
 | Start of this work | **did not start at all** | — |
-| Upstream tokenspeed, once it started | 208.0 | −16.2% |
-| **+ fp8 KV cache** | **245.8** | **−0.9%** |
-| vLLM 0.26 | 248.1 | — |
+| Upstream tokenspeed, once it started | 205.9 | −17.9% |
+| **+ fp8 KV cache** | **255.2** | **+1.8%** |
+| vLLM 0.26 | 250.8 | — |
 
-Essentially parity, from a position of not running.
+Ahead, from a position of not running — but **+1.8% is inside the noise and is
+not yet a claim**. See the acceptance bar below.
+
+### Correction
+
+An earlier version of this report read 245.8 against 248.1, i.e. −0.9%, and
+called it parity. Those are *tail* means, scored on the last 200 s. Both arms
+are limit cycles, so which phase the tail lands in decides the number: sweeping
+the tail window across the run gives 234–271 for TokenSpeed and 235–265 for
+vLLM. A ±7% instrument cannot resolve a 1% difference in either direction. The
+full post-warmup mean is the number the log's own gate calls for, and it changes
+the sign.
 
 The fp8-KV arm oscillates between two levels rather than sitting at its mean:
 
@@ -25,6 +40,21 @@ Bimodal, 211 against 273, 25.1% window spread. **The high mode already beats
 vLLM by 10%.** Closing the remaining gap is a matter of holding it there, not of
 raising a mean — and the tail mean is phase-dependent, which is why 245.8 and a
 later 246.4 should not be read as different numbers.
+
+## Acceptance bar
+
+"Not worse than the other frameworks" is not a bar that can be certified with
+this instrument, and parity is not a result worth shipping. The bar is:
+
+- **Passing: +10% on the full post-warmup mean**, arms repeated and run in both
+  orders.
+- The high mode of the current oscillation is 273 against vLLM's 250.8, so
+  **+10% is already physically present** in the hardware and the code — it is
+  reached whenever the arm sits in its fast phase. Holding it there is the work,
+  not finding new headroom.
+- Anything under about **+7% is unresolvable** by a single 600 s arm and must
+  not be quoted as a win. Tighten the instrument (repeat arms, report the range
+  across tail phases) before claiming a smaller delta.
 
 ## What made it start
 

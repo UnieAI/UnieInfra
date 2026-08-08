@@ -84,8 +84,10 @@ every session; this copy is the one that is shared and versioned.
    instead of materialising slices, removing a whole class of alignment bug.
    Reading one engine surfaces none of that, and skipping the step has cost this
    project five debug cycles on one feature (log E54).
-3. **Port and test. The result must not be worse than the other frameworks.**
-   The acceptance bar is a measured comparison against them, not "it runs".
+3. **Port and test. Passing is +10% against the other frameworks**, on the full
+   post-warmup mean, arms repeated and run in both orders. Parity is not a
+   result, and a delta under ~7% is unresolvable by a single 600 s arm on an
+   oscillating workload — do not quote one.
 4. **Then iterate on optimization.**
 5. **Write it up as a report.** The deliverable is not the code alone.
 

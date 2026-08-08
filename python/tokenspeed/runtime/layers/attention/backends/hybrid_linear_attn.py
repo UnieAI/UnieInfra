@@ -1271,21 +1271,45 @@ class MambaAttnBackend(AttentionBackend):
             else:
                 extend_start_loc = kwargs.get("extend_start_loc")
                 extend_seq_lens = kwargs.get("extend_seq_lens")
+                # On a MIXED plan every `extend_*` kwarg describes the extend
+                # segment alone -- rows [0, num_extends) -- while this function
+                # must produce `query_start_loc` for the whole batch. The decode
+                # tail contributes exactly one query token per row. Indexing the
+                # extend arrays to `bs` (what the branches below did) reads past
+                # their end:
+                #   RuntimeError: The size of tensor a (6) must match the size of
+                #   tensor b (3) at non-singleton dimension 0
+                num_extends = bs
+                if forward_mode.is_mixed():
+                    for _seg in (kwargs.get("extend_prefix_lens"), extend_seq_lens):
+                        if _seg is not None:
+                            num_extends = int(_seg.shape[0])
+                            break
+
                 if extend_start_loc is not None and extend_seq_lens is not None:
-                    query_start_loc = torch.empty(
-                        (bs + 1,), dtype=torch.int32, device=self.device
+                    extend_lens = torch.ones(
+                        bs, dtype=torch.int32, device=self.device
                     )
-                    query_start_loc[:bs] = extend_start_loc
-                    query_start_loc[bs] = extend_start_loc[-1] + extend_seq_lens[-1]
-                    extend_seq_lens_cpu = extend_seq_lens[:bs].to(
-                        device="cpu", dtype=torch.int32
+                    extend_lens[:num_extends] = extend_seq_lens[:num_extends].to(
+                        torch.int32
                     )
+                    query_start_loc = torch.zeros(
+                        bs + 1, dtype=torch.int32, device=self.device
+                    )
+                    torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
+                    extend_seq_lens_cpu = extend_lens.to(device="cpu")
                 else:
                     extend_prefix_lens = kwargs.get("extend_prefix_lens")
                     if extend_prefix_lens is not None:
-                        extend_lens = (seq_lens[:bs] - extend_prefix_lens[:bs]).to(
-                            torch.int32
+                        # Decode rows default to one new token; extend rows get
+                        # their chunk length.
+                        extend_lens = torch.ones(
+                            bs, dtype=torch.int32, device=self.device
                         )
+                        extend_lens[:num_extends] = (
+                            seq_lens[:num_extends]
+                            - extend_prefix_lens[:num_extends]
+                        ).to(torch.int32)
                     else:
                         # No prefix: all tokens are new
                         extend_lens = seq_lens[:bs].to(torch.int32)

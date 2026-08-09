@@ -76,17 +76,17 @@ capability 上界擋在 sm_103，剩下 Triton。**所以 sm_120 上每一次 pr
 
 數值一致到 bf16 的 1 ulp（max|Δ| = 0.0156）。端到端：
 
-| | Triton（起點） | FA2 | + plan 提升 | **+ 去掉多餘 step** | vLLM |
-|---|---|---|---|---|---|
-| TTFT cold | 381.0 ms | 283.6 | 278.8 | **271.6** | 273.2 → **贏 0.6%** |
-| TTFT repeat | 35.0 ms | 33.8 | 29.9 | **22.6** | 24.4 → **贏 7.4%** |
-| TTFT rag | 53.4 ms | 49.0 | 45.0 | **38.0** | 31.6 → 輸 20% |
-| TTFT turn | 73.5 ms | 67.2 | 63.1 | **59.3** | 57.8 → 輸 2.6% |
-| Throughput unique | 377.7 tok/s | 443.0 | 446.4 | **446.6** | 386.3 → **贏 15.6%** |
-| Throughput shared | 2303.4 tok/s | 2210.0 | 2237.3 | **2263.5** | 2573.1 → 輸 12% |
+| | Triton（起點） | FA2 | + plan | + 去多餘 step | **+ page 16** | vLLM |
+|---|---|---|---|---|---|---|
+| TTFT cold | 381.0 ms | 283.6 | 278.8 | 271.6 | **271.5** | 273.2 → **贏 0.6%** |
+| TTFT repeat | 35.0 ms | 33.8 | 29.9 | 22.6 | **19.4** | 24.4 → **贏 26%** |
+| TTFT rag | 53.4 ms | 49.0 | 45.0 | 38.0 | **32.8** | 31.6 → 輸 3.9% |
+| TTFT turn | 73.5 ms | 67.2 | 63.1 | 59.3 | **57.2** | 57.8 → **贏 1.1%** |
+| Throughput unique | 377.7 tok/s | 443.0 | 446.4 | 446.6 | **444.6** | 386.3 → **贏 15%** |
+| Throughput shared | 2303.4 tok/s | 2210.0 | 2237.3 | 2263.5 | **2219.3** | 2573.1 → 輸 14% |
 
-cold 從落後 39% 變成**領先 0.6%**；repeat 從落後 44% 變成**領先 7.4%**。
-（最後一欄的兩項修正見下面兩節。）
+四個 TTFT 形狀裡**三個領先**，rag 從落後 1.69x 收到 3.9%。四欄修正依序是：FA2、
+plan 提升、去掉多餘 step、page size 64→16（各見下節）。
 
 **plan 提升**（`install_paged_extend_plan`）：kernel 自己 plan 時，貴的不是 `plan()`
 ——它是內容鍵、第 0 層之後就命中——而是為了組鍵而做的 `cache_seqlens.to("cpu")`。
@@ -218,9 +218,23 @@ throughput 測試裡 64 個請求同時共用前綴、頁面全程 pinned，本�
 
 **兩個可歸因的差距**
 
-1. **page size 64 讓每次部分命中少重用最多 63 個 token。** 同一個 RAG 請求，
-   vLLM 重用 3888／3890（block_size 16），我們重用 **3840**（block_size 64）——
-   3890 向下取整到 64 的倍數就是 3840。多 prefill 48 個 token（+15%）。
+1. **~~page size 64 讓每次部分命中少重用最多 63 個 token~~ —— 已修（預設改為 16）。**
+   同一個 RAG 請求，vLLM 重用 3888／3890（block_size 16），我們原本只重用 3840。
+
+   | block_size | TTFT rag | cached | TTFT repeat | Throughput unique | shared |
+   |---|---|---|---|---|---|
+   | **16**（新預設） | **32.94 ms** | 3888 | **19.46 ms** | 444.6 | 2219.3 |
+   | 32 | 33.78 | 3872 | 21.39 | — | — |
+   | 64（舊預設） | 37.85 | 3840 | 22.62 | 446.9 | 2243.2 |
+
+   延遲 −13~14%，throughput −0.5~1.1%（雜訊內）。**repeat 是完全命中、沒有多算任何
+   token 卻也快了 3.2 ms**，所以 64 的代價不只是重用粒度，還有 page table 本身。
+
+   沒有任何結構原因需要 64：唯一的互動是 `mamba_cache_chunk_size =
+   max(FLA_CHUNK_SIZE, block_size)`，而 `FLA_CHUNK_SIZE` 本身就是 64，所以 recurrent
+   側不受影響。**只在 dense 模型上驗證** —— hybrid checkpoint 在這個容器裡兩種 page
+   size 都起不來（flashinfer 的 xqa kernel JIT 編譯失敗），那條路徑是靠上面的
+   `max()` 論證而非量測。
 2. **部分命中路徑每 token 慢 1.8x。** 以 repeat 當固定開銷基準相減：
    我們 15.1 ms／360 token = 42 µs/token，vLLM 7.2 ms／312 token = 23 µs/token。
 

@@ -132,7 +132,7 @@ vLLM 的作法是 `num_output_placeholders`（`v1/core/sched/async_scheduler.py:
 
 **已修**，但沒有照抄 —— 照抄需要在 dispatch 當下送 Finish 事件，而
 `FinishEvent::apply` 直接呼叫 `FreeRequest`
-（`csrc/fsm/forward_events.cpp:576 FinishEvent::apply`），會在 forward 還在飛的時候
+（`csrc/fsm/forward_events.cpp:601 FinishEvent::apply`），會在 forward 還在飛的時候
 釋放該請求的 KV pages。vLLM 靠 `defer_block_free` / `last_sched_seq` 圍欄擋住
 （`v1/core/sched/scheduler.py:1169 _update_after_schedule`），我們沒有那道圍欄。
 
@@ -189,8 +189,32 @@ loadback_diff = match_result.NodesWithout<ResourceType::Device>();
 成本（22.6 ms，還贏 vLLM），只有後綴不同時才發生。
 
 `disable_kvstore=True` 只讓 rag 從 40.93 → 38.12 ms（2.8 ms），**不是 14 ms**：那些
-搬運大多和 GEMM 重疊。所以「關掉它」不是答案，而且關掉會失去 host 層的容量。要修的是
-逐出策略 —— device 幾乎全空時不該把剛用過的前綴降級到 host。**尚未修**。
+搬運大多和 GEMM 重疊。所以「關掉它」不是答案，而且關掉會失去 host 層的容量。
+
+**根因**在 `csrc/fsm/forward_events.cpp:702 WriteBackDoneEvent`，而且原本的註解就寫著
+後果：「written-back cache demotes to host-only, so the next hit must load back.」
+`DemoteWrittenBackDevice` 沒有任何壓力判斷 —— 每個請求完成後**無條件**把已寫回的頁面
+從 device 釋放。device 層淪為暫存區、host 層才是快取。
+
+改成只在 device 真的有壓力時才降級（可用頁面低於總量 1/8）。已寫回 host 的節點被
+`EnsureCapacity` 驅逐是免費的，所以留著不花額外代價。
+
+| | 之前 | **之後** |
+|---|---|---|
+| 部分命中的 device 總時間 | 48.76 ms | **36.41 ms**（−25%） |
+| `_kv_transfer_per_layer_capped_kernel` | 36x、11.46 ms | **完全消失** |
+| kernel 數 | 772 | 734 |
+| TTFT rag | 38.0 ms | 37.7 |
+| Throughput shared | 2263.5 tok/s | 2245.5 |
+
+**GPU 工作少了 25%，但沒有轉成使用者可見的收益** —— 那些搬運本來就和 GEMM 重疊
+（`disable_kvstore` 實驗早就預告了：14.2 ms 裡只有 2.8 ms 在關鍵路徑上），而
+throughput 測試裡 64 個請求同時共用前綴、頁面全程 pinned，本來就不會 loadback。
+依本專案的 +10% 門檻**這不算結果**；保留的理由是它嚴格少做事、輸出逐位相同。
+真正該受益的是 GPU 飽和的並行 RAG 負載，那個我還沒量到。
+
+過程中我一度誤判為正確性回歸：換 .so 後第一次跑輸出不同。連跑三次才發現那是冷 JIT
+快取造成的，新舊 .so 各跑三次都回到同一個基準。**換掉編譯產物後第一次的執行不能當數據。**
 
 **兩個可歸因的差距**
 

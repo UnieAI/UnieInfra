@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -31,6 +32,11 @@ from tokenspeed_kernel import (
     mha_extend_with_kvcache,
     mha_plan,
     mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.flashinfer import (
+    clear_paged_extend_plan,
+    install_paged_extend_plan,
+    paged_extend_planning_enabled,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
@@ -191,6 +197,10 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
 
         # Static information needed for metadata construction and kernel dispatch
+        self.num_q_heads_local = max(
+            config.num_attention_heads // config.attn_tp_size, 1
+        )
+        self.num_kv_heads_local = max(config.num_kv_heads // config.attn_tp_size, 1)
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
@@ -251,6 +261,54 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     # ------------------------------------------------------------------
     # Metadata initialization
     # ------------------------------------------------------------------
+
+    def _install_paged_extend_plan(self, metadata, extend_prefix_lens_cpu) -> None:
+        """Plan the FA2 paged extend kernel once for this forward.
+
+        The kernel can plan itself, but only by copying ``cache_seqlens`` to the
+        host to key the plan -- a sync per layer, which drains the queue the
+        previous layers just filled. Everything the plan needs is already on the
+        host here (prefix + extend lengths), so doing it once costs no sync at
+        all. This is where SGLang plans too (``init_forward_metadata``).
+
+        Installs on every extend forward, or clears; a plan is never allowed to
+        outlive the forward it was built for, which is what lets the kernel
+        match it by tensor identity alone.
+        """
+        if not paged_extend_planning_enabled():
+            return
+        clear_paged_extend_plan()
+        # The flat KV path hands each state group its own page table and
+        # `_select_page_table` gives a layer its group's, so plan one per group;
+        # the single-table path has exactly one. Planning the table the kernel
+        # will not be handed is what made the first version of this inert.
+        if metadata.page_tables:
+            tables = list(metadata.page_tables.values())
+        elif metadata.page_table is not None:
+            tables = [metadata.page_table]
+        else:
+            return
+        prefix_cpu = [int(x) for x in extend_prefix_lens_cpu.tolist()]
+        seq_lens_cpu = [p + e for p, e in zip(prefix_cpu, metadata.extend_seq_lens_cpu)]
+        for page_table in tables:
+            install_paged_extend_plan(
+                cu_seqlens_q=metadata.cu_extend_seq_lens,
+                cache_seqlens=metadata.seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                page_table=page_table,
+                num_qo_heads=self.num_q_heads_local,
+                num_kv_heads=self.num_kv_heads_local,
+                head_dim=self.head_dim,
+                page_size=self.page_size,
+                is_causal=True,
+                # Same expression the kernel uses for its default, so the two agree
+                # bit for bit rather than by luck.
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                window_left=-1,
+                logit_cap=0.0,
+                q_dtype=self.qkv_dtype,
+                kv_dtype=self.kv_cache_dtype,
+            )
 
     def init_forward_metadata(
         self,
@@ -417,6 +475,10 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     cu_extend_seq_lens_cpu[-1] + (bs - num_extends) if is_mixed else 0
                 ),
             )
+            self._install_paged_extend_plan(
+                self.forward_extend_metadata, extend_prefix_lens_cpu[:rows]
+            )
+
             if is_mixed:
                 # Decode tail: rows [num_extends, bs), one query token each.
                 self.forward_decode_metadata = MHADecodeMetadata(

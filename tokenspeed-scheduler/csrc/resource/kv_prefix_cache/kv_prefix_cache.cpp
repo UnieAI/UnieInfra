@@ -353,6 +353,21 @@ bool KVPrefixCache::EnsureCapacityByEvict(std::int32_t required_num_pages) {
     return manager.AvailablePages() >= required_num_pages;
 }
 
+template <ResourceType RType>
+std::int32_t KVPrefixCache::AvailablePagesOfType() const {
+    return const_cast<KVPrefixCache*>(this)->getResourceManager<RType>().AvailablePages();
+}
+
+template <ResourceType RType>
+std::int32_t KVPrefixCache::TotalPagesOfType() const {
+    return const_cast<KVPrefixCache*>(this)->getResourceManager<RType>().TotalPages();
+}
+
+template std::int32_t KVPrefixCache::AvailablePagesOfType<ResourceType::Device>() const;
+template std::int32_t KVPrefixCache::AvailablePagesOfType<ResourceType::Host>() const;
+template std::int32_t KVPrefixCache::TotalPagesOfType<ResourceType::Device>() const;
+template std::int32_t KVPrefixCache::TotalPagesOfType<ResourceType::Host>() const;
+
 std::vector<TreeNode*> KVPrefixCache::ReleaseDeviceResourcesPresentOnHost(TreeNode* last_node,
                                                                           std::function<void(TreeNode*)> on_release) {
     std::vector<TreeNode*> released;

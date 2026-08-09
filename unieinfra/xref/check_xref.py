@@ -35,7 +35,10 @@ ROOTS: list[tuple[str, Path]] = [
     ("tokenspeed", UNIEINFRA / "python" / "tokenspeed"),
     ("tokenspeed-scheduler", UNIEINFRA / "tokenspeed-scheduler"),
     ("tokenspeed-kernel", UNIEINFRA / "tokenspeed-kernel" / "python"),
-    ("tokenspeed-kernel-pkg", UNIEINFRA / "tokenspeed-kernel" / "python" / "tokenspeed_kernel"),
+    (
+        "tokenspeed-kernel-pkg",
+        UNIEINFRA / "tokenspeed-kernel" / "python" / "tokenspeed_kernel",
+    ),
     ("unieinfra", UNIEINFRA),
     ("vllm", Path("/workspace/roy/vllm/vllm")),
     ("vllm-root", Path("/workspace/roy/vllm")),

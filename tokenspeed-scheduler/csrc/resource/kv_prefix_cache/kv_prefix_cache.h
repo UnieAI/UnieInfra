@@ -66,6 +66,14 @@ public:
     template <ResourceType RType>
     bool EnsureCapacityByEvict(std::int32_t required_num_pages);
 
+    // Free / total pages of a tier. Callers deciding whether to give device
+    // pages up early need to know whether anyone is waiting for them.
+    template <ResourceType RType>
+    std::int32_t AvailablePagesOfType() const;
+
+    template <ResourceType RType>
+    std::int32_t TotalPagesOfType() const;
+
     std::vector<TreeNode*> ReleaseDeviceResourcesPresentOnHost(TreeNode* last_node,
                                                                std::function<void(TreeNode*)> on_release = {});
 

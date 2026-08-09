@@ -116,6 +116,7 @@ public:
 
     OwnedPages Allocate(std::int32_t num_pages) { return allocator_->Allocate(num_pages); }
     std::int32_t AvailablePages() const { return allocator_->AvailablePages(); }
+    std::int32_t TotalPages() const { return allocator_->TotalPages(); }
 
     // O(N) scan — locked leaves are in lru_leaves_ but not evictable.
     std::int32_t EvictablePagesNum() const {

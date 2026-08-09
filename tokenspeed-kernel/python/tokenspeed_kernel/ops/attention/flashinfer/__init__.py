@@ -651,7 +651,15 @@ if _ragged_prefill_available():
 
 _paged_prefill_wrappers: dict[tuple, "BatchPrefillWithPagedKVCacheWrapper"] = {}
 _paged_prefill_plans: dict[int, tuple] = {}
-_PAGED_PREFILL_WORKSPACE_BYTES = 128 * 1024 * 1024
+# 512 MB, matching the trtllm path above rather than the 128 MB the ragged
+# sibling uses. flashinfer sizes batch_prefill_tmp_v from the batch and head
+# geometry, and 128 MB is enough for an 8B at one request but overflows on
+# Qwen3.5-27B at four -- "Buffer overflow when allocating memory for
+# batch_prefill_tmp_v", raised from plan() rather than from the kernel, so the
+# forward dies rather than degrading. A bug that only appears at both a larger
+# model and a higher concurrency is exactly the kind an 8B single-request
+# benchmark cannot find.
+_PAGED_PREFILL_WORKSPACE_BYTES = 512 * 1024 * 1024
 
 # Plans installed by the runtime for the forward that is about to run, so the
 # 36 layers of that forward do not each rebuild one. A list rather than a single

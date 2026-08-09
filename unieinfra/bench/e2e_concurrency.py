@@ -69,13 +69,30 @@ def percentile(samples: list[float], q: float) -> float:
     return ordered[idx]
 
 
-def build_prompts(shape: str, n: int, prefix_words: int) -> list[str]:
-    shared = " ".join(f"ctx{j}" for j in range(prefix_words))
+def build_prompts(
+    shape: str, n: int, prefix_words: int, round_id: int = 0
+) -> list[str]:
+    """Prompts for one round.
+
+    `shared` deliberately gives every request the same long prefix and a short
+    distinct tail, in every round: that is what RAG and agent traffic is, and
+    the prefix cache is meant to serve it. Its TTFT is a cache-hit TTFT by
+    construction, which is the point rather than an accident.
+
+    `unique` has to vary per round as well as per request. Building the list
+    once and replaying it for every repeat turns rounds 2..N into cache hits,
+    and with the first round discarded as warm-up that leaves a "cold"
+    benchmark measuring nothing but the cache -- 2840 tokens read 18.5 ms where
+    a genuine cold prefill of that length costs about 130 ms.
+    """
     if shape == "shared":
+        shared = " ".join(f"ctx{j}" for j in range(prefix_words))
         return [
             shared + " " + " ".join(f"q{i}t{j}" for j in range(32)) for i in range(n)
         ]
-    return [" ".join(f"u{i}w{j}" for j in range(prefix_words)) for i in range(n)]
+    return [
+        " ".join(f"r{round_id}u{i}w{j}" for j in range(prefix_words)) for i in range(n)
+    ]
 
 
 class _Result:
@@ -232,16 +249,22 @@ def main() -> int:
 
     try:
         for conc in levels:
-            prompts = build_prompts(args.shape, conc, args.prefix_words)
-            # Warm the shared prefix and any lazily built kernels. The first
-            # run after a config or binary change recompiles and is not a data
-            # point.
-            run(prompts[:1], 4)
+            prompts = build_prompts(args.shape, conc, args.prefix_words, 0)
+            # Warm with a full round at this level, not one short request.
+            # A 1-request 4-token warm-up leaves the first real round carrying
+            # thread-pool and first-touch cost, and with a handful of repeats
+            # that single round *is* the p99: it read 33.5 ms at concurrency 1
+            # where 30 sequential requests measure 18.4-18.9, a 1.02x spread.
+            # The engine has no jitter there; the harness did.
+            run(prompts, args.out_tokens)
 
             results: list[_Result] = []
             produced = 0
             wall = 0.0
-            for _ in range(args.repeats):
+            for round_id in range(1, args.repeats + 1):
+                # Fresh prompts per round for `unique`; `shared` returns
+                # the same set every time on purpose.
+                prompts = build_prompts(args.shape, conc, args.prefix_words, round_id)
                 t0 = time.perf_counter()
                 round_results = run(prompts, args.out_tokens)
                 wall += time.perf_counter() - t0

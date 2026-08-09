@@ -42,21 +42,20 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import torch
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
-
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (  # noqa: E402
     _local_topk_for_ep,
     _routing,
     _routing_from_topk,
     _silu_gate_up,
 )
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from triton_kernels.matmul import PrecisionConfig, matmul  # noqa: E402
-from triton_kernels.tensor import wrap_torch_tensor  # noqa: E402
 from triton_kernels.matmul_details.opt_flags import (  # noqa: E402
     scoped_opt_flags_constraints,
 )
+from triton_kernels.tensor import wrap_torch_tensor  # noqa: E402
 
 
 @contextmanager
@@ -145,9 +144,7 @@ def triton_bf16_moe_apply(
     enable_pdl: bool = False,
 ) -> torch.Tensor:
     if topk_weights is None or topk_ids is None:
-        raise RuntimeError(
-            "triton bf16 MoE requires precomputed topk_weights/topk_ids"
-        )
+        raise RuntimeError("triton bf16 MoE requires precomputed topk_weights/topk_ids")
     if topk_weights.shape != topk_ids.shape:
         raise RuntimeError(
             "topk_weights and topk_ids must have the same shape, got "

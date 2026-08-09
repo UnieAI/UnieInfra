@@ -351,6 +351,37 @@ def get_pack_factor(num_bits):
     return 32 // num_bits
 
 
+def pack_cols(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    """Pack ``num_bits`` values along the column dim into int32.
+
+    The inverse of :func:`unpack_cols`. Adapted from SGLang
+    (``sglang/srt/layers/quantization/utils.py``), Apache-2.0.
+    """
+    expected_shape = (size_k, size_n)
+    if q_w.shape != expected_shape:
+        raise ValueError(f"q_w.shape = {q_w.shape}, expected {expected_shape}")
+
+    pack_factor = get_pack_factor(num_bits)
+    if size_n % pack_factor != 0:
+        raise ValueError(f"size_n={size_n} must be divisible by {pack_factor}.")
+
+    orig_device = q_w.device
+
+    q_w_cpu = q_w.cpu().numpy().astype(numpy.uint32)
+    q_res = numpy.zeros((size_k, size_n // pack_factor), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w_cpu[:, i::pack_factor] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
+    return q_res.contiguous()
+
+
 def unpack_cols(
     packed_q_w: torch.Tensor,
     num_bits: int,

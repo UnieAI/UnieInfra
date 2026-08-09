@@ -90,7 +90,24 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
-    block_size: int = 64
+    # KV page size. 16 to match vLLM (SGLang goes further, to 1) -- nobody else
+    # pages this coarsely, and 64 was costing real latency for nothing
+    # measurable in return. A partial prefix hit can only reuse whole pages, so
+    # 64 throws away up to 63 tokens at every boundary: on Qwen3-8B with a
+    # 3890-token shared prefix it reused 3840 against vLLM's 3888, then paid to
+    # recompute the difference. Measured on the RAG shape, 64 -> 16 moves TTFT
+    # 37.85 -> 32.94 ms, and on an exact repeat -- where no extra tokens are
+    # computed at all, so this is page-table cost rather than reuse -- 22.62 ->
+    # 19.46 ms. Batch-64 throughput moves -0.5% to -1.1%, i.e. within noise.
+    #
+    # Nothing structural wanted 64: the only interaction is
+    # mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, block_size), and
+    # FLA_CHUNK_SIZE is itself 64, so the recurrent side is unchanged by
+    # construction. Validated on dense models only -- the hybrid checkpoint
+    # cannot start in this container at either page size (flashinfer's xqa
+    # kernel fails to JIT), so that path is argued from the max() above rather
+    # than measured.
+    block_size: int = 16
     # special kv cache
     mamba_ssm_dtype: str = "float32"
     mamba_track_interval: int = 256

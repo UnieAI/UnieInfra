@@ -70,9 +70,7 @@ class _FusedArg:
 
 @pytest.fixture(scope="module")
 def cos_sin_cache():
-    inv = 1.0 / (
-        1e6 ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
-    )
+    inv = 1.0 / (1e6 ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM))
     freqs = torch.einsum("i,j->ij", torch.arange(MAX_POS, dtype=torch.float32), inv)
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1).cuda()
 

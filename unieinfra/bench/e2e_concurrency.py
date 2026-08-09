@@ -26,10 +26,17 @@ between: how far concurrency can go before a user notices. A single-request
 latency number and an offline batch-throughput number both miss it, because
 neither reports what a user waits for while others are being served.
 
-So this reports, per concurrency level, the distribution a user actually
-experiences -- TTFT and inter-token latency, p50 and p99 -- alongside the
-aggregate token rate. The knee in the p99 column is the answer to "how many
-users can this serve".
+So this reports, per concurrency level:
+
+  in tok / out tok   total prompt and completion tokens actually processed
+  in/req  / out/req  average length of each, so a row is reproducible
+  RPS                completed requests per second
+  TTFT p50 / p99     what a user waits for the first token, median and tail
+  ITL p50 / p99      what a user waits between streamed tokens
+  TPS                output tokens per second, aggregate
+
+The knee in TTFT p99 is the answer to "how many users can this serve"; TPS is
+the answer to "how much can this machine do".
 
 Requests are issued concurrently and each is timed from its own submission, not
 from the start of the batch: a request that queues for 400 ms has a 400 ms TTFT
@@ -66,21 +73,19 @@ def build_prompts(shape: str, n: int, prefix_words: int) -> list[str]:
     shared = " ".join(f"ctx{j}" for j in range(prefix_words))
     if shape == "shared":
         return [
-            shared + " " + " ".join(f"q{i}t{j}" for j in range(32))
-            for i in range(n)
+            shared + " " + " ".join(f"q{i}t{j}" for j in range(32)) for i in range(n)
         ]
-    return [
-        " ".join(f"u{i}w{j}" for j in range(prefix_words)) for i in range(n)
-    ]
+    return [" ".join(f"u{i}w{j}" for j in range(prefix_words)) for i in range(n)]
 
 
 class _Result:
-    __slots__ = ("ttft_ms", "total_ms", "n_out")
+    __slots__ = ("ttft_ms", "total_ms", "n_out", "n_in")
 
-    def __init__(self, ttft_ms: float, total_ms: float, n_out: int):
+    def __init__(self, ttft_ms: float, total_ms: float, n_out: int, n_in: int = 0):
         self.ttft_ms = ttft_ms
         self.total_ms = total_ms
         self.n_out = n_out
+        self.n_in = n_in
 
     @property
     def itl_ms(self) -> float:
@@ -113,15 +118,18 @@ def _run_tokenspeed(engine, prompts, out_tokens) -> list[_Result]:
         start = time.perf_counter()
         first = None
         n_out = 0
+        n_in = 0
         for chunk in engine.generate(prompt, sampling, stream=True):
             if first is None:
                 first = time.perf_counter()
             n_out = chunk["meta_info"].get("completion_tokens", n_out)
+            n_in = chunk["meta_info"].get("prompt_tokens", n_in)
         end = time.perf_counter()
         return _Result(
             (first - start) * 1e3 if first else float("nan"),
             (end - start) * 1e3,
             max(n_out, 1),
+            n_in,
         )
 
     with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
@@ -131,15 +139,15 @@ def _run_tokenspeed(engine, prompts, out_tokens) -> list[_Result]:
 async def _run_vllm(engine, prompts, out_tokens) -> list[_Result]:
     from vllm import SamplingParams
 
-    sampling = SamplingParams(
-        temperature=0.0, max_tokens=out_tokens, ignore_eos=True
-    )
+    sampling = SamplingParams(temperature=0.0, max_tokens=out_tokens, ignore_eos=True)
 
     async def one(idx: int, prompt: str) -> _Result:
         start = time.perf_counter()
         first = None
         n_out = 0
+        n_in = 0
         async for out in engine.generate(prompt, sampling, f"req{idx}"):
+            n_in = len(out.prompt_token_ids or ()) or n_in
             if first is None and out.outputs and out.outputs[0].token_ids:
                 first = time.perf_counter()
             if out.outputs:
@@ -149,11 +157,10 @@ async def _run_vllm(engine, prompts, out_tokens) -> list[_Result]:
             (first - start) * 1e3 if first else float("nan"),
             (end - start) * 1e3,
             max(n_out, 1),
+            n_in,
         )
 
-    return list(
-        await asyncio.gather(*(one(i, p) for i, p in enumerate(prompts)))
-    )
+    return list(await asyncio.gather(*(one(i, p) for i, p in enumerate(prompts))))
 
 
 def main() -> int:
@@ -165,6 +172,17 @@ def main() -> int:
         help="comma-separated levels to sweep",
     )
     ap.add_argument("--out-tokens", type=int, default=64)
+    ap.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help=(
+            "rounds per concurrency level, pooled into the percentiles. "
+            "Without this a level of 1 has a single sample and its p50 is "
+            "whatever that one request happened to cost -- which read 33 ms "
+            "against a true median of 18.5 the first time this was run."
+        ),
+    )
     ap.add_argument("--prefix-words", type=int, default=700)
     ap.add_argument("--shape", default="shared", choices=("shared", "unique"))
     ap.add_argument("--max-model-len", type=int, default=8192)
@@ -181,9 +199,7 @@ def main() -> int:
                 model=args.model,
                 dtype="bfloat16",
                 max_model_len=args.max_model_len,
-                gpu_memory_utilization=float(
-                    os.environ.get("BENCH_GPU_UTIL", "0.88")
-                ),
+                gpu_memory_utilization=float(os.environ.get("BENCH_GPU_UTIL", "0.88")),
             )
         )
         runner = _run_vllm
@@ -202,8 +218,9 @@ def main() -> int:
         f"prefix~{args.prefix_words} words"
     )
     print(
-        f"  {'conc':>5} {'TTFT p50':>9} {'TTFT p99':>9} {'ITL p50':>8} "
-        f"{'ITL p99':>8} {'tok/s':>9} {'wall s':>7}"
+        f"  {'conc':>5} {'in tok':>9} {'out tok':>8} {'in/req':>7} "
+        f"{'out/req':>8} {'RPS':>7} {'TTFT p50':>9} {'TTFT p99':>9} "
+        f"{'ITL p50':>8} {'ITL p99':>8} {'TPS':>8}"
     )
 
     loop = asyncio.new_event_loop() if backend == "vllm" else None
@@ -221,19 +238,29 @@ def main() -> int:
             # point.
             run(prompts[:1], 4)
 
-            t0 = time.perf_counter()
-            results = run(prompts, args.out_tokens)
-            wall = time.perf_counter() - t0
+            results: list[_Result] = []
+            produced = 0
+            wall = 0.0
+            for _ in range(args.repeats):
+                t0 = time.perf_counter()
+                round_results = run(prompts, args.out_tokens)
+                wall += time.perf_counter() - t0
+                results += round_results
+                produced += sum(r.n_out for r in round_results)
 
             ttfts = [r.ttft_ms for r in results]
             itls = [r.itl_ms for r in results if r.n_out > 1]
-            produced = sum(r.n_out for r in results)
+            consumed = sum(r.n_in for r in results)
+            n_req = len(results)
             print(
-                f"  {conc:5d} {percentile(ttfts, 0.5):9.2f} "
+                f"  {conc:5d} {consumed:9d} {produced:8d} "
+                f"{consumed / n_req:7.0f} {produced / n_req:8.0f} "
+                f"{n_req / wall:7.1f} "
+                f"{percentile(ttfts, 0.5):9.2f} "
                 f"{percentile(ttfts, 0.99):9.2f} "
                 f"{percentile(itls, 0.5) if itls else float('nan'):8.2f} "
                 f"{percentile(itls, 0.99) if itls else float('nan'):8.2f} "
-                f"{produced / wall:9.1f} {wall:7.2f}",
+                f"{produced / wall:8.1f}",
                 flush=True,
             )
     finally:

@@ -47,16 +47,24 @@ if BACKEND == "vllm":
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
     with set_current_vllm_config(VllmConfig()):
-        rope = get_rope(H, MP, True, {"rope_theta": 1e6, "rope_type": "default"},
-                        dtype=torch.bfloat16).cuda()
+        rope = get_rope(
+            H,
+            MP,
+            True,
+            {"rope_theta": 1e6, "rope_type": "default"},
+            dtype=torch.bfloat16,
+        ).cuda()
     make = lambda pos, q, k: (lambda: rope.forward_cuda(pos, q, k))
 else:
     from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 
     load_builtin_kernels()
     impl = KernelRegistry.get().get_impl("cuda_embedding_rope")
-    make = lambda pos, q, k: (lambda: impl(positions=pos, q=q, k=k, head_size=H,
-                                           cos_sin_cache=cache, is_neox=True))
+    make = lambda pos, q, k: (
+        lambda: impl(
+            positions=pos, q=q, k=k, head_size=H, cos_sin_cache=cache, is_neox=True
+        )
+    )
 
 
 def host_us(fn, n=3000):

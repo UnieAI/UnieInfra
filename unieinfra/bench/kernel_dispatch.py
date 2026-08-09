@@ -33,9 +33,10 @@ Compares, in host time with no events and no sync:
 import time
 
 import torch
-
-from tokenspeed_kernel.ops.attention import mha_extend_with_kvcache
-from tokenspeed_kernel.ops.attention import _blockscaled_signature_and_scales
+from tokenspeed_kernel.ops.attention import (
+    _blockscaled_signature_and_scales,
+    mha_extend_with_kvcache,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 
@@ -64,9 +65,18 @@ def build(total_q):
     cu_q = torch.tensor([0, total_q], dtype=torch.int32, device="cuda")
     cu_kv = torch.tensor([0, total_q], dtype=torch.int32, device="cuda")
     seqlens = torch.tensor([total_q], dtype=torch.int32, device="cuda")
-    return dict(q=q, cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, k_cache=k_cache,
-                v_cache=v_cache, page_table=page_table, cache_seqlens=seqlens,
-                max_seqlen_q=total_q, max_seqlen_k=total_q, is_causal=True)
+    return dict(
+        q=q,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=seqlens,
+        max_seqlen_q=total_q,
+        max_seqlen_k=total_q,
+        is_causal=True,
+    )
 
 
 print(f"  {'total_q':>8} {'wrapper us':>11} {'raw kernel us':>14} {'overhead us':>12}")
@@ -83,18 +93,37 @@ for total_q in (128, 512, 1024, 4096):
         a["q"], a["k_cache"], a["v_cache"], None, None, None
     )
     kernel = select_kernel(
-        "attention", "mha_extend_with_kvcache", sig,
-        traits={"head_dim": D, "page_size": PAGE, "is_causal": True,
-                "sliding_window": False, "support_logit_cap": False,
-                "support_sinks": False, "return_lse": False},
-        solution=None, override=None,
+        "attention",
+        "mha_extend_with_kvcache",
+        sig,
+        traits={
+            "head_dim": D,
+            "page_size": PAGE,
+            "is_causal": True,
+            "sliding_window": False,
+            "support_logit_cap": False,
+            "support_sinks": False,
+            "return_lse": False,
+        },
+        solution=None,
+        override=None,
     )
     raw = lambda: kernel(
-        q=a["q"], cu_seqlens_q=a["cu_seqlens_q"], cu_seqlens_kv=a["cu_seqlens_kv"],
-        k_cache=a["k_cache"], v_cache=a["v_cache"], page_table=a["page_table"],
-        cache_seqlens=a["cache_seqlens"], max_seqlen_q=a["max_seqlen_q"],
-        max_seqlen_k=a["max_seqlen_k"], is_causal=True, window_left=-1,
-        logit_cap=0.0, sinks=None, return_lse=False, softmax_scale=None,
+        q=a["q"],
+        cu_seqlens_q=a["cu_seqlens_q"],
+        cu_seqlens_kv=a["cu_seqlens_kv"],
+        k_cache=a["k_cache"],
+        v_cache=a["v_cache"],
+        page_table=a["page_table"],
+        cache_seqlens=a["cache_seqlens"],
+        max_seqlen_q=a["max_seqlen_q"],
+        max_seqlen_k=a["max_seqlen_k"],
+        is_causal=True,
+        window_left=-1,
+        logit_cap=0.0,
+        sinks=None,
+        return_lse=False,
+        softmax_scale=None,
         **scale_kwargs,
     )
     try:
@@ -114,23 +143,45 @@ page_table, cache_seqlens = a["page_table"], a["cache_seqlens"]
 
 def bookkeeping():
     sig, _ = _blockscaled_signature_and_scales(q, k_cache, v_cache, None, None, None)
-    traits = {"head_dim": q.shape[-1], "page_size": k_cache.shape[1],
-              "is_causal": True, "sliding_window": False,
-              "support_logit_cap": False, "support_sinks": False,
-              "return_lse": False}
-    kern = select_kernel("attention", "mha_extend_with_kvcache", sig,
-                         traits=traits, solution=None, override=None)
-    shape_params = {
-        "batch_size": cache_seqlens.shape[0], "total_q": q.shape[0],
-        "num_pages": k_cache.shape[0], "page_size": k_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1], "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2], "head_dim": q.shape[-1],
-        "max_seqlen_q": 1024, "max_seqlen_k": 1024,
+    traits = {
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "is_causal": True,
+        "sliding_window": False,
+        "support_logit_cap": False,
+        "support_sinks": False,
+        "return_lse": False,
     }
-    ShapeCapture.get().record("attention", "mha_extend_with_kvcache",
-                              kern.name, q.dtype, shape_params)
-    with kernel_scope("attention", "mha_extend_with_kvcache", q.dtype,
-                      kernel_name=kern.name, **shape_params):
+    kern = select_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        sig,
+        traits=traits,
+        solution=None,
+        override=None,
+    )
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": k_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "head_dim": q.shape[-1],
+        "max_seqlen_q": 1024,
+        "max_seqlen_k": 1024,
+    }
+    ShapeCapture.get().record(
+        "attention", "mha_extend_with_kvcache", kern.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "mha_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kern.name,
+        **shape_params,
+    ):
         pass
 
 

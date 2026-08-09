@@ -77,10 +77,23 @@ if TYPE_CHECKING:
 
 
 _KERNEL_SOLUTION_BY_BACKEND = {
+    # None means "no solution constraint": selection ranks every registered
+    # kernel by priority, which is what you want unless you are pinning one for
+    # a comparison. On sm_120 that lands on the fa2 paged extend kernel.
     "mha": None,
+    "flashinfer_fa2": "flashinfer_fa2",
     "fa3": "fa3",
     "fa4": "fa4",
     "triton": "triton",
+    # Solution names denote lineage, not algorithm: "fa3"/"fa4" are Tri Dao's
+    # flash_attn package (ops/attention/flash_attn/, importing flash_attn.cute),
+    # while everything flashinfer-backed is prefixed "flashinfer". So the FA2
+    # *algorithm* as implemented by flashinfer is "flashinfer_fa2", not "fa2" --
+    # asking for "fa2" should not hand you a different library's kernel.
+    #
+    # Bare "flashinfer" pins the solution of that name, which for
+    # mha_extend_with_kvcache is only the trtllm-gen kernel -- capability-bounded
+    # to <= sm_103 because it needs tcgen05, so it fails selection on sm_120.
     "flashinfer": "flashinfer",
 }
 

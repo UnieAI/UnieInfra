@@ -49,11 +49,14 @@ SHARED = " ".join(f"ctx{j}" for j in range(PREFIX_WORDS))
 
 
 def shapes():
-    yield "cold", [f"unique{i} " + " ".join(f"u{i}w{j}" for j in range(PREFIX_WORDS))
-                   for i in range(REPEATS)]
+    yield "cold", [
+        f"unique{i} " + " ".join(f"u{i}w{j}" for j in range(PREFIX_WORDS))
+        for i in range(REPEATS)
+    ]
     yield "repeat", [SHARED for _ in range(REPEATS)]
-    yield "rag", [SHARED + " " + " ".join(f"q{i}t{j}" for j in range(64))
-                  for i in range(REPEATS)]
+    yield "rag", [
+        SHARED + " " + " ".join(f"q{i}t{j}" for j in range(64)) for i in range(REPEATS)
+    ]
     turns, convo = [], SHARED
     for i in range(REPEATS):
         convo = convo + " " + " ".join(f"turn{i}w{j}" for j in range(128))
@@ -65,8 +68,12 @@ def main():
     if BACKEND == "vllm":
         from vllm import LLM, SamplingParams
 
-        llm = LLM(model=MODEL, dtype="bfloat16", max_model_len=8192,
-                  gpu_memory_utilization=float(os.environ.get("AB_GPU_UTIL", "0.88")))
+        llm = LLM(
+            model=MODEL,
+            dtype="bfloat16",
+            max_model_len=8192,
+            gpu_memory_utilization=float(os.environ.get("AB_GPU_UTIL", "0.88")),
+        )
         sp = SamplingParams(temperature=0.0, max_tokens=1)
         tok = llm.get_tokenizer()
 
@@ -74,6 +81,7 @@ def main():
             t0 = time.perf_counter()
             llm.generate([prompt], sp, use_tqdm=False)
             return (time.perf_counter() - t0) * 1e3
+
     else:
         from tokenspeed.runtime.entrypoints.engine import Engine
 
@@ -92,9 +100,12 @@ def main():
         ttft(prompts[0])
         times = [ttft(p) for p in prompts]
         tail = times[1:] if name != "cold" else times
-        print(f"  {name:7s} tokens={len(tok.encode(prompts[-1])):6d}  "
-              f"median {statistics.median(tail):8.2f} ms  "
-              f"min {min(tail):8.2f}  all {[round(t) for t in times]}", flush=True)
+        print(
+            f"  {name:7s} tokens={len(tok.encode(prompts[-1])):6d}  "
+            f"median {statistics.median(tail):8.2f} ms  "
+            f"min {min(tail):8.2f}  all {[round(t) for t in times]}",
+            flush=True,
+        )
 
     if BACKEND != "vllm":
         engine.shutdown()

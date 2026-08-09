@@ -50,6 +50,7 @@ if BACKEND == "vllm":
     fwd = act.forward_cuda
 else:
     import tokenspeed_kernel.ops  # noqa: F401
+
     from tokenspeed.runtime.layers.activation import SiluAndMul
 
     act = SiluAndMul().cuda()

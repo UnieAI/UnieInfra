@@ -42,12 +42,15 @@ Other prefill conventions (verified equal to bf16 on B200):
 
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
 from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.layernorm.flashinfer import rmsnorm
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -59,7 +62,37 @@ from tokenspeed_kernel.signature import format_signatures
 platform = current_platform()
 SUPPORTED_HEAD_DIM = 128
 
+_l2norm_weights: dict[tuple, torch.Tensor] = {}
+
+
+def _l2norm(x: torch.Tensor) -> torch.Tensor:
+    """Row-wise L2 normalisation over the last dim.
+
+    Routed through flashinfer's RMSNorm rather than the Triton `l2norm_fwd`,
+    which runs at 380 GB/s on this part -- 29% of what a plain copy of the same
+    bytes achieves (1310 GB/s) -- and costs 22.8 us per call against RMSNorm's
+    9.4 us on [1024, 16, 128] bf16.
+
+    The two are the same function up to a constant:
+        rmsnorm(x, w) = x / sqrt(mean(x^2) + eps) * w
+        l2norm(x)     = x / sqrt(sum(x^2)  + eps)
+    and sum = mean * D, so `l2norm(x) == rmsnorm(x, w = 1/sqrt(D))`. Verified
+    against `l2norm_fwd` at max|diff| 1.95e-03 (bf16 rounding), cosine
+    0.9999996.
+    """
+    if rmsnorm is error_fn:
+        return l2norm_fwd(x)
+    head_dim = x.shape[-1]
+    key = (head_dim, x.dtype, x.device.index)
+    w = _l2norm_weights.get(key)
+    if w is None:
+        w = torch.full((head_dim,), head_dim**-0.5, dtype=x.dtype, device=x.device)
+        _l2norm_weights[key] = w
+    return rmsnorm(x.reshape(-1, head_dim), w, 1e-6).view_as(x)
+
+
 _chunk_gated_delta_rule = error_fn
+_chunk_gated_delta_rule_raw = error_fn
 _has_blackwell_prefill = False
 
 # `is_blackwell` is `arch_version.major == 10`, which excludes sm_120 (major
@@ -78,10 +111,12 @@ if platform.is_blackwell_plus:
         from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
 
         _arch_major = platform.arch_version.major
-        _has_blackwell_prefill = (
-            getattr(_fi_gdn, f"chunk_gated_delta_rule_sm{_arch_major}0", None)
-            is not None
+        _chunk_gated_delta_rule_raw = getattr(
+            _fi_gdn, f"chunk_gated_delta_rule_sm{_arch_major}0", None
         )
+        _has_blackwell_prefill = _chunk_gated_delta_rule_raw is not None
+        if _chunk_gated_delta_rule_raw is None:
+            _chunk_gated_delta_rule_raw = error_fn
         _chunk_gated_delta_rule = _fi_chunk
     except ImportError:
         pass
@@ -156,7 +191,31 @@ def is_available() -> bool:
     # lacks the tensor-core/TMA path the sm10x one has. Re-measure before
     # enabling: the probe above already finds the kernel, so this is the only
     # line to revisit when flashinfer ships a faster one.
-    return False
+    #
+    # 2026-08-08: a standalone timing loop on the *raw* kernel disagrees with
+    # the table above -- flashinfer sm120 came out ~2x better on both host and
+    # device time (48 calls, 5 reps, median; 1024 tokens: 9.05 ms host / 9.11 ms
+    # device vs Triton's 18.18 / 18.17). The table measured the integrated path,
+    # this measured the kernel, so the gap is most likely per-call conversion in
+    # the wrapper below rather than the kernel. Setting
+    # TOKENSPEED_ENABLE_FI_GDN_SM120=1 registers the kernel so the integrated
+    # path can be measured against the same baseline; the default stays off
+    # until that measurement says otherwise.
+    return os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120") == "1"
+
+
+def _use_raw_kernel() -> bool:
+    """Whether to call the arch-specific kernel instead of the public API.
+
+    Only sm120 for now: that is where the public wrapper's per-call Python cost
+    was measured (see the call site) and where the raw entry point's contract
+    was verified against the Triton scan. The sm10x path keeps the public API
+    until the same two things are checked there.
+    """
+    return (
+        _chunk_gated_delta_rule_raw is not error_fn
+        and platform.arch_version.major == 12
+    )
 
 
 def is_supported(
@@ -270,8 +329,8 @@ if is_available():
         beta2 = beta.squeeze(0) if beta.dim() == 3 else beta
 
         if qk_l2norm:
-            q3 = l2norm_fwd(q3)
-            k3 = l2norm_fwd(k3)
+            q3 = _l2norm(q3)
+            k3 = _l2norm(k3)
 
         head_dim = q3.shape[-1]
         if scale is None:
@@ -306,20 +365,70 @@ if is_available():
             )
             checkpoint_cu_starts[1:] = torch.cumsum(per_seq_h_ckpts, dim=0)
 
-        out, final_state = _chunk_gated_delta_rule(
-            q3.contiguous(),
-            k3.contiguous(),
-            v3.contiguous(),
-            g=torch.exp(g2).float().contiguous(),
-            beta=beta2.float().contiguous(),
-            scale=scale,
-            initial_state=fi_initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            state_checkpoints=state_checkpoints,
-            checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
-        )
+        alpha = torch.exp(g2).float().contiguous()
+        beta_f = beta2.float().contiguous()
+
+        if _use_raw_kernel():
+            # flashinfer's public `chunk_gated_delta_rule` is wrapped in
+            # `@flashinfer_api(trace=...)`, which costs ~0.33 ms of Python per
+            # call. At 48 GDN layers that is ~16 ms per prefill -- three times
+            # the kernel's own host cost, and enough on its own to make the
+            # fused kernel look slower than the nine-launch Triton scan.
+            # Measured at 1024 tokens, 48 calls, host time, median of 5:
+            #
+            #     raw kernel, args pre-computed        5.41 ms
+            #     + this wrapper's casts               5.97 ms
+            #     public API (same work)              21.20 ms
+            #
+            # The dispatch the public API does for us is a compute-capability
+            # switch we have already made in `is_available`, so call the
+            # arch-specific kernel directly and keep the conversions here.
+            out = torch.empty(
+                v3.shape[0],
+                v3.shape[1],
+                v3.shape[2],
+                device=v3.device,
+                dtype=torch.bfloat16,
+            )
+            # `state` is the OUTPUT the kernel writes; `init_state` is the
+            # incoming recurrent state. They must be separate tensors -- aliasing
+            # them drops the initial state, which is silently correct only for a
+            # first chunk and wrong for every continuation.
+            final_state = torch.empty_like(fi_initial_state)
+            _chunk_gated_delta_rule_raw(
+                o=out,
+                state=final_state,
+                q=q3.contiguous(),
+                k=k3.contiguous(),
+                v=v3.contiguous(),
+                init_state=fi_initial_state,
+                alpha=alpha,
+                beta=beta_f,
+                cu_seqlens=cu_seqlens.to(torch.int64),
+                scale=scale,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=(
+                    checkpoint_cu_starts.to(torch.int64)
+                    if checkpoint_cu_starts is not None
+                    else None
+                ),
+                checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
+            )
+        else:
+            out, final_state = _chunk_gated_delta_rule(
+                q3.contiguous(),
+                k3.contiguous(),
+                v3.contiguous(),
+                g=alpha,
+                beta=beta_f,
+                scale=scale,
+                initial_state=fi_initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
+            )
 
         out = out.to(q.dtype)
         if batched:

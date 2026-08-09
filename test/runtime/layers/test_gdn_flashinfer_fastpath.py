@@ -87,7 +87,11 @@ def test_matches_fla(
         head_first=False,
         use_qk_l2norm_in_kernel=True,
     )
-    o_fi, st_fi = gdn.gdn_chunk_prefill(
+    # gdn_chunk_prefill returns a GdnChunkPrefillResult, not a 2-tuple. This
+    # test unpacked it as a pair and had been dormant on this box -- the sm_120
+    # kernel was never registered, so it always skipped and the stale call was
+    # never exercised.
+    res = gdn.gdn_chunk_prefill(
         l2norm_fwd(q),
         l2norm_fwd(k),
         v,
@@ -97,6 +101,14 @@ def test_matches_fla(
         initial_state=h0.clone(),
         cu_seqlens=cu,
     )
+    o_fi, st_fi = res.out, res.final_state
+
+    # FLA returns the recurrent state K-first [N, H, K, V]; `gdn_chunk_prefill`'s
+    # contract is K-last [N, H, V, K] (flashinfer-native, matching the runtime's
+    # SSM state pool). The head dim is square, so nothing catches the mismatch by
+    # shape -- comparing them untransposed fails for the Triton backend too, not
+    # just flashinfer. Verified: with the transpose, Triton matches FLA exactly.
+    st_ref = st_ref.transpose(-1, -2)
 
     assert o_fi.shape == o_ref.shape
     assert o_fi.dtype == o_ref.dtype

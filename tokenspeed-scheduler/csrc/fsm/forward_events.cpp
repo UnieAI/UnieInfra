@@ -79,9 +79,34 @@ std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(const std::vector<
     return nodes;
 }
 
+// Below this fraction of the device pool free, a finished request gives its
+// pages up as soon as they are on host. Above it, it keeps them.
+//
+// Demoting eagerly costs a full PCIe round trip on the next partial hit: the
+// prefix has to be dragged back a layer at a time. Measured on Qwen3-8B with a
+// 3890-token shared prefix, that is 11.46 ms of loadback per request -- 15.7 MB
+// per layer at 49 GB/s, i.e. the whole prefix, every time -- while ~68 GB of
+// device KV cache sat unused. Keeping them costs nothing that is not already
+// paid: the host copy exists, so `EnsureCapacity` can evict these nodes for
+// free the moment anyone actually needs the pages.
+//
+// One eighth rather than zero because eviction is not instantaneous: leaving a
+// margin means a burst of arrivals finds pages ready instead of waiting on an
+// eviction pass.
+constexpr double kEagerDemoteFreeFraction = 0.125;
+
+bool DeviceUnderPressure(tokenspeed::KVPrefixCache* kv_prefix_cache) {
+    const std::int32_t total = kv_prefix_cache->TotalPagesOfType<tokenspeed::ResourceType::Device>();
+    if (total <= 0) return true;
+    const std::int32_t available = kv_prefix_cache->AvailablePagesOfType<tokenspeed::ResourceType::Device>();
+    return static_cast<double>(available) < kEagerDemoteFreeFraction * static_cast<double>(total);
+}
+
 void DemoteWrittenBackDevice(tokenspeed::KVPrefixCache* kv_prefix_cache,
-                             tokenspeed::HybridPrefixCache* hybrid_prefix_cache, tokenspeed::TreeNode* device_node) {
+                             tokenspeed::HybridPrefixCache* hybrid_prefix_cache, tokenspeed::TreeNode* device_node,
+                             bool only_under_pressure = false) {
     if (kv_prefix_cache == nullptr || device_node == nullptr) return;
+    if (only_under_pressure && !DeviceUnderPressure(kv_prefix_cache)) return;
     kv_prefix_cache->ReleaseDeviceResourcesPresentOnHost(device_node, [hybrid_prefix_cache](tokenspeed::TreeNode* n) {
         if (hybrid_prefix_cache != nullptr) {
             hybrid_prefix_cache->OnKVDeviceDemote(n);
@@ -674,14 +699,16 @@ WritingBack CommitDrainingEvent::operator()(Draining&& state) {
     return WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(mamba_writeback_nodes)};
 }
 
-// WritingBack -> Finished: written-back cache demotes to host-only, so the next hit must load back.
+// WritingBack -> Finished: written-back cache keeps its device pages unless the
+// device pool is under pressure, so a later hit is served from device rather
+// than loaded back over PCIe. Under pressure it demotes as before.
 Finished WriteBackDoneEvent::operator()(WritingBack&& state) {
     TreeNode* device_node = state.DeviceNode();
     if (hybrid_prefix_cache_ != nullptr) {
         hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes());
     }
     state.DropDeviceNodeRef();
-    DemoteWrittenBackDevice(kv_prefix_cache_, hybrid_prefix_cache_, device_node);
+    DemoteWrittenBackDevice(kv_prefix_cache_, hybrid_prefix_cache_, device_node, /*only_under_pressure=*/true);
     if (hybrid_prefix_cache_ != nullptr) {
         hybrid_prefix_cache_->DemoteIdleMambaDeviceCopiesPresentOnHost();
     }

@@ -85,8 +85,10 @@ print(f"backend={BACKEND}")
 for m in TOKENS:
     block_dev = 0.0
     print(f"  tokens={m}")
-    print(f"    {'layer':>14} {'K':>6} {'N':>6} {'device us':>10} {'launch':>7} "
-          f"{'host us':>9} {'TFLOP/s':>9}")
+    print(
+        f"    {'layer':>14} {'K':>6} {'N':>6} {'device us':>10} {'launch':>7} "
+        f"{'host us':>9} {'TFLOP/s':>9}"
+    )
     for name, k, n in SHAPES:
         x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
         w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
@@ -95,7 +97,11 @@ for m in TOKENS:
         h = host_us(fn)
         tflops = 2 * m * k * n / (d / 1e6) / 1e12
         block_dev += d
-        print(f"    {name:>14} {k:6d} {n:6d} {d:10.2f} {launches:7.1f} "
-              f"{h:9.2f} {tflops:9.1f}")
-    print(f"    {'block total':>14} {'':6} {'':6} {block_dev:10.2f}"
-          f"   -> 36 layers = {block_dev * 36 / 1000:.2f} ms")
+        print(
+            f"    {name:>14} {k:6d} {n:6d} {d:10.2f} {launches:7.1f} "
+            f"{h:9.2f} {tflops:9.1f}"
+        )
+    print(
+        f"    {'block total':>14} {'':6} {'':6} {block_dev:10.2f}"
+        f"   -> 36 layers = {block_dev * 36 / 1000:.2f} ms"
+    )

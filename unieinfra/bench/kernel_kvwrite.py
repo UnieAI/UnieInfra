@@ -70,8 +70,9 @@ if BACKEND == "vllm":
     from vllm import _custom_ops as ops
 
     BLOCK = 16
-    k_cache = torch.zeros(SLOTS // BLOCK, BLOCK, KV_HEADS, HEAD_DIM,
-                          dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.zeros(
+        SLOTS // BLOCK, BLOCK, KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
     v_cache = torch.zeros_like(k_cache)
     one = torch.tensor(1.0, device="cuda")
 
@@ -79,11 +80,14 @@ if BACKEND == "vllm":
         return lambda: ops.reshape_and_cache_flash(
             k, v, k_cache, v_cache, loc, "auto", one, one
         )
+
 else:
     import tokenspeed_kernel.ops  # noqa: F401
     from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
 
-    k_cache = torch.zeros(SLOTS, KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.zeros(
+        SLOTS, KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
     v_cache = torch.zeros_like(k_cache)
 
     def make(n, k, v, loc):

@@ -42,25 +42,31 @@ SHARED = " ".join(f"ctx{j}" for j in range(PROMPT_WORDS))
 
 
 def prompt_sets():
-    yield "unique", [" ".join(f"u{i}w{j}" for j in range(PROMPT_WORDS))
-                     for i in range(N_REQ)]
-    yield "shared", [SHARED + " " + " ".join(f"q{i}t{j}" for j in range(32))
-                     for i in range(N_REQ)]
+    yield "unique", [
+        " ".join(f"u{i}w{j}" for j in range(PROMPT_WORDS)) for i in range(N_REQ)
+    ]
+    yield "shared", [
+        SHARED + " " + " ".join(f"q{i}t{j}" for j in range(32)) for i in range(N_REQ)
+    ]
 
 
 def main():
     if BACKEND == "vllm":
         from vllm import LLM, SamplingParams
 
-        llm = LLM(model=MODEL, dtype="bfloat16", max_model_len=8192,
-                  gpu_memory_utilization=float(os.environ.get("AB_GPU_UTIL", "0.88")))
-        sp = SamplingParams(temperature=0.0, max_tokens=OUT_TOKENS,
-                            ignore_eos=True)
+        llm = LLM(
+            model=MODEL,
+            dtype="bfloat16",
+            max_model_len=8192,
+            gpu_memory_utilization=float(os.environ.get("AB_GPU_UTIL", "0.88")),
+        )
+        sp = SamplingParams(temperature=0.0, max_tokens=OUT_TOKENS, ignore_eos=True)
         tok = llm.get_tokenizer()
 
         def run(prompts):
             outs = llm.generate(prompts, sp, use_tqdm=False)
             return sum(len(o.outputs[0].token_ids) for o in outs)
+
     else:
         from tokenspeed.runtime.entrypoints.engine import Engine
 
@@ -75,8 +81,7 @@ def main():
         def run(prompts):
             outs = engine.generate(
                 prompts,
-                {"temperature": 0.0, "max_new_tokens": OUT_TOKENS,
-                 "ignore_eos": True},
+                {"temperature": 0.0, "max_new_tokens": OUT_TOKENS, "ignore_eos": True},
             )
             return sum(
                 o["meta_info"].get("completion_tokens", OUT_TOKENS) for o in outs
@@ -92,9 +97,11 @@ def main():
         t0 = time.perf_counter()
         n_out = run(prompts)
         dt = time.perf_counter() - t0
-        print(f"  {name:7s} in={n_in:7d} out={n_out:6d}  {dt:7.2f} s  "
-              f"output {n_out / dt:8.1f} tok/s  total {(n_in + n_out) / dt:8.1f} tok/s",
-              flush=True)
+        print(
+            f"  {name:7s} in={n_in:7d} out={n_out:6d}  {dt:7.2f} s  "
+            f"output {n_out / dt:8.1f} tok/s  total {(n_in + n_out) / dt:8.1f} tok/s",
+            flush=True,
+        )
 
     if BACKEND != "vllm":
         engine.shutdown()

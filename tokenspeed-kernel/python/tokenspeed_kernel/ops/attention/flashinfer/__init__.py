@@ -885,7 +885,7 @@ if _paged_prefill_available():
         "attention",
         "mha_extend_with_kvcache",
         name="flashinfer_paged_mha_extend_with_kvcache",
-        solution="fa2",
+        solution="flashinfer_fa2",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(8, 0),
             vendors=frozenset({"nvidia"}),

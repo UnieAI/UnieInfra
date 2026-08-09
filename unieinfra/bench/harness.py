@@ -101,15 +101,12 @@ def row(label: str, dev: float, launches: float, host: float, nbytes: int = 0):
     """One comparable line. Both instruments, plus the L2 tell-tale."""
     band = f"{gbps(nbytes, dev):9.1f}" if nbytes else " " * 9
     flag = " L2" if nbytes and gbps(nbytes, dev) > HBM_PEAK_GB_S else ""
-    return (
-        f"  {label:>18} {dev:9.2f} {launches:7.1f} {host:9.2f} {band}{flag}"
-    )
+    return f"  {label:>18} {dev:9.2f} {launches:7.1f} {host:9.2f} {band}{flag}"
 
 
 def header() -> str:
     return (
-        f"  {'case':>18} {'device us':>9} {'launch':>7} {'host us':>9} "
-        f"{'GB/s':>9}"
+        f"  {'case':>18} {'device us':>9} {'launch':>7} {'host us':>9} " f"{'GB/s':>9}"
     )
 
 

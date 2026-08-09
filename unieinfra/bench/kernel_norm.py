@@ -59,6 +59,7 @@ if BACKEND == "vllm":
     fwd = norm.forward_cuda
 else:
     import tokenspeed_kernel.ops  # noqa: F401
+
     from tokenspeed.runtime.layers.layernorm import RMSNorm
 
     norm = RMSNorm(HIDDEN, eps=1e-6).cuda().to(torch.bfloat16)
@@ -96,7 +97,9 @@ def device_us(fn, reps=50):
 print(f"backend={BACKEND}")
 for label, use_res in (("rmsnorm", False), ("fused_add_rmsnorm", True)):
     print(f"  {label}")
-    print(f"    {'rows':>6} {'device us':>10} {'launches':>9} {'host us':>9} {'GB/s':>9}")
+    print(
+        f"    {'rows':>6} {'device us':>10} {'launches':>9} {'host us':>9} {'GB/s':>9}"
+    )
     for n in ROWS:
         x = torch.randn(n, HIDDEN, dtype=torch.bfloat16, device="cuda")
         res = torch.randn_like(x) if use_res else None

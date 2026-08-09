@@ -40,7 +40,7 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_shared_situ_projection,
 )
 from tokenspeed_kernel.platform import ArchVersion, Platform
-from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.profiling import ProfilingState, ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
@@ -436,22 +436,24 @@ def mm(
     if kernel.name in _KERNELS_WITH_PDL:
         kernel_kwargs["enable_pdl"] = enable_pdl
 
-    shape_params = {"M": M, "N": N, "K": K}
-    ShapeCapture.get().record(
-        "gemm",
-        "mm",
-        kernel.name,
-        select_dtype,
-        shape_params,
-    )
-    with kernel_scope(
-        "gemm",
-        "mm",
-        select_dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-        has_out=out is not None,
-    ):
+    # Both consumers below are inert unless capture or profiling is switched on,
+    # but the dict build and the `**` expansion into kernel_scope were paid on
+    # every call regardless. GEMM dispatches four times per layer, so that is
+    # 144 calls per forward on an 8B -- worth the branch.
+    capture = ShapeCapture.get()
+    if capture.enabled or ProfilingState.get().active:
+        shape_params = {"M": M, "N": N, "K": K}
+        capture.record("gemm", "mm", kernel.name, select_dtype, shape_params)
+        with kernel_scope(
+            "gemm",
+            "mm",
+            select_dtype,
+            kernel_name=kernel.name,
+            **shape_params,
+            has_out=out is not None,
+        ):
+            output = kernel(*kernel_args, **kernel_kwargs)
+    else:
         output = kernel(*kernel_args, **kernel_kwargs)
 
     if bias is not None and not fused_bias:

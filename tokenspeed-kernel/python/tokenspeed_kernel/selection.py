@@ -175,6 +175,28 @@ _oracles: dict[str, SelectionOracle] = {}
 _global_overrides: dict[tuple[str, str], str] = {}
 _config_overrides: dict[tuple[str, str], _ConfigOverrideEntry] | None = None
 
+# `TOKENSPEED_KERNEL_OVERRIDE_<FAMILY>_<MODE>`, resolved once per operator.
+# `select_kernel` runs on every kernel dispatch -- four GEMMs, one attention and
+# several norms per layer, times the layer count, per forward -- and building
+# that name (two `.upper()` calls and an f-string) and then reading it back out
+# of `os.environ` costs 0.46 us each time. `os.environ` is a `_Environ` mapping
+# that decodes on every lookup, so it is the expensive half. Environment
+# variables do not change under a running engine, and a kernel override that
+# took effect mid-run would be a bug rather than a feature.
+_env_overrides: dict[tuple[str, str], str | None] = {}
+
+
+def _env_override_for(family: str, mode: str) -> str | None:
+    key = (family, mode)
+    try:
+        return _env_overrides[key]
+    except KeyError:
+        value = os.environ.get(
+            f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+        )
+        _env_overrides[key] = value
+        return value
+
 
 def set_selection_policy(policy: SelectionPolicy) -> None:
     """Set per-op selection strategy. Clears all cached selections."""
@@ -299,6 +321,17 @@ def clear_config_overrides() -> None:
     """
     global _config_overrides
     _config_overrides = {}
+    clear_env_overrides()
+
+
+def clear_env_overrides() -> None:
+    """Forget memoized ``TOKENSPEED_KERNEL_OVERRIDE_*`` lookups.
+
+    Only needed by tests that set those variables after an operator has already
+    dispatched once; a running engine never changes them.
+    """
+    _env_overrides.clear()
+    KernelRegistry.get().clear_cache()
 
 
 def _get_config_override(family: str, mode: str) -> _ConfigOverrideEntry | None:
@@ -643,9 +676,8 @@ def select_kernel(
     if global_override:
         override = global_override
 
-    # 3. Environment variable
-    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
-    env_override = os.environ.get(env_key)
+    # 3. Environment variable (read once per operator, see _env_override_for)
+    env_override = _env_override_for(family, mode)
     if env_override:
         override = env_override
     registry = KernelRegistry.get()

@@ -1374,6 +1374,14 @@ class TestGemmDispatchProfiling:
         )
         KernelRegistry.get().register(spec, impl)
 
+    @staticmethod
+    def _enable_capture(monkeypatch) -> None:
+        """Make shape capture look active for the duration of one test."""
+        from tokenspeed_kernel.profiling import ShapeCapture
+
+        capture = ShapeCapture.get()
+        monkeypatch.setattr(capture, "enabled", True)
+
     class _ScopeRecorder:
         def __init__(self):
             self.calls: list[tuple[tuple, dict]] = []
@@ -1407,6 +1415,11 @@ class TestGemmDispatchProfiling:
 
         scope = self._ScopeRecorder()
         monkeypatch.setattr(gemm, "kernel_scope", scope)
+        # `mm` only builds the shape metrics and opens the scope when something
+        # will consume them -- otherwise it goes straight to the kernel, which
+        # is what the hot path wants. Turn capture on so the scope is live and
+        # this test can assert on the metrics it receives.
+        self._enable_capture(monkeypatch)
 
         A = torch.randn(4, 8, dtype=torch.float16)
         B = torch.randn(6, 8, dtype=torch.float16)
@@ -1445,6 +1458,11 @@ class TestGemmDispatchProfiling:
 
         scope = self._ScopeRecorder()
         monkeypatch.setattr(gemm, "kernel_scope", scope)
+        # `mm` only builds the shape metrics and opens the scope when something
+        # will consume them -- otherwise it goes straight to the kernel, which
+        # is what the hot path wants. Turn capture on so the scope is live and
+        # this test can assert on the metrics it receives.
+        self._enable_capture(monkeypatch)
 
         A = torch.randn(4, 8, dtype=torch.float16)
         B = torch.randn(6, 8, dtype=torch.float16)

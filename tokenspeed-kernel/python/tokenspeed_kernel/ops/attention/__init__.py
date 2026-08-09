@@ -47,7 +47,12 @@ from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
     kda_chunk_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.profiling import (
+    _NOOP_SCOPE,
+    ProfilingState,
+    ShapeCapture,
+    kernel_scope,
+)
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
@@ -1208,35 +1213,42 @@ def mha_extend_with_kvcache(
         override=override,
     )
 
-    # Record shapes
-    shape_params = {
-        "batch_size": cache_seqlens.shape[0],
-        "total_q": q.shape[0],
-        "num_pages": k_cache.shape[0],
-        "page_size": k_cache.shape[1],
-        "max_pages_per_seq": page_table.shape[1],
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[2],
-        "head_dim": q.shape[-1],
-        "max_seqlen_q": max_seqlen_q,
-        "max_seqlen_k": max_seqlen_k,
-    }
-    ShapeCapture.get().record(
-        "attention",
-        "mha_extend_with_kvcache",
-        kernel.name,
-        q.dtype,
-        shape_params,
-    )
+    # Record shapes -- but only when someone is listening. Ten tensor-shape
+    # reads, a dict, and a `**` expansion cost about 1 us per call and both
+    # consumers discard them unless capture or profiling is on. Measured 9.71 us
+    # of dispatch on this path against a 48 us kernel at 128 tokens.
+    capture = ShapeCapture.get()
+    if capture.enabled or ProfilingState.get().active:
+        shape_params = {
+            "batch_size": cache_seqlens.shape[0],
+            "total_q": q.shape[0],
+            "num_pages": k_cache.shape[0],
+            "page_size": k_cache.shape[1],
+            "max_pages_per_seq": page_table.shape[1],
+            "num_q_heads": q.shape[1],
+            "num_kv_heads": k_cache.shape[2],
+            "head_dim": q.shape[-1],
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+        }
+        capture.record(
+            "attention",
+            "mha_extend_with_kvcache",
+            kernel.name,
+            q.dtype,
+            shape_params,
+        )
+        scope = kernel_scope(
+            "attention",
+            "mha_extend_with_kvcache",
+            q.dtype,
+            kernel_name=kernel.name,
+            **shape_params,
+        )
+    else:
+        scope = _NOOP_SCOPE
 
-    # Enter profiling scope
-    with kernel_scope(
-        "attention",
-        "mha_extend_with_kvcache",
-        q.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
+    with scope:
         return kernel(
             q=q,
             cu_seqlens_q=cu_seqlens_q,

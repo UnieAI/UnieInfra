@@ -51,9 +51,13 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.utils import validate_attention_partition
+from tokenspeed.runtime.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    validate_attention_partition,
+)
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 # ModelOpt checkpoints that declare ``kv_cache_quant_algo`` carry per-layer KV
 # scales next to the k/v projections. They are only materialised as parameters
@@ -209,6 +213,68 @@ class Qwen3Attention(nn.Module):
     def _apply_rotary_pos_emb(self, t, cos, sin):
         return (t * cos) + self._rotate_half(t) * sin
 
+    def _attn(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """RoPE + attention, using the fused RoPE+KV pre-write when possible.
+
+        Same scaffolding as ``LlamaAttention._attn``. It matters more than it
+        looks: the standalone KV write is a Triton launch whose *kernel* is
+        1.7-2.2x faster than vLLM's CUDA one (0.97 vs 1.64 us at one token) but
+        whose Python launch costs ~14.9 us of host time against vLLM's 7.5 us
+        -- and below a few thousand tokens the host is what the step actually
+        waits on. Folding the write into the RoPE kernel removes the launch
+        rather than trying to make it cheaper.
+
+        Falls back to plain RoPE + ``self.attn(q, k, v)`` whenever the backend
+        cannot pre-write or the layer has non-trivial k/v scales; without that
+        fallback those layers would silently lose their KV writes.
+        """
+        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
+            n = v.shape[0]
+            fused_kv_arg = create_fused_set_kv_buffer_arg(
+                value=v.view(n, self.num_kv_heads, self.head_dim),
+                layer=self.attn,
+                # Flat path: prewrite at this layer's group locations. Identity
+                # for backends without flat cache groups, so it costs nothing
+                # and keeps the hybrid ones writing where the reader looks.
+                out_cache_loc=ctx.attn_backend.select_out_cache_loc(
+                    self.attn, out_cache_loc, ctx.forward_mode
+                ),
+                token_to_kv_pool=ctx.token_to_kv_pool,
+            )
+            if fused_kv_arg is not None:
+                # No ``output_q_rope``: rope Q in place, so the tensor handed to
+                # attention is the same strided view of qkv the unfused path
+                # passes. Allocating a fresh contiguous Q instead (as llama.py
+                # does) changes the attention kernel's last bits and made greedy
+                # decode diverge from the unfused path on near-tied logits --
+                # the KV bytes are identical either way, verified bitwise. It
+                # also saves one allocation per layer.
+                self.rotary_emb(
+                    positions,
+                    q,
+                    k,
+                    fused_set_kv_buffer_arg=fused_kv_arg,
+                    enable_pdl=pdl_enabled(),
+                )
+                return self.attn(
+                    q,
+                    None,
+                    None,
+                    ctx,
+                    out_cache_loc,
+                    save_kv_cache=False,
+                )
+        q, k = self.rotary_emb(positions, q, k)
+        return self.attn(q, k, v, ctx, out_cache_loc)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -220,8 +286,7 @@ class Qwen3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, ctx, out_cache_loc)
+        attn_output = self._attn(positions, q, k, v, ctx, out_cache_loc)
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)

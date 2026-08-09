@@ -1819,6 +1819,39 @@ class EventLoop:
             if st is not None:
                 st.stats.mark_scheduled(now)
 
+    def _rids_completing_this_step(self, forward_op) -> set[str]:
+        """Requests whose final token the forward being dispatched produces.
+
+        The scheduler learns that a request finished only when its results are
+        committed, and under the overlap loop that happens *after* the next
+        forward has been dispatched -- so a request that is already done still
+        gets one more step scheduled and run. Measured on Qwen3-8B that extra
+        step is the whole residual TTFT gap to vLLM: turning overlap off moved
+        TTFT 29.96 -> 20.04 ms, and the gap is the same ~5.5 ms whether the
+        prompt is 8 tokens or 7838, i.e. it is a step, not compute.
+
+        vLLM counts the tokens a step will produce at schedule time
+        (``num_output_placeholders``,
+        ``v1/core/sched/async_scheduler.py:19``). This is the same accounting,
+        kept on the Python side because the C++ scheduler has no notion of
+        ``max_new_tokens`` at all.
+
+        Length stops only. An EOS stop cannot be known before the token exists,
+        so those still pay the extra step -- as they do in vLLM, whose
+        placeholder count is likewise blind to EOS.
+        """
+        completing = set()
+        for rid in forward_op.request_ids:
+            state = self.output_processor.rid_to_state.get(rid)
+            if state is None:
+                continue
+            max_new = getattr(state.sampling_params, "max_new_tokens", None)
+            if not max_new:
+                continue
+            if len(state.output_ids) + 1 >= max_new:
+                completing.add(rid)
+        return completing
+
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
         sampling backend does its own flip detection + RNG state management
@@ -1878,6 +1911,9 @@ class EventLoop:
         )
         prev_results: ModelExecutionResult = None
         prev_forward_op = None
+        # Requests whose last token the in-flight forward produces; see
+        # `_rids_completing_this_step`.
+        pending_finish_rids: set[str] = set()
 
         while not self._shutdown_complete():
             # Order this iter's default-stream writes (KVAllocator,
@@ -1895,6 +1931,7 @@ class EventLoop:
                 self._paused_idle_step(prev_forward_op, prev_results)
                 prev_results = None
                 prev_forward_op = None
+                pending_finish_rids = set()
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
@@ -1906,6 +1943,20 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            if (
+                forward_op is not None
+                and pending_finish_rids
+                and forward_op.num_extends() <= 0
+                and all(rid in pending_finish_rids for rid in forward_op.request_ids)
+            ):
+                # Every request here produced its last token in the forward that
+                # is still in flight, so this step would compute tokens nobody
+                # reads. The scheduler is told nothing, so the pages stay owned;
+                # the Finish emitted by the commit below frees them as usual --
+                # which is why this cannot free a page out from under the
+                # in-flight forward. Pure-decode plans only: a chunked prefill
+                # is real work even for a request on its last token.
+                forward_op = None
             self._flush_mamba_retract_states(forward_op)
 
             stats = self._get_scheduler_stats()
@@ -1936,6 +1987,7 @@ class EventLoop:
                         self._publish_scheduler_kv_events()
                         prev_results = None
                         prev_forward_op = None
+                    pending_finish_rids = set()
                     self.model_executor.execute_idle_forward(
                         dp_metadata.global_num_tokens,
                         dp_metadata.global_batch_size,
@@ -2008,6 +2060,13 @@ class EventLoop:
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
+            # Computed after the commit above, which is what advances
+            # `output_ids` for the step that just landed.
+            pending_finish_rids = (
+                self._rids_completing_this_step(forward_op)
+                if forward_op is not None
+                else set()
+            )
             prev_results = curr_results
             prev_forward_op = forward_op
 

@@ -49,8 +49,16 @@ struct PagedCacheSnapshot;
 class HybridPrefixCache {
 public:
     // `mamba_allocator` may be null; paged-cache adjunct is enabled separately.
+    // `mamba_ckpt_allocator`, when non-null, is where tree-owned snapshots come
+    // from; `allocator` then serves only running sequences. Null keeps both in
+    // the one pool, which is the arrangement that let the cache starve the batch.
     HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size,
-                      MambaHostAllocator* mamba_host_allocator = nullptr);
+                      MambaHostAllocator* mamba_host_allocator = nullptr,
+                      MambaChunkAllocator* mamba_ckpt_allocator = nullptr);
+
+    // The pool a retained snapshot is allocated from: the checkpoint pool when
+    // one is configured, else the active pool.
+    MambaChunkAllocator* CheckpointAllocator() const { return mamba_ckpt_allocator_; }
     ~HybridPrefixCache();
 
     MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
@@ -220,6 +228,7 @@ private:
 
     KVPrefixCache& kv_prefix_cache_;
     MambaChunkAllocator* mamba_allocator_;
+    MambaChunkAllocator* mamba_ckpt_allocator_{nullptr};
     MambaHostAllocator* mamba_host_allocator_;
     MambaEvictionManager mamba_eviction_manager_;
     std::int32_t mamba_cache_chunk_size_;

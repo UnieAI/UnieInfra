@@ -773,6 +773,7 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
         loadback_diff,
         mamba_allocator_ ? &*mamba_allocator_ : nullptr,
         std::move(mamba_loadback_nodes),
+        mamba_ckpt_allocator_ ? &*mamba_ckpt_allocator_ : nullptr,
     };
 }
 

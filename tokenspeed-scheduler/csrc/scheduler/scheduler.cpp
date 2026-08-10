@@ -120,6 +120,12 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (has_mamba_pool) {
         mamba_allocator_.emplace(config_.mamba_pool_total_chunks);
     }
+    // The checkpoint pool exists so a cached snapshot cannot take the slot a
+    // running sequence needs. Sized independently of the active pool because it
+    // holds a different thing at a different precision.
+    if (has_mamba_pool && config_.mamba_ckpt_pool_slots > 0) {
+        mamba_ckpt_allocator_.emplace(config_.mamba_ckpt_pool_slots);
+    }
     const bool has_mamba_l2_pool = has_mamba_pool && config_.enable_mamba_l2 && config_.mamba_l2_host_slots > 0;
     if (has_mamba_l2_pool) {
         mamba_host_allocator_.emplace(config_.mamba_l2_host_slots);
@@ -133,7 +139,13 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (has_mamba_adjunct || has_prefix_cache_adjunct || has_paged_cache_groups) {
         MambaChunkAllocator* mamba_ptr = has_mamba_adjunct ? &*mamba_allocator_ : nullptr;
         MambaHostAllocator* mamba_host_ptr = has_mamba_l2_pool ? &*mamba_host_allocator_ : nullptr;
-        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size, mamba_host_ptr);
+        // Eviction and capacity questions are about the pool the tree actually
+        // allocates from, so the cache is handed the checkpoint pool when there
+        // is one and the active pool otherwise.
+        MambaChunkAllocator* mamba_ckpt_ptr =
+            (has_mamba_adjunct && mamba_ckpt_allocator_.has_value()) ? &*mamba_ckpt_allocator_ : nullptr;
+        hybrid_prefix_cache_.emplace(kv_prefix_cache_, mamba_ptr, config_.mamba_cache_chunk_size, mamba_host_ptr,
+                                     mamba_ckpt_ptr);
         kv_prefix_cache_.GetDeviceManager().SetEvictionCallback(
             [this](TreeNode* node) { hybrid_prefix_cache_->OnKVEvict(node); });
         kv_prefix_cache_.GetHostManager().SetEvictionCallback(

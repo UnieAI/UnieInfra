@@ -215,7 +215,8 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
                                      ReqPoolAllocator* req_pool_allocator, KVPrefixCache* kv_prefix_cache,
                                      MatchResult match_result, std::vector<TreeNode*> loadback_diff,
                                      MambaChunkAllocator* mamba_allocator = nullptr,
-                                     std::vector<TreeNode*> mamba_loadback_nodes = {})
+                                     std::vector<TreeNode*> mamba_loadback_nodes = {},
+                                     MambaChunkAllocator* mamba_ckpt_allocator = nullptr)
         : decode_input_tokens_(decode_input_tokens),
           device_allocator_(device_allocator),
           req_pool_allocator_(req_pool_allocator),
@@ -223,7 +224,8 @@ struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecod
           match_result_(std::move(match_result)),
           loadback_diff_(std::move(loadback_diff)),
           mamba_loadback_nodes_(std::move(mamba_loadback_nodes)),
-          mamba_allocator_(mamba_allocator) {}
+          mamba_allocator_(mamba_allocator),
+          mamba_ckpt_allocator_(mamba_ckpt_allocator) {}
 
     Decoding operator()(Retracted&& state);
 
@@ -237,6 +239,9 @@ private:
     PageAllocator* device_allocator_{};
     ReqPoolAllocator* req_pool_allocator_{};
     KVPrefixCache* kv_prefix_cache_{};
+    // Where a snapshot this recovery publishes is allocated from; null means
+    // the active pool, as before the checkpoint pool existed.
+    MambaChunkAllocator* mamba_ckpt_allocator_{};
     MatchResult match_result_{};
     std::vector<TreeNode*> loadback_diff_;
     std::vector<TreeNode*> mamba_loadback_nodes_;

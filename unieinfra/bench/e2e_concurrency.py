@@ -107,14 +107,90 @@ def build_prompts(
     return [f"salt{round_id}n{i} " + body for i in range(n)]
 
 
-class _Result:
-    __slots__ = ("ttft_ms", "total_ms", "n_out", "n_in")
+def describe_engine(backend: str, engine, args) -> dict:
+    """The resolved configuration of whichever engine is running.
 
-    def __init__(self, ttft_ms: float, total_ms: float, n_out: int, n_in: int = 0):
+    Resolved, not requested. Both engines silently override some arguments, and
+    a comparison is only a comparison if the two columns can be read against
+    each other -- so this reports the same key names for both.
+    """
+    cfg = {
+        "model": args.model,
+        "dtype": "bfloat16",
+        "max_model_len": args.max_model_len,
+        "out_tokens": args.out_tokens,
+        "prefix_words": args.prefix_words,
+        "repeats": args.repeats,
+        "sampling": "temperature=0.0, ignore_eos=True",
+    }
+    if backend == "vllm":
+        vc = getattr(engine, "vllm_config", None)
+        cache = getattr(vc, "cache_config", None)
+        sched = getattr(vc, "scheduler_config", None)
+        cfg["prefix_caching"] = getattr(cache, "enable_prefix_caching", "?")
+        cfg["kv_cache_dtype"] = getattr(cache, "cache_dtype", "?")
+        cfg["block_size"] = getattr(cache, "block_size", "?")
+        cfg["max_num_seqs"] = getattr(sched, "max_num_seqs", "?")
+        cfg["chunked_prefill"] = getattr(sched, "enable_chunked_prefill", "?")
+    else:
+        sa = getattr(engine, "server_args", None)
+        for key, attr in (
+            ("prefix_caching", "enable_prefix_caching"),
+            ("kv_cache_dtype", "kv_cache_dtype"),
+            ("block_size", "block_size"),
+            ("max_num_seqs", "max_num_seqs"),
+            ("chunked_prefill", "chunked_prefill_size"),
+            ("mixed_batch", "enable_mixed_batch"),
+            ("mamba_ckpt_slots", "int8_mamba_ckpt_size"),
+        ):
+            cfg[key] = getattr(sa, attr, "?") if sa is not None else "?"
+    return cfg
+
+
+def check_output_text(texts: list[str]) -> str:
+    """One line on whether the generated text is usable, for the report.
+
+    A latency number says nothing about whether the engine produced language.
+    These runs set ignore_eos so every request emits exactly out_tokens, which
+    is right for timing and is also the condition under which a broken decode
+    path degenerates quietly -- into one repeated token, or into replacement
+    characters from a detokenizer handed the wrong ids.
+    """
+    if not texts:
+        return "no text captured"
+    sample = next((t for t in texts if t), "")
+    if not sample:
+        return "EMPTY -- every completion was blank"
+    bad = sample.count("\ufffd")
+    words = sample.split()
+    uniq = len(set(words))
+    verdict = "ok"
+    if bad:
+        verdict = f"MOJIBAKE -- {bad} replacement chars"
+    elif uniq <= 1 and len(words) > 4:
+        verdict = "DEGENERATE -- one token repeated"
+    preview = sample[:80].replace("\n", " ")
+    return f"{verdict} | uniq_words={uniq}/{len(words)} | {preview!r}"
+
+
+class _Result:
+    __slots__ = ("ttft_ms", "total_ms", "n_out", "n_in", "text")
+
+    def __init__(
+        self,
+        ttft_ms: float,
+        total_ms: float,
+        n_out: int,
+        n_in: int = 0,
+        text: str = "",
+    ):
         self.ttft_ms = ttft_ms
         self.total_ms = total_ms
         self.n_out = n_out
         self.n_in = n_in
+        # Kept so the run can be checked for mojibake and degenerate repetition;
+        # a timing number alone cannot tell a working engine from a broken one.
+        self.text = text
 
     @property
     def itl_ms(self) -> float:
@@ -148,17 +224,20 @@ def _run_tokenspeed(engine, prompts, out_tokens) -> list[_Result]:
         first = None
         n_out = 0
         n_in = 0
+        text = ""
         for chunk in engine.generate(prompt, sampling, stream=True):
             if first is None:
                 first = time.perf_counter()
             n_out = chunk["meta_info"].get("completion_tokens", n_out)
             n_in = chunk["meta_info"].get("prompt_tokens", n_in)
+            text = chunk.get("text", text)
         end = time.perf_counter()
         return _Result(
             (first - start) * 1e3 if first else float("nan"),
             (end - start) * 1e3,
             max(n_out, 1),
             n_in,
+            text,
         )
 
     with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
@@ -175,18 +254,21 @@ async def _run_vllm(engine, prompts, out_tokens) -> list[_Result]:
         first = None
         n_out = 0
         n_in = 0
+        text = ""
         async for out in engine.generate(prompt, sampling, f"req{idx}"):
             n_in = len(out.prompt_token_ids or ()) or n_in
             if first is None and out.outputs and out.outputs[0].token_ids:
                 first = time.perf_counter()
             if out.outputs:
                 n_out = len(out.outputs[0].token_ids)
+                text = out.outputs[0].text or text
         end = time.perf_counter()
         return _Result(
             (first - start) * 1e3 if first else float("nan"),
             (end - start) * 1e3,
             max(n_out, 1),
             n_in,
+            text,
         )
 
     return list(await asyncio.gather(*(one(i, p) for i, p in enumerate(prompts))))
@@ -277,11 +359,14 @@ def main() -> int:
         )
         runner = _run_tokenspeed
 
-    print(
-        f"backend={backend} shape={args.shape} out={args.out_tokens} "
-        f"prefix~{args.prefix_words} words kv={args.kv_cache_dtype or 'auto'} "
-        f"max_num_seqs={args.max_num_seqs or 'default'}"
-    )
+    # Every knob that differs between the two engines, printed from the engine
+    # rather than from the argv it was asked for: a model that does not support
+    # a feature has it turned back off silently (vLLM does exactly that with
+    # prefix caching on hybrids), so a report quoting the request describes a
+    # run that did not happen.
+    print(f"backend={backend} shape={args.shape}")
+    for key, val in sorted(describe_engine(backend, engine, args).items()):
+        print(f"  cfg {key} = {val}")
     print(
         f"  {'conc':>5} {'in tok':>9} {'out tok':>8} {'in/req':>7} "
         f"{'out/req':>8} {'RPS':>7} {'TTFT p50':>9} {'TTFT p99':>9} "
@@ -332,6 +417,13 @@ def main() -> int:
                 f"{percentile(itls, 0.5) if itls else float('nan'):8.2f} "
                 f"{percentile(itls, 0.99) if itls else float('nan'):8.2f} "
                 f"{produced / wall:8.1f}",
+                flush=True,
+            )
+            # Printed per level rather than once: a decode path can be fine at
+            # low concurrency and degenerate under batching, which is exactly
+            # the regime these rows are about.
+            print(
+                f"        text: {check_output_text([r.text for r in results])}",
                 flush=True,
             )
     finally:

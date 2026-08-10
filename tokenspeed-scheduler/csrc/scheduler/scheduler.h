@@ -131,6 +131,20 @@ private:
         Request* request, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
+    // Whether the active Mamba pool can still serve `slots` mandatory
+    // allocations this step.
+    //
+    // Admission has to ask, because the allocation sites downstream cannot
+    // fail gracefully: SchedulePrefillEvent and friends throw. vLLM expresses
+    // the same thing by returning a block count the scheduler cannot satisfy
+    // (single_type_kv_cache_manager.py:1206 returns num_gpu_blocks + 1), so the
+    // request is simply not scheduled this round rather than failing mid-step.
+    // Ours returns {} from the schedule* helpers, which has that meaning here.
+    //
+    // Only the active pool is counted. Snapshots come from the checkpoint pool
+    // when one is configured, and those are best-effort by construction.
+    bool hasMambaCapacity(std::int32_t slots) const;
+
 #if TOKENSPEED_FLAT_KVCACHE
     // One hash pass at admission: non-owning device/host probes plus the hashes
     // retained for acquisition after every admission check succeeds.

@@ -185,6 +185,8 @@ def make_config(
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
     mamba_pool_total_chunks: int = 0,
+    # Zero keeps tree-owned snapshots in the active pool, as before.
+    mamba_ckpt_pool_slots: int = 0,
     enable_mamba_l2: bool = False,
     mamba_l2_host_slots: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
@@ -216,6 +218,7 @@ def make_config(
     cfg.enable_mamba = enable_mamba
     cfg.mamba_cache_chunk_size = mamba_cache_chunk_size
     cfg.mamba_pool_total_chunks = mamba_pool_total_chunks
+    cfg.mamba_ckpt_pool_slots = mamba_ckpt_pool_slots
     cfg.enable_mamba_l2 = enable_mamba_l2
     cfg.mamba_l2_host_slots = mamba_l2_host_slots
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode

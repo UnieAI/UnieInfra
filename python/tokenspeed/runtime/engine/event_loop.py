@@ -114,6 +114,39 @@ def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
     return scheduler.calc_rolling_hash(tokens, apply_match=True)
 
 
+def validate_mixed_batch_backend(server_args, attn_backend) -> None:
+    """Refuse ``--enable-mixed-batch`` on a backend that cannot serve MIXED.
+
+    Refuse at startup rather than on the first batch that happens to mix. With
+    mixed batching on, the C++ scheduler emits plans holding prefill and decode
+    ops together; a backend that cannot serve MIXED discovers that only when
+    such a plan arrives, which is minutes into a run and surfaces as a shape
+    error deep inside a state gather rather than as the configuration mistake
+    it is.
+
+    Module-level rather than inline in ``EventLoop.__init__`` so the decision is
+    testable: it depends on two attributes, while constructing an ``EventLoop``
+    needs a model, a scheduler and a GPU.
+
+    Args:
+        server_args: Parsed server arguments; only ``enable_mixed_batch`` is read.
+        attn_backend: The selected attention backend. One that declares nothing
+            is assumed capable, which is the pre-guard behaviour.
+
+    Raises:
+        ValueError: If the flag is set and the backend declares it cannot mix.
+    """
+    if server_args.enable_mixed_batch and not getattr(
+        attn_backend, "supports_mixed_batch", True
+    ):
+        raise ValueError(
+            "--enable-mixed-batch requires an attention backend that can "
+            f"serve mixed batches; {type(attn_backend).__name__} declares "
+            "supports_mixed_batch = False. Drop the flag, or run a model "
+            "whose backend supports MIXED."
+        )
+
+
 # Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
 # not busy-spin a CPU core waiting for /resume.
 _PAUSED_IDLE_SLEEP_S = 0.001
@@ -250,21 +283,7 @@ class EventLoop:
             num_total_pages=num_total_pages,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
-        # Refuse here rather than on the first batch that happens to mix. With
-        # mixed batching on, the C++ scheduler emits plans holding prefill and
-        # decode ops together; a backend that cannot serve MIXED discovers that
-        # only when such a plan arrives, which is minutes into a run and
-        # surfaces as a shape error deep inside a state gather rather than as
-        # the configuration mistake it is.
-        if server_args.enable_mixed_batch and not getattr(
-            attn_backend, "supports_mixed_batch", True
-        ):
-            raise ValueError(
-                "--enable-mixed-batch requires an attention backend that can "
-                f"serve mixed batches; {type(attn_backend).__name__} declares "
-                "supports_mixed_batch = False. Drop the flag, or run a model "
-                "whose backend supports MIXED."
-            )
+        validate_mixed_batch_backend(server_args, attn_backend)
 
         self.model_executor = create_model_executor(
             server_args=server_args,

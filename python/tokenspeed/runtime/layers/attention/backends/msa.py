@@ -120,6 +120,13 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     # stale-table guard. TODO(radix-removal): drop the flag.
     uses_flat_cache_groups: bool = True
 
+    # MIXED is not wired here: `init_forward_metadata` builds extend metadata
+    # for every row, so a decode tail would be described by out-of-range
+    # extend_seq_lens / extend_prefix_lens slices. Declaring it lets the startup
+    # guard refuse `--enable-mixed-batch` instead of the run dying on the first
+    # plan that happens to mix.
+    supports_mixed_batch: bool = False
+
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
@@ -197,7 +204,14 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
-        assert not forward_mode.is_mixed(), "MSA backend does not support mixed batch"
+        # Not an `assert`: that vanishes under `python -O`, and the un-asserted
+        # path would run extend metadata over the decode rows rather than fail.
+        # See `supports_mixed_batch`, which refuses the flag at startup.
+        if forward_mode.is_mixed():
+            raise NotImplementedError(
+                "MSA backend does not support mixed prefill+decode batches "
+                "(see AttentionBackend.supports_mixed_batch)"
+            )
 
         seq_lens = seq_lens[:bs]
 

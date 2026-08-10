@@ -28,6 +28,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     STATE_LAYER_TYPES,
     PagedCacheGroupSpec,
+    resolve_layer_types_and_window,
     scheduler_ext_flat_kvcache,
 )
 from tokenspeed.runtime.layers.attention.configs.base import (
@@ -83,11 +84,11 @@ class MHAConfig(BaseAttnConfig):
             kv_cache_dtype = "bfloat16"
 
         hf_config = getattr(model_config, "hf_config", None)
-        # paged_cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
-        layer_types = tuple(
-            getattr(hf_config, "paged_cache_layer_types", None)
-            or getattr(hf_config, "layer_types", None)
-            or ()
+        # Composite configs (Gemma 3/4) carry these on the text sub-config, so
+        # resolve against the same sub-config the rest of this method already
+        # reads num_attention_heads and head_dim from.
+        layer_types, sliding_window_tokens = resolve_layer_types_and_window(
+            hf_config, getattr(model_config, "hf_text_config", None)
         )
         if (
             is_draft
@@ -96,7 +97,6 @@ class MHAConfig(BaseAttnConfig):
         ):
             # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
             layer_types = ()
-        sliding_window_tokens = getattr(hf_config, "sliding_window", None)
         conv_state_shape = temporal_state_shape = None
         conv_dtype = ssm_dtype = None
         if (

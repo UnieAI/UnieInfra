@@ -111,6 +111,50 @@ STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 _SLIDING_SUBGROUP_PREFIX = "sliding_attention_"
 
 
+def resolve_layer_types_and_window(
+    hf_config: object | None,
+    hf_text_config: object | None = None,
+) -> tuple[tuple[str, ...], object | None]:
+    """Resolve the per-layer attention labels and the sliding window from a config.
+
+    Composite configs (Gemma 3, Gemma 4) keep ``layer_types`` and
+    ``sliding_window`` on the text sub-config rather than the top level, so
+    reading only the top level silently yields ``()`` and ``None`` -- which
+    collapses a mixed local/global stack into a single full-attention group and
+    runs the sliding layers as full attention without raising.
+
+    The top level is read first, so configs that forward attribute access to a
+    nested ``text_config`` (Qwen3.5, Kimi K3, Inkling) answer there exactly as
+    before. For a flat config ``hf_text_config`` is ``hf_config`` and the
+    fallback cannot change the result.
+
+    Args:
+        hf_config: The top-level HF config, or None.
+        hf_text_config: The text sub-config (``ModelConfig.hf_text_config``).
+            Defaults to ``hf_config`` when omitted.
+
+    Returns:
+        ``(layer_types, sliding_window_tokens)``. ``layer_types`` is empty when
+        neither config declares labels; ``sliding_window_tokens`` is None when
+        neither declares a window.
+    """
+    if hf_text_config is None:
+        hf_text_config = hf_config
+    # paged_cache_layer_types wins: it can carry labels outside transformers'
+    # ALLOWED_LAYER_TYPES.
+    layer_types = tuple(
+        getattr(hf_config, "paged_cache_layer_types", None)
+        or getattr(hf_config, "layer_types", None)
+        or getattr(hf_text_config, "paged_cache_layer_types", None)
+        or getattr(hf_text_config, "layer_types", None)
+        or ()
+    )
+    sliding_window_tokens = getattr(hf_config, "sliding_window", None)
+    if sliding_window_tokens is None:
+        sliding_window_tokens = getattr(hf_text_config, "sliding_window", None)
+    return layer_types, sliding_window_tokens
+
+
 def _retention_for_label(label: str) -> Retention | None:
     """Retention for a paged-cache layer_type label, or None if unknown.
 

@@ -1083,6 +1083,11 @@ class CudaGraphWrapper:
         mamba_cow_src_indices: torch.Tensor | None = None,
         mamba_branching_seqlens: torch.Tensor | None = None,
         mamba_track_pool_indices: torch.Tensor | None = None,
+        # Ragged multi-snapshot destinations. Passed through untouched: only
+        # the extend path publishes snapshots, and that path is not captured,
+        # so there is no graph buffer to pad these into.
+        mamba_track_multi_counts: torch.Tensor | None = None,
+        mamba_track_multi_indices: torch.Tensor | None = None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
         flat_block_tables: dict | None = None,
@@ -1146,6 +1151,10 @@ class CudaGraphWrapper:
             mamba_kwargs["mamba_branching_seqlens"] = mamba_branching_seqlens
         if mamba_track_pool_indices is not None:
             mamba_kwargs["mamba_track_pool_indices"] = mamba_track_pool_indices
+        if mamba_track_multi_counts is not None:
+            mamba_kwargs["mamba_track_multi_counts"] = mamba_track_multi_counts
+        if mamba_track_multi_indices is not None:
+            mamba_kwargs["mamba_track_multi_indices"] = mamba_track_multi_indices
 
         # MLA/KDA backends build their eager metadata from the FlatKV contract
         # and refresh their captured decode buffers from it during replay.

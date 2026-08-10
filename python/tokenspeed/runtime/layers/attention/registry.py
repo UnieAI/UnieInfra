@@ -769,17 +769,18 @@ def _apply_gemma4_hetero_kv(config, model_config) -> bool:
         # The per-group page sizes this layout needs are only honoured by the
         # flat scheduler ext (the radix path has one page size for the whole
         # pool), so publishing them here would produce write locs in the wrong
-        # units. Leave the pool uniform: the pool's store guard then refuses
-        # the first full-attention write with a precise message instead of
-        # this layout corrupting rows.
-        logger.warning(
-            "Gemma 4 needs heterogeneous KV (%s per layer) but the installed "
-            "tokenspeed_scheduler ext is not flat-built; the uniform KV pool "
-            "cannot represent the full-attention geometry and will refuse "
-            "those writes. Rebuild the ext with TOKENSPEED_FLAT_KVCACHE.",
-            sorted(set(geometry)),
+        # units. Warning and continuing would leave the pool uniform, which
+        # cannot represent the full-attention geometry -- the store guard then
+        # refuses the first full-attention write, i.e. the server comes up and
+        # dies on the first request. Refuse here instead, where the message can
+        # still say what to rebuild.
+        raise RuntimeError(
+            f"Gemma 4 needs heterogeneous KV ({sorted(set(geometry))} per "
+            "layer) but the installed tokenspeed_scheduler ext is not "
+            "flat-built. The uniform KV pool cannot represent the "
+            "full-attention geometry and would refuse those writes on the "
+            "first request. Rebuild the ext with TOKENSPEED_FLAT_KVCACHE=ON."
         )
-        return False
     alloc, counts = normalize_layer_kv_geometry(geometry)
     ratio = alloc // min(counts)
     # Byte-uniform slots: the widest layer's page is the base block, the

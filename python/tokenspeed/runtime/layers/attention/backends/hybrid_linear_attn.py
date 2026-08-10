@@ -75,6 +75,12 @@ from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton impor
 
 logger = logging.getLogger(__name__)
 
+# Must equal kMambaSnapshotStrideTokens in
+# tokenspeed-scheduler/csrc/fsm/forward_events.cpp. The scheduler publishes a
+# recurrent snapshot every this many tokens; this side picks the matching state
+# out of the scan's checkpoint buffer, so the two constants move together.
+MAMBA_SNAPSHOT_STRIDE_TOKENS = 512
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -298,6 +304,14 @@ class MambaForwardMetadata:
     track_conv_indices: torch.Tensor | None = None
     track_ssm_final_src: torch.Tensor | None = None
     track_ssm_final_dst: torch.Tensor | None = None
+    # ---- per-step plan for the EXTEND path (see forward_extend) ----
+    # Identical for every recurrent layer in a step, and both were recomputed
+    # inside each of the 48 layer forwards: a device comparison and a Python
+    # loop over a CPU tensor, 48x for one answer. TurboMind's
+    # GatedDeltaNetLayer draws the same line -- everything depending on the
+    # batch shape is computed once in Setup(), and each layer only Runs.
+    extend_has_initial_states: torch.Tensor | None = None
+    extend_total_tokens: int = -1
     # Flat path (state slabs): dual in/out page indices per request.
     state_in_pages: torch.Tensor | None = None
     state_out_pages: torch.Tensor | None = None
@@ -1520,6 +1534,36 @@ class MambaAttnBackend(AttentionBackend):
                 # state always comes from the chunked scan's intermediate
                 # checkpoints; the chunk's final state is never the one filed.
 
+                # Multi-snapshot destinations the scheduler published for this
+                # step, if any. Falls back to the single-snapshot path when the
+                # scheduler did not publish extras (short chunks, or a mamba
+                # pool with nothing spare) so behaviour degrades to what it was.
+                multi_counts = kwargs.get("mamba_track_multi_counts")
+                multi_indices = kwargs.get("mamba_track_multi_indices")
+                use_multi = (
+                    multi_counts is not None
+                    and multi_indices is not None
+                    and int(multi_counts[:bs].sum()) > int((track_indices >= 0).sum())
+                )
+
+                if use_multi:
+                    expanded = self._expand_multi_track(
+                        prefix,
+                        extend_lens,
+                        page_size,
+                        multi_counts[:bs],
+                        multi_indices,
+                        query_start_loc,
+                    )
+                    if expanded is not None:
+                        (
+                            track_ssm_h_src,
+                            track_ssm_h_src_fla,
+                            track_ssm_h_dst,
+                            track_conv_indices,
+                        ) = expanded
+                        track_mask = torch.zeros_like(track_mask)  # handled above
+
                 if track_mask.any():
                     (
                         track_ssm_h_src,
@@ -1537,6 +1581,19 @@ class MambaAttnBackend(AttentionBackend):
                         track_mask,
                     )
 
+        # Per-step plan for the recurrent extend path: one device comparison and
+        # one CPU reduction, instead of the same two inside all 48 layers.
+        extend_has_initial_states = None
+        extend_total_tokens = -1
+        if forward_mode.is_extend_or_mixed() or is_draft_extend:
+            _prefix = kwargs.get("extend_prefix_lens")
+            if _prefix is None:
+                _prefix = kwargs.get("extend_prefix_lens_cpu")
+            if _prefix is not None:
+                extend_has_initial_states = _prefix > 0
+            if extend_seq_lens_cpu is not None:
+                extend_total_tokens = int(extend_seq_lens_cpu.sum())
+
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
@@ -1550,6 +1607,8 @@ class MambaAttnBackend(AttentionBackend):
             track_conv_indices=track_conv_indices,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            extend_has_initial_states=extend_has_initial_states,
+            extend_total_tokens=extend_total_tokens,
             state_in_pages=state_in_pages,
             state_out_pages=state_out_pages,
             state_in_pages_by_group=state_in_pages_by_group,
@@ -1572,6 +1631,105 @@ class MambaAttnBackend(AttentionBackend):
             dtype=start.dtype,
         )
         return indices.clamp(0, query_start_loc[-1] - 1)
+
+    def _expand_multi_track(
+        self,
+        prefix: torch.Tensor,
+        extend_lens: torch.Tensor,
+        page_size: int,
+        counts: torch.Tensor,
+        flat_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ):
+        """Index tensors for every (request, snapshot depth) pair.
+
+        The single-snapshot path indexes everything by request, so it cannot
+        express K rows for one sequence; this builds the flattened form
+        directly. Rows are ordered per request, ascending by depth, matching the
+        order the scheduler attached its slots in -- pairing is positional and a
+        mismatch files a state under a depth it does not describe.
+
+        Returns None when nothing lines up, so the caller falls back to the
+        single-snapshot path rather than publishing something wrong.
+        """
+        device = extend_lens.device
+        prefix_l = [int(x) for x in prefix.tolist()]
+        extend_l = [int(x) for x in extend_lens.tolist()]
+        counts_l = [int(x) for x in counts.tolist()]
+        flat_l = [int(x) for x in flat_indices.tolist()]
+        starts_l = [int(x) for x in query_start_loc.tolist()]
+
+        # flashinfer ckpts[k] is the state after chunk k, so a sequence of
+        # length L contributes L // CHUNK of them; offsets are exclusive sums.
+        fi_offset, fla_offset = [], []
+        acc_fi = acc_fla = 0
+        for L in extend_l:
+            fi_offset.append(acc_fi)
+            fla_offset.append(acc_fla)
+            acc_fi += L // FLA_CHUNK_SIZE
+            acc_fla += (L - 1) // FLA_CHUNK_SIZE + 1
+
+        src, src_fla, dst, conv = [], [], [], []
+        cursor = 0
+        for i, count in enumerate(counts_l):
+            slots = flat_l[cursor : cursor + count]
+            cursor += count
+            if count <= 0:
+                continue
+            depths = self._publish_depths_for(
+                prefix_l[i], prefix_l[i] + extend_l[i], page_size, count
+            )
+            if len(depths) != len(slots):
+                # The two sides disagree on how many depths this chunk is
+                # worth; publishing a mispaired state is worse than publishing
+                # none, so drop the whole step onto the single-snapshot path.
+                return None
+            for depth, slot in zip(depths, slots):
+                track_len = depth - prefix_l[i]
+                if slot < 0 or track_len <= 0 or track_len % FLA_CHUNK_SIZE:
+                    continue
+                if track_len >= extend_l[i]:
+                    continue
+                src.append(fi_offset[i] + track_len // FLA_CHUNK_SIZE - 1)
+                src_fla.append(fla_offset[i] + track_len // FLA_CHUNK_SIZE)
+                dst.append(slot)
+                # The conv window ends at the same token the state describes.
+                conv.append(starts_l[i] + track_len - 1)
+
+        if not dst:
+            return None
+        as_t = lambda xs: torch.as_tensor(xs, dtype=torch.int64, device=device)
+        return as_t(src), as_t(src_fla), as_t(dst), as_t(conv)
+
+    @staticmethod
+    def _publish_depths_for(
+        chunk_begin: int, final_len: int, page_size: int, max_count: int
+    ) -> list[int]:
+        """The depths the scheduler retained a snapshot at, ascending.
+
+        A bit-for-bit mirror of `MambaCheckpointPublishDepths` in
+        `csrc/fsm/forward_events.cpp`. The two MUST agree: C++ attaches slot i
+        to the radix node at depth i, and this side decides which of the scan's
+        intermediate states gets copied into slot i. Disagree and a state is
+        filed under a depth it does not describe, so a later hit resumes from
+        the wrong recurrent state -- silently, with plausible output.
+        """
+        deepest = (final_len // page_size) * page_size - page_size
+        if deepest <= chunk_begin:
+            return []
+        depths = []
+        stride = MAMBA_SNAPSHOT_STRIDE_TOKENS
+        depth = stride
+        while depth < deepest:
+            if depth > chunk_begin and depth < final_len:
+                track = depth - chunk_begin
+                if track % FLA_CHUNK_SIZE == 0:
+                    depths.append(depth)
+            depth += stride
+        depths.append(deepest)
+        if len(depths) > max_count:
+            depths = depths[-max_count:]
+        return depths
 
     def _compute_track_ssm_indices(
         self,
@@ -2473,17 +2631,21 @@ class MambaAttnBackend(AttentionBackend):
             extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
             if extend_seq_lens_cpu is None:
                 extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
-            has_initial_states = (
-                extend_prefix_lens > 0 if extend_prefix_lens is not None else None
-            )
+            # Planned once per step (init_forward_metadata); the per-layer
+            # fallback stays for callers that pass their own extend_prefix_lens.
+            has_initial_states = self.forward_metadata.extend_has_initial_states
+            if has_initial_states is None and extend_prefix_lens is not None:
+                has_initial_states = extend_prefix_lens > 0
             need_h_track = (
                 self.forward_metadata.track_ssm_h_src is not None
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             )
 
             # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
-            if extend_seq_lens_cpu is not None:
-                ntok = int(sum(int(x) for x in extend_seq_lens_cpu))
+            ntok = self.forward_metadata.extend_total_tokens
+            if ntok < 0 and extend_seq_lens_cpu is not None:
+                ntok = int(extend_seq_lens_cpu.sum())
+            if ntok >= 0:
                 scrub_padding_tail(ntok, mixed_qkv, a, b)
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)

@@ -1971,6 +1971,13 @@ class ModelExecutor:
                             "mamba_track_pool_indices": self.input_buffers.mamba_track_pool_indices_buf[
                                 :bs
                             ],
+                            # Ragged multi-snapshot destinations; the backend
+                            # falls back to the single-snapshot path when these
+                            # carry nothing extra.
+                            "mamba_track_multi_counts": self.input_buffers.mamba_track_multi_counts_buf[
+                                :bs
+                            ],
+                            "mamba_track_multi_indices": self.input_buffers.mamba_track_multi_indices_buf,
                         }
                         if self.input_buffers.has_mamba
                         else {}

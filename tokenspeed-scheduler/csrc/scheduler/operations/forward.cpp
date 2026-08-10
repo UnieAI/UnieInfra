@@ -950,6 +950,13 @@ static PrefillOperation applyPrefillEvent(Request* request, Event& event, std::s
         if (mamba->HasCheckpoint()) {
             op.mamba_checkpoint_dst_idx = mamba->CheckpointIndex();
         }
+        // Slots already handed to the radix tree by the event applied above.
+        // The tree owns them now, so this is the only record of where the GPU
+        // must write.
+        op.mamba_checkpoint_dst_indices_multi = mamba->PublishedCheckpointIndices();
+        if (op.mamba_checkpoint_dst_idx < 0 && !op.mamba_checkpoint_dst_indices_multi.empty()) {
+            op.mamba_checkpoint_dst_idx = op.mamba_checkpoint_dst_indices_multi.back();
+        }
     }
 
     MaybeFillFlatBlockTables(op, request, flat_group_ids);
@@ -1043,6 +1050,13 @@ static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int3
         if (mamba->HasCheckpoint()) {
             op.mamba_checkpoint_dst_idx = mamba->CheckpointIndex();
         }
+        // Slots already handed to the radix tree by the event applied above.
+        // The tree owns them now, so this is the only record of where the GPU
+        // must write.
+        op.mamba_checkpoint_dst_indices_multi = mamba->PublishedCheckpointIndices();
+        if (op.mamba_checkpoint_dst_idx < 0 && !op.mamba_checkpoint_dst_indices_multi.empty()) {
+            op.mamba_checkpoint_dst_idx = op.mamba_checkpoint_dst_indices_multi.back();
+        }
     }
 
     MaybeFillFlatBlockTables(op, request, flat_group_ids);
@@ -1113,6 +1127,13 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         op.mamba_working_idx = mamba->WorkingIndex();
         if (mamba->HasCheckpoint()) {
             op.mamba_checkpoint_dst_idx = mamba->CheckpointIndex();
+        }
+        // Slots already handed to the radix tree by the event applied above.
+        // The tree owns them now, so this is the only record of where the GPU
+        // must write.
+        op.mamba_checkpoint_dst_indices_multi = mamba->PublishedCheckpointIndices();
+        if (op.mamba_checkpoint_dst_idx < 0 && !op.mamba_checkpoint_dst_indices_multi.empty()) {
+            op.mamba_checkpoint_dst_idx = op.mamba_checkpoint_dst_indices_multi.back();
         }
     }
 

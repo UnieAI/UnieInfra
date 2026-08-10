@@ -141,6 +141,61 @@ std::int32_t MambaCheckpointPublishDepth(tokenspeed::HybridPrefixCache* hybrid_c
     return publish_depth;
 }
 
+// Stride between retained snapshots, in tokens.
+//
+// Reuse on a hybrid is min(KV depth, deepest usable snapshot), so a divergence
+// loses at most one stride of reuse. 512 keeps that loss under ~19% of a
+// 2690-token document while retaining 5 snapshots rather than the 42 the scan
+// actually produces. See unieinfra/xref/35-hybrid-prefix-reuse.md for the
+// stride/cost table.
+constexpr std::int32_t kMambaSnapshotStrideTokens = 512;
+
+// Ceiling on retained snapshots per chunk. The pool is shared with every
+// in-flight sequence's working state, so an unbounded count would let one long
+// document starve the batch. Six covers ~3k tokens at the stride above, which
+// is the document size this was measured on.
+constexpr std::int32_t kMambaSnapshotMaxPerRequest = 6;
+
+// Every depth this chunk should retain a snapshot at, ascending.
+//
+// The last entry is what the old single-snapshot rule published -- one page
+// below the chunk end, which serves an exact repeat. The earlier entries are
+// what makes a *diverging* request find an ancestor at all: they sit on the
+// stride grid, below any plausible divergence point, so a match that stops at
+// the end of a shared document still has a snapshot above it.
+//
+// Every returned depth satisfies the same alignment invariant as the single
+// one: the GPU only leaves intermediate states on its own chunk grain, and a
+// depth off that grain is silently dropped rather than rejected. Getting this
+// wrong publishes nothing at all -- measured, when a 256-token setback was
+// tried, exact repeats stopped reusing too.
+std::vector<std::int32_t> MambaCheckpointPublishDepths(tokenspeed::HybridPrefixCache* hybrid_cache,
+                                                       std::int32_t chunk_begin, std::int32_t chunk_size,
+                                                       std::int32_t page_size, std::int32_t max_count) {
+    std::vector<std::int32_t> depths;
+    if (hybrid_cache == nullptr || chunk_size <= 0 || page_size <= 0 || max_count <= 0) return depths;
+
+    const std::int32_t deepest = MambaCheckpointPublishDepth(hybrid_cache, chunk_begin, chunk_size, page_size);
+    if (deepest < 0) return depths;
+
+    const std::int32_t final_len = chunk_begin + chunk_size;
+    for (std::int32_t depth = kMambaSnapshotStrideTokens; depth < deepest; depth += kMambaSnapshotStrideTokens) {
+        if (depth <= chunk_begin) continue;  // already covered by an earlier chunk
+        if (depth >= final_len) break;
+        const std::int32_t track_len = depth - chunk_begin;
+        if (hybrid_cache->AlignMambaCacheSeqlen(track_len) != track_len) continue;
+        depths.push_back(depth);
+    }
+    depths.push_back(deepest);
+
+    // Keep the deepest ones when the pool is short: a shallow snapshot is worth
+    // less than a deep one to every future match.
+    if (static_cast<std::int32_t>(depths.size()) > max_count) {
+        depths.erase(depths.begin(), depths.end() - max_count);
+    }
+    return depths;
+}
+
 }  // namespace
 
 namespace tokenspeed::fsm {
@@ -235,21 +290,50 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
         *tokens_for_insert, *prefix_pages, std::move(pages_to_insert));
 
     if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
-        const std::int32_t publish_depth =
-            MambaCheckpointPublishDepth(hybrid_cache, chunk_begin, chunk_size, page_size);
-        // SplitAt resolves, or carves out, the ancestor at that exact depth --
-        // Insert leaves one node spanning the whole chunk, so the node a match
-        // will land on usually does not exist yet. Same primitive the
-        // paged-cache snapshot path already uses.
-        TreeNode* attach_node =
-            publish_depth > 0
-                ? hybrid_cache->GetKVPrefixCache().GetRadixTree().SplitAt(insert_result.last_node, publish_depth)
-                : nullptr;
-        if (attach_node != nullptr && !attach_node->HasMamba()) {
-            hybrid_cache->InsertMamba(attach_node, local_mamba_allocator->DetachCheckpoint());
-        } else {
-            local_mamba_allocator->DetachCheckpoint();
+        // How many depths this chunk is worth retaining. Asked for here rather
+        // than at the four allocation sites because only here are chunk_begin
+        // and chunk_size known -- a short prompt wants one snapshot and a long
+        // document wants several, and reserving the maximum per request would
+        // starve a pool shared with every other in-flight sequence.
+        local_mamba_allocator->ClearPublishedCheckpoints();
+        const auto wanted =
+            MambaCheckpointPublishDepths(hybrid_cache, chunk_begin, chunk_size, page_size, kMambaSnapshotMaxPerRequest);
+        const std::int32_t extra = static_cast<std::int32_t>(wanted.size()) - 1;
+        if (extra > 0) {
+            // Best-effort; a refusal here costs reuse depth, not correctness.
+            local_mamba_allocator->AllocateCheckpoints(extra);
         }
+
+        // One slot per depth, ascending, as many as the pool gave us. The
+        // depths and the slots are paired by position and must stay that way:
+        // a slot filed under a depth it does not describe would resume a later
+        // hit from the wrong recurrent state, silently.
+        auto slots = local_mamba_allocator->DetachCheckpoints();
+        const auto publish_depths = MambaCheckpointPublishDepths(
+            hybrid_cache, chunk_begin, chunk_size, page_size, static_cast<std::int32_t>(slots.size()));
+        std::size_t next_slot = 0;
+        for (std::int32_t publish_depth : publish_depths) {
+            if (next_slot >= slots.size()) break;
+            // SplitAt resolves, or carves out, the ancestor at that exact depth
+            // -- Insert leaves one node spanning the whole chunk, so the node a
+            // match will land on usually does not exist yet. Same primitive the
+            // paged-cache snapshot path already uses.
+            TreeNode* attach_node =
+                publish_depth > 0
+                    ? hybrid_cache->GetKVPrefixCache().GetRadixTree().SplitAt(insert_result.last_node, publish_depth)
+                    : nullptr;
+            if (attach_node != nullptr && !attach_node->HasMamba()) {
+                const std::int32_t slot_index = slots[next_slot]->Index();
+                hybrid_cache->InsertMamba(attach_node, std::move(slots[next_slot]));
+                // The operation built after this event is what tells the GPU
+                // where to write; ownership has just moved to the tree, so the
+                // index has to be carried out by hand.
+                local_mamba_allocator->RecordPublishedCheckpoint(slot_index);
+            }
+            ++next_slot;
+        }
+        // Anything left over (no node to attach to, or a node that already had
+        // a state) is released here by going out of scope.
     }
     device_node_ref = std::make_unique<DeviceNodeRef>(insert_result.last_node);
 }

@@ -159,7 +159,7 @@ vLLM 的作法是 `num_output_placeholders`（`v1/core/sched/async_scheduler.py:
 
 **已修**，但沒有照抄 —— 照抄需要在 dispatch 當下送 Finish 事件，而
 `FinishEvent::apply` 直接呼叫 `FreeRequest`
-（`csrc/fsm/forward_events.cpp:601 FinishEvent::apply`），會在 forward 還在飛的時候
+（`csrc/fsm/forward_events.cpp:685 FinishEvent::apply`），會在 forward 還在飛的時候
 釋放該請求的 KV pages。vLLM 靠 `defer_block_free` / `last_sched_seq` 圍欄擋住
 （`v1/core/sched/scheduler.py:1169 _update_after_schedule`），我們沒有那道圍欄。
 
@@ -218,7 +218,7 @@ loadback_diff = match_result.NodesWithout<ResourceType::Device>();
 `disable_kvstore=True` 只讓 rag 從 40.93 → 38.12 ms（2.8 ms），**不是 14 ms**：那些
 搬運大多和 GEMM 重疊。所以「關掉它」不是答案，而且關掉會失去 host 層的容量。
 
-**根因**在 `csrc/fsm/forward_events.cpp:702 WriteBackDoneEvent`，而且原本的註解就寫著
+**根因**在 `csrc/fsm/forward_events.cpp:789 WriteBackDoneEvent`，而且原本的註解就寫著
 後果：「written-back cache demotes to host-only, so the next hit must load back.」
 `DemoteWrittenBackDevice` 沒有任何壓力判斷 —— 每個請求完成後**無條件**把已寫回的頁面
 從 device 釋放。device 層淪為暫存區、host 層才是快取。

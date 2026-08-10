@@ -85,14 +85,29 @@ def build_prompts(
     benchmark measuring nothing but the cache -- 2840 tokens read 18.5 ms where
     a genuine cold prefill of that length costs about 130 ms.
     """
-    if shape == "shared":
+    if shape in ("shared", "rag"):
         shared = " ".join(f"ctx{j}" for j in range(prefix_words))
+        if shape == "rag":
+            # A new question against the same document every round. `shared`
+            # replays the identical prompt and therefore measures an exact
+            # repeat; this is the shape RAG and agent traffic actually has, and
+            # the one that needs a recurrent snapshot above the divergence
+            # point rather than at the end of the previous request.
+            return [
+                shared + " " + " ".join(f"r{round_id}q{i}t{j}" for j in range(32))
+                for i in range(n)
+            ]
         return [
             shared + " " + " ".join(f"q{i}t{j}" for j in range(32)) for i in range(n)
         ]
-    return [
-        " ".join(f"r{round_id}u{i}w{j}" for j in range(prefix_words)) for i in range(n)
-    ]
+    # A short distinct salt in front of a common body. A radix prefix cache keys
+    # on the prefix, so differing at the first token defeats it entirely, while
+    # the body keeps the token count equal to the `shared` shape. Built the
+    # other way -- a wholly different vocabulary per request -- the prompts
+    # tokenised to 5490 tokens against shared's 2840 and the shapes stopped
+    # being comparable.
+    body = " ".join(f"ctx{j}" for j in range(prefix_words))
+    return [f"salt{round_id}n{i} " + body for i in range(n)]
 
 
 class _Result:
@@ -201,7 +216,7 @@ def main() -> int:
         ),
     )
     ap.add_argument("--prefix-words", type=int, default=700)
-    ap.add_argument("--shape", default="shared", choices=("shared", "unique"))
+    ap.add_argument("--shape", default="shared", choices=("shared", "unique", "rag"))
     ap.add_argument("--max-model-len", type=int, default=8192)
     args = ap.parse_args()
 

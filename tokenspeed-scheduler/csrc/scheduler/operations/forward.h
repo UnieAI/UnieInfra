@@ -66,6 +66,10 @@ struct ForwardOperationBase {
     // Mamba extension (default: inactive)
     std::int32_t mamba_working_idx{-1};
     std::int32_t mamba_checkpoint_dst_idx{-1};
+    // Every slot this step published, ascending by depth. `mamba_checkpoint_dst_idx`
+    // stays as the deepest of them so single-snapshot consumers are unaffected;
+    // this vector is what lets the GPU fill all of them in one forward.
+    std::vector<std::int32_t> mamba_checkpoint_dst_indices_multi{};
     std::int32_t mamba_cow_src_idx{-1};
     std::int32_t mamba_branching_seqlen{-1};
 };
@@ -104,6 +108,8 @@ struct FlatForwardOperation {
     // Mamba extension (SoA)
     std::vector<std::int32_t> mamba_working_indices;
     std::vector<std::int32_t> mamba_checkpoint_dst_indices;
+    std::vector<std::int32_t> mamba_checkpoint_multi_counts;
+    std::vector<std::int32_t> mamba_checkpoint_multi_indices;
     std::vector<std::int32_t> mamba_cow_src_indices;
     std::vector<std::int32_t> mamba_branching_seqlens;
 
@@ -142,7 +148,15 @@ struct FlatForwardOperation {
                     begins.push_back(inner.begin);
                     sizes.push_back(inner.size);
                     mamba_working_indices.push_back(inner.mamba_working_idx);
+                    // Flattened as (counts, indices): one count per request,
+                    // then that many indices. A ragged field cannot cross the
+                    // binding as a nested vector without copying per request.
                     mamba_checkpoint_dst_indices.push_back(inner.mamba_checkpoint_dst_idx);
+                    mamba_checkpoint_multi_counts.push_back(
+                        static_cast<std::int32_t>(inner.mamba_checkpoint_dst_indices_multi.size()));
+                    mamba_checkpoint_multi_indices.insert(mamba_checkpoint_multi_indices.end(),
+                                                          inner.mamba_checkpoint_dst_indices_multi.begin(),
+                                                          inner.mamba_checkpoint_dst_indices_multi.end());
                     mamba_cow_src_indices.push_back(inner.mamba_cow_src_idx);
                     mamba_branching_seqlens.push_back(inner.mamba_branching_seqlen);
                     for (auto& [gid, pages] : inner.paged_cache_pages) {

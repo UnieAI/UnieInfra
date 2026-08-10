@@ -36,9 +36,9 @@ CudaGraphMixin`，且 `:69 support_cuda_graph` 明寫只在 decoding context 回
 | 3 | graph 捕捉 | `runtime/execution/cuda_graph_wrapper.py:303 capture` | vLLM compile 期捕捉 | `srt/model_executor/runner/decode_cuda_graph_runner.py:933 capture` | `_torch/pyexecutor/cuda_graph_runner.py:460 capture` | — |
 | 4 | 沒命中的 fallback | 走 eager `_forward_step` | eager / piecewise | eager runner（`srt/model_executor/runner/eager_runner.py`） | eager forward | 無此分支 |
 | 5 | attention（A：full） | `runtime/layers/attention/backends/mha.py:996 forward_decode` | `v1/attention/backends/flash_attn.py` | `srt/layers/attention/triton_backend.py` | `_torch/attention_backend/trtllm.py` | `src/turbomind/models/llama/unified_attention_layer.cc` |
-| 6 | attention（B：GDN） | `runtime/layers/attention/backends/hybrid_linear_attn.py:2161 forward_decode` | `v1/attention/backends/gdn_attn.py` | `srt/layers/attention/linear/gdn_backend.py` | `_torch/modules/fla/` | `src/turbomind/kernels/linear_attn/kernel/sm_120/entry.cu:238 LaunchSm120Recurrent` |
-| 7 | conv1d 狀態更新 | `runtime/layers/attention/backends/hybrid_linear_attn.py:2249 causal_conv1d_update` | 獨立 kernel | 獨立 kernel | 獨立 kernel | 融進 recurrent kernel |
-| 8 | recurrent 掃描 | `runtime/layers/attention/backends/hybrid_linear_attn.py:2311 gdn_decode_step` → `ops/attention/__init__.py:551 gdn_decode_step`（單一融合 kernel，含 L2 norm） | fused recurrent | fused recurrent | fused recurrent | 同 6 |
+| 6 | attention（B：GDN） | `runtime/layers/attention/backends/hybrid_linear_attn.py:2296 forward_decode` | `v1/attention/backends/gdn_attn.py` | `srt/layers/attention/linear/gdn_backend.py` | `_torch/modules/fla/` | `src/turbomind/kernels/linear_attn/kernel/sm_120/entry.cu:238 LaunchSm120Recurrent` |
+| 7 | conv1d 狀態更新 | `runtime/layers/attention/backends/hybrid_linear_attn.py:2598 causal_conv1d_update` | 獨立 kernel | 獨立 kernel | 獨立 kernel | 融進 recurrent kernel |
+| 8 | recurrent 掃描 | `runtime/layers/attention/backends/hybrid_linear_attn.py:2446 gdn_decode_step` → `ops/attention/__init__.py:551 gdn_decode_step`（單一融合 kernel，含 L2 norm） | fused recurrent | fused recurrent | fused recurrent | 同 6 |
 | 9 | MLP / MoE | `runtime/moe/` | `model_executor/layers/fused_moe/` | `srt/layers/moe/` | `_torch/modules/fused_moe/` | `src/turbomind/models/llama/moe_ffn_layer.cc` |
 | 10 | logits | `runtime/layers/logits_processor.py` | `model_executor/layers/logits_processor.py` | `srt/layers/logits_processor.py` | `_torch/pyexecutor/handle_logits.py` | `src/turbomind/models/llama/language_model.cc` |
 | 11 | logits processor / grammar | `runtime/sampling/custom_logit_processor.py`、`runtime/grammar/` | `v1/sample/logits_processor/` | `srt/sampling/custom_logit_processor.py` | `_torch/pyexecutor/guided_decoder.py` | `src/turbomind/generation/logits_processor.cc`、`guided_decoding.cc` |
@@ -77,7 +77,7 @@ vLLM 的 piecewise 沒有這個懸崖，但每段之間有 graph launch 的固�
 ### 2.3 GDN decode 的融合程度
 
 UnieInfra 的 decode 路徑已經是融合的：
-`runtime/layers/attention/backends/hybrid_linear_attn.py:2311 gdn_decode_step` 是單一
+`runtime/layers/attention/backends/hybrid_linear_attn.py:2446 gdn_decode_step` 是單一
 kernel（L2 norm 在 kernel 內），加上 `:2249 causal_conv1d_update` 共 2 個 launch。
 這與 prefill 的 9 個形成對比 —— **同一個模型、同一層，prefill 沒有做 decode 已經做到的
 融合**。

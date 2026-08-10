@@ -44,16 +44,49 @@ public:
     std::int32_t WorkingIndex() const;
     bool HasWorking() const { return working_ != nullptr; }
 
-    bool AllocateCheckpoint();
+    // Recurrent snapshots retained for later prefix reuse.
+    //
+    // More than one, because reuse on a hybrid is min(KV depth, deepest usable
+    // snapshot) and a single snapshot can only sit at one depth. Published at
+    // the end of a request it serves an exact repeat and nothing else: a
+    // request sharing the document but asking a different question matches KV
+    // to the divergence point, which is *above* that snapshot, and gets zero.
+    // See unieinfra/xref/35-hybrid-prefix-reuse.md.
+    //
+    // Allocation is best-effort: these are a cache, so running out of slots
+    // must degrade reuse depth rather than fail the request. Callers get
+    // however many were available, in ascending depth order.
+    bool AllocateCheckpoints(std::int32_t count);
+    std::vector<std::int32_t> CheckpointIndices() const;
+    std::size_t CheckpointCount() const { return checkpoints_.size(); }
+    std::vector<std::unique_ptr<MambaSlot>> DetachCheckpoints();
+
+    // Slots this step actually attached to a radix node, ascending by depth.
+    //
+    // Detaching hands ownership to the tree, so by the time the forward
+    // operation is built the allocator no longer knows which slots it gave
+    // away -- and the operation is what tells the GPU where to write. Without
+    // this the nodes would hold slots that never receive a state, and a later
+    // hit would resume from uninitialised memory. Recorded at attach time, in
+    // the same order as the depths.
+    void RecordPublishedCheckpoint(std::int32_t index) { published_.push_back(index); }
+    const std::vector<std::int32_t>& PublishedCheckpointIndices() const { return published_; }
+    void ClearPublishedCheckpoints() { published_.clear(); }
+
+    // Single-snapshot spellings, kept so callers that only ever want the
+    // deepest one (decode-side tracking, retract) stay unchanged.
+    bool AllocateCheckpoint() { return AllocateCheckpoints(1); }
     std::int32_t CheckpointIndex() const;
-    bool HasCheckpoint() const { return checkpoint_ != nullptr; }
+    bool HasCheckpoint() const { return !checkpoints_.empty(); }
     std::unique_ptr<MambaSlot> DetachCheckpoint();
+
     std::unique_ptr<MambaSlot> DetachWorking();
 
 private:
     MambaChunkAllocator* allocator_;
     std::unique_ptr<MambaSlot> working_{};
-    std::unique_ptr<MambaSlot> checkpoint_{};
+    std::vector<std::unique_ptr<MambaSlot>> checkpoints_{};
+    std::vector<std::int32_t> published_{};
 };
 
 }  // namespace tokenspeed

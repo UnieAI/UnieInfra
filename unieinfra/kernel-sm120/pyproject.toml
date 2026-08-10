@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "unieinfra-kernel-sm120"
 version = "0.2.0"
 description = "Out-of-tree tokenspeed-kernel plugins for NVIDIA sm_120"
+license = "AGPL-3.0-or-later"
+license-files = ["../LICENSE"]
 requires-python = ">=3.10"
 # tokenspeed-kernel's plugin contract is documented as experimental and free to
 # change without notice, so this pins a lower bound and expects to be re-checked

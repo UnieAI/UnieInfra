@@ -242,6 +242,42 @@ class RMSNorm(torch.nn.Module):
         return result, None, None
 
 
+class RMSNormWithoutScale(torch.nn.Module):
+    """RMSNorm with no learnable weight (``with_scale=False``).
+
+    Gemma 4 applies this to the value stream (``v_norm``). There is no
+    parameter to load, so unlike :class:`RMSNorm` this module holds no state
+    beyond ``eps``.
+
+    The reduction runs in float32 and the result is cast back to the input
+    dtype, matching the HF reference.
+
+    Args:
+        eps: Added to the mean square before the reciprocal square root.
+    """
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize over the last dimension.
+
+        Args:
+            x: Any shape; the last dimension is reduced.
+
+        Returns:
+            A tensor of the same shape and dtype as ``x``.
+        """
+        orig_dtype = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+        return xf.to(orig_dtype)
+
+    def extra_repr(self) -> str:
+        return f"eps={self.variance_epsilon}"
+
+
 class GemmaRMSNorm(torch.nn.Module):
     def __init__(
         self,

@@ -40,19 +40,44 @@ std::int32_t LocalMambaAllocator::WorkingIndex() const {
     return working_ ? working_->Index() : -1;
 }
 
-bool LocalMambaAllocator::AllocateCheckpoint() {
-    auto slot = allocator_->Allocate();
-    if (!slot.has_value()) return false;
-    checkpoint_ = std::make_unique<MambaSlot>(std::move(*slot));
-    return true;
+bool LocalMambaAllocator::AllocateCheckpoints(std::int32_t count) {
+    if (count <= 0) return false;
+    for (std::int32_t i = 0; i < count; ++i) {
+        auto slot = allocator_->Allocate();
+        // Best-effort: stop at the first refusal and keep what we have. These
+        // are cache entries, so a short pool costs reuse depth, never
+        // correctness -- the caller publishes as many depths as it got slots.
+        if (!slot.has_value()) break;
+        checkpoints_.push_back(std::make_unique<MambaSlot>(std::move(*slot)));
+    }
+    return !checkpoints_.empty();
+}
+
+std::vector<std::int32_t> LocalMambaAllocator::CheckpointIndices() const {
+    std::vector<std::int32_t> indices;
+    indices.reserve(checkpoints_.size());
+    for (const auto& slot : checkpoints_) {
+        indices.push_back(slot ? slot->Index() : -1);
+    }
+    return indices;
+}
+
+std::vector<std::unique_ptr<MambaSlot>> LocalMambaAllocator::DetachCheckpoints() {
+    return std::move(checkpoints_);
 }
 
 std::int32_t LocalMambaAllocator::CheckpointIndex() const {
-    return checkpoint_ ? checkpoint_->Index() : -1;
+    // The deepest one: publish order is ascending depth, so the last slot is
+    // the one a single-snapshot caller means.
+    if (checkpoints_.empty() || checkpoints_.back() == nullptr) return -1;
+    return checkpoints_.back()->Index();
 }
 
 std::unique_ptr<MambaSlot> LocalMambaAllocator::DetachCheckpoint() {
-    return std::move(checkpoint_);
+    if (checkpoints_.empty()) return nullptr;
+    auto slot = std::move(checkpoints_.back());
+    checkpoints_.pop_back();
+    return slot;
 }
 
 std::unique_ptr<MambaSlot> LocalMambaAllocator::DetachWorking() {

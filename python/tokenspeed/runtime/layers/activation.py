@@ -41,8 +41,11 @@ _is_amd = current_platform().is_amd
 if _is_amd:
     from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
+    # No Triton GeGLU on the AMD path; GeluTanhAndMul falls back to native.
+    gelu_tanh_and_mul = None
 else:
     from tokenspeed_kernel.ops.activation.flashinfer import (
+        gelu_tanh_and_mul,
         silu_and_mul,
     )
 
@@ -88,6 +91,31 @@ class SiluAndMul(torch.nn.Module):
         d = x.shape[-1] // 2
         out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
         return silu_and_mul(x, out, enable_pdl=pdl_enabled())
+
+
+class GeluTanhAndMul(torch.nn.Module):
+    """GeGLU gated activation over a fused ``[..., gate | up]`` input.
+
+    Computes ``gelu(gate, approximate="tanh") * up``, the activation Gemma 3
+    and Gemma 4 use (``hidden_activation="gelu_pytorch_tanh"``).
+
+    On NVIDIA CUDA tensors this is one fused kernel launch; elsewhere (AMD,
+    CPU, meta) it falls back to the native chunk/gelu/multiply, which allocates
+    an extra intermediate but is numerically the reference.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] % 2 != 0:
+            raise ValueError(
+                f"GeGLU expects an even [gate, up] width, got {x.shape[-1]}"
+            )
+        d = x.shape[-1] // 2
+        if x.is_cuda and not _is_amd:
+            out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+            gelu_tanh_and_mul(x, out, enable_pdl=pdl_enabled())
+            return out
+        gate, up = x[..., :d], x[..., d:]
+        return torch.nn.functional.gelu(gate, approximate="tanh") * up
 
 
 class SituAndMul(torch.nn.Module):

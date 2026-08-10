@@ -394,6 +394,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
         .def_ro("mamba_track_pool_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
+        // Ragged, flattened as (counts, indices): counts[i] slots for request i,
+        // then that many entries in indices. Ascending by snapshot depth.
+        .def_ro("mamba_track_pool_counts_multi", &tokenspeed::FlatForwardOperation::mamba_checkpoint_multi_counts)
+        .def_ro("mamba_track_pool_indices_multi",
+                &tokenspeed::FlatForwardOperation::mamba_checkpoint_multi_indices)
         .def_ro("mamba_cow_src_indices", &tokenspeed::FlatForwardOperation::mamba_cow_src_indices)
         .def_ro("mamba_branching_seqlens", &tokenspeed::FlatForwardOperation::mamba_branching_seqlens);
 

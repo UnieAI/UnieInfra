@@ -226,14 +226,28 @@ def main() -> int:
     if backend == "vllm":
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-        engine = AsyncLLMEngine.from_engine_args(
-            AsyncEngineArgs(
-                model=args.model,
-                dtype="bfloat16",
-                max_model_len=args.max_model_len,
-                gpu_memory_utilization=float(os.environ.get("BENCH_GPU_UTIL", "0.88")),
-            )
+        # Prefix caching must be asked for explicitly. Qwen3.5/3.6 hybrids
+        # declare IsHybrid without MambaPrefixCaching, so vLLM resolves
+        # enable_prefix_caching=False for them -- with no warning. Leaving it at
+        # the default measures the reference engine with its cache switched off,
+        # which is not a comparison. Dense Qwen3 already resolves True, so
+        # passing it is a no-op there.
+        engine_args = AsyncEngineArgs(
+            model=args.model,
+            dtype="bfloat16",
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=float(os.environ.get("BENCH_GPU_UTIL", "0.88")),
+            enable_prefix_caching=True,
         )
+        engine = AsyncLLMEngine.from_engine_args(engine_args)
+        # The *resolved* value, not the requested one: a model that does not
+        # support the feature has it turned back off here, silently, and asking
+        # engine_args would report the request rather than what is running.
+        cfg = getattr(engine, "vllm_config", None)
+        resolved = getattr(
+            getattr(cfg, "cache_config", None), "enable_prefix_caching", "?"
+        )
+        print(f"  vllm enable_prefix_caching={resolved} (requested True)")
         runner = _run_vllm
     else:
         from tokenspeed.runtime.entrypoints.engine import Engine

@@ -214,6 +214,13 @@ def main() -> int:
     ap.add_argument("--prefix-words", type=int, default=700)
     ap.add_argument("--shape", default="shared", choices=("shared", "unique"))
     ap.add_argument("--max-model-len", type=int, default=8192)
+    # Mixed prefill+decode batching only has an effect where prefill and decode
+    # coexist in the same step, which needs a queue -- so this harness is the
+    # one that can measure it and `e2e_concurrency.py` is not. Measured on
+    # Qwen3.5-27B: closed-loop at concurrency 16 and 32, on vs off is 231.3 vs
+    # 231.5 and 312.2 vs 313.3 tok/s -- indistinguishable, because every round
+    # prefills as one wave and then decodes as one wave.
+    ap.add_argument("--enable-mixed-batch", action="store_true")
     args = ap.parse_args()
 
     backend = os.environ.get("BACKEND", "tokenspeed")
@@ -222,21 +229,37 @@ def main() -> int:
     if backend == "vllm":
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
+        # Prefix caching must be asked for explicitly, and the *resolved* value
+        # printed. Qwen3.5/3.6 hybrids declare IsHybrid without
+        # MambaPrefixCaching, so vLLM resolves enable_prefix_caching=False for
+        # them with no warning: leaving it at the default measures the
+        # reference engine with its cache switched off, which is not a
+        # comparison. Same fix as `e2e_concurrency.py`; this harness predates it.
         engine = AsyncLLMEngine.from_engine_args(
             AsyncEngineArgs(
                 model=args.model,
                 dtype="bfloat16",
                 max_model_len=args.max_model_len,
                 gpu_memory_utilization=float(os.environ.get("BENCH_GPU_UTIL", "0.88")),
+                enable_prefix_caching=True,
             )
         )
+        cfg = getattr(engine, "vllm_config", None)
+        resolved = getattr(
+            getattr(cfg, "cache_config", None), "enable_prefix_caching", "?"
+        )
+        print(f"  vllm enable_prefix_caching={resolved} (requested True)")
         loop = asyncio.new_event_loop()
     else:
         from tokenspeed.runtime.entrypoints.engine import Engine
 
         engine = Engine(
-            model=args.model, dtype="bfloat16", max_model_len=args.max_model_len
+            model=args.model,
+            dtype="bfloat16",
+            max_model_len=args.max_model_len,
+            **({"enable_mixed_batch": True} if args.enable_mixed_batch else {}),
         )
+        print(f"  tokenspeed enable_mixed_batch={args.enable_mixed_batch}")
         loop = None
 
     print(

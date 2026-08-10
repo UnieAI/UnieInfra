@@ -164,23 +164,54 @@ descriptor 準備、segment state 修正）。判準寫在 `src/turbomind/kernel
 其他四家沒有這個切換 —— Triton 版的 grid 直接由 `cu_seqlens` 決定，varlen batch 不平衡
 時就是長尾。
 
-### 4.3 mixed batch 裡 prefill 與 decode 的切分順序
+### 4.3 GDN 路徑上的 mixed batch —— 四家全表
 
-這就是 `AGENTS.local.md` 記的那一條，屬於 **kernel 側**（不是 `20-scheduler.md` 的排程
-優先權）：
+屬於 **kernel／layer 側**（不是 `20-scheduler.md` 的排程優先權，兩者同名不同事）。
 
-- TurboMind 把 recurrent（decode）與 chunked（prefill）**分派到兩條 stream**
-  （`src/turbomind/models/llama/GatedDeltaNetLayer.cc:440 chunk_stream`），兩段可以重疊；
-- 其他四家在同一條 stream 上依序做兩段。
+| | conv1d | recurrent kernel | split 在哪 | 段序 | split 何時算 |
+|---|---|---|---|---|---|
+| vLLM | **不切**（`model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1360 causal_conv1d_fn`，`causal_conv1d_update` 在 `elif`，只有 `num_prefills == 0` 才走） | 切（`:1395 split_non_spec`） | mixer `:1260 _forward_core` + metadata builder `v1/attention/backends/gdn_attn.py:333` | **decode 前**（`v1/attention/backends/utils.py:707`） | **每 step 一次** |
+| SGLang | **不切**（`srt/layers/attention/linear/gdn_backend.py:563 causal_conv1d_fn`） | **不切**（`:657` 一次 `chunk_gated_delta_rule` 吃全批） | **沒有 split**。decode row = `extend_len 1` + `prefix_len > 0`（`srt/managers/schedule_batch.py:2724`） | prefill 前（row 順序，非 split） | — |
+| TRT-LLM | **切 —— 四家唯一**（`_torch/modules/mamba/gdn_mixer.py:793 causal_conv1d_fn` / `:833`） | 不切（`:1026-1042`） | mixer `:1073 forward_core()` | prefill 前（`:1094`） | **每層** |
+| TurboMind | **不切**（`src/turbomind/models/llama/GatedDeltaNetLayer.cc:393`，contract 見 `src/turbomind/models/llama/gated_delta_net_kernels.h:11`） | 切（兩個 `Plan`，`:285-307`） | layer `:258-262 Setup()`，host 端零 device sync | generation 前（`src/turbomind/engine/engine.cc:541`） | 每層，但 host 端 |
+| **UnieInfra** | **不切** | **不切** | **沒有 split**（S1，見下） | prefill 前 | 每 step 一次（`hybrid_linear_attn.py` `_whole_batch_prefix_lens`） |
 
-TurboMind 另外一項：傳 offset 而不是實體化 slice（`args.q_offsets` 一路傳到 kernel），
-省掉一整類對齊 bug 與一次 gather。
+**三個結論**
 
-### 4.4 conv1d 要不要切
+1. **三比一不切 conv1d。** 唯一切的 TRT-LLM 為此付出 `fused_gdn_post_conv` 另配 5 個張量、
+   對全部 token 再走一遍（`_torch/modules/mamba/fuse_elementwise_ops.py:389`），純粹為了把 conv split 造成的
+   layout 分歧補回來。兩家共同的不變量是：`causal_conv1d_fn` 的 `query_start_loc` /
+   `cache_indices` / `has_initial_state` /（vLLM 另有）`nums_dict` 必須描述**同一組 row**，
+   而那組 row 是**整個 batch、不 rebase**。
+2. **沒有一家同時切 conv 與 recurrent**（除 TRT-LLM 的 spec verify 路徑）。本引擎曾經在
+   attention backend 層把整個 forward 一刀切下去，那是四家都沒有的結構，也是
+   「每修一個冒出下一個」的來源，終點是 extend 半邊 `causal_conv1d_fn` 在 bs=16（而非 bs=8）
+   的 illegal memory access。S1 改為不切，那個位置因此不存在。
+3. **段序 2:2，是選擇不是需求。** 本引擎維持 prefill-first，與 TRT-LLM／SGLang 同邊。
+   這一邊有結構紅利：prefill 在前時**前綴切片本身就是 rebase**
+   （`query_start_loc[:num_prefill+1]` 天生從 0 起算），整條路徑不需要任何算術 rebase。
 
-`AGENTS.local.md` 記錄：vLLM 的 GDN 路徑**不切 convolution**，而 mamba2 路徑會切。
-本表確認 vLLM 的 GDN 走的是 `qwen_gdn_linear_attn.py`，與 `mamba2` 是不同檔案 ——
-survey 時讀錯檔案會得到相反的結論。
+**只有 TurboMind 有的兩項**（本引擎的 optimize 候選，見 plan S2/S3）：
+
+- 傳絕對 offset 而非實體化 slice —— chunked 半邊拿到**完整**的 `q/k/v/g/beta/out`
+  （`src/turbomind/models/llama/GatedDeltaNetLayer.cc:492`），只有 `q_offsets` 取一個 view（`:487-488`），值不 rebase。
+  「沒有東西要減，就沒有地方會忘記減」。
+- 兩條 stream 重疊（`:436-440` fork / `:506-507` join，aux stream 優先權 -1 跑 prefill）。
+  共用物件逐項稽核不相交，**無隱藏依賴**；會吃掉增益的是 SM 競爭、per-layer fork/join
+  粒度、以及 recurrent 每層在 host 端重編 TMA descriptor（`src/turbomind/kernels/linear_attn/kernel/sm_120/recurrent.cu:848`）。
+
+**一個要避開的形狀**：TurboMind 的 conv1d 用 `avg_seq = total_tokens / batch_size` 挑變體
+（`src/turbomind/models/llama/gated_delta_net_kernels.cu:467`），大量 decode row 會把平均拉低、逼含長 prefill 的
+batch 走 `NUM_TOKENS==1` 變體 —— GDN 路徑上唯一「混批讓 kernel 選錯」的地方。
+
+### 4.4 讀錯表親模組的兩次紀錄
+
+vLLM 的 GDN 走 `qwen_gdn_linear_attn.py`，與 `mamba2` 是不同檔案，兩者對「要不要切
+convolution」的答案相反 —— 第一次 survey 讀了 `mamba_mixer2.py`，得到相反結論。
+
+第二次同樣的錯：「SGLang split prefill-first」讀的是 `srt/layers/attention/linear/lightning_backend.py:170`，
+那是 Lightning/Bailing linear attention（MiniMax/Ling 家族）。SGLang 的 GDN 是
+`srt/layers/attention/linear/gdn_backend.py`，**沒有 split 可以排序**。
 
 ---
 

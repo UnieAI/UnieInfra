@@ -380,7 +380,17 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    // A first chunk takes a working slot and a checkpoint slot, both mandatory.
+    // Admission gates NEW work only. A request already in flight must always be
+    // allowed to advance: decode is the only path that ever frees a slot, so
+    // gating it on spare capacity deadlocks a full pool -- nothing can progress,
+    // so nothing is released, so nothing can progress. Observed as a 0%-GPU
+    // stall on the first attempt at this.
+    //
+    // Two slots because a first chunk takes a working slot and a checkpoint
+    // slot, both mandatory. Later chunks and decode take one checkpoint each
+    // and are NOT gated; they still throw if the pool is empty, which is the
+    // remaining hole -- the honest fix is a per-request reservation for the
+    // whole lifetime, not a per-step check.
     if (!hasMambaCapacity(2)) return {};
     MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
                                                     : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
@@ -564,8 +574,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event,
     std::map<std::string, std::int32_t>& simulated_free) {
-    // The working slot is already held; this chunk takes one more checkpoint.
-    if (!hasMambaCapacity(1)) return {};
     std::int32_t unscheduled = request->UnScheduledPrefillSize();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
 
@@ -640,7 +648,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
                                                                   std::map<std::string, std::int32_t>& simulated_free) {
-    if (!hasMambaCapacity(1)) return {};
     std::int32_t tail_available = request->TailPageAvailableTokens();
     std::int32_t extra_tokens = std::max(0, request->GetReserveNumTokensInNextScheduleEvent() - tail_available);
     std::int32_t pages_needed = (extra_tokens + config_.block_size - 1) / config_.block_size;

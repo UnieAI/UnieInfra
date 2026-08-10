@@ -23,7 +23,8 @@
 
 namespace tokenspeed {
 
-LocalMambaAllocator::LocalMambaAllocator(MambaChunkAllocator* allocator) : allocator_{allocator} {}
+LocalMambaAllocator::LocalMambaAllocator(MambaChunkAllocator* allocator, MambaChunkAllocator* checkpoint_allocator)
+    : allocator_{allocator}, checkpoint_allocator_{checkpoint_allocator != nullptr ? checkpoint_allocator : allocator} {}
 
 bool LocalMambaAllocator::AllocateWorking() {
     auto slot = allocator_->Allocate();
@@ -43,7 +44,7 @@ std::int32_t LocalMambaAllocator::WorkingIndex() const {
 bool LocalMambaAllocator::AllocateCheckpoints(std::int32_t count) {
     if (count <= 0) return false;
     for (std::int32_t i = 0; i < count; ++i) {
-        auto slot = allocator_->Allocate();
+        auto slot = checkpoint_allocator_->Allocate();
         // Best-effort: stop at the first refusal and keep what we have. These
         // are cache entries, so a short pool costs reuse depth, never
         // correctness -- the caller publishes as many depths as it got slots.

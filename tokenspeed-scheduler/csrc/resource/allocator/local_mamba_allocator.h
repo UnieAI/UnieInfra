@@ -31,7 +31,11 @@ class MambaChunkAllocator;
 
 class LocalMambaAllocator {
 public:
-    explicit LocalMambaAllocator(MambaChunkAllocator* allocator);
+    // Two pools, because the two things have different lifetimes: `allocator`
+    // serves this request's working state, `checkpoint_allocator` serves the
+    // snapshots it hands to the radix tree. Passing the same pointer for both
+    // is the old single-pool arrangement and is still supported.
+    explicit LocalMambaAllocator(MambaChunkAllocator* allocator, MambaChunkAllocator* checkpoint_allocator = nullptr);
     ~LocalMambaAllocator() = default;
 
     LocalMambaAllocator(LocalMambaAllocator&&) noexcept = default;
@@ -84,6 +88,7 @@ public:
 
 private:
     MambaChunkAllocator* allocator_;
+    MambaChunkAllocator* checkpoint_allocator_;
     std::unique_ptr<MambaSlot> working_{};
     std::vector<std::unique_ptr<MambaSlot>> checkpoints_{};
     std::vector<std::int32_t> published_{};

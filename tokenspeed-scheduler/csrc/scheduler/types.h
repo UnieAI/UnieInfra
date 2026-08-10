@@ -133,6 +133,13 @@ struct SchedulerConfig {
     std::int32_t mamba_pool_total_chunks{0};
     bool enable_mamba_l2{false};
     std::int32_t mamba_l2_host_slots{0};
+    // Slots in the *checkpoint* pool, a second index space for tree-owned
+    // snapshots. Zero keeps the old arrangement, where a retained snapshot is
+    // taken from the same pool a running sequence draws its working and
+    // checkpoint slots from -- which is what made retaining several per chunk
+    // fail at 64 concurrent requests. Non-zero means the radix allocates here
+    // instead and a cached state can never starve a live one.
+    std::int32_t mamba_ckpt_pool_slots{0};
 };
 
 }  // namespace tokenspeed

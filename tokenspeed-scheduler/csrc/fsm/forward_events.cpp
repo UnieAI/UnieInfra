@@ -442,7 +442,11 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator;
     if (mamba_allocator_ != nullptr) {
-        local_mamba_allocator = std::make_unique<LocalMambaAllocator>(mamba_allocator_);
+        // Snapshots come from the checkpoint pool when one is configured, so a
+        // cached state cannot take the slot a running sequence needs.
+        local_mamba_allocator = std::make_unique<LocalMambaAllocator>(
+            mamba_allocator_,
+            hybrid_prefix_cache_ != nullptr ? hybrid_prefix_cache_->CheckpointAllocator() : nullptr);
         if (!AllocateMambaWorkingOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
             throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba working slot");
         }
@@ -691,7 +695,9 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
     old_mamba_allocator.reset();
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator;
     if (mamba_allocator_ != nullptr) {
-        local_mamba_allocator = std::make_unique<LocalMambaAllocator>(mamba_allocator_);
+        // Snapshots come from the checkpoint pool when one is configured, so a
+        // cached state cannot take the slot a running sequence needs.
+        local_mamba_allocator = std::make_unique<LocalMambaAllocator>(mamba_allocator_, mamba_ckpt_allocator_);
         if (!local_mamba_allocator->AllocateWorking()) {
             throw std::logic_error("ScheduleDecodeFromRetractedEvent: failed to allocate Mamba recovery working slot");
         }

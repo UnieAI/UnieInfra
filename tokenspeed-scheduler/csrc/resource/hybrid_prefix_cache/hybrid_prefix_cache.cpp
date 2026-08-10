@@ -94,11 +94,15 @@ const TreeNode* FindExactRadixNode(const KVPrefixCache& cache,
 }  // namespace
 
 HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
-                                     std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator)
+                                     std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator,
+                                     MambaChunkAllocator* mamba_ckpt_allocator)
     : kv_prefix_cache_{kv_prefix_cache},
       mamba_allocator_{mamba_allocator},
+      mamba_ckpt_allocator_{mamba_ckpt_allocator},
       mamba_host_allocator_{mamba_host_allocator},
-      mamba_eviction_manager_{mamba_allocator},
+      // Eviction is a question about the pool the tree allocates from, so it
+      // follows the checkpoint pool wherever one exists.
+      mamba_eviction_manager_{mamba_ckpt_allocator != nullptr ? mamba_ckpt_allocator : mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
 
 HybridPrefixCache::~HybridPrefixCache() {

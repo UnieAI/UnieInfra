@@ -146,6 +146,35 @@ def test_int8_is_smaller_than_the_active_state_it_replaces():
     assert ckpt_bytes_per_slot < active_bytes_per_slot
 
 
+def test_per_layer_round_trip_matches_the_whole_pool_one():
+    """The per-layer path is an addition, so it has to agree with the ported
+    whole-pool path rather than quietly diverge from it."""
+    torch.manual_seed(2)
+    pool = _pool()
+    ssm = torch.randn(L, 6, H, DV, DK, dtype=torch.float32)
+    conv = torch.randn(L, 6, 5, 7, dtype=torch.float32)
+
+    src = torch.tensor([1, 3], dtype=torch.int64)
+    whole = pool.alloc(2)
+    per_layer = pool.alloc(2)
+    assert whole is not None and per_layer is not None
+
+    pool.store_from_active(ssm, [conv], src, whole)
+    for layer in range(L):
+        pool.store_layer_from_active(layer, ssm[layer], conv[layer], src, per_layer)
+
+    assert torch.equal(pool.temporal.qdata[:, whole], pool.temporal.qdata[:, per_layer])
+    assert torch.equal(pool.temporal.scale[:, whole], pool.temporal.scale[:, per_layer])
+    assert torch.equal(pool.conv[0][:, whole], pool.conv[0][:, per_layer])
+
+    dst = torch.tensor([0, 5], dtype=torch.int64)
+    for layer in range(L):
+        pool.load_layer_to_active(layer, ssm[layer], conv[layer], per_layer, dst)
+    assert torch.equal(conv[:, dst], conv[:, src])
+    err = (ssm[:, dst] - ssm[:, src]).abs().max()
+    assert err < 0.02 * ssm[:, src].abs().max()
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_scale_follows_the_state_dtype(dtype):
     """Quantize and dequantize must use the identical scale, which is why the

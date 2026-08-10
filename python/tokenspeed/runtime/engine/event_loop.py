@@ -491,6 +491,13 @@ class EventLoop:
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            # Non-zero moves tree-owned snapshots into their own index space,
+            # so the cache stops competing with running sequences for slots.
+            mamba_ckpt_pool_slots=(
+                int(server_args.int8_mamba_ckpt_size or (2 * mamba_pool_total_chunks))
+                if (has_mamba and server_args.enable_int8_mamba_checkpoint)
+                else 0
+            ),
             enable_mamba_l2=server_args.enable_mamba_l2,
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,

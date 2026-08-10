@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -259,62 +258,42 @@ def _prepare_gdn_decode_state_path(
     return initial_state_indices, output_state_indices, solution
 
 
-def _rebase_scalar_kwargs(kwargs: dict, n_tokens: int) -> dict:
-    """Fix the scalar token counts a per-token slice cannot reach.
+def _whole_batch_prefix_lens(
+    seq_lens: torch.Tensor, extend_lens: torch.Tensor, bs: int
+) -> torch.Tensor:
+    """Prefix length of every request in the plan, decode tail included.
 
-    ``_slice_token_kwargs`` selects by shape, so an ``int`` passes through
-    untouched -- and the recurrent layer hands down ``seq_len``, the *whole*
-    batch's token count, which each half then uses to bound its own output.
-    On the extend half that overruns the sliced tensor by exactly the decode
-    tail (5353 against 5352 rows measured on Qwen3.5-27B at bs=16), and on the
-    decode half by three orders of magnitude.
+    A MIXED plan is ``[0, num_extends)`` extending followed by
+    ``[num_extends, bs)`` decoding, and the caller's ``extend_prefix_lens``
+    kwarg is sized to the extend segment alone. Everything the recurrent path
+    indexes by request -- the conv kernel's ``has_initial_state``, the gathered
+    recurrent state ``ssm_states[cache_indices]`` -- is sized to ``bs``, so the
+    short array is a row-count mismatch waiting to happen:
 
-    An overrun of one row is not reliably fatal -- it reads whatever the
-    allocator put next -- which is why this survived bs=8 and faulted at bs=16
-    with an illegal memory access rather than a wrong answer at both.
+        RuntimeError: The size of tensor a (2) must match the size of
+        tensor b (6) at non-singleton dimension 0
 
-    Args:
-        kwargs: The forward's keyword arguments, already token-sliced.
-        n_tokens: Token count of this half.
+    ``seq_lens[i] == prefix[i] + extend[i]`` holds for every row, and a decode
+    row contributes exactly one query token, so subtracting the whole-batch
+    ``extend_lens`` yields the whole-batch prefix directly. On a pure EXTEND
+    plan this reproduces the caller's array exactly, so there is no MIXED
+    special case to keep in sync.
 
-    Returns:
-        A new dict with the scalar token counts rebased.
-    """
-    out = dict(kwargs)
-    if "seq_len" in out:
-        out["seq_len"] = n_tokens
-    return out
-
-
-def _slice_token_kwargs(kwargs: dict, start: int, stop, total: int) -> dict:
-    """Slice the per-token entries of a forward's kwargs to ``[start, stop)``.
-
-    Selecting by shape rather than by name: the recurrent forward takes a
-    growing set of per-token tensors (the gate ``z``, cache write locations,
-    …) alongside per-request and scalar ones, and a name list would go stale
-    silently -- a missed entry is a wrong answer, not an error.
-
-    A tensor is per-token exactly when its leading dimension is the batch's
-    total query-token count. Per-request tensors are shorter (they are handled
-    by ``MambaForwardMetadata.segment``) and scalars have no shape.
+    This is the invariant vLLM and SGLang both hold on their GDN paths: the
+    conv kernel's ``query_start_loc`` / ``cache_indices`` / ``has_initial_state``
+    describe one and the same row set, and that row set is the whole batch
+    (``qwen_gdn_linear_attn.py:1360-1375``, ``gdn_backend.py:563``). Neither
+    engine splits the convolution.
 
     Args:
-        kwargs: The forward's keyword arguments.
-        start: First token index to keep.
-        stop: One past the last, or None for "to the end".
-        total: The batch's total query-token count.
+        seq_lens: Total length of each request after this step, ``[>= bs]``.
+        extend_lens: Query tokens contributed by each request, ``[bs]`` int32.
+        bs: Request count of the plan.
 
     Returns:
-        A new dict with per-token tensors sliced and everything else as-is.
+        ``[bs]`` int32 prefix lengths, on ``extend_lens``' device.
     """
-    out = {}
-    for key, val in kwargs.items():
-        if torch.is_tensor(val) and val.dim() >= 1 and val.shape[0] == total:
-            seg = val[start:stop]
-            out[key] = seg if start == 0 else seg.clone()
-        else:
-            out[key] = val
-    return out
+    return seq_lens[:bs].to(extend_lens.dtype) - extend_lens
 
 
 @dataclass
@@ -323,6 +302,9 @@ class MambaForwardMetadata:
     mamba_cache_indices: torch.Tensor
     mamba_output_indices: torch.Tensor | None = None
     mamba_req_pool_indices: torch.Tensor | None = None
+    # Per-request, sized to the WHOLE plan (`bs`) on EXTEND and MIXED alike --
+    # not to the extend segment, which is what the caller's kwarg of the same
+    # name carries. See `_whole_batch_prefix_lens`.
     extend_prefix_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
     # Pre-computed src/dst indices for extracting Mamba prefix-cache snapshots.
@@ -349,78 +331,6 @@ class MambaForwardMetadata:
     # the legacy state-slab path).
     state_in_pages_by_group: dict[str, torch.Tensor] | None = None
     state_out_pages_by_group: dict[str, torch.Tensor] | None = None
-
-    def segment(self, start: int, stop: int) -> "MambaForwardMetadata":
-        """A view of requests ``[start, stop)``, for serving a MIXED batch.
-
-        The linear kernels take one batch of uniform kind: a MIXED plan has to
-        be split and each half run down its own path, the way
-        ``MHAAttnBackend._forward_mixed`` does for full attention. This produces
-        the per-half metadata for that.
-
-        Per-request tensors are sliced. ``query_start_loc`` is a cumulative
-        offset array of length ``bs + 1``, so it is sliced *and rebased* to
-        start at zero -- the segment's kernels index the segment's own packed
-        q/k/v, not the whole batch's.
-
-        ``extend_prefix_lens`` and ``extend_seq_lens_cpu`` already describe the
-        extend segment alone, so they pass through for a segment that starts at
-        0 and are dropped for one that does not.
-
-        Args:
-            start: First request index in the segment.
-            stop: One past the last request index.
-
-        Returns:
-            A new ``MambaForwardMetadata`` covering only those requests.
-        """
-
-        # `.clone()`, not `.contiguous()`: a slice along the leading dimension
-        # is *already* contiguous by PyTorch's definition, so `.contiguous()`
-        # returns the same view and the data pointer keeps its byte offset. The
-        # recurrent kernels reject that:
-        #   ValueError: Misaligned Tensor data on argument #9 when calling
-        #   run_gdn_decode_kernel_small_batch_pretranspose(...)
-        # Only the tail segment needs it -- a segment starting at 0 shares the
-        # base pointer -- and these are per-request index tensors, one element
-        # per sequence, so the copy is negligible.
-        def _rows(t):
-            if t is None:
-                return None
-            seg = t[start:stop]
-            return seg if start == 0 else seg.clone()
-
-        def _rows_by_group(d):
-            if d is None:
-                return None
-            return {k: _rows(v) for k, v in d.items()}
-
-        qsl = self.query_start_loc
-        if qsl is not None:
-            qsl = qsl[start : stop + 1] - qsl[start]  # arithmetic already copies
-
-        is_head = start == 0
-        return MambaForwardMetadata(
-            query_start_loc=qsl,
-            mamba_cache_indices=_rows(self.mamba_cache_indices),
-            mamba_output_indices=_rows(self.mamba_output_indices),
-            mamba_req_pool_indices=_rows(self.mamba_req_pool_indices),
-            extend_prefix_lens=self.extend_prefix_lens if is_head else None,
-            extend_seq_lens_cpu=self.extend_seq_lens_cpu if is_head else None,
-            # The track_* arrays are prefix-snapshot src/dst pairs, indexed by
-            # their own layout rather than by request, so they are not sliced.
-            # They are only produced on the extend path, hence head-only.
-            track_ssm_h_src=self.track_ssm_h_src if is_head else None,
-            track_ssm_h_src_fla=self.track_ssm_h_src_fla if is_head else None,
-            track_ssm_h_dst=self.track_ssm_h_dst if is_head else None,
-            track_conv_indices=self.track_conv_indices if is_head else None,
-            track_ssm_final_src=self.track_ssm_final_src if is_head else None,
-            track_ssm_final_dst=self.track_ssm_final_dst if is_head else None,
-            state_in_pages=_rows(self.state_in_pages),
-            state_out_pages=_rows(self.state_out_pages),
-            state_in_pages_by_group=_rows_by_group(self.state_in_pages_by_group),
-            state_out_pages_by_group=_rows_by_group(self.state_out_pages_by_group),
-        )
 
 
 class LayerMappedKVPool:
@@ -1385,6 +1295,11 @@ class MambaAttnBackend(AttentionBackend):
 
         mamba_output_indices = None
         extend_seq_lens_cpu = None
+        # Whole-batch prefix lengths, built alongside `extend_lens` below. On a
+        # MIXED plan the caller's `extend_prefix_lens` kwarg covers the extend
+        # segment alone, which is one row-count short of every array the
+        # recurrent path indexes by request; see `_whole_batch_prefix_lens`.
+        extend_prefix_lens_full = None
         if is_target_verify and not self.flat_state_active:
             draft_token_num = int(
                 kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
@@ -1445,6 +1360,9 @@ class MambaAttnBackend(AttentionBackend):
                     )
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
                     extend_seq_lens_cpu = extend_lens.to(device="cpu")
+                    extend_prefix_lens_full = _whole_batch_prefix_lens(
+                        seq_lens, extend_lens, bs
+                    )
                 else:
                     extend_prefix_lens = kwargs.get("extend_prefix_lens")
                     if extend_prefix_lens is not None:
@@ -1464,6 +1382,9 @@ class MambaAttnBackend(AttentionBackend):
                     )
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
                     extend_seq_lens_cpu = extend_lens.to(device="cpu")
+                    extend_prefix_lens_full = _whole_batch_prefix_lens(
+                        seq_lens, extend_lens, bs
+                    )
                 set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -1636,7 +1557,11 @@ class MambaAttnBackend(AttentionBackend):
         extend_has_initial_states = None
         extend_total_tokens = -1
         if forward_mode.is_extend_or_mixed() or is_draft_extend:
-            _prefix = kwargs.get("extend_prefix_lens")
+            # `extend_prefix_lens_full` covers the decode tail too; the kwargs
+            # fall back is for the spec paths above, which never mix.
+            _prefix = extend_prefix_lens_full
+            if _prefix is None:
+                _prefix = kwargs.get("extend_prefix_lens")
             if _prefix is None:
                 _prefix = kwargs.get("extend_prefix_lens_cpu")
             if _prefix is not None:
@@ -1649,7 +1574,11 @@ class MambaAttnBackend(AttentionBackend):
             mamba_cache_indices=mamba_cache_indices,
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices[:bs],
-            extend_prefix_lens=kwargs.get("extend_prefix_lens"),
+            extend_prefix_lens=(
+                extend_prefix_lens_full
+                if extend_prefix_lens_full is not None
+                else kwargs.get("extend_prefix_lens")
+            ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_src_fla=track_ssm_h_src_fla,
@@ -2675,9 +2604,12 @@ class MambaAttnBackend(AttentionBackend):
             else:
                 conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
                 conv_cache_indices = cache_indices
-            extend_prefix_lens = kwargs.get("extend_prefix_lens")
+            # Metadata first, kwargs second: on a MIXED plan the caller's kwarg
+            # describes the extend segment alone, while everything below indexes
+            # by request over the whole batch (see `_whole_batch_prefix_lens`).
+            extend_prefix_lens = self.forward_metadata.extend_prefix_lens
             if extend_prefix_lens is None:
-                extend_prefix_lens = self.forward_metadata.extend_prefix_lens
+                extend_prefix_lens = kwargs.get("extend_prefix_lens")
             extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
             if extend_seq_lens_cpu is None:
                 extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
@@ -2997,49 +2929,30 @@ class HybridLinearAttnBackend(AttentionBackend):
     # buffers) exist on those paths.
     uses_flat_cache_groups: bool = True
 
-    # Opt-in, because the recurrent half is not finished.
+    # The recurrent half serves a MIXED plan by not splitting it: a decode row
+    # is an extend row of length 1 whose prefix is its history, so the whole
+    # batch is one valid extend batch and runs down `forward_extend` unchanged.
+    # The only constraint left is the full-attention half's (spec width, draft
+    # rank), so defer to it.
     #
-    # It was a flat False, and the startup guard reads this flag, so
-    # `_forward_mixed_linear` had never executed even once -- not even to fail.
-    # Running it is what produced the evidence below, so the env var exists to
-    # keep that possible without letting an ordinary `--enable-mixed-batch`
-    # reach a path that still aborts:
+    # This is SGLang's design (`gdn_backend.py:563` runs one `causal_conv1d_fn`
+    # and one `chunk_gated_delta_rule` over prefill and decode rows together;
+    # `schedule_batch.py:2724` appends the decode rows as `extend_len = 1`).
+    # vLLM and TurboMind split the *recurrent* kernel but likewise never split
+    # the convolution (`qwen_gdn_linear_attn.py:1360-1375`,
+    # `gated_delta_net_kernels.h:11-14`); TRT-LLM is the only one of the four
+    # that splits the conv, and pays a full re-pack pass over every token to
+    # undo it (`fuse_elementwise_ops.py:389-397`). See
+    # `unieinfra/xref/30-prefill.md` §4.3 for the four-engine table.
     #
-    #   conc 8   serves correctly (rag shape, TTFT 951 ms, 111.8 tok/s)
-    #   conc 16  CUDA illegal memory access in causal_conv1d_fn, on the extend
-    #            half, from _forward_mixed_linear -> forward_extend
-    #
-    # The first failure it hit was real and is fixed (snapshot tracking was
-    # computed over `bs` rows while `extend_prefix_lens` describes the extend
-    # segment alone). The second is open. Note that it is batch-size dependent,
-    # which points at an index built from a count the split does not rebase
-    # rather than at the split's shape.
+    # A previous attempt split the batch here in the attention backend, which
+    # does not own the tensors it was slicing; each fix surfaced the next thing
+    # it did not own, ending in an illegal memory access inside the extend
+    # half's `causal_conv1d_fn` at bs=16 but not bs=8. Not splitting removes
+    # that site rather than re-indexing it.
     @property
     def supports_mixed_batch(self) -> bool:
-        if os.environ.get("TOKENSPEED_ENABLE_HYBRID_MIXED_BATCH") != "1":
-            return False
         return getattr(self.full_attn_backend, "supports_mixed_batch", False)
-
-    # Historical note, kept because it is the survey result:
-    #
-    # That method splits a MIXED batch into its extend and decode halves and
-    # runs each down its own path, which is the right shape -- vLLM does the
-    # same (`mamba_mixer2.py` splits along the token dimension into
-    # `[num_decode_tokens, num_prefill_tokens]` and runs
-    # `mamba_chunk_scan_combined_varlen` against `selective_state_update`).
-    #
-    # But vLLM splits inside the *mixer*, where the layer owns its tensors, and
-    # this splits inside the attention backend, which does not. Each fix
-    # surfaced the next thing the backend does not own: the query length arrays,
-    # then tensor alignment on the output buffer, then an illegal address in the
-    # state gather. Moving the split to the layer is the change that ends that
-    # sequence; more patching here will not.
-    #
-    # Kept rather than reverted because the parts below are correct and were
-    # expensive to find: `MambaForwardMetadata.segment` (per-request slicing
-    # with a rebased `query_start_loc`), `_slice_token_kwargs` (per-token
-    # selection by shape rather than by name), and the `.clone()`-not-
-    # -`.contiguous()` rule for offset slices.
 
     def __init__(
         self,
@@ -3102,136 +3015,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         if self.linear_attn_backend is None or layer_id in self.full_attn_layers:
             return self.full_attn_backend
         return self.linear_attn_backend
-
-    def _forward_mixed_linear(
-        self,
-        backend,
-        q,
-        k,
-        v,
-        layer,
-        out_cache_loc,
-        token_to_kv_pool,
-        bs: int,
-        *,
-        save_kv_cache: bool,
-        **kwargs,
-    ):
-        """Serve a MIXED batch on a linear-attention layer, one half at a time.
-
-        The recurrent kernels take a batch of one kind: a chunked scan over
-        variable-length segments, or a single-step update. A MIXED plan holds
-        both, so running it whole down the extend path hands the scan a
-        per-request state of the wrong height --
-
-            RuntimeError: The size of tensor a (2) must match the size of
-            tensor b (6) at non-singleton dimension 0
-
-        -- where 2 is the extend segment and 6 is the batch.
-
-        Full attention already splits for the same reason
-        (``MHAAttnBackend._forward_mixed``, and the ``mixed_decode_rows`` /
-        sibling ``MHADecodeMetadata`` pair that exists to carry the halves).
-        This is the recurrent equivalent: run the extend segment, then the
-        decode tail, each with its own metadata slice, and rejoin.
-
-        The batch layout is the one the scheduler and MHA already use: requests
-        ``[0, num_extends)`` are extending and own the leading
-        ``query_start_loc[num_extends]`` query tokens; requests
-        ``[num_extends, bs)`` are decoding and contribute one token each, in
-        order, after them.
-
-        Returns:
-            The layer output for the whole batch, token order preserved.
-        """
-        md = backend.forward_metadata
-        qsl = md.query_start_loc
-        num_extends = bs
-        if md.extend_prefix_lens is not None:
-            num_extends = int(md.extend_prefix_lens.shape[0])
-        elif md.extend_seq_lens_cpu is not None:
-            num_extends = int(md.extend_seq_lens_cpu.shape[0])
-
-        # Nothing to split: one half is empty, so the whole batch is uniform
-        # and the ordinary path is both correct and cheaper.
-        if qsl is None or num_extends <= 0 or num_extends >= bs:
-            return backend.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                forward_mode=ForwardMode.EXTEND,
-                **kwargs,
-            )
-
-        split = int(qsl[num_extends])
-        if os.environ.get("TOKENSPEED_DEBUG_MIXED_LINEAR") == "1":
-            import sys
-
-            print(
-                f"[mixed-linear] bs={bs} num_extends={num_extends} "
-                f"split_tok={split} total_tok={int(qsl[-1])}",
-                file=sys.stderr,
-                flush=True,
-            )
-        # Not `q.shape[0]`: on a recurrent layer `q` is None -- the payload
-        # arrives through kwargs (`z`, and friends) rather than as a query, and
-        # which kwarg carries it varies by layer. `query_start_loc` is the
-        # batch's cumulative token offsets, so its last entry is the token count
-        # by construction, and it is present on every path that reaches here.
-        total_tokens = int(qsl[-1])
-        full_md = md
-        outs = []
-        try:
-            backend.forward_metadata = full_md.segment(0, num_extends)
-            outs.append(
-                backend.forward_extend(
-                    None if q is None else q[:split],
-                    None if k is None else k[:split],
-                    None if v is None else v[:split],
-                    layer,
-                    None if out_cache_loc is None else out_cache_loc[:split],
-                    token_to_kv_pool,
-                    num_extends,
-                    save_kv_cache=save_kv_cache,
-                    forward_mode=ForwardMode.EXTEND,
-                    **_rebase_scalar_kwargs(
-                        _slice_token_kwargs(kwargs, 0, split, total_tokens), split
-                    ),
-                )
-            )
-            backend.forward_metadata = full_md.segment(num_extends, bs)
-            outs.append(
-                backend.forward_decode(
-                    None if q is None else q[split:].clone(),
-                    None if k is None else k[split:].clone(),
-                    None if v is None else v[split:].clone(),
-                    layer,
-                    None if out_cache_loc is None else out_cache_loc[split:].clone(),
-                    token_to_kv_pool,
-                    bs - num_extends,
-                    save_kv_cache=save_kv_cache,
-                    **_rebase_scalar_kwargs(
-                        _slice_token_kwargs(kwargs, split, None, total_tokens),
-                        total_tokens - split,
-                    ),
-                )
-            )
-        finally:
-            # The caller reuses this backend for every later layer in the step.
-            backend.forward_metadata = full_md
-
-        outs = [o for o in outs if o is not None]
-        if not outs:
-            return None
-        # The GDN scan can return [1, T, Hv, D]; flatten before joining so both
-        # halves agree on rank, and let the caller's collapse see a 3-D result.
-        outs = [o.flatten(0, 1) if o.dim() == 4 else o for o in outs]
-        return torch.cat(outs, dim=0)
 
     _MAMBA_KWARGS = frozenset(
         {
@@ -3361,19 +3144,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
                 ret = backend.forward_decode(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    out_cache_loc,
-                    token_to_kv_pool,
-                    bs,
-                    save_kv_cache=save_kv_cache,
-                    **kwargs,
-                )
-            elif forward_mode.is_mixed() and backend is self.linear_attn_backend:
-                ret = self._forward_mixed_linear(
-                    backend,
                     q,
                     k,
                     v,

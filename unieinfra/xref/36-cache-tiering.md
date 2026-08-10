@@ -3,7 +3,21 @@
 四家對照。這一題是 `35-hybrid-prefix-reuse.md` 的下一層：那一份問「快照該存在哪個深度」，
 這一份問「命中之後，那個狀態怎麼變成請求正在算的狀態」。
 
-會單獨開一份，是因為我們在這一步和其他所有人**反著做**，而那個反向正是容量天花板的成因。
+> ## ⚠ 更正（同日）：本文件第一版說「我們別名不複製」，那是錯的
+>
+> 我們**有**複製：`runtime/execution/runtime_states.py:98 copy_mamba_states`，
+> 在 forward 之前對 `conv_state` 與 `ssm_state` 各做一次
+> `fused_mamba_state_copy(src=cow_src, dst=working)`。
+>
+> 第一版的依據是「Python 裡三個 `mamba_cow_src_indices` 讀取點全在 `is_target_verify`
+> 底下」。那三個是**推測解碼**的讀取點；一般命中的複製在 executor 裡，我沒有搜到就下了結論。
+> op 裡也一直都有目的地 —— 就是 `mamba_working_idx`，只是它不叫 `cow_dst`。
+>
+> **結論沒有改變，理由改變了。** 採用獨立 int8 池仍然正確，但原因不是「別名逼得同池」，
+> 而更簡單：快照本來就是從活池配的（`LocalMambaAllocator::AllocateCheckpoints`）。
+> 複製語意早就在位置上了，所以要接的只有「來源換成 checkpoint 池、複製換成解量化」。
+>
+> 教訓和 `port-first-then-optimize` 記的是同一條：**沒有讀到不等於不存在。**
 
 ---
 
@@ -12,9 +26,9 @@
 | 步驟 | UnieInfra（我們） | SGLang | vLLM | TRT-LLM | TurboMind |
 |---|---|---|---|---|---|
 | 快取狀態存在哪 | 活池，同精度 | **獨立 `int8_ckpt_pool`** | KV block pool，同一套 | 雙緩衝，不走前綴樹 | — |
-| 命中時如何取用 | **別名（alias）**：working index 直接就是樹的 slot | **複製**：`load_to_active` 解量化進請求自己的 slot | **複製**：把 state 複製進本步新配的 block | replay 重算 | — |
-| 複製發生在哪 | 不發生 | `srt/model_executor/model_runner.py:1581 load_to_active`，**forward stream 上、mamba 層讀池之前** | `v1/core/single_type_kv_cache_manager.py:1163 remove_skipped_blocks` | `_torch/pyexecutor/mamba_cache_manager.py:232 _advance_replay_state` | — |
-| 有沒有 dst 索引 | **只有 `mamba_cow_src_idx`，沒有 dst** | `mamba_cow_src_indices` + `mamba_cow_dst_indices` | 新 block id 即 dst | 雙緩衝的另一半 | — |
+| 命中時如何取用 | **複製**：`copy_mamba_states` 把 cow_src 複製進 working slot | **複製**：`load_to_active` 解量化進請求自己的 slot | **複製**：把 state 複製進本步新配的 block | replay 重算 | — |
+| 複製發生在哪 | `runtime/execution/runtime_states.py:98 copy_mamba_states`，forward 之前 | `srt/model_executor/model_runner.py:1581 load_to_active`，**forward stream 上、mamba 層讀池之前** | `v1/core/single_type_kv_cache_manager.py:1163 remove_skipped_blocks` | `_torch/pyexecutor/mamba_cache_manager.py:232 _advance_replay_state` | — |
+| 有沒有 dst 索引 | 有，但叫 `mamba_working_idx` 而不是 cow_dst | `mamba_cow_src_indices` + `mamba_cow_dst_indices` | 新 block id 即 dst | 雙緩衝的另一半 | — |
 | 沒有壓縮時的退路 | — | `mamba_pool.copy_from(src, dst)`，仍然是複製 | 同上 | — | — |
 
 引用（pinned commits，見 `00-METHOD.md`）：
@@ -28,22 +42,18 @@
 
 ## 2. 分歧點
 
-### D20 —— 命中時複製 vs 別名（**我們是孤例**）
+### D20 —— 快照從哪個池子配（**我們是孤例**）
 
-**SGLang 與 vLLM 都複製**，而且兩家都不是為了壓縮才複製：SGLang 在**沒有** int8 池時
-仍然走 `mamba_pool.copy_from(src, dst)`，vLLM 則把 state 複製進本步新配的 block。
-複製是它們的預設語意，量化只是讓被複製的來源可以更便宜。
+四家在「命中時複製」這件事上其實**一致**。分歧在更前面一步：**被快取的狀態是從哪個池子配的。**
 
-**我們別名**：一次普通的前綴命中不在 Python 消費 `mamba_cow_src_indices`（三個讀取點
-全部在 `is_target_verify` 底下），也沒有任何 `cow_dst` —— 請求直接讀樹擁有的那一格。
+- **SGLang**：獨立 `int8_ckpt_pool`，和活池完全分開
+- **vLLM**：和 KV 同一個 block pool，但那個池子有統一的 refcount 與驅逐，且排不進去時
+  回傳 `num_gpu_blocks + 1` 讓 scheduler 不排它 —— **不會稍後 throw**
+- **我們**：`LocalMambaAllocator::AllocateCheckpoints` 從**活池**配，而 admission
+  完全沒把它算進去，所以配不到時在 `SchedulePrefillEvent` 裡直接 throw
 
-別名看起來更快，**每次命中省下一次複製**。代價是它把兩件事鎖死在一起：
-
-1. 快取狀態必須和活狀態**在同一個張量、同一個精度**，否則沒得別名
-2. 因此快取必然和執行中的序列**搶同一個池子**
-
-而那正是 `failed to allocate Mamba checkpoint slot` 的來源 —— conc=64 當機、
-加鎖之後 conc=512 仍然斷。**別名不是一個可以保留的優化，它是天花板本身。**
+這就是 `failed to allocate Mamba checkpoint slot` 的根因 —— conc=64 當機、加鎖後 512 仍然斷。
+**不是複製語意的問題，是配置來源與 admission 的問題。**
 
 ### 這筆複製到底多貴
 
@@ -53,17 +63,16 @@
 - 它取代的是重算 ~2560 個 token 的 prefill（`bf156ad4` 量到 437 → 89.7 ms）
 - 48 層 × 2 個張量的搬移，對照的是幾百毫秒的 prefill
 
-**在真正的成本尺度上這筆複製看不見。** 我們用它換來的是一個把快取和活請求綁在一起的
-資料佈局，然後為了那個佈局付掉一整天：兩次失敗的修法、一個只是在調停不該存在之競爭的鎖。
+**在真正的成本尺度上這筆複製看不見** —— 這一段的意義因此不是「該不該複製」（我們本來就複製），
+而是「換成解量化之後會不會變貴」：不會，它取代的仍然是幾百毫秒的 prefill。
 
 ### D21 —— 複製排在哪條 stream 上
 
 SGLang 把 COW 排在 **forward stream、mamba 層讀池之前**，註解寫明理由是
-「so the copies don't race the scheduler copy stream」。這不是效能考量而是正確性考量：
-scheduler 的複製流和 forward 流是兩條，把 COW 放在 forward 流上就不需要跨流同步。
+「so the copies don't race the scheduler copy stream」。這不是效能考量而是正確性考量。
 
-我們沒有這個位置可以放，因為我們沒有這一步。**移植複製語意的時候，這個放置點要一起移植**，
-否則就是把一個競態換成另一個。
+我們的 `copy_mamba_states` 由 `execute_forward_op` 在 forward 之前呼叫，位置相同 ——
+這一格我們本來就對，第一版誤以為我們沒有這一步。
 
 ### D22 —— TRT-LLM 不走前綴樹
 
@@ -82,7 +91,7 @@ scheduler 的複製流和 forward 流是兩條，把 COW 放在 forward 流上�
 
 | 做法 | 命中成本 | 容量 | 併發天花板 |
 |---|---|---|---|
-| 別名（我們現在） | **0 次複製** | 快取吃活池，同精度 | **conc≥64 當機 / 512 斷** |
+| 複製 + 快照配在活池（我們現在） | 1 次複製 | 快取吃活池，同精度 | **conc≥64 當機 / 512 斷** |
 | 複製 + 同精度獨立池 | 1 次複製 | 1x | 無爭搶 |
 | **複製 + int8 獨立池（SGLang）** | 1 次複製 + 解量化 | **~4x** | 無爭搶 |
 
@@ -97,10 +106,10 @@ scheduler 的複製流和 forward 流是兩條，把 COW 放在 forward 流上�
 
 ## 4. 要改的東西
 
-1. C++ 的 op 要帶 **`mamba_cow_dst_idx`**，不能只有 src —— 沒有 dst 就沒有複製的目的地
-2. 前綴命中時，working index 不再等於樹的 slot；請求讀自己的 slot
-3. 複製排在 **forward stream、mamba 層讀池之前**（SGLang 的位置，理由是避開 scheduler copy stream 的競態）
-4. 有 int8 池時走 `load_layer_to_active`，沒有時走一般複製 —— 兩條路都要在，和 SGLang 一樣
+更正之後只剩兩件，因為複製語意和它的放置點我們本來就有：
 
-第 1、2 點是 `41939351` 停下來的原因：我當時不確定我們的命中是別名還是複製，
-而猜錯**不會噴錯，只會從錯的遞迴狀態接續**。現在確定了是別名。
+1. ~~op 要帶 cow_dst~~ —— 已經有，叫 `mamba_working_idx`
+2. ~~複製排在 forward 之前~~ —— 已經是
+3. **`copy_mamba_states` 在有 int8 池時改走 `load_layer_to_active`**（來源換池、複製換解量化）✅ 已接
+4. **admission 要把 mamba slot 算進去** —— vLLM 用「回傳一個排不進去的數字」表達，
+   我們在 `SchedulePrefillEvent` 裡 throw。這是 512 斷點剩下的那一半，尚未做。

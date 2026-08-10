@@ -568,6 +568,10 @@ class SimpleMambaPool:
 
         self.mamba_cache = (self.conv_state, self.ssm_state)
         self.layer_transfer_counter = None
+        # Set by the registry when --enable-int8-mamba-checkpoint is on. When it
+        # is None every snapshot stays in the tensors above, which is the
+        # arrangement where a cached state competes with a running one.
+        self.ckpt_pool = None
 
         self.current_input_indices = torch.full(
             (self.current_input_size,), -1, dtype=torch.int32, device=device
@@ -2700,9 +2704,17 @@ class MambaAttnBackend(AttentionBackend):
                     raise RuntimeError(
                         "Missing conv indices for intermediate mamba track"
                     )
-                conv_states[self.forward_metadata.track_ssm_h_dst] = mixed_qkv_t[
+                window = mixed_qkv_t[
                     :, self.forward_metadata.track_conv_indices
                 ].transpose(0, 1)
+                ckpt_pool = getattr(self.pool, "ckpt_pool", None)
+                if ckpt_pool is None:
+                    conv_states[self.forward_metadata.track_ssm_h_dst] = window
+                else:
+                    ckpt_pool.conv[0][
+                        self.pool.mamba_map[layer_id],
+                        self.forward_metadata.track_ssm_h_dst,
+                    ] = window.to(ckpt_pool.conv[0].dtype)
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv_t,
@@ -2943,9 +2955,20 @@ class MambaAttnBackend(AttentionBackend):
             )
 
             if need_h_track:
-                ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
-                    h_src
-                ].to(ssm_states.dtype, copy=False)
+                dst = self.forward_metadata.track_ssm_h_dst
+                harvested = fi_h_checkpoints[h_src]
+                ckpt_pool = getattr(self.pool, "ckpt_pool", None)
+                if ckpt_pool is None:
+                    ssm_states[dst] = harvested.to(ssm_states.dtype, copy=False)
+                else:
+                    # `dst` indexes the checkpoint pool now, not this layer's
+                    # slice of the active pool -- the two are separate index
+                    # spaces, which is the whole point. Writing to the wrong one
+                    # would not fault; it would file a state under a slot that
+                    # describes something else and resume a later hit from it.
+                    ckpt_pool.temporal.store_layer(
+                        self.pool.mamba_map[layer_id], dst, harvested
+                    )
 
             if need_final_track:
                 fused_mamba_state_copy(

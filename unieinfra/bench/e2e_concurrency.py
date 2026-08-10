@@ -216,6 +216,22 @@ def main() -> int:
         ),
     )
     ap.add_argument("--prefix-words", type=int, default=700)
+    # The engine-side cap on simultaneously running sequences. Left at its
+    # default, a sweep past it measures the queue rather than the engine: the
+    # client may open 512 connections while only max_num_seqs of them are ever
+    # resident, so both engines have to be told the same number for a row above
+    # the default to mean anything.
+    ap.add_argument("--max-num-seqs", type=int, default=None)
+    # Both engines default to `auto`, i.e. the activation dtype. That is a fair
+    # comparison but it leaves fp8 KV switched off, and fp8 KV is measured at
+    # +19.0% throughput and 1.92x cache capacity here -- capacity being exactly
+    # what saturates first on the unique shape. A row taken with this set is a
+    # different configuration from one taken without, not a better one, so the
+    # two must not be read side by side.
+    ap.add_argument("--kv-cache-dtype", default=None)
+    # Mixed prefill+decode in one step. Off by default in the engine, and the
+    # hybrid models are exactly where it has never run.
+    ap.add_argument("--enable-mixed-batch", action="store_true")
     ap.add_argument("--shape", default="shared", choices=("shared", "unique", "rag"))
     ap.add_argument("--max-model-len", type=int, default=8192)
     args = ap.parse_args()
@@ -238,6 +254,8 @@ def main() -> int:
             max_model_len=args.max_model_len,
             gpu_memory_utilization=float(os.environ.get("BENCH_GPU_UTIL", "0.88")),
             enable_prefix_caching=True,
+            **({"max_num_seqs": args.max_num_seqs} if args.max_num_seqs else {}),
+            **({"kv_cache_dtype": args.kv_cache_dtype} if args.kv_cache_dtype else {}),
         )
         engine = AsyncLLMEngine.from_engine_args(engine_args)
         # The *resolved* value, not the requested one: a model that does not
@@ -256,12 +274,16 @@ def main() -> int:
             model=args.model,
             dtype="bfloat16",
             max_model_len=args.max_model_len,
+            **({"max_num_seqs": args.max_num_seqs} if args.max_num_seqs else {}),
+            **({"kv_cache_dtype": args.kv_cache_dtype} if args.kv_cache_dtype else {}),
+            **({"enable_mixed_batch": True} if args.enable_mixed_batch else {}),
         )
         runner = _run_tokenspeed
 
     print(
         f"backend={backend} shape={args.shape} out={args.out_tokens} "
-        f"prefix~{args.prefix_words} words"
+        f"prefix~{args.prefix_words} words kv={args.kv_cache_dtype or 'auto'} "
+        f"max_num_seqs={args.max_num_seqs or 'default'}"
     )
     print(
         f"  {'conc':>5} {'in tok':>9} {'out tok':>8} {'in/req':>7} "

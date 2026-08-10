@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -256,6 +257,33 @@ def _prepare_gdn_decode_state_path(
     """
     solution = "triton" if ssm_states.dtype == torch.bfloat16 else None
     return initial_state_indices, output_state_indices, solution
+
+
+def _rebase_scalar_kwargs(kwargs: dict, n_tokens: int) -> dict:
+    """Fix the scalar token counts a per-token slice cannot reach.
+
+    ``_slice_token_kwargs`` selects by shape, so an ``int`` passes through
+    untouched -- and the recurrent layer hands down ``seq_len``, the *whole*
+    batch's token count, which each half then uses to bound its own output.
+    On the extend half that overruns the sliced tensor by exactly the decode
+    tail (5353 against 5352 rows measured on Qwen3.5-27B at bs=16), and on the
+    decode half by three orders of magnitude.
+
+    An overrun of one row is not reliably fatal -- it reads whatever the
+    allocator put next -- which is why this survived bs=8 and faulted at bs=16
+    with an illegal memory access rather than a wrong answer at both.
+
+    Args:
+        kwargs: The forward's keyword arguments, already token-sliced.
+        n_tokens: Token count of this half.
+
+    Returns:
+        A new dict with the scalar token counts rebased.
+    """
+    out = dict(kwargs)
+    if "seq_len" in out:
+        out["seq_len"] = n_tokens
+    return out
 
 
 def _slice_token_kwargs(kwargs: dict, start: int, stop, total: int) -> dict:
@@ -1501,14 +1529,31 @@ class MambaAttnBackend(AttentionBackend):
                 extend_prefix_lens_kw is not None
                 and mamba_track_pool_indices is not None
             ):
-                prefix = extend_prefix_lens_kw[:bs].to(
+                # Snapshot tracking describes the EXTENDING rows only. A MIXED
+                # plan is [0, num_extends) extend followed by
+                # [num_extends, bs) decode, and `extend_prefix_lens` is sized to
+                # the extend segment alone -- so slicing the other per-request
+                # tensors to `bs` pairs 16 sequence lengths against 15 prefixes:
+                #   RuntimeError: The size of tensor a (16) must match the size
+                #   of tensor b (15) at non-singleton dimension 0
+                # A decode row advances one token and has no chunked scan to
+                # harvest an intermediate state from, so bounding this block to
+                # the extend segment loses nothing.
+                extend_rows = (
+                    int(extend_prefix_lens_kw.shape[0])
+                    if forward_mode.is_mixed()
+                    else bs
+                )
+                prefix = extend_prefix_lens_kw[:extend_rows].to(
                     dtype=torch.int32, device=self.device
                 )
-                track_indices = mamba_track_pool_indices[:bs].to(
+                track_indices = mamba_track_pool_indices[:extend_rows].to(
                     dtype=torch.int32, device=self.device
                 )
-                extend_lens = (seq_lens[:bs] - prefix).to(torch.int32)
-                checkpoint_mask = (track_indices >= 0) & (mamba_cache_indices >= 0)
+                extend_lens = (seq_lens[:extend_rows] - prefix).to(torch.int32)
+                checkpoint_mask = (track_indices >= 0) & (
+                    mamba_cache_indices[:extend_rows] >= 0
+                )
 
                 page_size = getattr(self.pool, "page_size", 1)
                 final_lens = prefix + extend_lens
@@ -1543,7 +1588,8 @@ class MambaAttnBackend(AttentionBackend):
                 use_multi = (
                     multi_counts is not None
                     and multi_indices is not None
-                    and int(multi_counts[:bs].sum()) > int((track_indices >= 0).sum())
+                    and int(multi_counts[:extend_rows].sum())
+                    > int((track_indices >= 0).sum())
                 )
 
                 if use_multi:
@@ -1551,9 +1597,9 @@ class MambaAttnBackend(AttentionBackend):
                         prefix,
                         extend_lens,
                         page_size,
-                        multi_counts[:bs],
+                        multi_counts[:extend_rows],
                         multi_indices,
-                        query_start_loc,
+                        query_start_loc[: extend_rows + 1],
                     )
                     if expanded is not None:
                         (
@@ -1573,10 +1619,10 @@ class MambaAttnBackend(AttentionBackend):
                         track_lens,
                         track_mask,
                         track_indices,
-                        seq_lens[:bs] - prefix,  # extend_seq_lens
+                        seq_lens[:extend_rows] - prefix,  # extend_seq_lens
                     )
                     track_conv_indices = self._compute_track_conv_indices(
-                        query_start_loc,
+                        query_start_loc[: extend_rows + 1],
                         track_lens,
                         track_mask,
                     )
@@ -2928,7 +2974,30 @@ class HybridLinearAttnBackend(AttentionBackend):
     # buffers) exist on those paths.
     uses_flat_cache_groups: bool = True
 
-    # False, and `_forward_mixed_linear` below is why it is not True yet.
+    # Opt-in, because the recurrent half is not finished.
+    #
+    # It was a flat False, and the startup guard reads this flag, so
+    # `_forward_mixed_linear` had never executed even once -- not even to fail.
+    # Running it is what produced the evidence below, so the env var exists to
+    # keep that possible without letting an ordinary `--enable-mixed-batch`
+    # reach a path that still aborts:
+    #
+    #   conc 8   serves correctly (rag shape, TTFT 951 ms, 111.8 tok/s)
+    #   conc 16  CUDA illegal memory access in causal_conv1d_fn, on the extend
+    #            half, from _forward_mixed_linear -> forward_extend
+    #
+    # The first failure it hit was real and is fixed (snapshot tracking was
+    # computed over `bs` rows while `extend_prefix_lens` describes the extend
+    # segment alone). The second is open. Note that it is batch-size dependent,
+    # which points at an index built from a count the split does not rebase
+    # rather than at the split's shape.
+    @property
+    def supports_mixed_batch(self) -> bool:
+        if os.environ.get("TOKENSPEED_ENABLE_HYBRID_MIXED_BATCH") != "1":
+            return False
+        return getattr(self.full_attn_backend, "supports_mixed_batch", False)
+
+    # Historical note, kept because it is the survey result:
     #
     # That method splits a MIXED batch into its extend and decode halves and
     # runs each down its own path, which is the right shape -- vLLM does the
@@ -2947,9 +3016,7 @@ class HybridLinearAttnBackend(AttentionBackend):
     # expensive to find: `MambaForwardMetadata.segment` (per-request slicing
     # with a rebased `query_start_loc`), `_slice_token_kwargs` (per-token
     # selection by shape rather than by name), and the `.clone()`-not-
-    # -`.contiguous()` rule for offset slices. The guard in
-    # `EventLoop.__init__` reads this flag and nothing else, so none of it runs.
-    supports_mixed_batch: bool = False
+    # -`.contiguous()` rule for offset slices.
 
     def __init__(
         self,
@@ -3079,6 +3146,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
         split = int(qsl[num_extends])
+        if os.environ.get("TOKENSPEED_DEBUG_MIXED_LINEAR") == "1":
+            import sys
+
+            print(
+                f"[mixed-linear] bs={bs} num_extends={num_extends} "
+                f"split_tok={split} total_tok={int(qsl[-1])}",
+                file=sys.stderr,
+                flush=True,
+            )
         # Not `q.shape[0]`: on a recurrent layer `q` is None -- the payload
         # arrives through kwargs (`z`, and friends) rather than as a query, and
         # which kwarg carries it varies by layer. `query_start_loc` is the
@@ -3100,7 +3176,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                     num_extends,
                     save_kv_cache=save_kv_cache,
                     forward_mode=ForwardMode.EXTEND,
-                    **_slice_token_kwargs(kwargs, 0, split, total_tokens),
+                    **_rebase_scalar_kwargs(
+                        _slice_token_kwargs(kwargs, 0, split, total_tokens), split
+                    ),
                 )
             )
             backend.forward_metadata = full_md.segment(num_extends, bs)
@@ -3114,7 +3192,10 @@ class HybridLinearAttnBackend(AttentionBackend):
                     token_to_kv_pool,
                     bs - num_extends,
                     save_kv_cache=save_kv_cache,
-                    **_slice_token_kwargs(kwargs, split, None, total_tokens),
+                    **_rebase_scalar_kwargs(
+                        _slice_token_kwargs(kwargs, split, None, total_tokens),
+                        total_tokens - split,
+                    ),
                 )
             )
         finally:

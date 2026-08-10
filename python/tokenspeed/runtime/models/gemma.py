@@ -408,9 +408,7 @@ class Gemma4Attention(nn.Module):
         # qk-norm (per head) then RoPE. The norms reduce over head_dim, so the
         # head axis is folded into the row axis rather than materialised.
         q = self.q_norm(q.reshape(-1, self.head_dim)).view(num_tokens, self.q_size)
-        k = self.k_norm(k_raw.reshape(-1, self.head_dim)).view(
-            num_tokens, self.kv_size
-        )
+        k = self.k_norm(k_raw.reshape(-1, self.head_dim)).view(num_tokens, self.kv_size)
         q, k = self.rotary_emb(positions, q, k)
 
         # v-norm (no learnable scale), no RoPE on values.

@@ -40,22 +40,40 @@ from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
 )
 
 
-def test_hybrid_linear_attn_declares_it_cannot_mix():
-    """The class attribute is the whole contract -- the guard reads only this."""
-    assert HybridLinearAttnBackend.supports_mixed_batch is False
-
-
-def test_backends_may_mix_by_default():
-    """A backend that says nothing is assumed capable, as before this guard."""
-    assert AttentionBackend.supports_mixed_batch is True
-
-
 class _Incapable:
     supports_mixed_batch = False
 
 
 class _Capable:
     supports_mixed_batch = True
+
+
+def test_hybrid_linear_attn_declares_it_cannot_mix(monkeypatch):
+    """Off unless explicitly opted into, whatever the full-attention half says.
+
+    The recurrent half serves a MIXED batch correctly at small batch sizes and
+    faults with an illegal memory access at larger ones, so the default has to
+    stay False -- the guard reads this and nothing else. It is a property now
+    rather than a class attribute, because when the opt-in *is* set the answer
+    comes from the full-attention sub-backend, which is the half with a real
+    constraint (spec width, draft rank).
+    """
+    backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+    backend.full_attn_backend = _Capable()
+
+    monkeypatch.delenv("TOKENSPEED_ENABLE_HYBRID_MIXED_BATCH", raising=False)
+    assert backend.supports_mixed_batch is False
+
+    monkeypatch.setenv("TOKENSPEED_ENABLE_HYBRID_MIXED_BATCH", "1")
+    assert backend.supports_mixed_batch is True
+
+    backend.full_attn_backend = _Incapable()
+    assert backend.supports_mixed_batch is False
+
+
+def test_backends_may_mix_by_default():
+    """A backend that says nothing is assumed capable, as before this guard."""
+    assert AttentionBackend.supports_mixed_batch is True
 
 
 class _Silent:
@@ -100,7 +118,9 @@ def test_allows_a_capable_backend(backend):
 
 
 @pytest.mark.parametrize(
-    "backend", [_Capable(), _Silent(), _Incapable()], ids=["capable", "silent", "incapable"]
+    "backend",
+    [_Capable(), _Silent(), _Incapable()],
+    ids=["capable", "silent", "incapable"],
 )
 def test_flag_off_never_refuses(backend):
     """Without the flag the backend's capability is irrelevant."""

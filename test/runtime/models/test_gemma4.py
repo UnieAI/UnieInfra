@@ -313,8 +313,12 @@ def test_rotary_covers_the_whole_head_dim() -> None:
     rope_angles = int(PARTIAL * GLOBAL_HEAD_DIM // 2)
     half = GLOBAL_HEAD_DIM // 2
     cos, sin = rot.cos_sin_cache[:, :half], rot.cos_sin_cache[:, half:]
-    torch.testing.assert_close(cos[:, rope_angles:], torch.ones_like(cos[:, rope_angles:]))
-    torch.testing.assert_close(sin[:, rope_angles:], torch.zeros_like(sin[:, rope_angles:]))
+    torch.testing.assert_close(
+        cos[:, rope_angles:], torch.ones_like(cos[:, rope_angles:])
+    )
+    torch.testing.assert_close(
+        sin[:, rope_angles:], torch.zeros_like(sin[:, rope_angles:])
+    )
 
 
 def test_rotary_rejects_a_head_dim_mismatch(monkeypatch) -> None:

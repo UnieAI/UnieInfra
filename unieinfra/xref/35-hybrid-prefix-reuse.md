@@ -4,13 +4,31 @@
 
 量到的（`unieinfra/bench/`，`reuse_probe`，2690-token 文件 + ~130-token 尾巴）：
 
-| 情況 | 我們 | vLLM |
+| 情況 | 我們 | vLLM（**快取關閉，見下方更正**）|
 |---|---|---|
 | 冷（第一次） | 510 ms, cached=0 | 582 ms, cached=0 |
 | 完全重複 | **60 ms, cached=2752** | 412 ms, cached=0 |
 | 換尾巴（RAG） | 437 ms, cached=0 | 431 ms, cached=0 |
 
-完全重複我們贏 6.9x，**RAG 兩邊都是 0**。這份文件是把它修好之前該讀完的東西。
+> **更正（2026-08-10）：這一欄的 vLLM 不是 vLLM。**
+>
+> 這些數字是用 vLLM 的預設值量的，而 `Qwen3_5ForConditionalGeneration` 宣告 `IsHybrid`
+> 卻沒宣告 `MambaPrefixCaching`，所以 vLLM 把 `enable_prefix_caching` 解析成 **False，
+> 且不發任何警告**。上表量到的是一個**前綴快取被關掉的 vLLM**，那個 cached=0 是設定造成的，
+> 不是能力上限。
+>
+> 明確傳 `enable_prefix_caching=True` 之後，同一台卡、同一個模型、同一支 harness 的
+> RAG e2e（Qwen3.5-27B，conc=1/4/16 的 TTFT p50）：
+> **447.87 / 1620.73 / 4134.22 ms → 112.76 / 358.40 / 1160.97 ms。**
+> vLLM 在 RAG 形狀上**確實會重用**，它只是預設不重用。
+>
+> 因此「RAG 兩邊都是 0」這句話是錯的，`bf156ad4` commit message 裡的
+> 「vLLM reuses nothing in either case」同樣是錯的。本次改動仍然成立
+> （我們從 437 ms 降到 89.7 ms），但**它不是「補上一個 vLLM 也沒有的能力」，
+> 而是「補上一個 vLLM 打開開關就有的能力」**，而且領先幅度遠比原本記載的小。
+> 對照表見 `unieinfra/REPORT-commits.md` §12。
+>
+> 一般化的教訓已寫進 `AGENTS.local.md` 的量測紀律：**參照引擎的預設值要查，不能假設。**
 
 ---
 
@@ -49,7 +67,7 @@ const std::int32_t publish_depth = (final_len / page_size) * page_size - page_si
 | 引擎 | 每序列保留幾個遞迴快照 | 存在哪 | RAG 重用 |
 |---|---|---|---|
 | **SGLang** | 多個，掛在 radix 節點上 | 獨立的 `MambaCheckpointPool`，SSM 存 **int8** | 有 |
-| **vLLM** | — | — | **無**（實測 cached=0） |
+| **vLLM** | `mamba_cache_mode="align"` 的對齊邊界 | KV block 池同一套管理 | **有，但預設關閉**（見開頭更正） |
 | **TRT-LLM** | 多個，但用途不同（replay 重算） | 雙緩衝 + `MIN_REPLAY_HISTORY_SIZE=16` | 不走前綴樹 |
 | **TurboMind** | 無此機制 | `kernels/linear_attn/` 只有前向 kernel | 無 |
 | **我們** | **一個** | working slot 旁的單一 `checkpoint_` | **無** |

@@ -196,6 +196,39 @@ std::vector<std::int32_t> MambaCheckpointPublishDepths(tokenspeed::HybridPrefixC
     return depths;
 }
 
+// A mandatory Mamba slot, reclaiming a cached snapshot if the pool is empty.
+//
+// Retained snapshots are a cache and `EnsureMambaCapacityByEvict` frees the
+// coldest of them, but nothing in this file called it: the pool only ever grew,
+// and a request that found it empty threw. That was survivable while each chunk
+// retained a single snapshot, and became a hard failure at concurrency once a
+// chunk retained up to `kMambaSnapshotMaxPerRequest` of them -- measured as
+// "SchedulePrefillEvent: failed to allocate Mamba checkpoint slot" on the
+// unique-prompt shape at 64 concurrent requests, where nothing is ever reused
+// and every finished request leaves six snapshots behind.
+//
+// Eviction skips any node whose device resource is still referenced, so the
+// snapshots this step is about to publish -- held by the in-flight request --
+// cannot be freed out from under the forward that writes them.
+//
+// Returning false still throws at the call site: that means the pool cannot
+// satisfy even one working set, which is a sizing error rather than pressure.
+bool AllocateMambaCheckpointOrEvict(tokenspeed::LocalMambaAllocator* local,
+                                    tokenspeed::HybridPrefixCache* hybrid_cache) {
+    if (local->AllocateCheckpoint()) return true;
+    if (hybrid_cache == nullptr) return false;
+    if (!hybrid_cache->EnsureMambaCapacityByEvict(1)) return false;
+    return local->AllocateCheckpoint();
+}
+
+bool AllocateMambaWorkingOrEvict(tokenspeed::LocalMambaAllocator* local,
+                                 tokenspeed::HybridPrefixCache* hybrid_cache) {
+    if (local->AllocateWorking()) return true;
+    if (hybrid_cache == nullptr) return false;
+    if (!hybrid_cache->EnsureMambaCapacityByEvict(1)) return false;
+    return local->AllocateWorking();
+}
+
 }  // namespace
 
 namespace tokenspeed::fsm {
@@ -410,10 +443,10 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator;
     if (mamba_allocator_ != nullptr) {
         local_mamba_allocator = std::make_unique<LocalMambaAllocator>(mamba_allocator_);
-        if (!local_mamba_allocator->AllocateWorking()) {
+        if (!AllocateMambaWorkingOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
             throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba working slot");
         }
-        if (!local_mamba_allocator->AllocateCheckpoint()) {
+        if (!AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
             throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba checkpoint slot");
         }
     }
@@ -507,7 +540,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     local_kv_allocator->Acquire(tokens_this_round_);
 
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
-        if (!local_mamba_allocator->AllocateCheckpoint()) {
+        if (!AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
             throw std::logic_error("SchedulePrefillEvent: failed to allocate Mamba checkpoint slot");
         }
     }
@@ -573,7 +606,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
-        if (!local_mamba_allocator->AllocateCheckpoint()) {
+        if (!AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
             throw std::logic_error("ScheduleDecodeEvent: failed to allocate Mamba checkpoint slot");
         }
     }
@@ -817,9 +850,11 @@ Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
     auto host_ref = std::move(static_cast<WritingBack&&>(state)).TakeHostNodeRef();
     std::unique_ptr<LocalKVAllocator> local_device_allocator = std::move(state).TakeKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeMambaAllocator();
+    auto mamba_node_lock = std::move(state).TakeMambaNodeLock();
     // DeviceNodeRef inside WritingBack base is released here (unique_ptr dtor).
-    return Retracted{token_container, page_size, std::move(host_ref), std::move(local_device_allocator),
-                     std::move(local_mamba_allocator)};
+    return Retracted{token_container,          page_size,
+                     std::move(host_ref),      std::move(local_device_allocator),
+                     std::move(local_mamba_allocator), std::move(mamba_node_lock)};
 #endif
 }
 
@@ -944,6 +979,7 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
 
     // Save Mamba state into the prefix cache before retract so loadback can recover it.
+    std::unique_ptr<MambaNodeLock> mamba_node_lock;
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr &&
         (local_mamba_allocator->HasCheckpoint() || local_mamba_allocator->HasWorking())) {
         TreeNode* terminal = match_result_.device.last_node;
@@ -954,7 +990,18 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                 hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
             }
         }
-        // Once retracted, the recoverable Mamba state is tree-owned and evictable: keep no request-local slots.
+        // The state is tree-owned from here, so the request keeps no local slot
+        // -- but it is not a cache entry either: this is the only copy of the
+        // recurrent state this request can resume from, and losing it aborts
+        // the request rather than costing a recompute. Lock it for the duration
+        // of the retraction; the guard releases on resume and on abort alike.
+        //
+        // Leaving it evictable is what produced "Retracted request ... lost
+        // tree-owned Mamba state, aborting request" once several snapshots per
+        // chunk made the slot pool tight enough to evict under load.
+        if (terminal != nullptr && terminal->HasMamba()) {
+            mamba_node_lock = std::make_unique<MambaNodeLock>(terminal);
+        }
         local_mamba_allocator.reset();
     }
 
@@ -965,7 +1012,8 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                       std::move(local_allocator),
                       std::move(pages_to_transfer),
                       std::move(mamba_writeback_nodes),
-                      std::move(local_mamba_allocator)};
+                      std::move(local_mamba_allocator),
+                      std::move(mamba_node_lock)};
 #endif
 }
 

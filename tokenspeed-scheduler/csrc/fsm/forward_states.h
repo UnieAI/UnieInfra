@@ -395,13 +395,15 @@ struct Retracting : public WritingBack {
     Retracting(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
                std::vector<PagePair> pages_to_transfer, std::vector<TreeNode*> mamba_writeback_nodes = {},
-               std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
+               std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr,
+               std::unique_ptr<MambaNodeLock>&& mamba_node_lock = nullptr)
         : WritingBack(std::move(device_node_ref), std::move(host_node_ref), std::move(mamba_writeback_nodes)),
           token_container_{token_container},
           page_size_{page_size},
           local_kv_allocator_(std::move(local_kv_allocator)),
           pages_to_transfer_(std::move(pages_to_transfer)),
-          local_mamba_allocator_(std::move(local_mamba_allocator)) {}
+          local_mamba_allocator_(std::move(local_mamba_allocator)),
+          mamba_node_lock_(std::move(mamba_node_lock)) {}
 
     Retracting(Retracting&&) noexcept = default;
     Retracting& operator=(Retracting&&) noexcept = default;
@@ -409,6 +411,9 @@ struct Retracting : public WritingBack {
     TokenContainer* GetTokenContainer() const { return token_container_; }
     std::unique_ptr<LocalKVAllocator> TakeKVAllocator() && { return std::move(local_kv_allocator_); }
     std::unique_ptr<LocalMambaAllocator> TakeMambaAllocator() && { return std::move(local_mamba_allocator_); }
+    // Handed on to Retracted so the protection spans the whole retraction, not
+    // just the write-back half of it.
+    std::unique_ptr<MambaNodeLock> TakeMambaNodeLock() && { return std::move(mamba_node_lock_); }
     std::int32_t GetPageSize() const { return page_size_; }
 
     const std::vector<PagePair>& GetPagesToTransfer() const { return pages_to_transfer_; }
@@ -424,17 +429,20 @@ private:
     std::unique_ptr<LocalKVAllocator> local_kv_allocator_{};
     std::vector<PagePair> pages_to_transfer_{};
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator_{};
+    std::unique_ptr<MambaNodeLock> mamba_node_lock_{};
 };
 
 struct Retracted {
     Retracted(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
               std::unique_ptr<LocalKVAllocator> local_kv_allocator,
-              std::unique_ptr<LocalMambaAllocator> local_mamba_allocator = nullptr)
+              std::unique_ptr<LocalMambaAllocator> local_mamba_allocator = nullptr,
+              std::unique_ptr<MambaNodeLock> mamba_node_lock = nullptr)
         : token_container_{token_container},
           page_size_{page_size},
           host_node_ref_{std::move(host_node_ref)},
           local_kv_allocator_(std::move(local_kv_allocator)),
-          local_mamba_allocator_(std::move(local_mamba_allocator)) {}
+          local_mamba_allocator_(std::move(local_mamba_allocator)),
+          mamba_node_lock_(std::move(mamba_node_lock)) {}
 
     TokenContainer* GetTokenContainer() { return token_container_; }
     std::int32_t GetPageSize() const { return page_size_; }
@@ -456,6 +464,8 @@ private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};
     std::unique_ptr<LocalKVAllocator> local_kv_allocator_{};
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator_{};
+    // Released when this state is destroyed, i.e. on resume and on abort alike.
+    std::unique_ptr<MambaNodeLock> mamba_node_lock_{};
 };
 
 struct Finished {};

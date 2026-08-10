@@ -502,50 +502,71 @@ RuntimeError: SchedulePrefillEvent: failed to allocate Mamba checkpoint slot
 會直接 throw。低併發看不到，因為池子還有餘裕 —— **這是一個只有靠形狀 × 併發度
 兩個維度一起掃才會出現的 bug**。
 
-### 第一版修法是錯的，記錄下來
+### 三次嘗試才修好，前兩次的「失敗」有一半是量錯的
 
-`EnsureMambaCapacityByEvict` 早就存在而且**沒有任何呼叫者**，看起來正是缺的那一塊：
-在強制配置失敗時回收最冷的快取快照。實測不行：
+**第一版：隨需 eviction。** `EnsureMambaCapacityByEvict` 早就存在而且**沒有任何呼叫者**，
+看起來正是缺的那塊。實測不行：
 
 ```
 [Scheduler] Retracted request ... lost tree-owned Mamba state, aborting request
 ```
 
-**被退回（retract）的請求，它的遞迴狀態是掛在樹上的，而那個節點沒有 ref-count**，
-所以 LRU 會把它選走，然後那個請求被整個中止。**用中止請求換掉配置失敗，是更糟的交易。**
+被退回（retract）的請求，遞迴狀態掛在樹上，而 `applyRetract` 有一行註解講得很明白：
 
-### 第二版修法也是錯的，同樣記錄下來
+```cpp
+// Once retracted, the recoverable Mamba state is tree-owned and evictable: keep no request-local slots.
+```
 
-想法：額外快照只從池子「保留線以上的餘裕」拿（保留 50%），池子滿了就退化成單快照。
-編出來量了，兩個結果都不好：
+**那個狀態被刻意標成可驅逐**，於是 LRU 選走它，請求被整個中止。
 
-| 量測 | 改動前（committed） | 保留閘門 | 判定 |
-|---|---|---|---|
-| `unique` conc=64 | 當機 | **仍然失敗**（改為 `lost tree-owned Mamba state`，請求被中止） | 沒修好 |
-| `rag` conc=16 TTFT p50 | 736.74 ms | 908.58 ms | **退步 23%** |
-| `rag` conc=16 TPS | 289.2 | 273.0 | 退步 5.6% |
-| `rag` conc=64 TTFT p50 | 2368.68 ms | 2235.00 ms | 持平 |
+**第二版：保留閘門**（額外快照只從池子餘裕拿）。沒有修好 conc=64，也就沒有意義。
 
-**沒有修好目標問題，卻付掉了主要的收益。** 已回退，樹上維持 committed 狀態。
+**第三版（採用）：把遞迴狀態的鎖和 KV 的 refcount 分開。**
 
-注意 `lost tree-owned Mamba state` 在這一版**沒有任何 eviction 呼叫**的情況下仍然出現，
-所以它不是第一版修法造成的：池子耗盡時，被退回的請求本來就會失去它掛在樹上的狀態。
-兩版修法只是把同一個容量不足換了個症狀。
+四家怎麼做，一讀就有答案：
 
-### 目前狀態與下一步
+| 引擎 | 遞迴狀態放哪 | 被退回時誰保護它 |
+|---|---|---|
+| **SGLang** | 獨立 mamba pool + radix 節點 | **`mamba_lock_ref`，與 `full_lock_ref` 分開**（`mamba_radix_cache.py:84-90`）。KV 鎖整條路徑到 root，mamba 只鎖**那一個節點** —— 遞迴狀態不可切片，一次匹配只從某一個快照接續 |
+| **vLLM** | **和 KV 同一個 block pool** | 同一套 refcount 與驅逐。排不進去就回傳 `num_gpu_blocks + 1`（`single_type_kv_cache_manager.py:1206`），**由 scheduler 不排它，而不是稍後 throw** |
+| **TRT-LLM** | 雙緩衝 + replay 重算 | 不走前綴樹 |
+| **我們（改前）** | 獨立 mamba pool | **只有 KV 的 refcount**，而被退回的請求正好沒有 KV 參考 |
 
-**`bf156ad4` 帶著一個已知的併發上限進入樹中**：`unique` 形狀在 conc≥64 會失敗。
-唯一經過量測、確定能修好的辦法是把 `kMambaSnapshotMaxPerRequest` 設回 1，
-但那等於放棄整個 RAG 收益。
+缺的就是 SGLang 那半：`TreeNode::mamba_lock_ref_`，加上一個 RAII `MambaNodeLock`
+由 `Retracting`/`Retracted` 持有 —— 用 guard 而不是在每個轉移點記得解鎖，
+resume 與 abort 都自動釋放。鎖建立之後隨需 eviction 才安全，兩者一起才是修法。
 
-真正的修法在別的層：**scheduler 的准入沒有把 mamba slot 算進去**。它會收下一個
-它配不出 slot 的請求，然後在 `SchedulePrefillEvent` 裡 throw。KV 那邊有
-`EnsureCapacity` 與模擬配額，recurrent 這邊沒有等價物 —— 這是一個結構缺口，
-不是一個常數調得對不對的問題，`20-scheduler.md` 的准入那一列應該補上這個分歧點。
+### 驗收（乾淨 build，`--concurrency 1,4,16,64`）
 
-在那之前，這個 feature 的安全操作範圍是 **conc ≤ 32**，而這也正是 TTFT p99
-的 SLA 容量所在（見上表），所以實務上尚未擋住任何可用的操作點 —— 但這是巧合，
-不是設計。
+| shape | conc | 改前 TTFT p50 | **改後** | 改前 TPS | **改後** |
+|---|---|---|---|---|---|
+| unique | 64 | **當機** | **14410.27 ms** | — | **131.7** |
+| rag | 64 | 2368.68 | **2235.04** | 550.4 | **575.9** |
+| shared | 64 | 1728.34 | **1469.12** | 593.2 | **645.5** |
+| rag | 1 / 4 / 16 | 93.59 / 264.33 / 736.63 | 93.74 / 264.14 / 736.24 | 26.3 / 92.4 / 289.2 | 26.3 / 92.4 / 289.4 |
+
+**當機修好，conc=64 還快了（rag +4.6%、shared +8.8% TPS），低併發完全不動。**
+
+C++ 測試已寫（`test_mamba_eviction.cpp` 三個案例：鎖住的節點不被驅逐、不計入可驅逐數、
+move 不會重複釋放），但**這個容器沒有 git，googletest 抓不下來，所以沒有在這裡執行過**。
+Python 端 `test/runtime/execution` 與 `test/runtime/layers` 144 passed / 31 skipped。
+
+### 前兩版的「退步」有一半是我量錯的
+
+驗證第一、二版時我用 `--concurrency 16,64`，省掉了 1 和 4。**`rag` 形狀在同一個 process 裡
+跨 concurrency 共用同一份文件**，所以掃 `1,4,16` 時 conc=16 已經被前兩輪暖過，
+單獨從 16 開始則沒有 —— 736 對 907，23% 的差距全部來自這個順序。
+
+我拿 907 去對 736，於是「保留閘門退步 23%」「lock+evict 掉 29% TPS」兩個結論都是假的。
+後來甚至一度據此判定「HEAD 無法重現 736」，還建了 flat 與 radix 兩種乾淨 build 去找一個
+不存在的 binary 差異。**用同樣參數重跑基準線就會發現，而我一次都沒做。**
+
+規則：**改動前後必須用同一組 harness 參數**；在一個會累積快取的形狀上，
+concurrency 清單本身就是參數的一部分。
+
+---
+
+## 附錄 A — 完整 commit 清單（時間由舊到新）
 
 `—` 表示這個 commit 沒有可量測的效能效果，不是漏填。
 

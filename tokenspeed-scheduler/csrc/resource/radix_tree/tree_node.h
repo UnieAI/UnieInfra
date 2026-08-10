@@ -109,6 +109,25 @@ public:
     HostResource& Host() { return *host_resource_; }
     const HostResource& Host() const { return *host_resource_; }
 
+    // Recurrent-state lock, separate from the KV resource's reference count.
+    //
+    // A retracted request parks its recurrent state on a tree node and holds no
+    // KV reference -- its pages were released, that is what retraction is -- so
+    // the KV reference count says nothing about whether that snapshot is still
+    // needed. Evicting it aborts the request outright ("Retracted request ...
+    // lost tree-owned Mamba state").
+    //
+    // SGLang carries the same pair for the same reason: `full_lock_ref` over
+    // the whole path to root, `mamba_lock_ref` on the single node that owns the
+    // state (mamba_radix_cache.py:84-90, inc_lock_ref():902). Only this node
+    // matters, because a recurrent state is not sliceable: a match resumes from
+    // exactly one snapshot, never from a range of them.
+    std::int32_t MambaLockRef() const { return mamba_lock_ref_; }
+    void LockMamba() { ++mamba_lock_ref_; }
+    void UnlockMamba() {
+        if (mamba_lock_ref_ > 0) --mamba_lock_ref_;
+    }
+
     bool HasMamba() const { return mamba_slot_ != nullptr; }
     bool HasMambaOnHost() const { return mamba_host_slot_ != nullptr; }
     std::int32_t MambaSlotIndex() const;
@@ -155,6 +174,7 @@ private:
     std::unique_ptr<DeviceResource> device_resource_{};
     std::unique_ptr<HostResource> host_resource_{};
     std::unique_ptr<MambaSlot> mamba_slot_{};
+    std::int32_t mamba_lock_ref_{0};
     std::unique_ptr<MambaSlot> mamba_host_slot_{};
     std::unique_ptr<PagedCacheSnapshot> paged_cache_snapshot_{};
 
@@ -223,4 +243,36 @@ inline TreeNode* FindChild(const TreeNode* parent, const token_vec_t& key) {
     auto iter = children.find(key);
     return iter != children.end() ? iter->second.get() : nullptr;
 }
+
+// RAII hold on a node's recurrent state, in the same shape as HostNodeRef and
+// DeviceNodeRef: construct to protect, destroy to release. Carried by the
+// Retracting/Retracted states so that every exit path -- resume, abort,
+// destruction -- releases it, instead of each transition remembering to.
+class MambaNodeLock {
+public:
+    explicit MambaNodeLock(TreeNode* node) : node_{node} {
+        if (node_ != nullptr) node_->LockMamba();
+    }
+    ~MambaNodeLock() {
+        if (node_ != nullptr) node_->UnlockMamba();
+    }
+
+    MambaNodeLock(MambaNodeLock&& other) noexcept : node_{other.node_} { other.node_ = nullptr; }
+    MambaNodeLock& operator=(MambaNodeLock&& other) noexcept {
+        if (this != &other) {
+            if (node_ != nullptr) node_->UnlockMamba();
+            node_ = other.node_;
+            other.node_ = nullptr;
+        }
+        return *this;
+    }
+    MambaNodeLock(const MambaNodeLock&) = delete;
+    MambaNodeLock& operator=(const MambaNodeLock&) = delete;
+
+    TreeNode* Node() const { return node_; }
+
+private:
+    TreeNode* node_{};
+};
+
 }  // namespace tokenspeed

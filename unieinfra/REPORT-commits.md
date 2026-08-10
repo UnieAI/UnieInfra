@@ -1,6 +1,6 @@
 # 從 sm_120 適配到 RAG —— 逐 commit 報告
 
-範圍：`1dd493da..HEAD`，共 69 個 commit，2026-08-04 至 2026-08-10。
+範圍：`1dd493da~1..HEAD`，共 68 個 commit（含 re-fork 本身），2026-08-04 至 2026-08-10。
 硬體：RTX PRO 6000 Blackwell（sm_120，HBM 1792 GB/s，L2 128 MB）。
 模型：`Qwen3-8B`（dense）、`Qwen3.5-27B`（GDN hybrid）、`Qwen3.6-35B-A3B`（MoE）。
 
@@ -18,6 +18,30 @@
 | 讓它變快 | fp8 KV +19.0%，從 −17.9% 追到 +1.8% vs vLLM |
 | 讓 RAG 能用 | 前綴重用 0 → 2560 tokens，對自己 TTFT 降 4.5–6.3x |
 | 對 vLLM 的實際位置 | 重複形狀贏 1.5–2.6x、RAG 贏 1.2–1.6x、**全新 prompt 高併發輸 1.7x** |
+
+> ## ⚠ 先讀這個：本報告之前的所有 vLLM 對照都是錯的
+>
+> `Qwen3_5ForConditionalGeneration` 宣告 `IsHybrid` 但沒宣告 `MambaPrefixCaching`，
+> vLLM 因此把 `enable_prefix_caching` 解析成 **False，而且不發任何警告**。
+> harness 什麼都沒傳 —— 所以這個 repo 裡**每一次 hybrid 對照，比的都是一個
+> 前綴快取被關掉的 vLLM**。
+>
+> RAG 形狀，TTFT p50（conc 1/4/16）：
+>
+> | vLLM 設定 | TTFT p50 |
+> |---|---|
+> | 預設值（快取實際關閉） | 447.87 / 1620.73 / 4134.22 ms |
+> | 明確傳 `enable_prefix_caching=True` | **112.76 / 358.40 / 1160.97 ms** |
+>
+> 受影響的錯誤宣稱：`bf156ad4` commit message 的
+> "vLLM reuses nothing in either case"、`35-hybrid-prefix-reuse.md` 的
+> 「RAG 兩邊都是 0」。**兩句都是錯的。**
+>
+> `bf156ad4` 自己的收益不變（437 → 89.7 ms 是對我們自己量的），
+> 但它補的**不是 vLLM 沒有的能力，是 vLLM 開個開關就有的能力**。
+>
+> 已修：harness 明確傳旗標並印出 **resolved** 值而非 requested 值（`4e20e1b8`）。
+> §12 的所有數字都是修正後重量的。
 
 ---
 
@@ -441,3 +465,157 @@ conc=1 還小贏 1.10x，所以這不是單請求的計算速度問題，是**�
   也是唯一一個「vLLM 有、我們沒有」的機制（混合批次）在數字上的樣子。
 - 只看 `rag` 或只看 `shared` 會得到「我們全面領先」的錯誤結論；
   只看 `unique` 會得到「我們全面落後」的錯誤結論。**三個形狀都要跑。**
+
+---
+
+## 13. 高併發（32 / 64 / 128）—— 以及它打出來的一個回歸
+
+只有我們這一側，vLLM 尚未在這些併發度重量，**所以這一節沒有對照，不要拿來比較**。
+
+| shape | conc | in tok | out tok | in/req | out/req | RPS | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | TPS |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| rag | 32 | 280896 | 6144 | 2926 | 64 | 6.4 | 1673.20 | 1918.20 | 53.71 | 67.50 | 408.6 |
+| rag | 64 | 562752 | 12288 | 2931 | 64 | 8.6 | 2368.68 | 3832.84 | 74.68 | 101.84 | **550.4** |
+| rag | 128 | 1129152 | 24576 | 2940 | 64 | 7.8 | 4098.87 | 13393.83 | 87.76 | 196.82 | 496.7 |
+| shared | 32 | 274752 | 6144 | 2862 | 64 | 7.2 | 1112.76 | 1322.85 | 53.21 | 63.11 | 463.4 |
+| shared | 64 | 550464 | 12288 | 2867 | 64 | 9.3 | 1728.34 | 3258.55 | 74.65 | 96.71 | **593.2** |
+| shared | 128 | 1104576 | 24576 | 2876 | 64 | 7.3 | 3883.45 | 13997.27 | 100.67 | 273.90 | 466.6 |
+| unique | 32 | 258690 | 6144 | 2695 | 64 | 2.0 | 8259.63 | 12892.75 | 144.58 | 241.54 | 126.4 |
+| unique | 64 | — | — | — | — | — | — | — | — | — | **當機（見下）** |
+
+**吞吐的膝點在 conc=64。** 128 的 TPS 反而低於 64（rag 496.7 對 550.4、shared 466.6 對
+593.2），而 TTFT p99 從 3.8 秒跳到 13.4 秒。以「TTFT p99 ≤ 1 秒」為 SLA，這台單卡在
+27B 上的容量在 conc=16 與 32 之間，不在 128。
+
+### `bf156ad4` 在 conc=64 的 unique 形狀上會讓引擎當掉
+
+```
+RuntimeError: SchedulePrefillEvent: failed to allocate Mamba checkpoint slot
+```
+
+**歸因（不是推測）**：把 `kMambaSnapshotMaxPerRequest` 改回 1 重新編譯，
+同一個工作負載跑得乾淨（conc=64 unique，TTFT p50 14377 ms，TPS 133.6）。
+改回 6 就當。所以這是 `bf156ad4` 的回歸。
+
+機制：`unique` 形狀永遠沒有重用，但每個結束的請求仍然留下最多 6 個快照，
+而那個 slot 池同時要裝每個在飛序列的 working 與 checkpoint。強制配置沒有退路，
+會直接 throw。低併發看不到，因為池子還有餘裕 —— **這是一個只有靠形狀 × 併發度
+兩個維度一起掃才會出現的 bug**。
+
+### 第一版修法是錯的，記錄下來
+
+`EnsureMambaCapacityByEvict` 早就存在而且**沒有任何呼叫者**，看起來正是缺的那一塊：
+在強制配置失敗時回收最冷的快取快照。實測不行：
+
+```
+[Scheduler] Retracted request ... lost tree-owned Mamba state, aborting request
+```
+
+**被退回（retract）的請求，它的遞迴狀態是掛在樹上的，而那個節點沒有 ref-count**，
+所以 LRU 會把它選走，然後那個請求被整個中止。**用中止請求換掉配置失敗，是更糟的交易。**
+
+### 第二版修法也是錯的，同樣記錄下來
+
+想法：額外快照只從池子「保留線以上的餘裕」拿（保留 50%），池子滿了就退化成單快照。
+編出來量了，兩個結果都不好：
+
+| 量測 | 改動前（committed） | 保留閘門 | 判定 |
+|---|---|---|---|
+| `unique` conc=64 | 當機 | **仍然失敗**（改為 `lost tree-owned Mamba state`，請求被中止） | 沒修好 |
+| `rag` conc=16 TTFT p50 | 736.74 ms | 908.58 ms | **退步 23%** |
+| `rag` conc=16 TPS | 289.2 | 273.0 | 退步 5.6% |
+| `rag` conc=64 TTFT p50 | 2368.68 ms | 2235.00 ms | 持平 |
+
+**沒有修好目標問題，卻付掉了主要的收益。** 已回退，樹上維持 committed 狀態。
+
+注意 `lost tree-owned Mamba state` 在這一版**沒有任何 eviction 呼叫**的情況下仍然出現，
+所以它不是第一版修法造成的：池子耗盡時，被退回的請求本來就會失去它掛在樹上的狀態。
+兩版修法只是把同一個容量不足換了個症狀。
+
+### 目前狀態與下一步
+
+**`bf156ad4` 帶著一個已知的併發上限進入樹中**：`unique` 形狀在 conc≥64 會失敗。
+唯一經過量測、確定能修好的辦法是把 `kMambaSnapshotMaxPerRequest` 設回 1，
+但那等於放棄整個 RAG 收益。
+
+真正的修法在別的層：**scheduler 的准入沒有把 mamba slot 算進去**。它會收下一個
+它配不出 slot 的請求，然後在 `SchedulePrefillEvent` 裡 throw。KV 那邊有
+`EnsureCapacity` 與模擬配額，recurrent 這邊沒有等價物 —— 這是一個結構缺口，
+不是一個常數調得對不對的問題，`20-scheduler.md` 的准入那一列應該補上這個分歧點。
+
+在那之前，這個 feature 的安全操作範圍是 **conc ≤ 32**，而這也正是 TTFT p99
+的 SLA 容量所在（見上表），所以實務上尚未擋住任何可用的操作點 —— 但這是巧合，
+不是設計。
+
+`—` 表示這個 commit 沒有可量測的效能效果，不是漏填。
+
+| # | commit | 做了什麼 | 效果 |
+|---|---|---|---|
+| 1 | `1dd493da` | 以共同祖先重新 fork upstream tokenspeed | rebase 從不可能變成一行指令 |
+| 2 | `ab27cd9b` | 把 fork 分歧分類成 upstream PR 與 plugin | — |
+| 3 | `57312157` | proton import 改 optional | — |
+| 4 | `b93a8a8e` | Triton MHA prefill 跳過越界 query block | mixed batch 2.04–2.27x；均勻批次不變 |
+| 5 | `d97efd1c` | engine 啟動時載入 kernel plugin | plugin 系統從完全無效變有效 |
+| 6 | `1fa7d5a4` | 允許修改 upstream 檔案並寫明維持條件 | — |
+| 7 | `423338aa` | 修正 layout 表的錯誤敘述 | — |
+| 8 | `228886f0` | 回報真實 shared memory 預算 | 每張 CUDA 卡都回報 0 → 101376 |
+| 9 | `73b27362` | prefill tile 依實測 shared memory 決定 | `OutOfResources` 消失 |
+| 10 | `48a80ebb` | 擋掉兩個必定失敗的 FlashInfer kernel | 啟動不再 crash |
+| 11 | `1bdc361e` | 日誌 E48：re-fork 後可跑，落後 vLLM 16.2% | — |
+| 12 | `4c1ad83a` | attention page P 與 state stride N 分離 | 讓 `--mamba-track-interval` 觸及幾何 |
+| 13 | `aa890b2b` | 日誌 E48b：**撤回** E45 的 +10.3% | 該程式碼在倉庫中不存在 |
+| 14 | `3ebb577c` | 日誌 E49：w4a16 未校準 ppl +7.2% | 負面結果 |
+| 15 | `36e416a4` | 修正 w4a16 patch 的未驗證宣稱 | — |
+| 16 | `c808eee3` | 記錄 sm_120 進度與未完成項 | — |
+| 17 | `6a913132` | pre-commit hook 排除凍結的 legacy 封存 | — |
+| 18 | `7f7e22c3` | 對 plugin 套用格式化 | — |
+| 19 | `86d1c7d1` | 重排一個未格式化的 dict comprehension | — |
+| 20 | `4119f79c` | cutlass fused-MoE routing scale 保持 float32 | self-routing 在 bf16/fp16 不再失敗 |
+| 21 | `3eb83e9d` | dense Qwen3 略過它沒有的 KV-cache scale | NVFP4/FP8-KV checkpoint 不再 KeyError |
+| 22 | `b12febcc` | 讓環境變數指定 smg exporter port | — |
+| 23 | `0abe5e65` | 讓 upstreaming Status 表描述真實存在的分支 | — |
+| 24 | `996b05f4` | Triton MHA kernel 接受 fp8 KV cache | **+19.0% throughput**，容量 1.92x |
+| 25 | `b8a392f8` | fp8-KV 路徑 query 保持 activation 精度 | 同上（配套） |
+| 26 | `add29d74` | 記錄 fp8 KV 實際是什麼、量到什麼 | — |
+| 27 | `7b195f10` | 列出 fp8 KV 分支並標出非獨立的那個 | — |
+| 28 | `2e18a3e4` | 記錄 fp8 KV +19.0% 與 harness 的誤報方式 | — |
+| 29 | `d4e075ce` | 記錄 w4a16 沒有可重用路徑，是死碼 | 能力缺口 |
+| 30 | `64e632d8` | MHA backend 能服務混合批次 | full-attention 半邊完成 |
+| 31 | `c81fa7fa` | `--enable-mixed-batch` 改成啟動時拒絕 | crash → 明確拒絕 |
+| 32 | `128b4ac2` | 日誌 E52：容量計畫方向相反、bf16 SSM 無效 | 三個負面結果 |
+| 33 | `8ecb4b24` | 切分 GDN state bounds | 中途嘗試 |
+| 34 | `69a5f7c5` | 切分 GDN query lengths | 中途嘗試 |
+| 35 | `932c4661` | 日誌 E53：需要 forward split，不是更多 index 修補 | — |
+| 36 | `146c4175` | recurrent 路徑切分混合批次（**關閉**） | 機制在，放錯層 |
+| 37 | `3aceeab8` | 日誌 E54：vLLM 與 TRT-LLM 都切在 mixer | — |
+| 38 | `83dc7af3` | 日誌 E54b：四家都切；TurboMind 用 offset | 順序是選擇不是需求 |
+| 39 | `4bd9bebf` | 把優化流程寫進共享的版本控管檔案 | — |
+| 40 | `7b0aa0ee` | sm_120 狀態報告 | — |
+| 41 | `547819e1` | **修正 headline 的正負號**，門檻設在 +10% | −0.9% → +1.8%（尾段平均相位偏誤） |
+| 42 | `cf63637e` | 日誌 E55：decode profile，三個「缺的」融合有兩個已存在 | — |
+| 43 | `fc09f69c` | **撤回** E55：kernel 名稱不是舊指令的證據 | — |
+| 44 | `8922ba60` | 日誌 E55b：**撤回** roofline 估計（算出 159% HBM） | — |
+| 45 | `e1852925` | 快照發佈到匹配搆得到的深度 | 27B 重複 prompt 重用 0 → 可用 |
+| 46 | `4d35899c` | 用探測取代版本旗標找 GDN kernel | 解開 4 道閘門 |
+| 47 | `94d0fa12` | libstdc++ shim 上 `LD_LIBRARY_PATH` | 4 個 kernel 從 raise 變可用；RoPE 贏 vLLM 1.70x |
+| 48 | `936b835f` | RoPE wrapper 砍 3.2 µs Python | 10.51 → **7.31 µs**（vLLM 7.77） |
+| 49 | `edd295cf` | Qwen3 改用融合 RoPE+KV write | 每層少一 launch，**端到端無變化** |
+| 50 | `da0619da` | 不再每次呼叫重推 dispatch 狀態 | wrapper 24.36 → 14.93 µs，**端到端 0** |
+| 51 | `de851d8d` | FA2 paged extend，每 forward 只 plan 一次 | 對 Triton 1.86–4.57x；RAG 15.2x |
+| 52 | `9e08f8ce` | 不為已結束的請求再跑一步 | 8B TTFT 29.96 → **15.85 ms** |
+| 53 | `bdbb3571` | 啟用融合 sm_120 GDN chunk-prefill kernel | 48 層 17.9 → **11.4 ms**，比 vLLM 快 1.65x |
+| 54 | `a90de320` | 為 bf16 專家註冊 ragged Triton matmul | 對 cutlass 2.1–2.6x；仍落後 vLLM 1.2–8x |
+| 55 | `a1483ec5` | 補回 w4a16 Marlin 的 Python 半邊 | 30 測試通過；端到端仍不可跑 |
+| 56 | `18f1fa92` | 五引擎橫向對照 + sm_120 kernel 計分板 | 19 個分歧點 |
+| 57 | `46b6614b` | 寫回主機的 KV 留在裝置上 | 部分命中 48.76 → **36.41 ms** |
+| 58 | `55004cc2` | 記錄 KV 降級發現與冷 JIT 量測陷阱 | — |
+| 59 | `2d0fe6cd` | 對兩個新檔案套用格式化 | — |
+| 60 | `54c6b607` | KV 分頁 64 → 16 token | TTFT **−13~14%** |
+| 61 | `8def103b` | 共享吞吐缺口是降級挑錯節點 | 定位，未修 |
+| 62 | `5f5635a7` | 記錄失敗的 LRU 降級嘗試 | 無增益且輸出不確定，已回退 |
+| 63 | `44b780bd` | 可執行的 benchmark 套件與併發曲線 | — |
+| 64 | `9c411865` | 回報完整請求形狀；FA2 依血緣改名 | — |
+| 65 | `29f8eda0` | FA2 workspace 128 → 512 MB | 27B 在 conc≥4 不再 Buffer overflow |
+| 66 | `f7d6015f` | 讀完四家後的 hybrid 前綴重用設計 | — |
+| 67 | `bf156ad4` | 保留多個遞迴快照 | **RAG 437 → 89.7 ms，重用 0 → 2560** |
+| 68 | `4e20e1b8` | vLLM 前綴快取旗標 + 更正 + 本報告 | 揭露先前所有 hybrid 對照皆無效 |

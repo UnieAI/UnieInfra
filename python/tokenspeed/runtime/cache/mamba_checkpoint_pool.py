@@ -197,6 +197,25 @@ class Int8CheckpointStore:
         """Dequantize the states at ``slots`` -> [L, N, H, d_v, d_k]."""
         return self.dequantize(self.qdata[:, slots], self.scale[:, slots], out_dtype)
 
+    def store_layer(self, layer: int, slots: torch.Tensor, state: torch.Tensor) -> None:
+        """Quantize one layer's states into ``slots``. ``state``: [N, H, d_v, d_k].
+
+        Not in the source, which stores all L layers at once because its radix
+        cache runs outside the model. Here the publish happens inside a layer's
+        forward, where only that layer's slice of the active pool is in hand.
+        """
+        q, scale = self.quantize(state)
+        self.qdata[layer, slots] = q
+        self.scale[layer, slots] = scale.to(self.scale.dtype)
+
+    def load_layer(
+        self, layer: int, slots: torch.Tensor, out_dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Dequantize one layer's states at ``slots`` -> [N, H, d_v, d_k]."""
+        return self.dequantize(
+            self.qdata[layer, slots], self.scale[layer, slots], out_dtype
+        )
+
     def copy_to_pool(
         self,
         dst_temporal: torch.Tensor,
@@ -347,6 +366,37 @@ class MambaCheckpointPool:
             "conv": conv,
             "total": qdata + scale + conv,
         }
+
+    def store_layer_from_active(
+        self,
+        layer: int,
+        ssm_state: torch.Tensor,
+        conv_state: torch.Tensor,
+        active_slots: torch.Tensor,
+        ckpt_slots: torch.Tensor,
+    ) -> None:
+        """One layer's publish: quantize temporal, copy conv verbatim.
+
+        ``ssm_state``/``conv_state`` are this layer's slice of the active pool,
+        which is what a layer forward has -- the whole-pool variants above take
+        the [L, ...] tensors the radix side would use.
+        """
+        self.temporal.store_layer(layer, ckpt_slots, ssm_state[active_slots])
+        self.conv[0][layer, ckpt_slots] = conv_state[active_slots]
+
+    def load_layer_to_active(
+        self,
+        layer: int,
+        ssm_state: torch.Tensor,
+        conv_state: torch.Tensor,
+        ckpt_slots: torch.Tensor,
+        active_slots: torch.Tensor,
+    ) -> None:
+        """One layer's cache hit: dequantize temporal, copy conv back."""
+        ssm_state[active_slots] = self.temporal.load_layer(
+            layer, ckpt_slots, ssm_state.dtype
+        )
+        conv_state[active_slots] = self.conv[0][layer, ckpt_slots].to(conv_state.dtype)
 
     def mem_usage_bytes(self) -> int:
         conv_bytes = sum(c.numel() * c.element_size() for c in self.conv)

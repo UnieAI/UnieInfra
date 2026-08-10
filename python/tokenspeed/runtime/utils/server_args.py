@@ -113,6 +113,18 @@ class ServerArgs:
     mamba_track_interval: int = 256
     max_mamba_cache_size: int | None = None
     mamba_full_memory_ratio: float = 0.9
+    # Cached recurrent snapshots in their own int8 pool, ported from SGLang.
+    #
+    # Off keeps them in the active pool at full precision, where a retained
+    # snapshot competes with every running sequence's working slot -- measured
+    # as "failed to allocate Mamba checkpoint slot" at 64 concurrent requests
+    # on the unique-prompt shape, and again at 512 after the eviction fix.
+    # On gives them a separate index space at roughly a quarter the bytes.
+    enable_int8_mamba_checkpoint: bool = False
+    # Slots in that pool. None means twice the active pool, matching SGLang's
+    # default: a cached state is the cheap one, so there should be more of them
+    # than there are live sequences.
+    int8_mamba_ckpt_size: int | None = None
     enable_mamba_l2: bool = False
     mamba_l2_host_slots: int = 0
     mamba_l2_ratio: float = 2.0
@@ -1050,6 +1062,21 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
+        parser.add_argument(
+            "--enable-int8-mamba-checkpoint",
+            action="store_true",
+            help=(
+                "Keep cached recurrent snapshots in a separate int8 pool instead "
+                "of the active state pool, so a cached state cannot take the slot "
+                "a running sequence needs."
+            ),
+        )
+        parser.add_argument(
+            "--int8-mamba-ckpt-size",
+            type=int,
+            default=ServerArgs.int8_mamba_ckpt_size,
+            help="Slots in the int8 checkpoint pool. Defaults to twice the active pool.",
         )
         parser.add_argument(
             "--enable-mamba-l2",

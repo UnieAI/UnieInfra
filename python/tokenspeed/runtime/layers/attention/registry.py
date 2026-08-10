@@ -611,6 +611,61 @@ def _create_hybrid_linear_attn(
             max_req_pool_size=req_pool_padding_index,
         )
         mamba_pool.is_kda_cache = is_kda
+
+        # Cached snapshots live in their own int8 pool when asked for. Sized and
+        # checked against free HBM before allocating, so an oversized request
+        # fails with a number rather than a mid-allocation CUDA OOM.
+        if server_args.enable_int8_mamba_checkpoint:
+            from tokenspeed.runtime.cache.mamba_checkpoint_pool import (
+                MambaCheckpointPool,
+            )
+
+            ckpt_slots = int(
+                server_args.int8_mamba_ckpt_size or (2 * mamba_pool_total_chunks)
+            )
+            # temporal_state_shape is K-last [Hv, V, K]; the store's scale
+            # reduces over V, which is what makes it per-(head, k-channel).
+            n_heads, head_v_dim, head_k_dim = temporal_state_shape
+            ckpt_kwargs = dict(
+                num_layers=len(mamba_layer_ids),
+                num_slots=ckpt_slots,
+                num_heads=n_heads,
+                head_v_dim=head_v_dim,
+                head_k_dim=head_k_dim,
+                conv_shapes=[tuple(conv_state_shape)],
+                conv_dtype=conv_dtype,
+                temporal_dtype=ssm_dtype,
+            )
+            est = MambaCheckpointPool.estimate_mem_usage_bytes(**ckpt_kwargs)
+            free_bytes = None
+            if str(config.device).startswith("cuda"):
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(config.device)
+                except Exception:
+                    free_bytes = None
+            gb = 1 << 30
+            logger.info(
+                "int8 mamba checkpoint pool: %d slots, %.2fGB "
+                "(qdata %.2f + scale %.2f + conv %.2f); active pool %d slots%s",
+                ckpt_slots,
+                est["total"] / gb,
+                est["qdata"] / gb,
+                est["scale"] / gb,
+                est["conv"] / gb,
+                mamba_pool_size,
+                "" if free_bytes is None else f"; free HBM {free_bytes / gb:.2f}GB",
+            )
+            if free_bytes is not None and est["total"] >= free_bytes:
+                raise RuntimeError(
+                    f"int8 mamba checkpoint pool needs ~{est['total'] / gb:.2f}GB "
+                    f"but only {free_bytes / gb:.2f}GB HBM is free. Lower "
+                    f"--int8-mamba-ckpt-size (currently {ckpt_slots}) or "
+                    f"--gpu-memory-utilization."
+                )
+            mamba_pool.ckpt_pool = MambaCheckpointPool(
+                device=config.device, **ckpt_kwargs
+            )
+
         linear_attn_backend.set_pool(mamba_pool)
     # Flat state paging (dual-index) keys off the KV pool's state slabs +
     # published "linear_attention" group; no-op on the radix path.

@@ -371,10 +371,17 @@ void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, b
 }
 #endif
 
+bool Scheduler::hasMambaCapacity(std::int32_t slots) const {
+    if (!mamba_allocator_.has_value() || slots <= 0) return true;
+    return mamba_allocator_->AvailableSlots() >= slots;
+}
+
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
+    // A first chunk takes a working slot and a checkpoint slot, both mandatory.
+    if (!hasMambaCapacity(2)) return {};
     MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
                                                     : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
     std::int32_t loadback_tokens = 0;
@@ -557,6 +564,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event,
     std::map<std::string, std::int32_t>& simulated_free) {
+    // The working slot is already held; this chunk takes one more checkpoint.
+    if (!hasMambaCapacity(1)) return {};
     std::int32_t unscheduled = request->UnScheduledPrefillSize();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
 
@@ -631,6 +640,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
                                                                   std::map<std::string, std::int32_t>& simulated_free) {
+    if (!hasMambaCapacity(1)) return {};
     std::int32_t tail_available = request->TailPageAvailableTokens();
     std::int32_t extra_tokens = std::max(0, request->GetReserveNumTokensInNextScheduleEvent() - tail_available);
     std::int32_t pages_needed = (extra_tokens + config_.block_size - 1) / config_.block_size;

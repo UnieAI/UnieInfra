@@ -65,7 +65,7 @@ CP setup/correction cost does not amortize until…」，是針對這張卡調�
 | 4 | input layernorm | `runtime/layers/layernorm.py` | `model_executor/layers/layernorm.py` | `srt/layers/layernorm.py` | `_torch/modules/layer_norm.py` | `src/turbomind/kernels/norm/` |
 | 5 | QKV proj | `runtime/layers/linear.py` | `model_executor/layers/linear.py` | `srt/layers/linear.py` | `_torch/modules/linear.py` | `src/turbomind/models/llama/LlamaLinear.cu` |
 | 6 | RoPE | `runtime/layers/rotary_embedding.py` | `model_executor/layers/rotary_embedding/` | `srt/layers/rotary_embedding/` | `_torch/modules/rotary_embedding.py` | `src/turbomind/models/llama/llama_rope.h` |
-| 7 | attention（prefill） | `runtime/layers/attention/backends/mha.py:1026 forward_extend` | `v1/attention/backends/flash_attn.py` | `srt/layers/attention/triton_backend.py` | `_torch/attention_backend/trtllm.py` / `triton_prefill.py` | `src/turbomind/models/llama/unified_attention_layer.cc`；kernel 在 `src/turbomind/kernels/attention/` |
+| 7 | attention（prefill） | `runtime/layers/attention/backends/mha.py:1037 forward_extend` | `v1/attention/backends/flash_attn.py` | `srt/layers/attention/triton_backend.py` | `_torch/attention_backend/trtllm.py` / `triton_prefill.py` | `src/turbomind/models/llama/unified_attention_layer.cc`；kernel 在 `src/turbomind/kernels/attention/` |
 | 8 | o_proj | 同 5 | 同 5 | 同 5 | 同 5 | 同 5 |
 | 9 | post norm + residual | 同 4 | 同 4 | 同 4 | 同 4 | `src/turbomind/models/llama/unified_decoder.cc:104 AllreduceResidualRMSnorm` |
 | 10 | MLP / MoE | `runtime/layers/dense/`、`runtime/moe/` | `model_executor/layers/fused_moe/` | `srt/layers/moe/` | `_torch/modules/fused_moe/` | `src/turbomind/models/llama/{LlamaFfnLayer.cc,moe_ffn_layer.cc}` |

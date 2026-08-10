@@ -87,6 +87,14 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* prote
         if (n->OnDevice() && GetResource<ResourceType::Device>(n).RefCount() > 0) {
             continue;
         }
+        // A retracted request holds no KV reference -- releasing its pages is
+        // what retraction is -- so the device count above does not cover the
+        // one case that matters here. Without this check, eviction takes the
+        // snapshot the request intends to resume from and the scheduler aborts
+        // it: "Retracted request ... lost tree-owned Mamba state".
+        if (n->MambaLockRef() > 0) {
+            continue;
+        }
         candidates.push(n);
     }
 
@@ -102,7 +110,8 @@ std::int32_t MambaEvictionManager::Evict(std::int32_t num_slots, TreeNode* prote
         TreeNode* parent = leaf->Parent();
         if (parent != nullptr && !parent->IsRoot() && isMambaLeaf(parent)) {
             mamba_leaves_.insert(parent);
-            bool parent_locked = parent->OnDevice() && GetResource<ResourceType::Device>(parent).RefCount() > 0;
+            bool parent_locked = (parent->OnDevice() && GetResource<ResourceType::Device>(parent).RefCount() > 0) ||
+                                 parent->MambaLockRef() > 0;
             if (!parent_locked && parent != protected_node) {
                 candidates.push(parent);
             }
@@ -122,6 +131,9 @@ std::int32_t MambaEvictionManager::EvictableSlots() const {
     std::int32_t total = 0;
     for (const TreeNode* n : mamba_leaves_) {
         if (n->OnDevice() && GetResource<ResourceType::Device>(n).RefCount() > 0) {
+            continue;
+        }
+        if (n->MambaLockRef() > 0) {
             continue;
         }
         total++;

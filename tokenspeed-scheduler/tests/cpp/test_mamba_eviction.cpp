@@ -93,6 +93,56 @@ TEST_F(MambaEvictionTest, SkipsLockedNodes) {
     EXPECT_TRUE(node->HasMamba());
 }
 
+// A retracted request holds no KV reference -- releasing its pages is what
+// retraction is -- so DeviceNodeRef cannot express "this snapshot is still
+// needed". Without the separate mamba lock the LRU takes it and the scheduler
+// aborts the request: "Retracted request ... lost tree-owned Mamba state".
+TEST_F(MambaEvictionTest, SkipsMambaLockedNodeWithoutDeviceRef) {
+    auto tokens = token_vec_t{1, 2, 3, 4};
+    auto* node = MakeNodeWithMamba(&root_, tokens);
+    ASSERT_EQ(GetResource<ResourceType::Device>(node).RefCount(), 0);
+
+    {
+        MambaNodeLock lock(node);
+        EXPECT_EQ(node->MambaLockRef(), 1);
+        EXPECT_EQ(eviction_->Evict(1), 0);
+        EXPECT_TRUE(node->HasMamba());
+    }
+
+    // The guard releases on scope exit, which is how resume and abort both
+    // return the snapshot to the cache.
+    EXPECT_EQ(node->MambaLockRef(), 0);
+    EXPECT_EQ(eviction_->Evict(1), 1);
+    EXPECT_FALSE(node->HasMamba());
+}
+
+TEST_F(MambaEvictionTest, MambaLockedNodeIsNotCountedEvictable) {
+    auto t1 = token_vec_t{1, 2};
+    auto t2 = token_vec_t{3, 4};
+    auto* locked = MakeNodeWithMamba(&root_, t1);
+    MakeNodeWithMamba(&root_, t2);
+    EXPECT_EQ(eviction_->EvictableSlots(), 2);
+
+    MambaNodeLock lock(locked);
+    EXPECT_EQ(eviction_->EvictableSlots(), 1);
+}
+
+// The move must not double-release: two decrements against one increment would
+// let a live retraction's snapshot become evictable again.
+TEST_F(MambaEvictionTest, MambaNodeLockMoveTransfersOwnership) {
+    auto tokens = token_vec_t{1, 2, 3, 4};
+    auto* node = MakeNodeWithMamba(&root_, tokens);
+
+    {
+        MambaNodeLock lock(node);
+        MambaNodeLock moved(std::move(lock));
+        EXPECT_EQ(node->MambaLockRef(), 1);
+        EXPECT_EQ(moved.Node(), node);
+        EXPECT_EQ(lock.Node(), nullptr);
+    }
+    EXPECT_EQ(node->MambaLockRef(), 0);
+}
+
 TEST_F(MambaEvictionTest, EnsureCapacityEvictsEnough) {
     auto t1 = token_vec_t{1, 2};
     auto t2 = token_vec_t{3, 4};

@@ -34,8 +34,8 @@
 | D17 | chunk 切分無 policy（等同 FCFS） | scheduler | 只有 TRT-LLM 有三種 policy | 多數 | **小到中**：TTFT 分布 | `20-scheduler.md` §2.5 |
 | D18 | 串流不做 stop 前綴抑制 | API | 只有 SGLang 有 | 多數 | **小**（正確性/體感） | `10-api.md` §2.3 |
 | D19 | OpenAI 協定層在編譯過的 Rust binary 裡 | API | 其他四家都在同一個 repo、同語言 | 孤例 | **不可量**（但擋住 profiler） | `10-api.md` §2.1 |
-| D20 | 命中時複製 vs 別名遞迴狀態 | scheduler | SGLang 與 vLLM **都複製**（SGLang 連沒有壓縮時也複製）；UnieInfra 別名 | **孤例** | **大**：別名逼得快取與活請求同池同精度，是 `failed to allocate Mamba checkpoint slot` 的根因 | `36-cache-tiering.md` §2 |
-| D21 | COW 排在哪條 stream | scheduler | SGLang 排在 forward stream、mamba 層讀池之前；UnieInfra 無此步驟 | 缺席 | **正確性**：避開 scheduler copy stream 的競態 | `36-cache-tiering.md` §2 |
+| D20 | 快照從哪個池子配 | scheduler | SGLang 獨立 int8 池；vLLM 同 KV 池但有統一 refcount 且排不進去就不排；UnieInfra 從**活池**配且 admission 不算它 | **孤例** | **大**：`failed to allocate Mamba checkpoint slot` 的根因 | `36-cache-tiering.md` §2 |
+| D21 | 配不到 slot 時怎麼辦 | scheduler | vLLM 回傳 `num_gpu_blocks + 1` 讓 scheduler 不排它；UnieInfra 在 `SchedulePrefillEvent` 裡 throw | **孤例** | **大**：512 斷點剩下的那一半 | `36-cache-tiering.md` §4 |
 | D22 | 快取狀態的精度 | quant | 只有 SGLang 量化成 int8（獨立池）；其餘同活狀態精度 | 多數（但容量少 4x） | **大**：~4x 快取容量 | `36-cache-tiering.md` §3 |
 
 ### 1.1 UnieInfra 結構**優於**參照引擎的地方（別改壞）

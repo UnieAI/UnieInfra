@@ -101,13 +101,40 @@ class RuntimeStates:
         mamba_cow_src_indices: torch.Tensor,
         bs: int,
     ) -> None:
-        """Copy Mamba states for copy-on-write requests."""
+        """Copy Mamba states for copy-on-write requests.
+
+        This is the step SGLang runs as ``load_to_active`` and vLLM as the copy
+        into the block it allocated this step: a prefix hit gets its own working
+        slot, seeded from the cached state, rather than reading the tree's slot
+        in place. Which is why a cached state may live somewhere else entirely.
+        """
         if self.mamba_pool is None:
             return
         if mamba_cow_src_indices is None:
             return
         src_indices = mamba_cow_src_indices[:bs].long()
         dst_indices = mamba_pool_indices[:bs].long()
+
+        ckpt_pool = getattr(self.mamba_pool, "ckpt_pool", None)
+        if ckpt_pool is not None:
+            # `src` indexes the checkpoint pool, `dst` the active one -- two
+            # index spaces, so this cannot be the fused same-tensor copy below.
+            # Rows with no cached source keep whatever they had; -1 would
+            # address the reserved slot 0 and seed the request with garbage.
+            valid = src_indices >= 0
+            if bool(valid.any()):
+                src_valid = src_indices[valid]
+                dst_valid = dst_indices[valid]
+                for layer in range(ckpt_pool.temporal.num_layers):
+                    ckpt_pool.load_layer_to_active(
+                        layer,
+                        self.mamba_pool.ssm_state[layer],
+                        self.mamba_pool.conv_state[layer],
+                        src_valid,
+                        dst_valid,
+                    )
+            return
+
         # page_size=0 disables page-boundary filtering
         fused_mamba_state_copy(
             self.mamba_pool.conv_state,

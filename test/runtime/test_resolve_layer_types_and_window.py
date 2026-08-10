@@ -85,7 +85,9 @@ class ResolveLayerTypesAndWindowTest(unittest.TestCase):
 
     def test_flat_config_is_unchanged(self):
         """A flat config passes hf_text_config is hf_config; fallback is a no-op."""
-        flat = _Cfg(layer_types=("full_attention", "sliding_attention"), sliding_window=128)
+        flat = _Cfg(
+            layer_types=("full_attention", "sliding_attention"), sliding_window=128
+        )
 
         self.assertEqual(
             resolve_layer_types_and_window(flat, flat),
@@ -103,7 +105,9 @@ class ResolveLayerTypesAndWindowTest(unittest.TestCase):
         even though the two configs disagree.
         """
         text = _Cfg(layer_types=("full_attention",), sliding_window=999)
-        top = _Cfg(layer_types=("linear_attention", "full_attention"), sliding_window=64)
+        top = _Cfg(
+            layer_types=("linear_attention", "full_attention"), sliding_window=64
+        )
 
         self.assertEqual(
             resolve_layer_types_and_window(top, text),

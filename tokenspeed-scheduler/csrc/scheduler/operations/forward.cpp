@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <iterator>
 #include <limits>
@@ -1174,14 +1175,65 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     return op;
 }
 
+bool Scheduler::shouldMixThisStep(const std::vector<Request*>& candidates) const {
+    if (!config_.enable_mixed_prefill_decode) return false;
+    if (config_.max_batch_size <= 0) return true;
+
+    // Counted over every request the scheduler holds, NOT over `candidates`.
+    // The candidate list is this call's subset: measured at 256 concurrent it
+    // carried running=1 against a real running set of hundreds, so a threshold
+    // on it read load=0.002 and never fired -- the policy was inert and its
+    // sweep was indistinguishable from mixing being off.
+    std::int32_t running = 0;
+    std::int32_t waiting = 0;
+    for (const auto& [id, req] : requests_) {
+        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>() || req->Is<fsm::Retracted>()) {
+            ++running;
+        } else if (req->Is<fsm::Submitted>() || req->Is<fsm::Prefilling>()) {
+            ++waiting;
+        }
+    }
+    const bool has_waiting_prefill = waiting > 0;
+    (void)candidates;
+    // Nothing to interleave: a pure batch is both correct and cheaper.
+    if (!has_waiting_prefill || running == 0) return false;
+
+    // How deep the queue is relative to what this engine can run at once.
+    //
+    // Two earlier signals failed on measured data. running/max_batch_size never
+    // fires, because a starving engine has a SMALL running set by construction:
+    // at 256 concurrent, running sat at 10-44 while 210-246 waited, so it read
+    // 0.02-0.10. waiting/running does fire, but not selectively -- 64
+    // concurrent produced 3.3-15.0 and 256 produced 5.6-17.3, overlapping
+    // ranges, and the arm that fired at 64 lost 92 -> 61 tok/s.
+    //
+    // The queue length itself separates them cleanly (60 at 64 concurrent
+    // against 200+ at 256), and dividing by max_batch_size keeps the threshold
+    // meaningful when the engine's capacity changes rather than pinning it to
+    // one benchmark's request count.
+    const double load = static_cast<double>(waiting) / static_cast<double>(config_.max_batch_size);
+    if (std::getenv("TOKENSPEED_DEBUG_MIX") != nullptr) {
+        static std::int64_t n = 0;
+        if ((n++ % 200) == 0) {
+            spdlog::warn("[mix] running={} waiting={} starve={:.2f} -> {}", running, waiting, load,
+                         load >= config_.mixed_prefill_decode_min_load);
+        }
+    }
+    return load >= config_.mixed_prefill_decode_min_load;
+}
+
 std::tuple<std::vector<ForwardOperation>, std::variant<std::vector<LoadBackOperation>, std::vector<WriteBackOperation>>>
 Scheduler::newForwardOperation(std::vector<Request*> candidates) {
+    // Decided once per step, then read everywhere the static flag used to be:
+    // ordering and the two decode cut-offs have to agree, or the batch is
+    // ordered for one policy and truncated by the other.
+    const bool mix_this_step = shouldMixThisStep(candidates);
     auto priority = [&](const Request* req) -> int {
         if (req->Is<fsm::Prefilling>()) return 1;
         if (req->Is<fsm::Submitted>()) return 2;
         if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
-            // Decode-first if mixed-batch is enabled; prefill-first otherwise.
-            return config_.enable_mixed_prefill_decode ? 0 : 3;
+            // Decode-first when this step mixes; prefill-first otherwise.
+            return mix_this_step ? 0 : 3;
         }
         if (req->Is<fsm::Retracted>()) return 4;
         return 9;
@@ -1195,14 +1247,24 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     std::vector<ForwardOperation> ops;
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
+    std::int32_t prefills_this_step = 0;
     auto push_op = [&](auto op) {
         if (config_.role != Role::kD) {
             token_budget -= op.input_length;
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, PrefillOperation>) {
             pushed_prefill = true;
+            ++prefills_this_step;
         }
         ops.push_back(std::move(op));
+    };
+    // vLLM's max_num_partial_prefills: cap prefill's share of a step by count
+    // rather than deciding whether the step mixes at all. With this in place a
+    // step can always carry both kinds, because the prefill side cannot grow to
+    // crowd decode out.
+    auto prefill_slots_left = [&]() {
+        return config_.max_num_partial_prefills <= 0 ||
+               prefills_this_step < config_.max_num_partial_prefills;
     };
 #if TOKENSPEED_FLAT_KVCACHE
     // Mid-prefill chunk ops emit no ExtendResult; only decode and prefill-completing ops owe one.
@@ -1227,6 +1289,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
 
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
+            if (!prefill_slots_left()) continue;
             std::int32_t reserver_num_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             if (auto ev = schedulePrefill(request, token_budget, reserver_num_tokens, simulated_free)) {
                 PrefillOperation op = applyEventAndGenerateOp(request, *ev);
@@ -1241,6 +1304,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             }
         } else if (request->Is<fsm::Submitted>() || request->Is<fsm::PrefetchDone>()) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
+            if (!prefill_slots_left()) continue;
             std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
 
             // Role D only reserves the remote-prefill destination. A partial
@@ -1267,8 +1331,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
-            // Mixed-batch disabled: skip ALL decode once a prefill was scheduled.
-            if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
+            // Not mixing this step: skip ALL decode once a prefill was scheduled.
+            if (!mix_this_step && pushed_prefill) break;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 DecodeOperation op = applyEventAndGenerateOp(request, *ev);
@@ -1282,7 +1346,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 note_result_owed(request);
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
-            if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
+            if (!mix_this_step && pushed_prefill) break;
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();

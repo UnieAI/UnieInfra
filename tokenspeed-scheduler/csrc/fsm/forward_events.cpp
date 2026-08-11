@@ -450,9 +450,14 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
         if (!AllocateMambaWorkingOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
             throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba working slot");
         }
-        if (!AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
-            throw std::logic_error("SchedulePrefillFirstChunkEvent: failed to allocate Mamba checkpoint slot");
-        }
+        // Best-effort, not fatal. This slot is where the GPU writes a snapshot
+        // for the radix cache to keep; the request does not read it to make
+        // progress. Throwing here turned a full cache into a dead engine --
+        // "ScheduleDecodeEvent: failed to allocate Mamba checkpoint slot",
+        // 1024 of 1024 requests lost at 512 concurrent. Without a slot the op
+        // carries -1, no snapshot is published, and the only cost is reuse
+        // depth for a later request.
+        AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_);
     }
 
     TokenContainer* token_container = state.GetTokenContainer();
@@ -544,9 +549,14 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     local_kv_allocator->Acquire(tokens_this_round_);
 
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
-        if (!AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
-            throw std::logic_error("SchedulePrefillEvent: failed to allocate Mamba checkpoint slot");
-        }
+        // Best-effort, not fatal. This slot is where the GPU writes a snapshot
+        // for the radix cache to keep; the request does not read it to make
+        // progress. Throwing here turned a full cache into a dead engine --
+        // "ScheduleDecodeEvent: failed to allocate Mamba checkpoint slot",
+        // 1024 of 1024 requests lost at 512 concurrent. Without a slot the op
+        // carries -1, no snapshot is published, and the only cost is reuse
+        // depth for a later request.
+        AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_);
     }
 
     TokenContainer::Window window{.begin = state.window.begin + state.window.size, .size = tokens_this_round_};
@@ -610,9 +620,14 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
                       local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
-        if (!AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_)) {
-            throw std::logic_error("ScheduleDecodeEvent: failed to allocate Mamba checkpoint slot");
-        }
+        // Best-effort, not fatal. This slot is where the GPU writes a snapshot
+        // for the radix cache to keep; the request does not read it to make
+        // progress. Throwing here turned a full cache into a dead engine --
+        // "ScheduleDecodeEvent: failed to allocate Mamba checkpoint slot",
+        // 1024 of 1024 requests lost at 512 concurrent. Without a slot the op
+        // carries -1, no snapshot is published, and the only cost is reuse
+        // depth for a later request.
+        AllocateMambaCheckpointOrEvict(local_mamba_allocator.get(), hybrid_prefix_cache_);
     }
 
     std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();

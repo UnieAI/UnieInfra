@@ -1,4 +1,5 @@
 # Copyright (c) 2026 LightSeek Foundation
+# Copyright (c) 2026 UnieAI
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal

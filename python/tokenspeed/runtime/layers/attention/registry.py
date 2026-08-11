@@ -837,10 +837,34 @@ def _apply_gemma4_hetero_kv(config, model_config) -> bool:
             "first request. Rebuild the ext with TOKENSPEED_FLAT_KVCACHE=ON."
         )
     alloc, counts = normalize_layer_kv_geometry(geometry)
-    ratio = alloc // min(counts)
+    head_ratio = alloc // min(counts)
     # Byte-uniform slots: the widest layer's page is the base block, the
     # narrower full layers page at `ratio` x that many token rows over the
     # same bytes (identical to the Inkling layout, one label instead of six).
+    #
+    # The head ratio alone is byte-uniform per LAYER, not per BLOCK, and a
+    # block spans its whole group. Gemma 4 has 50 sliding layers against 10
+    # full ones, so a sliding block covers 16 tokens x 50 layers (~12.5 MB)
+    # while a full block covers 32 x 10 (~2.5 MB) -- same pool, same id, 5x
+    # the bytes. Admission charges both groups out of that one pool
+    # (KvCacheCoordinator::BlocksNeededFor sums over groups), so every full
+    # block spent 80% of an id on nothing: an 811-token request was charged
+    # 51 + 26 = 77 ids where its bytes are worth 57, and the pool ran out at
+    # 21 concurrent sequences with prefix caching off (1480 / 70 measured).
+    #
+    # Fold the layer-count ratio in so a block is byte-uniform too. Inkling
+    # is unaffected: it splits its sliding layers into equal-count sub-groups,
+    # so its layer ratio is 1 and this collapses to the old expression.
+    #
+    # Correcting it is BLOCKED, not forgotten. Measured on gemma-4-31B:
+    # ratio 2 (page 32) serves; ratio 4 (64), 8 (128) and 10 (160) each pass
+    # a single request and then die with a CUDA illegal memory access once a
+    # batch reaches ~12 concurrent sequences -- 127 of 128 requests lost. So
+    # the per-group page-size path is only exercised at 2x (Inkling's layout
+    # and this one), and widening it needs the write-loc/block-table math
+    # fixed first. What it would buy, if fixed: an 811-token request charged
+    # 57 ids instead of 77, i.e. ~34% more resident sequences.
+    ratio = head_ratio
     config.slot_tokens = config.page_size * ratio
     config.group_page_sizes = {"full_attention": config.page_size * ratio}
     config.layer_kv_head_counts = counts

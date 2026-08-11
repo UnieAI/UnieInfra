@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -148,13 +149,49 @@ std::int32_t MambaCheckpointPublishDepth(tokenspeed::HybridPrefixCache* hybrid_c
 // 2690-token document while retaining 5 snapshots rather than the 42 the scan
 // actually produces. See unieinfra/xref/35-hybrid-prefix-reuse.md for the
 // stride/cost table.
-constexpr std::int32_t kMambaSnapshotStrideTokens = 512;
+// Default only. The stride is a server arg (`--mamba-track-interval`, 256),
+// which existed and was never read here -- the engine carried two strides with
+// different values, one configurable and one compiled in.
+//
+// It matters more than it looks: on the RAG dataset (16 documents of ~4900
+// tokens asked 64 questions each) this engine reuses 16.2% of its tokens where
+// vLLM reuses 38.5%, so it recomputes more than twice the prefill, which is
+// most of the mid-concurrency gap. With a 512 stride and a cap of 6 the deepest
+// retained snapshot sits at 3072 of 4900 tokens, and a match cannot reach past
+// it.
+constexpr std::int32_t kMambaSnapshotStrideTokensDefault = 512;
 
 // Ceiling on retained snapshots per chunk. The pool is shared with every
 // in-flight sequence's working state, so an unbounded count would let one long
 // document starve the batch. Six covers ~3k tokens at the stride above, which
 // is the document size this was measured on.
-constexpr std::int32_t kMambaSnapshotMaxPerRequest = 6;
+// Chosen when the pool held 80 slots and every retained snapshot competed with
+// a running sequence's working slot. It now holds 221 (bf16 state, mamba memory
+// ratio 2.0), so the ceiling that made 6 the right number has moved.
+constexpr std::int32_t kMambaSnapshotMaxPerRequestDefault = 6;
+
+// Read once from the environment so the stride/cap pair can be swept without
+// threading config through the FSM. Both were fixed constants chosen when the
+// state pool held 80 slots; it now holds 221, and reuse is the measured gap at
+// mid concurrency (16.2% of tokens against vLLM's 38.5%). If a setting wins,
+// it becomes a real server arg -- `--mamba-track-interval` already exists for
+// the stride and is currently ignored here.
+inline std::int32_t EnvInt(const char* name, std::int32_t fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return fallback;
+    const int parsed = std::atoi(v);
+    return parsed > 0 ? parsed : fallback;
+}
+
+inline std::int32_t SnapshotStrideTokens() {
+    static const std::int32_t v = EnvInt("TOKENSPEED_MAMBA_SNAPSHOT_STRIDE", kMambaSnapshotStrideTokensDefault);
+    return v;
+}
+
+inline std::int32_t SnapshotMaxPerRequest() {
+    static const std::int32_t v = EnvInt("TOKENSPEED_MAMBA_SNAPSHOT_MAX", kMambaSnapshotMaxPerRequestDefault);
+    return v;
+}
 
 // Every depth this chunk should retain a snapshot at, ascending.
 //
@@ -171,7 +208,8 @@ constexpr std::int32_t kMambaSnapshotMaxPerRequest = 6;
 // tried, exact repeats stopped reusing too.
 std::vector<std::int32_t> MambaCheckpointPublishDepths(tokenspeed::HybridPrefixCache* hybrid_cache,
                                                        std::int32_t chunk_begin, std::int32_t chunk_size,
-                                                       std::int32_t page_size, std::int32_t max_count) {
+                                                       std::int32_t page_size, std::int32_t max_count,
+                                                       std::int32_t stride_tokens) {
     std::vector<std::int32_t> depths;
     if (hybrid_cache == nullptr || chunk_size <= 0 || page_size <= 0 || max_count <= 0) return depths;
 
@@ -179,7 +217,8 @@ std::vector<std::int32_t> MambaCheckpointPublishDepths(tokenspeed::HybridPrefixC
     if (deepest < 0) return depths;
 
     const std::int32_t final_len = chunk_begin + chunk_size;
-    for (std::int32_t depth = kMambaSnapshotStrideTokens; depth < deepest; depth += kMambaSnapshotStrideTokens) {
+    const std::int32_t stride = stride_tokens > 0 ? stride_tokens : kMambaSnapshotStrideTokensDefault;
+    for (std::int32_t depth = stride; depth < deepest; depth += stride) {
         if (depth <= chunk_begin) continue;  // already covered by an earlier chunk
         if (depth >= final_len) break;
         const std::int32_t track_len = depth - chunk_begin;
@@ -330,7 +369,8 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
         // starve a pool shared with every other in-flight sequence.
         local_mamba_allocator->ClearPublishedCheckpoints();
         const auto wanted =
-            MambaCheckpointPublishDepths(hybrid_cache, chunk_begin, chunk_size, page_size, kMambaSnapshotMaxPerRequest);
+            MambaCheckpointPublishDepths(hybrid_cache, chunk_begin, chunk_size, page_size,
+                                         SnapshotMaxPerRequest(), SnapshotStrideTokens());
         const std::int32_t extra = static_cast<std::int32_t>(wanted.size()) - 1;
         if (extra > 0) {
             // Best-effort; a refusal here costs reuse depth, not correctness.
@@ -343,7 +383,8 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
         // hit from the wrong recurrent state, silently.
         auto slots = local_mamba_allocator->DetachCheckpoints();
         const auto publish_depths = MambaCheckpointPublishDepths(
-            hybrid_cache, chunk_begin, chunk_size, page_size, static_cast<std::int32_t>(slots.size()));
+            hybrid_cache, chunk_begin, chunk_size, page_size, static_cast<std::int32_t>(slots.size()),
+            SnapshotStrideTokens());
         std::size_t next_slot = 0;
         for (std::int32_t publish_depth : publish_depths) {
             if (next_slot >= slots.size()) break;

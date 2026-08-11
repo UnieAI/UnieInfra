@@ -118,7 +118,14 @@ class ServerArgs:
     mamba_ssm_dtype: str = "bfloat16"
     mamba_track_interval: int = 256
     max_mamba_cache_size: int | None = None
-    mamba_full_memory_ratio: float = 0.9
+    # 2.0, not 0.9: the recurrent state pool and the KV pool are split by this
+    # ratio before either is sized, and the state pool is what binds. Measured
+    # on the real RAG dataset, 0.5 (110 slots / 265K KV tokens) is worse at
+    # every concurrency than 0.9 (157 / 209K), and 2.0 (221 / 132K) is better
+    # again: 596.9 tok/s at 256 concurrent against 516.4, with TTFT 10.0s
+    # against 15.8s. vLLM has no equivalent trade because its Mamba and KV
+    # blocks come out of one pool.
+    mamba_full_memory_ratio: float = 2.0
     # Cached recurrent snapshots in their own int8 pool, ported from SGLang.
     #
     # Off keeps them in the active pool at full precision, where a retained

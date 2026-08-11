@@ -303,6 +303,10 @@ class RequestHandler:
             ),
             self.max_req_len - len(req_state.prompt_input_ids) - 1,
         )
+        # Resolved only here -- the spec is built above, before the request
+        # length and the server's cap are folded in -- so hand the scheduler
+        # the settled number rather than the requested one.
+        req_spec.max_new_tokens = int(req_state.sampling_params.max_new_tokens)
         return (
             req_spec,
             req_state,

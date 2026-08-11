@@ -52,6 +52,7 @@ class Request {
 public:
     Request(const RequestSpec& spec, std::int32_t page_size, Role role);
 
+
     std::string Id() const { return id_; }
 
     // Keep Apply the only non-const function in Request
@@ -93,6 +94,15 @@ public:
     }
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
+
+    // Output tokens this request may still produce, or 0 when the caller did
+    // not say. Used to reserve KV for requests that are already decoding so a
+    // new arrival cannot be admitted into pages they will need.
+    std::int32_t RemainingOutputTokens() const {
+        if (max_new_tokens_ <= 0) return 0;
+        const std::int32_t produced = TokenSize() - prompt_size_;
+        return std::max(0, max_new_tokens_ - std::max(0, produced));
+    }
     std::int32_t GetLastToken() const { return token_container_.LastToken(); }
 
     PrefillInfo GetPrefillInfo() const;
@@ -321,6 +331,9 @@ private:
     std::int32_t page_size_;
     fsm::State state_;
     StorageInfo storage_info_;
+    // Set from RequestSpec; see RemainingOutputTokens().
+    std::int32_t max_new_tokens_{0};
+    std::int32_t prompt_size_{0};
 };
 
 using ConstRequestVector = std::vector<const Request*>;

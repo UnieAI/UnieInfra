@@ -871,6 +871,12 @@ std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* re
 
 std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retract_request) {
     if (auto event = scheduleRetract(retract_request)) {
+        // Logged because only the FAILED path was, which made "no retraction in
+        // the logs" unfalsifiable. A retraction throws away a request's whole
+        // prefill, so knowing whether it happens at all decides whether an
+        // admission-time KV reservation is worth building.
+        static std::int64_t retracted = 0;
+        spdlog::warn("[Scheduler] Retracted request {} (total {})", retract_request->Id(), ++retracted);
         if (auto op = applyEventAndGenerateOp(retract_request, std::move(*event))) {
             return std::move(*op);
         }
@@ -1239,13 +1245,23 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     // once a prefill was pushed -- which is why TTFT ran 3x vLLM's at 64
     // concurrent and why requests were dropped from 256 up: a new arrival
     // displaced the batch that was already running.
+    // Prefill-first, restored after measuring vLLM's running-first order
+    // (v1/core/sched/scheduler.py:440 and :640) on this engine: it was worse on
+    // all six arms of the real RAG dataset -- rag 391 -> 355 tok/s at 64
+    // concurrent and 403 -> 360 at 256, chat 297 -> 286 and 272 -> 265.
+    //
+    // Serving every running request first only pays off if a decode row in a
+    // mixed step is cheap, and here it is not: it becomes an extend row of
+    // length 1 on the chunked scan. Until the recurrent split makes that cheap,
+    // keeping decode out of prefill steps is the faster arrangement, and the
+    // cut-offs below are what do it.
     auto priority = [&](const Request* req) -> int {
-        // Already running: decode, and prefill chunks after the first.
-        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) return 0;
         if (req->Is<fsm::Prefilling>()) return 1;
-        if (req->Is<fsm::Retracted>()) return 2;
-        // Not started: takes whatever budget the running set left.
-        if (req->Is<fsm::Submitted>()) return 3;
+        if (req->Is<fsm::Submitted>()) return 2;
+        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
+            return mix_this_step ? 0 : 3;
+        }
+        if (req->Is<fsm::Retracted>()) return 4;
         return 9;
     };
     // TP-determinism: tie-break on Id() so every rank schedules the same subset (a rank-varying op deadlocks NCCL).
@@ -1341,11 +1357,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
-            // No cut-off: running requests are ordered ahead of new arrivals,
-            // so reaching a decode here means the step still has budget for it.
-            // Cutting decode off after a prefill was scheduled is what starved
-            // the running set.
-            (void)pushed_prefill;
+            // Not mixing this step: skip ALL decode once a prefill was scheduled.
+            if (!mix_this_step && pushed_prefill) break;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 DecodeOperation op = applyEventAndGenerateOp(request, *ev);
@@ -1359,6 +1372,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 note_result_owed(request);
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
+            if (!mix_this_step && pushed_prefill) break;
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();

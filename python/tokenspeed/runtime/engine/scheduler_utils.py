@@ -161,10 +161,19 @@ def aligned_max_scheduled_tokens(
     return max(max_scheduled_tokens - max_scheduled_tokens % grain, grain)
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+    """Build the scheduler's view of a request.
+
+    ``max_new_tokens`` is how much output the request may still produce. The
+    scheduler needs it to reserve KV for requests that are already decoding;
+    without it, admission can only look at pages free right now, over-admits,
+    and something already running has to be retracted -- losing its whole
+    prefill. Zero means unknown.
+    """
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.max_new_tokens = int(max_new_tokens or 0)
     return spec
 
 

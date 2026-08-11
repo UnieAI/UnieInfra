@@ -274,7 +274,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("rolling_hashes", &tokenspeed::RequestSpec::rolling_hashes)
-        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages);
+        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages)
+        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")

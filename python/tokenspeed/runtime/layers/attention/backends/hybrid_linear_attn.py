@@ -3020,7 +3020,13 @@ class MambaAttnBackend(AttentionBackend):
                 # (`_forward_core_decode_non_spec`, how it hands over state
                 # indices, how it rejoins). Kept behind a flag so the measured
                 # comparison stays reproducible while that is worked out.
-                if os.environ.get("TOKENSPEED_ENABLE_GDN_MIXED_SPLIT") == "1":
+                # On by default now. It was gated while it was broken -- it
+                # sliced a size-1 axis, so both halves computed the whole
+                # sequence -- and with that fixed it is the largest single win
+                # measured today: on the real RAG dataset at 256 concurrent,
+                # 516.4 tok/s against 431.1 without, and with the memory ratio
+                # at 2.0, 596.9. Set the variable to 0 to fall back.
+                if os.environ.get("TOKENSPEED_ENABLE_GDN_MIXED_SPLIT", "1") != "0":
                     n_ext = self.forward_metadata.mixed_num_extends
                     split_tok = self.forward_metadata.mixed_split_tok
                 else:

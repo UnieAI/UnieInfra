@@ -1446,7 +1446,18 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             # Quantize-on-store: fp8 data + per-token e8m0 scales into the paged interleaved layout
             self._store_kv_mxfp8(layer, out_cache_loc, token_to_kv_pool, k, v)
         elif self.is_fp8:
-            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            # Re-view per layer, exactly as the read path does (_get_kv_cache).
+            # The pool allocates every row at the widest layer's geometry and a
+            # narrower layer's row is a re-count of those bytes, so the raw
+            # buffer is the wrong shape for anything but the widest layer.
+            # Taking it raw handed Gemma 4's 4x512 full-attention layers to an
+            # 8x256 row and the server died at startup with
+            # `num_kv_heads mismatch: k.shape[1]=4 vs cache=8`. The kernel
+            # accepts the paged layout directly, so the read path's view is
+            # already the shape it wants -- and the page size must be the
+            # layer's group's, not the backend's global one, for the same
+            # reason the read path uses _layer_page_size.
+            k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
             fused_fp8_set_kv_buffer(
                 k=k,
                 v=v,
@@ -1455,7 +1466,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 cache_loc=out_cache_loc,
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
-                page_size=self.page_size,
+                page_size=self._layer_page_size(layer),
             )
         else:
             token_to_kv_pool.set_kv_buffer(

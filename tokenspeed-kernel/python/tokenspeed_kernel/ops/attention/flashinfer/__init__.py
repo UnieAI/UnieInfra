@@ -245,10 +245,22 @@ if platform.is_nvidia and platform.is_hopper_plus:
             # this: their attention page size is derived from the linear-state
             # row rather than chosen, so it is routinely none of these four.
             "page_size": frozenset({16, 32, 64, 128}),
-            # The same file also requires head_dim to be a multiple of 16 in
-            # [16, 256]. Not declared here: traits take a finite set, and
-            # enumerating 16 values would go stale against the rule. It has not
-            # bitten yet because every model tried has a head_dim XQA accepts.
+            # The same file requires head_dim to be a multiple of 16 in
+            # [16, 256]. This used to be left undeclared, on the grounds that
+            # a finite trait set would go stale against the rule -- but the
+            # rule IS a finite set, so generate it rather than transcribe it,
+            # and the sibling extend kernel above already declares its own.
+            #
+            # Gemma 4 is the model the old note said had not turned up yet:
+            # its 10 full-attention layers are 512 wide, so selection handed
+            # them this kernel and JIT raised `Invalid head_dim: 512`, taking
+            # the server down at capture. Declaring it lets selection route
+            # per layer instead -- the 50 sliding layers (256) keep XQA, the
+            # 10 full ones fall through to Triton. vLLM cannot do that: it
+            # decides once per model and forces every layer onto Triton
+            # (`Gemma4 model has heterogeneous head dimensions ... forcing
+            # TRITON_ATTN`).
+            "head_dim": frozenset(range(16, 257, 16)),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),

@@ -120,6 +120,34 @@ struct SchedulerConfig {
     std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+    // Fraction of max_batch_size above which a step is allowed to mix.
+    //
+    // Mixing is not free on the recurrent path: a decode row becomes an extend
+    // row of length 1, so it runs the chunked-scan prefill kernel instead of
+    // the fused decode one (9 launches per layer against 2, see
+    // unieinfra/xref/40-decode.md). Measured on Qwen3.5-27B over HTTP, always
+    // mixing costs 96 -> 60 tok/s at 64 and 128 concurrent, and always
+    // splitting fails outright at 256 -- 346 of 512 requests dropped -- because
+    // prefill never gets a turn. Neither setting wins everywhere, so the choice
+    // belongs per step rather than per server.
+    //
+    // Keyed on how full the running set is, because that is what decides
+    // whether a waiting prefill can get a step of its own: with room to spare a
+    // pure prefill step costs one step, and mixing would tax every decode row
+    // in the batch for it. Near capacity there is no such step to be had.
+    // Queue depth, as a fraction of max_batch_size, above which a step mixes.
+    // Measured on Qwen3.5-27B: 0.02-0.03 at 16 concurrent, 0.09-0.13 at 64,
+    // 0.16-0.27 at 128, 0.44-0.60 at 256, 0.90-1.13 at 512. Not mixing is the
+    // faster arm up to 128 and drops requests from 256, and 0.35 sits in the
+    // gap between those two regimes.
+    double mixed_prefill_decode_min_load{0.35};
+    // How many prompts may be partially prefilled in one step, vLLM's
+    // `max_num_partial_prefills` (config/scheduler.py:70, default 1). This is
+    // the knob that lets mixing stay on unconditionally: prefill's share of a
+    // step is bounded by a count, so decode is never starved and no per-step
+    // mix/no-mix decision is needed. Zero means unbounded, which is what this
+    // scheduler did before.
+    std::int32_t max_num_partial_prefills{0};
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};

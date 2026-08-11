@@ -145,6 +145,10 @@ private:
     // when one is configured, and those are best-effort by construction.
     bool hasMambaCapacity(std::int32_t slots) const;
 
+    // Whether THIS step should mix prefill and decode. See
+    // SchedulerConfig::mixed_prefill_decode_min_load for why it is per step.
+    bool shouldMixThisStep(const std::vector<Request*>& candidates) const;
+
 #if TOKENSPEED_FLAT_KVCACHE
     // One hash pass at admission: non-owning device/host probes plus the hashes
     // retained for acquisition after every admission check succeeds.

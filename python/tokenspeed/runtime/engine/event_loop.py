@@ -521,6 +521,8 @@ class EventLoop:
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+            mixed_prefill_decode_min_load=server_args.mixed_prefill_decode_min_load,
+            max_num_partial_prefills=server_args.max_num_partial_prefills,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         scheduler_cfg.enable_flatkv_pd = self._flatkv_pd_enabled

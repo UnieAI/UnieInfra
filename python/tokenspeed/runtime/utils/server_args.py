@@ -120,6 +120,19 @@ class ServerArgs:
     # as "failed to allocate Mamba checkpoint slot" at 64 concurrent requests
     # on the unique-prompt shape, and again at 512 after the eviction fix.
     # On gives them a separate index space at roughly a quarter the bytes.
+    # Running-set load above which a step may mix prefill with decode.
+    #
+    # Neither always-mix nor never-mix wins across the curve: measured over HTTP
+    # on Qwen3.5-27B, always mixing costs 96 -> 60 tok/s at 64 and 128
+    # concurrent, and never mixing drops 346 of 512 requests at 256 because
+    # prefill never gets a turn. 1.0 disables mixing in practice, 0.0 always
+    # mixes.
+    mixed_prefill_decode_min_load: float = 0.35
+    # vLLM's max_num_partial_prefills (its default is 1). Caps how many prompts
+    # a single step may prefill, which is how vLLM keeps mixing on
+    # unconditionally without prefill crowding decode out. 0 = unbounded, the
+    # behaviour before this knob existed.
+    max_num_partial_prefills: int = 0
     enable_int8_mamba_checkpoint: bool = False
     # Slots in that pool. None means twice the active pool, matching SGLang's
     # default: a cached state is the cheap one, so there should be more of them
@@ -566,6 +579,25 @@ class ServerArgs:
         # Impl constraints:
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
+
+        # The host tier moves recurrent state by slot index between the device
+        # pool and MambaHostAllocator's rows. With the int8 checkpoint pool on,
+        # a tree-owned snapshot is not in the device pool at all -- it is an
+        # int8 row in a different index space -- so the write-back would read
+        # the wrong pool at the wrong precision, and the indices are not even
+        # in range. Nothing would raise; the state would simply be wrong.
+        #
+        # SGLang rejects the same pair for the same reason
+        # (server_args.py:6023 _handle_int8_mamba_checkpoint: "they would read
+        # int8 checkpoint slots as bf16 active slots"). Making the host tier
+        # int8-aware is the work that would lift this.
+        if self.enable_int8_mamba_checkpoint and self.enable_mamba_l2:
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint cannot be combined with "
+                "--enable-mamba-l2: the host tier reads slot indices as active "
+                "device-pool rows, and an int8 checkpoint slot is neither. Pick "
+                "one until the host path is made int8-aware."
+            )
 
         if self.mm_encoder_tp_mode == "data":
             if self.disaggregation_mode not in ("null", "prefill"):
@@ -1062,6 +1094,25 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
+        parser.add_argument(
+            "--max-num-partial-prefills",
+            type=int,
+            default=ServerArgs.max_num_partial_prefills,
+            help=(
+                "How many prompts one step may prefill (vLLM's default is 1). "
+                "0 leaves it unbounded."
+            ),
+        )
+        parser.add_argument(
+            "--mixed-prefill-decode-min-load",
+            type=float,
+            default=ServerArgs.mixed_prefill_decode_min_load,
+            help=(
+                "Queue depth over max_batch_size above which a step mixes "
+                "prefill with decode. 0.0 always mixes, which with "
+                "--max-num-partial-prefills is vLLM's arrangement."
+            ),
         )
         parser.add_argument(
             "--enable-int8-mamba-checkpoint",

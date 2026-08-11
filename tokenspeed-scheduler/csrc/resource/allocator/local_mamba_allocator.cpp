@@ -44,7 +44,19 @@ std::int32_t LocalMambaAllocator::WorkingIndex() const {
 bool LocalMambaAllocator::AllocateCheckpoints(std::int32_t count) {
     if (count <= 0) return false;
     for (std::int32_t i = 0; i < count; ++i) {
-        auto slot = checkpoint_allocator_->Allocate();
+        // The FIRST checkpoint is mandatory -- the request harvests its own
+        // state into it and the caller throws if it is missing -- so it comes
+        // from the active pool, which is what admission counts. Only the extras
+        // retained for the radix tree come from the checkpoint pool, where a
+        // short pool has to cost reuse depth rather than a request.
+        //
+        // Drawing the mandatory one from the checkpoint pool stalls the engine
+        // outright when that pool is small: measured with a one-slot pool, the
+        // run sat at 0% GPU because the allocation has no fallback and no way
+        // to degrade.
+        MambaChunkAllocator* from =
+            checkpoints_.empty() ? allocator_ : checkpoint_allocator_;
+        auto slot = from->Allocate();
         // Best-effort: stop at the first refusal and keep what we have. These
         // are cache entries, so a short pool costs reuse depth, never
         // correctness -- the caller publishes as many depths as it got slots.

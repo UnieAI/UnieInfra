@@ -109,7 +109,13 @@ class ServerArgs:
     # than measured.
     block_size: int = 16
     # special kv cache
-    mamba_ssm_dtype: str = "float32"
+    # bfloat16, not float32: the recurrent state pool is sized in bytes, so the
+    # dtype sets how many sequences can run at once. float32 gave 80 slots
+    # against --max-num-seqs 452 on Qwen3.5-27B, and admission then refused new
+    # work at 1.45 requests per step while 141 waited and the step filled 1029
+    # of its 8192-token budget. bf16 doubles the pool and every number
+    # downstream moves with it. vLLM's default is bf16 for the same reason.
+    mamba_ssm_dtype: str = "bfloat16"
     mamba_track_interval: int = 256
     max_mamba_cache_size: int | None = None
     mamba_full_memory_ratio: float = 0.9

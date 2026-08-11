@@ -2510,10 +2510,14 @@ class MambaAttnBackend(AttentionBackend):
         """
         # Extend half: the scan, over its own rows and its own cumulative
         # offsets. `query_start_loc[: n_ext + 1]` already starts at 0.
+        # q/k/v are [1, T, H, D] -- the token axis is dim 1, not dim 0. Slicing
+        # dim 0 (size 1) is a silent no-op that hands BOTH halves the whole
+        # sequence: no error, no shape mismatch, just two kernels computing the
+        # wrong rows. g/beta are [1, T, H] and were already sliced correctly.
         ext = gdn_chunk_prefill(
-            query[:split_tok],
-            key[:split_tok],
-            value[:split_tok],
+            query[:, :split_tok],
+            key[:, :split_tok],
+            value[:, :split_tok],
             g[:, :split_tok],
             beta[:, :split_tok],
             scale=head_k_dim**-0.5,
@@ -2528,19 +2532,32 @@ class MambaAttnBackend(AttentionBackend):
         # and writes the pool directly at the decode rows' slots rather than
         # taking a gathered state, which is why nothing is written back for it
         # below.
-        dec_indices = cache_indices[n_ext:]
+        # Through the same helper the unsplit decode path uses, not around it.
+        # It picks Triton for bf16 state, and the reason is not performance:
+        # FlashInfer's bf16 kernel redirects padding rows to row 0, which is a
+        # live scheduler-owned row in the radix Mamba pool. Passing solution=None
+        # here would take that path -- and bf16 is now the default state dtype,
+        # so this would corrupt another request's state rather than fail.
+        (
+            dec_initial_indices,
+            dec_output_indices,
+            dec_solution,
+        ) = _prepare_gdn_decode_state_path(ssm_states, cache_indices[n_ext:], None)
+        # [1, T, H, D] -> the decode kernel's [T, 1, H, D]: take the decode
+        # tokens off the token axis, then give each its own length-1 time axis.
         dec_out = gdn_decode_step(
-            q=query[split_tok:],
-            k=key[split_tok:],
-            v=value[split_tok:],
+            q=query[0, split_tok:].unsqueeze(1),
+            k=key[0, split_tok:].unsqueeze(1),
+            v=value[0, split_tok:].unsqueeze(1),
             A_log=A_log,
             a=a[split_tok:].unsqueeze(1),
             dt_bias=dt_bias,
             b=b[split_tok:].unsqueeze(1),
             initial_state=ssm_states,
-            initial_state_indices=dec_indices,
-            output_state_indices=None,
+            initial_state_indices=dec_initial_indices,
+            output_state_indices=dec_output_indices,
             use_qk_l2norm=True,
+            solution=dec_solution,
         )
         # gdn_decode_step returns [B, 1, Hv, V]; the scan returns [1, T, Hv, V].
         # Join on the token axis in the batch's row order.

@@ -1,4 +1,5 @@
 # Copyright (c) 2026 LightSeek Foundation
+# Copyright (c) 2026 UnieAI
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -45,6 +46,7 @@ finished with the model's eager logits tail.
 from __future__ import annotations
 
 import bisect
+import inspect
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -156,6 +158,45 @@ def _prefill_bucket_step(size: int) -> int:
     return min(largest_pow2, PREFILL_BUCKET_MAX_STEP)
 
 
+def _takes_input_ids(fn) -> bool:
+    """Whether ``fn`` is the compute form ``f(input_ids)``.
+
+    ``get_input_embeddings`` means two different things in this tree: the
+    HuggingFace form takes nothing and returns the *module*
+    (``kimi_k3``, ``qwen3_5``, ``inkling``, ``minimax_m3``), while the compute
+    form takes ids and returns embeddings (``gemma``, ``qwen2``, ``qwen3``).
+    Calling the former with ids returns a module, so pick by signature.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params.values()
+    )
+
+
+def _resolve_input_embeds_fn(inner_model, embed_tokens):
+    """The callable that turns input ids into the stack's input embeddings.
+
+    ``embed_tokens`` is not the whole story for every family, and the graph
+    runs this lookup OUTSIDE the captured region, so whatever the model does
+    after the gather has to happen here too. Gemma multiplies by
+    ``sqrt(hidden_size)`` (~73.3 at hidden 5376); qwen2/qwen3 multiply by
+    ``config.scale_emb`` when the checkpoint declares one. Gathering straight
+    from ``embed_tokens`` skips that, and nothing about the shapes or dtypes
+    changes -- gemma-4-31B replayed the graph happily and emitted the same
+    token for every prompt, while eager prefill was correct.
+
+    Falls back to ``embed_tokens`` when the model exposes no compute-form
+    seam, which is what every family without post-processing wants anyway.
+    """
+    fn = getattr(inner_model, "get_input_embeddings", None)
+    if fn is not None and _takes_input_ids(fn):
+        return fn
+    return embed_tokens
+
+
 class CapturedForward(NamedTuple):
     """A bucket's captured inner-forward outputs (stable pool addresses)."""
 
@@ -224,6 +265,12 @@ class PrefillGraph:
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
         # read a static input-embeds buffer instead of gathering from input_ids.
         self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
+        # ...but gather through the model's own seam, which may scale the
+        # lookup afterwards (see _resolve_input_embeds_fn). `_embed_tokens`
+        # stays for its `.weight` shape/dtype/device.
+        self._input_embeds_fn = _resolve_input_embeds_fn(
+            self.inner_model, self._embed_tokens
+        )
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -344,7 +391,8 @@ class PrefillGraph:
         for bucket in sorted(self.capture_buckets, reverse=True):
             self._ctx = self._make_dummy_batch(bucket, decode_wrapper)
             self._land_input_embeds(
-                self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
+                self._input_embeds_fn(self.input_buffers.input_ids_buf[:bucket]),
+                bucket,
             )
             self._captured_hidden_mode = self._ctx.capture_hidden_mode
             # Breaks record the ambient dummy ctx; it is rebound live at replay.
@@ -573,7 +621,11 @@ class PrefillGraph:
                 input_ids, ctx, multimodal_context
             )
         self._land_input_embeds(
-            input_embeds if input_embeds is not None else self._embed_tokens(input_ids),
+            (
+                input_embeds
+                if input_embeds is not None
+                else self._input_embeds_fn(input_ids)
+            ),
             bucket,
         )
         # Re-pad tail rows: they hold the previous forward's residue, which captured kernels consume.

@@ -331,6 +331,10 @@ class MambaForwardMetadata:
     # the legacy state-slab path).
     state_in_pages_by_group: dict[str, torch.Tensor] | None = None
     state_out_pages_by_group: dict[str, torch.Tensor] | None = None
+    # Rows [0, mixed_num_extends) extend and [mixed_num_extends, bs) decode, or
+    # -1 when the plan is not MIXED. Recorded once here rather than re-derived
+    # per layer: the recurrent split reads it 48 times a step.
+    mixed_num_extends: int = -1
 
 
 class LayerMappedKVPool:
@@ -1569,11 +1573,21 @@ class MambaAttnBackend(AttentionBackend):
             if extend_seq_lens_cpu is not None:
                 extend_total_tokens = int(extend_seq_lens_cpu.sum())
 
+        # A MIXED plan puts the extending rows first. Recorded so the recurrent
+        # split can find the boundary without re-deriving it per layer; -1 on
+        # every other mode means "one kind of row, no split".
+        mixed_num_extends = -1
+        if forward_mode.is_mixed():
+            _epl = kwargs.get("extend_prefix_lens")
+            if _epl is not None:
+                mixed_num_extends = int(_epl.shape[0])
+
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices[:bs],
+            mixed_num_extends=mixed_num_extends,
             extend_prefix_lens=(
                 extend_prefix_lens_full
                 if extend_prefix_lens_full is not None
@@ -2442,6 +2456,84 @@ class MambaAttnBackend(AttentionBackend):
         # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
         return core_attn_out.transpose(0, 1)
 
+    def _forward_mixed_recurrent(
+        self,
+        *,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        head_k_dim,
+        recurrent_state,
+        query_start_loc,
+        cache_indices,
+        ssm_states,
+        n_ext: int,
+        split_tok: int,
+    ):
+        """Run a MIXED batch's extend rows on the scan and its decode rows on
+        the decode kernel, then rejoin.
+
+        This is the split vLLM performs and the one this engine was missing.
+        The convolution above ran over the whole batch and is not touched:
+        splitting it is what three of the four reference engines avoid, and the
+        one that does it (TRT-LLM) pays a re-pack pass over every token to undo
+        the layout divergence it creates.
+
+        Rows [0, n_ext) extend and [n_ext, bs) decode, and the token ranges
+        follow the same boundary, so both halves are contiguous slices. Their
+        states are disjoint too -- a row is one kind or the other -- so the two
+        kernels can write the same `ssm_states` without ordering between them.
+
+        Returns:
+            (core_attn_out, last_recurrent_state) with the extend rows first,
+            matching the batch's row order.
+        """
+        # Extend half: the scan, over its own rows and its own cumulative
+        # offsets. `query_start_loc[: n_ext + 1]` already starts at 0.
+        ext = gdn_chunk_prefill(
+            query[:split_tok],
+            key[:split_tok],
+            value[:split_tok],
+            g[:, :split_tok],
+            beta[:, :split_tok],
+            scale=head_k_dim**-0.5,
+            initial_state=recurrent_state[:n_ext],
+            cu_seqlens=query_start_loc[: n_ext + 1],
+            qk_l2norm=True,
+            output_final_state=True,
+            output_h=False,
+        )
+
+        # Decode half: one token per row, so the fused kernel applies. It reads
+        # and writes the pool directly at the decode rows' slots rather than
+        # taking a gathered state, which is why nothing is written back for it
+        # below.
+        dec_indices = cache_indices[n_ext:]
+        dec_out = gdn_decode_step(
+            q=query[split_tok:],
+            k=key[split_tok:],
+            v=value[split_tok:],
+            A_log=A_log,
+            a=a[split_tok:].unsqueeze(1),
+            dt_bias=dt_bias,
+            b=b[split_tok:].unsqueeze(1),
+            initial_state=ssm_states,
+            initial_state_indices=dec_indices,
+            output_state_indices=None,
+            use_qk_l2norm=True,
+        )
+        # gdn_decode_step returns [B, 1, Hv, V]; the scan returns [1, T, Hv, V].
+        # Join on the token axis in the batch's row order.
+        dec_out = dec_out.transpose(0, 1)
+        core_attn_out = torch.cat([ext.out, dec_out], dim=1)
+        return core_attn_out, ext.final_state
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2834,6 +2926,10 @@ class MambaAttnBackend(AttentionBackend):
 
             fi_h_checkpoints = None
             h_src = None
+            # Set by the MIXED branch below and read again by the state
+            # write-back, which runs for both branches -- so it has to exist
+            # before either.
+            split_tok = -1
             if need_h_track:
                 gdn_result = gdn_chunk_prefill(
                     query,
@@ -2866,25 +2962,95 @@ class MambaAttnBackend(AttentionBackend):
                         f"checkpoint layout {gdn_result.h_layout}"
                     )
             else:
-                gdn_result = gdn_chunk_prefill(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    scale=head_k_dim**-0.5,
-                    initial_state=recurrent_state,
-                    cu_seqlens=query_start_loc,
-                    qk_l2norm=True,
-                    output_final_state=True,
-                    output_h=False,
+                # A MIXED plan runs the decode rows on the DECODE kernel rather
+                # than as length-1 extend rows. Not splitting is correct and is
+                # what SGLang does, but it is not free here: a length-1 extend
+                # row goes down the chunked scan (9 launches per layer) where
+                # the fused decode kernel needs 2, and measured over HTTP that
+                # cost 96 -> 60 tok/s at 64 and 128 concurrent.
+                #
+                # vLLM splits exactly here and nowhere else
+                # (mamba/gdn/qwen_gdn_linear_attn.py:1394 `split_non_spec`):
+                # the convolution still runs over the whole batch -- three of
+                # the four reference engines never split it -- and only the
+                # recurrent kernel is divided. Rows are contiguous by
+                # construction, so this is a slice, not a gather; vLLM puts
+                # decode first, this engine puts extend first, and the order is
+                # a choice rather than a requirement.
+                #
+                # OFF by default: this port is not yet faithful. Measured on the
+                # real RAG dataset it is worse than not splitting at all -- 304
+                # against 391 tok/s at 64 concurrent, ITL 112 against 58 ms, and
+                # 256 concurrent fails outright. Those numbers say the decode
+                # half is not actually reaching the fused kernel, or is reaching
+                # it while paying something extra per step; either way what is
+                # here is a resemblance to vLLM's `split_non_spec`, not a
+                # line-by-line port of the path around it
+                # (`_forward_core_decode_non_spec`, how it hands over state
+                # indices, how it rejoins). Kept behind a flag so the measured
+                # comparison stays reproducible while that is worked out.
+                n_ext = (
+                    self.forward_metadata.mixed_num_extends
+                    if os.environ.get("TOKENSPEED_ENABLE_GDN_MIXED_SPLIT") == "1"
+                    else -1
                 )
-                core_attn_out = gdn_result.out
-                last_recurrent_state = gdn_result.final_state
+                split_tok = (
+                    int(query_start_loc[n_ext].item())
+                    if 0 < n_ext < query_start_loc.shape[0] - 1
+                    else -1
+                )
+                if split_tok > 0:
+                    core_attn_out, last_recurrent_state = self._forward_mixed_recurrent(
+                        query=query,
+                        key=key,
+                        value=value,
+                        g=g,
+                        beta=beta,
+                        a=a,
+                        b=b,
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        head_k_dim=head_k_dim,
+                        recurrent_state=recurrent_state,
+                        query_start_loc=query_start_loc,
+                        cache_indices=cache_indices,
+                        ssm_states=ssm_states,
+                        n_ext=n_ext,
+                        split_tok=split_tok,
+                    )
+                else:
+                    gdn_result = gdn_chunk_prefill(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        scale=head_k_dim**-0.5,
+                        initial_state=recurrent_state,
+                        cu_seqlens=query_start_loc,
+                        qk_l2norm=True,
+                        output_final_state=True,
+                        output_h=False,
+                    )
+                    core_attn_out = gdn_result.out
+                    last_recurrent_state = gdn_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[state_out_long if use_flat else cache_indices] = (
-                last_recurrent_state
-            )
+            if split_tok > 0:
+                # Split batch: `final_state` covers the extend rows only. The
+                # decode half already wrote its own slots inside the fused
+                # kernel, so writing `cache_indices` whole here would pair
+                # n_ext states against bs slots and put an extend row's state
+                # under a decode row's slot -- silently, since the shapes only
+                # disagree when n_ext != bs.
+                ssm_states[
+                    (state_out_long if use_flat else cache_indices)[
+                        : self.forward_metadata.mixed_num_extends
+                    ]
+                ] = last_recurrent_state
+            else:
+                ssm_states[state_out_long if use_flat else cache_indices] = (
+                    last_recurrent_state
+                )
 
             if need_h_track:
                 dst = self.forward_metadata.track_ssm_h_dst

@@ -319,6 +319,44 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --port 8000
 ```
 
+## Gemma 4
+
+Text decoding for `Gemma4ForConditionalGeneration` and `Gemma4ForCausalLM`.
+The vision and audio towers of the multimodal checkpoint are skipped, so text
+inputs work and image or audio inputs do not. Only the dense variant is wired
+today; `gemma-4-26B-A4B` sets `enable_moe_block=True` and is not supported yet.
+
+Gemma 4 interleaves two attention geometries: sliding layers serve
+`num_key_value_heads x head_dim` and full-attention layers serve
+`num_global_key_value_heads x global_head_dim` — half the KV bytes per token on
+`gemma-4-31B-it` (4 x 512 against 16 x 256). Publishing that heterogeneous
+layout needs per-group page sizes, which **only the flat scheduler ext honours**,
+so the extension must be built with `TOKENSPEED_FLAT_KVCACHE=ON`. On a radix
+build the layout is declined and the pool refuses the first full-attention
+write with an explicit geometry-mismatch error rather than corrupting rows.
+
+`--max-model-len` matters more than usual here: the config declares
+`max_position_embeddings=262144`, and the RoPE caches are sized from the served
+context. Left unclamped they cost 512 MB (full-attention, head_dim 512) plus
+256 MB (sliding, head_dim 256) in float32.
+
+```bash
+tokenspeed serve google/gemma-4-31B-it \
+  --served-model-name gemma-4-31b \
+  --tensor-parallel-size 2 \
+  --max-model-len 32768 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+The `bf16` checkpoint is 59 GB. `LargitData/gemma-4-31b-it-fp8` is the same
+model in compressed-tensors FP8 at 32 GB and fits where the bf16 one does not.
+
+Attention and dense tensor parallelism must match (`--tensor-parallel-size`
+drives both): the decoder's sandwich norms keep attention and MLP on one
+residual stream, and a split would need a shard exchange the layer does not
+perform. A mismatch is refused at construction.
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

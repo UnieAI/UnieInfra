@@ -136,10 +136,22 @@ struct SchedulerConfig {
     // pure prefill step costs one step, and mixing would tax every decode row
     // in the batch for it. Near capacity there is no such step to be had.
     // Queue depth, as a fraction of max_batch_size, above which a step mixes.
+    //
     // Measured on Qwen3.5-27B: 0.02-0.03 at 16 concurrent, 0.09-0.13 at 64,
-    // 0.16-0.27 at 128, 0.44-0.60 at 256, 0.90-1.13 at 512. Not mixing is the
-    // faster arm up to 128 and drops requests from 256, and 0.35 sits in the
-    // gap between those two regimes.
+    // 0.16-0.27 at 128, 0.44-0.60 at 256, 0.90-1.13 at 512 -- so 0.35 sits in a
+    // clean gap between the two regimes. Two earlier signals did not:
+    // running/max_batch_size never fires because a starving engine has a small
+    // running set by construction (10-44 running against 210-246 waiting at 256
+    // concurrent), and waiting/running fires indiscriminately because 64 and 256
+    // concurrent produce overlapping ranges (3.3-15.0 against 5.6-17.3).
+    //
+    // Re-measured after the recurrent split was fixed, because the first
+    // comparison was made while every mixed step silently did double work on
+    // the wrong rows. The conclusion held and the margin grew: on the real RAG
+    // dataset, always mixing (0.0) measures 223 tok/s at 64 concurrent and 266
+    // at 256, against 390 and 516 at this threshold. So the length-1 decode row
+    // on the chunked scan was not the only cost of mixing every step -- the
+    // extra launch, the rejoin, and the more ragged batch shape remain.
     double mixed_prefill_decode_min_load{0.35};
     // How many prompts may be partially prefilled in one step, vLLM's
     // `max_num_partial_prefills` (config/scheduler.py:70, default 1). This is

@@ -149,6 +149,20 @@ private:
     // SchedulerConfig::mixed_prefill_decode_min_load for why it is per step.
     bool shouldMixThisStep(const std::vector<Request*>& candidates) const;
 
+    // Device pages a first chunk must leave untouched for the requests already
+    // decoding. SGLang's `new_token_ratio`
+    // (managers/scheduler_components/new_token_ratio_tracker.py:14): admission
+    // that only looks at pages free *now* over-admits, the admitted requests
+    // decode, the pool runs dry mid-decode, and something already running has
+    // to be retracted -- which throws away its whole prefill.
+    std::int32_t reservedPagesForRunning() const;
+
+    // Fraction of each running request's remaining output that admission
+    // assumes will actually be generated. Decays toward the floor while steps
+    // succeed and snaps back up on a retraction, so the reservation tracks
+    // observed behaviour instead of a fixed guess.
+    double new_token_ratio_{0.7};
+
 #if TOKENSPEED_FLAT_KVCACHE
     // One hash pass at admission: non-owning device/host probes plus the hashes
     // retained for acquisition after every admission check succeeds.

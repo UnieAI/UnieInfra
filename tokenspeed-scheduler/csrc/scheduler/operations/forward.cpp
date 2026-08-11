@@ -1228,14 +1228,24 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     // ordering and the two decode cut-offs have to agree, or the batch is
     // ordered for one policy and truncated by the other.
     const bool mix_this_step = shouldMixThisStep(candidates);
+    // vLLM's order (v1/core/sched/scheduler.py:440 and :640): every RUNNING
+    // request is served first out of the step's token budget, and only what is
+    // left goes to requests waiting to start. A decode needs one token and an
+    // in-progress prefill chunk needs many, but neither can be crowded out by a
+    // request that has not begun.
+    //
+    // This engine used to do the opposite when not mixing -- Prefilling(1) and
+    // Submitted(2) ahead of Decoding(3), then `break` out of decode entirely
+    // once a prefill was pushed -- which is why TTFT ran 3x vLLM's at 64
+    // concurrent and why requests were dropped from 256 up: a new arrival
+    // displaced the batch that was already running.
     auto priority = [&](const Request* req) -> int {
+        // Already running: decode, and prefill chunks after the first.
+        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) return 0;
         if (req->Is<fsm::Prefilling>()) return 1;
-        if (req->Is<fsm::Submitted>()) return 2;
-        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
-            // Decode-first when this step mixes; prefill-first otherwise.
-            return mix_this_step ? 0 : 3;
-        }
-        if (req->Is<fsm::Retracted>()) return 4;
+        if (req->Is<fsm::Retracted>()) return 2;
+        // Not started: takes whatever budget the running set left.
+        if (req->Is<fsm::Submitted>()) return 3;
         return 9;
     };
     // TP-determinism: tie-break on Id() so every rank schedules the same subset (a rank-varying op deadlocks NCCL).
@@ -1331,8 +1341,11 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
-            // Not mixing this step: skip ALL decode once a prefill was scheduled.
-            if (!mix_this_step && pushed_prefill) break;
+            // No cut-off: running requests are ordered ahead of new arrivals,
+            // so reaching a decode here means the step still has budget for it.
+            // Cutting decode off after a prefill was scheduled is what starved
+            // the running set.
+            (void)pushed_prefill;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 DecodeOperation op = applyEventAndGenerateOp(request, *ev);
@@ -1346,7 +1359,6 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 note_result_owed(request);
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
-            if (!mix_this_step && pushed_prefill) break;
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();

@@ -1,4 +1,5 @@
 # Copyright (c) 2026 LightSeek Foundation
+# Copyright (c) 2026 UnieAI
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -30,13 +31,21 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     PagedCacheGroupSpec,
     resolve_layer_types_and_window,
     scheduler_ext_flat_kvcache,
+    split_groups_to_equal_depth,
 )
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+# Architectures whose cache groups are relabelled to equal depth before the
+# KV profile; see split_groups_to_equal_depth.
+_EQUAL_DEPTH_GROUP_ARCHITECTURES = frozenset(
+    {"Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"}
+)
 
 
 @dataclass
@@ -97,6 +106,16 @@ class MHAConfig(BaseAttnConfig):
         ):
             # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
             layer_types = ()
+        # Equal-depth cache groups, before the KV profile reads the slab count
+        # off these labels. Gated on Gemma 4: every other hybrid here either is
+        # already equal-depth (Inkling splits its own) or pairs attention with
+        # a recurrent group, where the slab arithmetic is different and this
+        # has not been measured.
+        if (
+            scheduler_ext_flat_kvcache()
+            and resolve_architecture(hf_config) in _EQUAL_DEPTH_GROUP_ARCHITECTURES
+        ):
+            layer_types = split_groups_to_equal_depth(layer_types)
         conv_state_shape = temporal_state_shape = None
         conv_dtype = ssm_dtype = None
         if (

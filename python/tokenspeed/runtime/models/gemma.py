@@ -65,6 +65,9 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    split_groups_to_equal_depth,
+)
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -290,10 +293,17 @@ class Gemma4Attention(nn.Module):
         rotary_emb: Gemma4RotaryEmbedding,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        group_id: str | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
         self.layer_type = layer_type
+        # The paged-cache group this layer's KV lives in. Distinct from
+        # layer_type: the sliding layers are relabelled into equal-depth
+        # sub-groups so no slab row is left dead (see
+        # split_groups_to_equal_depth). Every geometry decision below
+        # still keys off layer_type, which is what the checkpoint says.
+        self.group_id = group_id or layer_type
         self.is_sliding = layer_type == SLIDING_ATTENTION
         self.rotary_emb = rotary_emb
 
@@ -384,7 +394,7 @@ class Gemma4Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(config.sliding_window if self.is_sliding else -1),
-            group_id=layer_type,
+            group_id=self.group_id,
         )
 
     def forward(
@@ -452,9 +462,13 @@ class Gemma4DecoderLayer(nn.Module):
         super().__init__()
         self.mapping = mapping
         layer_type = config.layer_types[layer_id]
+        # Same relabelling the KV pool published its groups from, so a
+        # layer's group_id and the pool's groups cannot drift apart.
+        group_labels = split_groups_to_equal_depth(config.layer_types)
         self.self_attn = Gemma4Attention(
             config=config,
             mapping=mapping,
+            group_id=group_labels[layer_id],
             layer_id=layer_id,
             layer_type=layer_type,
             rotary_emb=rotary_emb,

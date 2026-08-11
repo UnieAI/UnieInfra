@@ -413,6 +413,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
+    // One prefill may not take the whole step. See
+    // SchedulerConfig::long_prefill_token_threshold.
+    if (config_.long_prefill_token_threshold > 0) {
+        tokens_this_round = std::min(tokens_this_round, config_.long_prefill_token_threshold);
+    }
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() && match_result.mamba_branching_seqlen == -1) {
         const std::int32_t aligned = hybrid_prefix_cache_->AlignMambaCacheSeqlen(tokens_this_round);
         if (aligned > 0) {
@@ -577,6 +582,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     std::map<std::string, std::int32_t>& simulated_free) {
     std::int32_t unscheduled = request->UnScheduledPrefillSize();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
+    // One prefill may not take the whole step. See
+    // SchedulerConfig::long_prefill_token_threshold.
+    if (config_.long_prefill_token_threshold > 0) {
+        tokens_this_round = std::min(tokens_this_round, config_.long_prefill_token_threshold);
+    }
 
     std::int32_t pages_needed = (tokens_this_round + config_.block_size - 1) / config_.block_size;
 

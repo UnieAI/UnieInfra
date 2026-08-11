@@ -198,6 +198,7 @@ def make_config(
     mamba_ckpt_pool_slots: int = 0,
     mixed_prefill_decode_min_load: float = 0.35,
     max_num_partial_prefills: int = 0,
+    long_prefill_token_threshold: int = 0,
     enable_mamba_l2: bool = False,
     mamba_l2_host_slots: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
@@ -232,6 +233,7 @@ def make_config(
     cfg.mamba_ckpt_pool_slots = mamba_ckpt_pool_slots
     cfg.mixed_prefill_decode_min_load = mixed_prefill_decode_min_load
     cfg.max_num_partial_prefills = max_num_partial_prefills
+    cfg.long_prefill_token_threshold = long_prefill_token_threshold
     cfg.enable_mamba_l2 = enable_mamba_l2
     cfg.mamba_l2_host_slots = mamba_l2_host_slots
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode

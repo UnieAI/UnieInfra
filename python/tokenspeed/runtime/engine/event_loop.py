@@ -523,6 +523,7 @@ class EventLoop:
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             mixed_prefill_decode_min_load=server_args.mixed_prefill_decode_min_load,
             max_num_partial_prefills=server_args.max_num_partial_prefills,
+            long_prefill_token_threshold=server_args.long_prefill_token_threshold,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         scheduler_cfg.enable_flatkv_pd = self._flatkv_pd_enabled

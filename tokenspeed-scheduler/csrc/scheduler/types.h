@@ -160,6 +160,20 @@ struct SchedulerConfig {
     // mix/no-mix decision is needed. Zero means unbounded, which is what this
     // scheduler did before.
     std::int32_t max_num_partial_prefills{0};
+    // Cap on how far ONE prefill may advance in a single step, vLLM's
+    // `long_prefill_token_threshold` (v1/core/sched/scheduler.py:478).
+    //
+    // Different from max_num_partial_prefills, which caps how many prefills a
+    // step may carry: this caps each one's stride, so several requests advance
+    // together within the same total token budget instead of one consuming it.
+    // Measured at 64 concurrent, this engine puts 5955 tokens of an 8192 budget
+    // into 9.27 requests -- one or two whole prompts a step -- and its TTFT is
+    // 4297 ms against vLLM's 2630 while its throughput is within 15%. Nothing
+    // is queued (18 waiting) and the batch is 73% full, so the gap is when each
+    // request's first token arrives, not how much work gets done.
+    //
+    // Zero means unbounded, which is what this scheduler did before.
+    std::int32_t long_prefill_token_threshold{0};
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};

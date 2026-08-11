@@ -139,6 +139,10 @@ class ServerArgs:
     # unconditionally without prefill crowding decode out. 0 = unbounded, the
     # behaviour before this knob existed.
     max_num_partial_prefills: int = 0
+    # vLLM's long_prefill_token_threshold: how far ONE prefill may advance in a
+    # step. Caps each request's stride rather than the number of requests, so
+    # several advance together inside the same token budget. 0 = unbounded.
+    long_prefill_token_threshold: int = 0
     enable_int8_mamba_checkpoint: bool = False
     # Slots in that pool. None means twice the active pool, matching SGLang's
     # default: a cached state is the cheap one, so there should be more of them
@@ -1100,6 +1104,15 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
+        )
+        parser.add_argument(
+            "--long-prefill-token-threshold",
+            type=int,
+            default=ServerArgs.long_prefill_token_threshold,
+            help=(
+                "Cap on how far one prefill advances per step (vLLM's knob of "
+                "the same name). 0 leaves it unbounded."
+            ),
         )
         parser.add_argument(
             "--max-num-partial-prefills",

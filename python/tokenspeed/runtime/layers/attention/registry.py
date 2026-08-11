@@ -864,6 +864,31 @@ def _apply_gemma4_hetero_kv(config, model_config) -> bool:
     # and this one), and widening it needs the write-loc/block-table math
     # fixed first. What it would buy, if fixed: an 811-token request charged
     # 57 ids instead of 77, i.e. ~34% more resident sequences.
+    #
+    # Both reference layouts were then ported here and both LOST, on
+    # gemma-4-31B at concurrency 64 against this arrangement's 267.6 tok/s
+    # and 34 resident sequences:
+    #
+    #   vLLM's equal-depth groups (split the 50 sliding layers round-robin
+    #   into 5 sub-groups of 10, `_get_kv_cache_groups_uniform_page_size`)
+    #     -> 135.7 tok/s, 26 resident. The labels come out right and the
+    #        slabs drop 50 -> 10 as intended, but the pool sizes its id count
+    #        from a fixed token target, so it allocated 3.6 GB instead of
+    #        18.1 and still advertised 23,680 tokens it did not have.
+    #
+    #   TRT-LLM's single pool with per-layer widths
+    #   (`kv_cache_manager_v2.py:3325`) -> 225.5 tok/s, 30 resident, because
+    #        one group turns the hybrid slab off ("predicate returned None --
+    #        non-uniform/single-group layer_types"): 60 separate buffers at
+    #        21.7 GB where 50 aliased slabs held the same tokens in 18.1.
+    #
+    # Which names the real difference: WE ALIAS AND THEY DO NOT. vLLM and
+    # TRT-LLM give every layer its own buffer, so summing each group's block
+    # count is exact for them. Our paired layers share one slab, so the two
+    # groups' blocks are not independent and summing them double-counts
+    # storage that is already shared. The accounting was copied from a layout
+    # we do not have. The fix is in BlocksNeededFor, not in the grouping --
+    # and it is something neither reference engine needs.
     ratio = head_ratio
     config.slot_tokens = config.page_size * ratio
     config.group_page_sizes = {"full_attention": config.page_size * ratio}

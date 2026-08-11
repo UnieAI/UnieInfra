@@ -315,7 +315,15 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 page_size=self.page_size,
                 is_causal=True,
                 # Same expression the kernel uses for its default, so the two agree
-                # bit for bit rather than by luck.
+                # bit for bit rather than by luck. This plan is therefore only
+                # matchable by layers that take that default: the forward path
+                # passes `layer.scaling`, and a model declaring anything else
+                # (Gemma 4 declares 1.0) simply misses the match and plans per
+                # call. Correct either way -- the kernel attends at the scale it
+                # was handed, not the one the plan recorded -- but the sync this
+                # exists to remove comes back. Fixing it needs the plan to be
+                # per-cache-group, which is the same work as the per-group
+                # head_dim below.
                 softmax_scale=1.0 / math.sqrt(self.head_dim),
                 window_left=-1,
                 logit_cap=0.0,
@@ -1245,6 +1253,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             max_seqlen=metadata.max_extend_seq_len,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             solution=self.kernel_solution,
         )
@@ -1296,6 +1305,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             is_causal=not bool(getattr(layer, "non_causal", False)),
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             solution=self.kernel_solution,
             **scale_kwargs,
@@ -1346,6 +1356,19 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     "FA2 cuda-graph decode split does not support logit_cap; "
                     "disable the flashinfer backend for this model."
                 )
+            # The wrapper was planned with the kernel's default scale, and run()
+            # takes no override -- a model whose scale is not that default (e.g.
+            # Gemma 4's 1.0) would be silently attended at the wrong temperature.
+            if not math.isclose(
+                layer.scaling, 1.0 / math.sqrt(layer.qk_head_dim), rel_tol=1e-12
+            ):
+                raise RuntimeError(
+                    "FA2 cuda-graph decode split carries no per-layer "
+                    f"softmax_scale; layer {layer.layer_id} declares "
+                    f"scaling={layer.scaling}, not the planned "
+                    f"{1.0 / math.sqrt(layer.qk_head_dim)}. Disable the "
+                    "flashinfer backend for this model."
+                )
             output = fa2_decode_cuda_graph_run(
                 fa2_wrapper,
                 q,
@@ -1365,6 +1388,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,

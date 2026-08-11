@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -335,6 +336,14 @@ class MambaForwardMetadata:
     # -1 when the plan is not MIXED. Recorded once here rather than re-derived
     # per layer: the recurrent split reads it 48 times a step.
     mixed_num_extends: int = -1
+    # First decode token's index, i.e. query_start_loc[mixed_num_extends].
+    #
+    # Resolved ONCE per step, on purpose. Reading it inside the layer forward
+    # costs a device-to-host sync per layer -- 48 of them a step -- and measured
+    # on the RAG shape that doubled ITL, 58.4 -> 112.2 ms, which is most of why
+    # the first split attempt was slower than not splitting at all. vLLM
+    # precomputes its split for the same reason.
+    mixed_split_tok: int = -1
 
 
 class LayerMappedKVPool:
@@ -1577,10 +1586,14 @@ class MambaAttnBackend(AttentionBackend):
         # split can find the boundary without re-deriving it per layer; -1 on
         # every other mode means "one kind of row, no split".
         mixed_num_extends = -1
+        mixed_split_tok = -1
         if forward_mode.is_mixed():
             _epl = kwargs.get("extend_prefix_lens")
             if _epl is not None:
                 mixed_num_extends = int(_epl.shape[0])
+                if 0 < mixed_num_extends < query_start_loc.shape[0] - 1:
+                    # The one sync, paid here instead of 48 times below.
+                    mixed_split_tok = int(query_start_loc[mixed_num_extends].item())
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
@@ -1588,6 +1601,7 @@ class MambaAttnBackend(AttentionBackend):
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices[:bs],
             mixed_num_extends=mixed_num_extends,
+            mixed_split_tok=mixed_split_tok,
             extend_prefix_lens=(
                 extend_prefix_lens_full
                 if extend_prefix_lens_full is not None
@@ -2989,16 +3003,12 @@ class MambaAttnBackend(AttentionBackend):
                 # (`_forward_core_decode_non_spec`, how it hands over state
                 # indices, how it rejoins). Kept behind a flag so the measured
                 # comparison stays reproducible while that is worked out.
-                n_ext = (
-                    self.forward_metadata.mixed_num_extends
-                    if os.environ.get("TOKENSPEED_ENABLE_GDN_MIXED_SPLIT") == "1"
-                    else -1
-                )
-                split_tok = (
-                    int(query_start_loc[n_ext].item())
-                    if 0 < n_ext < query_start_loc.shape[0] - 1
-                    else -1
-                )
+                if os.environ.get("TOKENSPEED_ENABLE_GDN_MIXED_SPLIT") == "1":
+                    n_ext = self.forward_metadata.mixed_num_extends
+                    split_tok = self.forward_metadata.mixed_split_tok
+                else:
+                    n_ext = -1
+                    split_tok = -1
                 if split_tok > 0:
                     core_attn_out, last_recurrent_state = self._forward_mixed_recurrent(
                         query=query,

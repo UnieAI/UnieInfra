@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -133,6 +134,21 @@ MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int3
     return match;
 }
 
+namespace {
+// Env-gated trace for the hybrid match (`TOKENSPEED_LOG_MATCH_DEPTH=1`).
+//
+// Reuse on a hybrid is min(KV match depth, deepest usable snapshot), and when
+// the second is missing the whole KV match is discarded. That discard is
+// correct -- without the recurrent state at position P the forward has to
+// restart from 0 -- but it is silent, so a match that found thousands of
+// tokens and a match that found nothing both read `#cached-token: 0`. Only
+// printing both numbers separates them.
+bool MatchTraceEnabled() {
+    static const bool on = std::getenv("TOKENSPEED_LOG_MATCH_DEPTH") != nullptr;
+    return on;
+}
+}  // namespace
+
 void HybridPrefixCache::augmentMatch(MatchResult& match) const {
     if (mamba_allocator_ == nullptr) return;
     TreeNode* root = match.device.last_node;
@@ -150,6 +166,9 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         const std::int32_t kv_depth = device_depth;
         TreeNode* kv_terminal = device_terminal;
         if (kv_terminal == nullptr || kv_terminal->IsRoot()) {
+            if (MatchTraceEnabled()) {
+                spdlog::info("[MATCHDEPTH] kv_pages=0 kv_tokens=0 mamba=NO-KV-MATCH mamba_tokens=-1");
+            }
             if (host_terminal != nullptr && !host_terminal->IsRoot()) {
                 TreeNode* mamba_node = FindLastMambaNode(host_terminal);
                 if (mamba_node != nullptr) {
@@ -170,6 +189,11 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         }
 
         TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
+        if (MatchTraceEnabled()) {
+            spdlog::info("[MATCHDEPTH] kv_pages={} kv_tokens={} mamba={} mamba_tokens={}", kv_depth,
+                         kv_depth * page_size, mamba_node == nullptr ? "MISS" : "hit",
+                         mamba_node == nullptr ? -1 : mamba_node->DepthInPage(page_size) * page_size);
+        }
         if (mamba_node == nullptr) {
             const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * match.device.page_size);
             if (aligned_seqlen > 0) {

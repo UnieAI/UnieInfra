@@ -76,6 +76,30 @@ from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton impor
 
 logger = logging.getLogger(__name__)
 
+# Prints the depth this side computes for each extending row
+# (`TOKENSPEED_LOG_PUBLISH_DEPTH=1`), to be read against the C++ `[PUBLISH]`
+# line for the same step. Nothing in the engine checks that the two agree, yet
+# every hit depends on it: C++ attaches the slot to the radix node at ITS depth
+# while the GPU writes the state harvested at THIS one, so a disagreement files
+# a state under a depth it does not describe and a later hit resumes from the
+# wrong place -- fluent, wrong, and invisible to every timing number.
+_PUBLISH_DEPTH_DEBUG = bool(os.environ.get("TOKENSPEED_LOG_PUBLISH_DEPTH"))
+_publish_depth_seen = 0
+
+
+def _publish_depth_debug(prefix, extend_lens, publish) -> None:
+    global _publish_depth_seen
+    if _publish_depth_seen >= 16:
+        return
+    _publish_depth_seen += 1
+    logger.info(
+        "[PYDEPTH] chunk_begin=%s chunk_size=%s publish=%s",
+        prefix[:8].tolist(),
+        extend_lens[:8].tolist(),
+        publish[:8].tolist(),
+    )
+
+
 # Must equal kMambaSnapshotStrideTokens in
 # tokenspeed-scheduler/csrc/fsm/forward_events.cpp. The scheduler publishes a
 # recurrent snapshot every this many tokens; this side picks the matching state
@@ -1507,12 +1531,23 @@ class MambaAttnBackend(AttentionBackend):
                 # diverging prefix splits the node inside that last page.
                 # Measured on Qwen3.5-27B: publishing at the end gave
                 # `#cached-token: 0` on every shape.
-                publish_lens = (final_lens // page_size) * page_size - page_size
-                track_lens = publish_lens - prefix
+                # Snapped down onto FLA_CHUNK_SIZE, not merely tested against
+                # it: the candidate is on the KV page grid and the scan only
+                # leaves states on its own chunk grain, so demanding the two
+                # coincide dropped roughly three prompts in four. Must stay
+                # bit-identical to `MambaCheckpointPublishDepth` in
+                # tokenspeed-scheduler/csrc/fsm/forward_events.cpp -- C++
+                # attaches the slot to the radix node at this depth, so a state
+                # harvested anywhere else is filed under a depth it does not
+                # describe and a later hit resumes from the wrong state.
+                page_lens = (final_lens // page_size) * page_size - page_size
+                track_lens = ((page_lens - prefix) // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
                 track_inside = (
                     checkpoint_mask & (track_lens > 0) & (track_lens < extend_lens)
                 )
-                track_mask = track_inside & ((track_lens % FLA_CHUNK_SIZE) == 0)
+                track_mask = track_inside
+                if _PUBLISH_DEPTH_DEBUG:
+                    _publish_depth_debug(prefix, extend_lens, prefix + track_lens)
                 # The publish depth is now strictly inside the extend, so the
                 # state always comes from the chunked scan's intermediate
                 # checkpoints; the chunk's final state is never the one filed.

@@ -123,6 +123,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(tokenspeed_scheduler_tests
+        tests/cpp/test_mamba_snapshot_depth.cpp
         tests/cpp/test_page_hasher.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_block_ref.cpp

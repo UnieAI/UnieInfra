@@ -27,6 +27,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <string>
+
+#include <spdlog/spdlog.h>
 
 #include "core/token_container.h"
 #include "fsm/cache_states.h"
@@ -132,14 +135,33 @@ std::int32_t MambaCheckpointPublishDepth(tokenspeed::HybridPrefixCache* hybrid_c
                                          std::int32_t chunk_size, std::int32_t page_size) {
     if (hybrid_cache == nullptr || chunk_size <= 0 || page_size <= 0) return -1;
     const std::int32_t final_len = chunk_begin + chunk_size;
-    const std::int32_t publish_depth = (final_len / page_size) * page_size - page_size;
-    if (publish_depth <= chunk_begin) return -1;
+    const std::int32_t page_depth = (final_len / page_size) * page_size - page_size;
+    if (page_depth <= chunk_begin) return -1;
+    // Kept in terms of the cache's own aligner so the two cannot drift; the
+    // grain-taking form in `detail` is the same arithmetic, made testable.
 
     // The GPU harvests this state from the chunked scan's intermediate
-    // checkpoints, which exist only on its own chunk grain.
-    const std::int32_t track_len = publish_depth - chunk_begin;
-    if (hybrid_cache->AlignMambaCacheSeqlen(track_len) != track_len) return -1;
-    return publish_depth;
+    // checkpoints, which exist only on its own chunk grain -- so SNAP the depth
+    // down onto that grain rather than demanding it already sit there.
+    //
+    // The candidate above is computed on the KV page grid (16), and the grain
+    // is 64, so requiring `align(track_len) == track_len` published a snapshot
+    // only when the two happened to coincide -- about one prompt in four.
+    // Measured on the RAG shape at concurrency 1: prompts of 873/680/1020/627
+    // tokens all returned -1 and published nothing, while 735 (whose depth
+    // lands on 704 = 11 x 64) was the only one of sixteen that did. Every
+    // later request then matched 640-736 tokens of KV, found no recurrent
+    // state to pair with it, and threw the whole match away: 6.8% reuse
+    // against an 84.1% ceiling on the same prompts.
+    //
+    // Snapping keeps every invariant the check was there to protect. The grain
+    // is a multiple of the page size, so the result still lands on a page
+    // boundary for `SplitAt`; and it only ever moves the depth DOWN, so it
+    // stays strictly below the chunk's own end, which is what lets a later
+    // match reach it at all.
+    const std::int32_t track_len = hybrid_cache->AlignMambaCacheSeqlen(page_depth - chunk_begin);
+    if (track_len <= 0) return -1;
+    return chunk_begin + track_len;
 }
 
 // Stride between retained snapshots, in tokens.
@@ -163,12 +185,27 @@ constexpr std::int32_t kMambaSnapshotStrideTokensDefault = 512;
 
 // Ceiling on retained snapshots per chunk. The pool is shared with every
 // in-flight sequence's working state, so an unbounded count would let one long
-// document starve the batch. Six covers ~3k tokens at the stride above, which
-// is the document size this was measured on.
-// Chosen when the pool held 80 slots and every retained snapshot competed with
-// a running sequence's working slot. It now holds 221 (bf16 state, mamba memory
-// ratio 2.0), so the ceiling that made 6 the right number has moved.
-constexpr std::int32_t kMambaSnapshotMaxPerRequestDefault = 6;
+// document starve the batch.
+//
+// ONE, because one is all the GPU writes. The cap keeps the deepest depths, and
+// the deepest is exactly the one `hybrid_linear_attn.py` harvests -- its
+// `publish_lens` is a single value per row, and the multi-snapshot harvest
+// (`_expand_multi_track`) does not fill the rest. Publishing more attaches
+// radix nodes to slots that never receive a state, so a later match that lands
+// between two published depths resumes from uninitialised memory. Measured:
+// with a cap of 6 the C++ side published {512, 832} for an 873-token chunk
+// while the GPU wrote only 832, and asking the same prompt twice returned
+// different text 8 times out of 8; at a cap of 1, 4 of 8 -- against a
+// cache-disabled control of 6 of 8 on the same prompts.
+//
+// Nothing is given up by this. The interior depths never served a hit: reuse
+// measured 82.0% at concurrency 1 and 44.0% at 32 with either cap, to the same
+// hit count and the same hit depths. They were pure liability.
+//
+// Raise it again when `_expand_multi_track` is proven to write every published
+// depth -- that is what makes a stride grid mean anything, and the stride is
+// still the way to the 74.4% ceiling this shape allows.
+constexpr std::int32_t kMambaSnapshotMaxPerRequestDefault = 1;
 
 // Read once from the environment so the stride/cap pair can be swept without
 // threading config through the FSM. Both were fixed constants chosen when the
@@ -191,6 +228,15 @@ inline std::int32_t SnapshotStrideTokens() {
 inline std::int32_t SnapshotMaxPerRequest() {
     static const std::int32_t v = EnvInt("TOKENSPEED_MAMBA_SNAPSHOT_MAX", kMambaSnapshotMaxPerRequestDefault);
     return v;
+}
+
+// Env-gated trace for the publish side (`TOKENSPEED_LOG_SNAPSHOT_PUBLISH=1`).
+// Prints how many depths were wanted, how many slots the pool gave, and for
+// each depth whether `SplitAt` produced a node and whether that node already
+// carried a state -- the three ways a published depth silently becomes nothing.
+inline bool SnapshotTraceEnabled() {
+    static const bool on = std::getenv("TOKENSPEED_LOG_SNAPSHOT_PUBLISH") != nullptr;
+    return on;
 }
 
 // Every depth this chunk should retain a snapshot at, ascending.
@@ -271,6 +317,22 @@ bool AllocateMambaWorkingOrEvict(tokenspeed::LocalMambaAllocator* local,
 }  // namespace
 
 namespace tokenspeed::fsm {
+
+namespace detail {
+
+std::int32_t MambaCheckpointPublishDepthForGrain(std::int32_t chunk_begin, std::int32_t chunk_size,
+                                                std::int32_t page_size, std::int32_t grain) {
+    if (chunk_size <= 0 || page_size <= 0) return -1;
+    const std::int32_t final_len = chunk_begin + chunk_size;
+    const std::int32_t page_depth = (final_len / page_size) * page_size - page_size;
+    if (page_depth <= chunk_begin) return -1;
+    const std::int32_t raw = page_depth - chunk_begin;
+    const std::int32_t track_len = grain > 0 ? (raw / grain) * grain : raw;
+    if (track_len <= 0) return -1;
+    return chunk_begin + track_len;
+}
+
+}  // namespace detail
 
 #if TOKENSPEED_FLAT_KVCACHE
 namespace {
@@ -385,6 +447,12 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
         const auto publish_depths = MambaCheckpointPublishDepths(
             hybrid_cache, chunk_begin, chunk_size, page_size, static_cast<std::int32_t>(slots.size()),
             SnapshotStrideTokens());
+        if (SnapshotTraceEnabled()) {
+            std::string ds;
+            for (std::int32_t d : publish_depths) ds += std::to_string(d) + " ";
+            spdlog::info("[PUBLISH] chunk_begin={} chunk_size={} wanted={} slots={} depths=[{}]", chunk_begin,
+                         chunk_size, wanted.size(), slots.size(), ds);
+        }
         std::size_t next_slot = 0;
         for (std::int32_t publish_depth : publish_depths) {
             if (next_slot >= slots.size()) break;
@@ -396,6 +464,11 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
                 publish_depth > 0
                     ? hybrid_cache->GetKVPrefixCache().GetRadixTree().SplitAt(insert_result.last_node, publish_depth)
                     : nullptr;
+            if (SnapshotTraceEnabled()) {
+                spdlog::info("[PUBLISH]   depth={} split={} has_mamba={}", publish_depth,
+                             attach_node == nullptr ? "NULL" : "ok",
+                             attach_node == nullptr ? -1 : static_cast<int>(attach_node->HasMamba()));
+            }
             if (attach_node != nullptr && !attach_node->HasMamba()) {
                 const std::int32_t slot_index = slots[next_slot]->Index();
                 hybrid_cache->InsertMamba(attach_node, std::move(slots[next_slot]));

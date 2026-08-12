@@ -509,4 +509,19 @@ private:
     std::int32_t protected_tail_tokens_{};
 };
 
+namespace detail {
+
+// Depth at which a chunk's recurrent snapshot is published, or -1 for none.
+//
+// Exposed with the grain passed in rather than read off a HybridPrefixCache so
+// the arithmetic can be tested without one. It has to satisfy two grids at
+// once -- the KV page grid a radix node can split on, and the coarser grain the
+// chunked scan leaves intermediate states on -- and getting that wrong is
+// silent: the depth is simply never published, reuse degrades to whatever the
+// exact-repeat path can serve, and no error is raised anywhere.
+std::int32_t MambaCheckpointPublishDepthForGrain(std::int32_t chunk_begin, std::int32_t chunk_size,
+                                                std::int32_t page_size, std::int32_t grain);
+
+}  // namespace detail
+
 }  // namespace tokenspeed::fsm

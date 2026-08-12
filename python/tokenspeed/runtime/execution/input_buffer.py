@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,6 +43,28 @@ if TYPE_CHECKING:
 
 
 logger = get_colorful_logger(__name__)
+
+# Diagnostic for the multi-snapshot publish path: prints how many snapshot
+# depths the C++ scheduler actually published per request. The backend's
+# `use_multi` gate needs sum(counts) to EXCEED the number of rows carrying a
+# single track index, so a step where every count is 1 silently degrades to the
+# one-snapshot path and no amount of stride tuning changes anything.
+_TRACK_MULTI_DEBUG = bool(os.environ.get("TOKENSPEED_LOG_TRACK_MULTI"))
+_track_multi_seen = 0
+
+
+def _track_multi_debug(counts, indices, batch_size: int) -> None:
+    global _track_multi_seen
+    if _track_multi_seen >= 12:
+        return
+    _track_multi_seen += 1
+    logger.info(
+        "[TRACKMULTI] bs=%d counts=%s sum=%d indices=%s",
+        batch_size,
+        counts[:16],
+        sum(counts),
+        indices[:24],
+    )
 
 
 class InputBuffers:
@@ -475,6 +498,8 @@ class InputBuffers:
             multi_indices = list(
                 getattr(forward_op, "mamba_track_pool_indices_multi", ())
             )
+            if _TRACK_MULTI_DEBUG and any(c > 0 for c in multi_counts):
+                _track_multi_debug(multi_counts, multi_indices, batch_size)
             if multi_counts:
                 n = min(len(multi_counts), batch_size)
                 self.mamba_track_multi_counts_buf[:n].copy_(

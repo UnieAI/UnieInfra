@@ -144,7 +144,10 @@ def test_per_layer_head_dim_and_kv_heads(monkeypatch) -> None:
     assert sliding.head_dim == LOCAL_HEAD_DIM
     assert sliding.num_kv_heads == NUM_KV_HEADS
     assert sliding.attn.sliding_window_size == SLIDING_WINDOW
-    assert sliding.attn.group_id == "sliding_attention"
+    # Sliding layers are relabelled into equal-depth sub-groups so no slab row
+    # is left dead (split_groups_to_equal_depth); the geometry above still
+    # keys off the checkpoint's own layer_type, which is what this asserts.
+    assert sliding.attn.group_id.startswith("sliding_attention")
 
     full = layers[2].self_attn
     assert full.is_sliding is False
@@ -154,6 +157,50 @@ def test_per_layer_head_dim_and_kv_heads(monkeypatch) -> None:
     assert full.num_kv_heads == NUM_GLOBAL_KV_HEADS
     assert full.attn.sliding_window_size == -1
     assert full.attn.group_id == "full_attention"
+
+
+def test_cache_groups_are_equal_depth() -> None:
+    """Every cache group holds the same number of layers.
+
+    The hybrid slab binds the i-th layer of EVERY group to slab i, so unequal
+    depth leaves dead rows: with gemma-4-31B's 50 sliding against 10 full, an
+    id allocated to the full group reserved a row-block across all 50 slabs
+    while only 10 layers used it. Measured with prefix caching off, an
+    811-token request took 70 ids where its bytes were worth 57 and the pool
+    ran out at 21 concurrent sequences.
+
+    Uses the real 31B shape rather than the tiny meta config, because the
+    ratio is what the split has to get right.
+    """
+    from collections import Counter
+
+    from tokenspeed.runtime.configs.paged_cache_spec import (
+        split_groups_to_equal_depth,
+    )
+
+    layer_types = tuple(
+        "full_attention" if (i + 1) % 6 == 0 else "sliding_attention" for i in range(60)
+    )
+    assert Counter(layer_types) == {"sliding_attention": 50, "full_attention": 10}
+
+    counts = Counter(split_groups_to_equal_depth(layer_types))
+    assert len(counts) == 6, counts
+    assert set(counts.values()) == {10}, counts
+    assert counts["full_attention"] == 10
+
+
+def test_equal_depth_split_is_a_noop_when_it_would_not_help() -> None:
+    """A uniform stack keeps the label the rest of the stack expects."""
+    from tokenspeed.runtime.configs.paged_cache_spec import (
+        split_groups_to_equal_depth,
+    )
+
+    uniform = ("full_attention",) * 8
+    assert split_groups_to_equal_depth(uniform) == uniform
+    assert split_groups_to_equal_depth(()) == ()
+    # 1:1 needs no split -- one sub-group is the label itself.
+    paired = ("sliding_attention", "full_attention") * 4
+    assert split_groups_to_equal_depth(paired) == paired
 
 
 def test_attention_k_eq_v(monkeypatch) -> None:

@@ -177,6 +177,87 @@ CPU/GPU 重疊的設計。改成 `init_forward_metadata` 裡每個 forward 算�
 兩次都是「量到微幅改善、以為成功」——實際上快路徑一次都沒被走到。**驗證方式是在慢
 路徑插 raise 再跑端到端**（命中 2 次 → 0 次），不是看數字有沒有變好。
 
+#### 第三個 bug（2026-08-13 修）：兩組的 page table 撞在同一個 plan 上
+
+上面兩個是 inert；這一個**會給出錯誤答案而且不報錯**。gemma-4-31B 開
+`TOKENSPEED_ENABLE_FI_PAGED_EXTEND=1` 之後回答流暢、語法完整、**內容完全是另一件事**
+（問「舉三個質數並解釋」，回一整段關於論說文寫作的韓文）。關掉旗標或
+`--attention-backend triton` 則與 vLLM 逐字相同。
+
+機制：慢路徑的 plan cache 鍵是「批次的**形狀**」——每序列頁數、末頁填充、query
+offset、head 幾何、scale、window——**沒有 page table 本身**，而且所有呼叫共用
+`_paged_prefill_wrapper(device)`（slot 0）。flat KV 路徑是**每個 cache group 一張表**，
+gemma-4-31B 有六張（`sliding_attention_0..4` + `full_attention`）；五張 sliding 表對同一
+個請求的頁數、末頁、offset、幾何、scale、window **全部相同**，鍵完全撞在一起。於是
+第 0 組 plan 了共用的 wrapper，另外四組直接命中快取，**拿第 0 組的頁去做 attention**。
+
+為什麼只有 gemma 中招：Qwen3.5-27B 的 `layer.scaling` 就是 kernel 預設的
+`1/sqrt(head_dim)`，永遠走 installed-plan 快路徑，慢路徑一次都不會進。Gemma 4 宣告
+`scaling = 1.0`（qk-norm 之後 q/k 已是 unit-RMS），上面第 2 點那個「算式對齊」的身份鍵
+因此**必然失配**，60 層每一層都掉進慢路徑。
+
+kernel 層直接量到（同形狀、頁不相交的兩張表 A/B）：
+
+| | fi(A) | fi(B) |
+|---|---|---|
+| vs triton(A) | 0.0078 | **0.0078** ← B 讀了 A 的頁 |
+| vs triton(B) | 2.789 | 2.789 |
+
+修法（`tokenspeed_kernel/ops/attention/flashinfer/__init__.py`）：
+
+* `install_paged_extend_plan` 改成**只登記批次**（`cu_seqlens_q` / `cache_seqlens` /
+  `page_table` / host 端 `seq_lens_cpu`）與**該表專屬的 wrapper**，不預先 plan。
+  幾何（head 數、head dim、page size）與 scale/window/soft cap 是**每層**的東西，
+  呼叫端拿不到：異質 KV 模型一次 forward 裡就有兩種幾何（gemma 4 sliding 16x256 @
+  page 16、full 4x512 @ page 32），scale 也不是 backend 手上的值。改由**第一個用到該表的
+  層**用它自己拿到的參數去 plan，同組其餘層沿用；由 `seq_lens_cpu` 出發的 plan 在哪裡做
+  都不需要同步，所以延後是免費的。
+* 匹配只比對**批次身份**（三個張量 `is`），幾何/scale 變了就地重新 plan——不再把
+  不同意 installed 值的層踢去慢路徑。
+* 慢路徑**每次都 plan**，並改用一個不會與任何組相撞的專屬 slot（`_PAGED_FALLBACK_SLOT`）。
+  頁表是 device 張量，要在這裡便宜地描述它就只能拿形狀當鍵，而形狀正是會撞的東西；
+  借用 slot 0 也會把第 0 組的 plan 蓋掉。
+
+端到端（gemma-4-31B-it、GPU 3、C=32、`vllm bench serve` sharegpt/rag、64 requests，
+三邊同一個 HTTP client）：
+
+| | ours FI=1 | ours FI=0（triton） | vLLM |
+|---|---|---|---|
+| chat「三個質數」80 token | 逐字相同 | 逐字相同 | 逐字相同 |
+| `/v1/completions` 5 token prompt、24 token | 逐字相同 | 逐字相同 | 逐字相同 |
+| `/v1/completions` 1200 詞 prompt、48 token | 逐字相同 | 逐字相同 | 逐字相同 |
+| 首 token argmax（5 / 387 / 5893 / 11 prompt token，`max_tokens=1`、`temperature=0`） | 四個全同 | 四個全同 | 四個全同 |
+| tok/s（第 1 對，FI 先） | **263.5** | 256.9 | 457.2 |
+| tok/s（第 2 對，triton 先） | **242.5** | 238.0 | — |
+| ITL p50 / p99 | 60–61 / 846–1110 ms | 61 / 926 ms | 57.6 / **61.2** |
+
+首 token logprob（`/v1/chat/completions`、`logprobs: true`、`max_tokens=1`、
+`temperature=0`；比逐字比對敏感得多）：
+
+| prompt（token 數） | token | ours FI=1 | ours FI=0 | vLLM |
+|---|---|---|---|---|
+| prime（24） | `Three` | -6.5565e-6 | -5.8412e-6 | -6.4373e-6 |
+| france（18） | `Paris` | -1.3232e-5 | -1.2278e-5 | -1.2755e-5 |
+| med（393） | `The` | -1.3113e-5 | -1.3828e-5 | -1.2636e-5 |
+| long（5912） | `The` | -1.2994e-5 | -1.2040e-5 | -1.1682e-5 |
+
+三邊 token 全同，logprob 最大差 1.3e-6（FI=1 對 vLLM，5912 token 那列）；FI=1 與
+FI=0 的差和 FI=0 與 vLLM 的差同一個量級，也就是 bf16 累加順序的噪聲，不是系統性偏移。
+5912 token 那一列橫跨多頁、六個 cache group 全部參與，正是撞 plan 時會炸的形狀。
+
+（`/v1/completions` 那條路拿不到數字：`logprobs > 0` 被引擎拒絕「top_logprobs_num > 0
+... not supported yet」，`logprobs = 0` 回空物件，即使 `--enable-output-logprobs` 有開。
+chat 那條可以。這是 gateway/引擎的另一個缺口，不是這個 bug。）
+
+所以 **FA2 paged extend 在 gemma-4-31B 上只值 +1.9~2.6%**（兩對、兩種順序），遠低於
+本專案 +10% 的門檻——prefill attention **不是** gemma 對上 vLLM 那 1.9x 缺口的來源。
+ITL p50 已經平手，差距全在 p99（我們 14~18x 於中位數，vLLM 的 p99 等於中位數），
+與 `registry.py::_apply_gemma4_hetero_kv` 那段「pool 打滿時的 stall」結論一致。
+
+回歸：`test/runtime/kernels/test_flashinfer_paged_extend_groups.py`（修前 8 fail /
+2 error，修後全過）；Qwen3.5-27B 開 FI=1 仍然正確（這個修改動到它一直在走的
+installed-plan 路徑，所以必須重跑）。
+
 ### 找到的第二個：overlap scheduling 讓 TTFT 多付一整個 step
 
 FA2 修完後，剩下的差距在每一種形狀上都是**同一個常數**（plan 提升前 +9.4~10.4 ms，

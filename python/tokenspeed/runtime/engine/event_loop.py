@@ -225,6 +225,17 @@ def validate_fi_gdn_prefill_graph(server_args) -> None:
         return
     if getattr(server_args, "disable_prefill_graph", False):
         return
+    if os.getenv("TOKENSPEED_UNSAFE_FI_GDN_GRAPH") == "1":
+        # Diagnostic escape hatch for whoever is chasing WHY the graph breaks
+        # this kernel -- the answer needs the broken configuration running with
+        # instrumentation. Named UNSAFE because it is: every completion under
+        # it is garbage.
+        logger.warning(
+            "TOKENSPEED_UNSAFE_FI_GDN_GRAPH=1: running the flashinfer GDN "
+            "kernel under a prefill graph on purpose. Output WILL be garbage. "
+            "This is for diagnosis only."
+        )
+        return
     raise ValueError(
         "TOKENSPEED_ENABLE_FI_GDN_SM120=1 requires --disable-prefill-graph. "
         "The flashinfer GDN chunk-prefill kernel is correct and faster, but "

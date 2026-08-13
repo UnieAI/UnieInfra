@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -1728,6 +1730,20 @@ class MambaAttnBackend(AttentionBackend):
             g = g.unsqueeze(0)
             beta = beta.unsqueeze(0)
 
+            if _gdn_trace_enabled():
+                import torch as _t
+
+                _gdn_trace(
+                    "call",
+                    capturing=bool(
+                        _t.cuda.is_available() and _t.cuda.is_current_stream_capturing()
+                    ),
+                    q_rows=int(query.shape[-3]) if query.dim() >= 3 else -1,
+                    cu_last=int(query_start_loc[-1].item()),
+                    cu_n=int(query_start_loc.numel()),
+                    state_id=id(recurrent_state),
+                    cu_id=id(query_start_loc),
+                )
             gdn_result = gdn_chunk_prefill(
                 query,
                 key,
@@ -1747,6 +1763,27 @@ class MambaAttnBackend(AttentionBackend):
             ssm_states[state_out_long] = last_recurrent_state
 
         return core_attn_out
+
+
+@functools.cache
+def _gdn_trace_enabled() -> bool:
+    """`TOKENSPEED_TRACE_GDN=1` -- log what the GDN prefill call actually sees.
+
+    The flashinfer kernel is correct standalone and garbage under a prefill
+    graph, while the mixer already carries `@break_point` and so should be
+    running eagerly. Reading the code did not explain it; this prints the
+    quantities that would differ if a capture-time value were reaching a replay.
+
+    Cached: this sits on the per-layer prefill path, and an `os.environ` lookup
+    there costs ~0.46 us each time (see `tokenspeed_kernel.selection`).
+    """
+    return os.getenv("TOKENSPEED_TRACE_GDN") == "1"
+
+
+def _gdn_trace(tag: str, **fields) -> None:
+    logger.info(
+        "[GDNTRACE] %s %s", tag, " ".join(f"{k}={v}" for k, v in fields.items())
+    )
 
 
 class HybridLinearAttnBackend(AttentionBackend):

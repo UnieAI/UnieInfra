@@ -41,7 +41,25 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
     const std::int32_t page_offset = first_pos % page_size;
     if (page_offset != 0) {
         const std::int32_t tokens_to_boundary = page_size - page_offset;
-        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
+        if (chunk_size < tokens_to_boundary) {
+            return 0;
+        }
+        // Re-align to the page grid, then keep going. Returning only
+        // `tokens_to_boundary` capped every misaligned chunk at less than one
+        // page, so a request that started off-grid -- which on a high-reuse
+        // shape is most of them, because a prefix hit rarely ends on a page
+        // boundary -- crawled forward under 128 tokens per prefill step.
+        //
+        // Measured on Qwen3.5-27B, RAG at C=128: single-sequence prefill steps
+        // carried 96-127 new tokens, i.e. exactly `page_size - page_offset`,
+        // and 19 of 36 prefill steps carried one sequence. Prompts of 606-1015
+        // tokens were taking several steps each to admit.
+        //
+        // Alignment is preserved: the chunk still ends on a page boundary,
+        // because everything past the first partial page is a whole number of
+        // pages.
+        const std::int32_t past_boundary = chunk_size - tokens_to_boundary;
+        return tokens_to_boundary + (past_boundary - past_boundary % page_size);
     }
     return chunk_size - chunk_size % page_size;
 }

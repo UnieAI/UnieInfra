@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Sequence
 from typing import Literal
@@ -32,6 +33,55 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 _mapped_host_triton_available: bool | None = None
+
+
+def _transfer_debug_enabled() -> bool:
+    """Whether to synchronise and attribute each cache transfer.
+
+    ``TOKENSPEED_DEBUG_CACHE_TRANSFER=1`` turns the Host-tier transfers from
+    asynchronous into synchronous-and-checked. The fault this exists for is
+    reported at an unrelated ``copy_event.synchronize()`` many kernels later,
+    so the traceback names nothing; synchronising here moves the report onto
+    the transfer that caused it and lets the ranges be printed with it.
+
+    Off by default: it serialises the transfer streams against the compute
+    stream, which is a large slowdown and -- since serialising is one of the
+    two things known to make the fault disappear -- may hide what it is
+    looking for. A clean run under this flag is therefore not evidence of
+    correctness; only a fault caught by it is evidence of anything.
+    """
+    return os.getenv("TOKENSPEED_DEBUG_CACHE_TRANSFER") == "1"
+
+
+def _check_transfer(
+    direction: str,
+    backend: str,
+    device_buffers: Sequence[torch.Tensor],
+    ranges: Sequence[tuple[int, int, int, int]],
+    stream,
+) -> None:
+    """Synchronise ``stream`` and re-raise any fault with the ranges attached.
+
+    Only called under ``TOKENSPEED_DEBUG_CACHE_TRANSFER=1``. The point is the
+    message, not the check: an illegal access raised here names the direction,
+    the backend, and the exact byte ranges in flight, none of which survive to
+    the place CUDA normally reports it.
+    """
+    try:
+        stream.synchronize()
+    except Exception as error:  # noqa: BLE001 - re-raised with context below
+        spans = [
+            f"buf={buffer_index} dev=[{device_offset},{device_offset + num_bytes})"
+            f" host=[{host_offset},{host_offset + num_bytes})"
+            for buffer_index, device_offset, host_offset, num_bytes in ranges[:8]
+        ]
+        sizes = sorted({row[3] for row in ranges})
+        extents = [buffer.numel() * buffer.element_size() for buffer in device_buffers]
+        raise RuntimeError(
+            f"cache transfer faulted: direction={direction} backend={backend} "
+            f"ranges={len(ranges)} distinct_sizes={sizes[:8]} "
+            f"device_buffer_bytes={extents} first_ranges={spans}"
+        ) from error
 
 
 def _triton_is_unavailable(error: Exception) -> bool:
@@ -146,6 +196,8 @@ def transfer_cache_ranges(
                     0 if direction == "d2h" else 1,
                 )
                 _mapped_host_triton_available = True
+                if _transfer_debug_enabled():
+                    _check_transfer(direction, "triton", device_buffers, ranges, stream)
                 return
             except (AttributeError, RuntimeError) as error:
                 if backend == "triton" or not _triton_is_unavailable(error):
@@ -164,3 +216,5 @@ def transfer_cache_ranges(
             host_buffer,
             ranges,
         )
+        if _transfer_debug_enabled():
+            _check_transfer(direction, "dma", device_buffers, ranges, stream)

@@ -197,10 +197,35 @@ def is_available() -> bool:
     # device time (48 calls, 5 reps, median; 1024 tokens: 9.05 ms host / 9.11 ms
     # device vs Triton's 18.18 / 18.17). The table measured the integrated path,
     # this measured the kernel, so the gap is most likely per-call conversion in
-    # the wrapper below rather than the kernel. Setting
-    # TOKENSPEED_ENABLE_FI_GDN_SM120=1 registers the kernel so the integrated
-    # path can be measured against the same baseline; the default stays off
-    # until that measurement says otherwise.
+    # the wrapper below rather than the kernel.
+    #
+    # 2026-08-13: the integrated measurement was run and the kernel is not just
+    # slower here, it is WRONG. On Qwen3.5-27B, RAG at C=128 through the HTTP
+    # harness, two arms, 256 requests and 0 failed on each:
+    #
+    #                  triton      flashinfer sm120
+    #   throughput     511.86         579.97 tok/s   +13.3%
+    #   mean TTFT     6979.4          5975.4 ms      -14.4%
+    #   generated text  normal      "!!!!!!!!!!!!!!!!!!!!!!!!"
+    #
+    # Every completion under this kernel was a run of exclamation marks. The
+    # timing numbers are real and meaningless: they measure an engine producing
+    # nothing. Both flags-on arms did it; both Triton arms on the same build
+    # produced coherent text.
+    #
+    # This is why the repository requires a sample of the output next to any
+    # throughput claim. On the numbers alone this looked like the largest single
+    # win of the day and was minutes from being made the default.
+    #
+    # The raw-kernel agreement above (3.1e-4 against the Triton scan) still
+    # holds, which localises the defect to the wrapper below rather than the
+    # kernel -- the same per-call conversion the note already suspected. Whoever
+    # takes it should compare the wrapper's inputs against the Triton path's for
+    # one call: decay space, q/k normalisation, and the initial-state layout are
+    # where the two conventions differ.
+    #
+    # Default stays OFF, and now for a correctness reason rather than a
+    # performance one.
     return os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120") == "1"
 
 

@@ -24,7 +24,31 @@ import argparse
 import sys
 
 
+def _select_scheduler_ext(raw_argv: list[str]) -> None:
+    """Pick the tokenspeed_scheduler extension this model needs.
+
+    Has to happen HERE, before the first `import tokenspeed.*`: the radix and
+    flat schedulers are two separate .so files (the flat build compiles the
+    radix insert/publish path out and its Scheduler constructor refuses an
+    empty group list), and `runtime/engine/event_loop.py` imports the
+    extension at module scope. By the time anything holds a ModelConfig the
+    choice is already made.
+
+    So read the checkpoint's `architectures` directly -- no torch, no
+    transformers, no engine import -- and record the answer in the
+    environment, where the engine subprocess inherits it. Anything unparseable
+    leaves the default alone; the loader will report it properly later.
+    """
+    from tokenspeed.flat_kvcache_select import select_flat_kvcache_ext_for_model_path
+
+    model = next((arg for arg in raw_argv if arg and not arg.startswith("-")), None)
+    if model is not None:
+        select_flat_kvcache_ext_for_model_path(model)
+
+
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
+    _select_scheduler_ext(raw_argv)
+
     from tokenspeed.cli.serve_smg import run_smg_from_args
 
     run_smg_from_args(args, raw_argv)

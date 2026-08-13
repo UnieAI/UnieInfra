@@ -45,6 +45,7 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     preflight_kimi_k3_flat_consumers,
     scheduler_ext_flat_kvcache,
     validate_flat_scheduler_config,
+    verify_flat_kvcache_ext_for_model,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -216,6 +217,12 @@ class EventLoop:
             draft_model_config = None
 
         preflight_kimi_k3_flat_consumers(self.model_config, draft_model_config)
+        # The CLI picked the extension off the checkpoint's architectures
+        # before this process imported anything. Check that answer against the
+        # real ModelConfig now that one exists -- a mismatch is a startup
+        # error in one direction and a silent 39% throughput loss in the
+        # other, and neither should be discovered from a benchmark.
+        verify_flat_kvcache_ext_for_model(self.model_config, draft_model_config)
 
         min_per_gpu_mem = self._init_distributed()
 

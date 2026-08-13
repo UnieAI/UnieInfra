@@ -842,53 +842,70 @@ def _apply_gemma4_hetero_kv(config, model_config) -> bool:
     # narrower full layers page at `ratio` x that many token rows over the
     # same bytes (identical to the Inkling layout, one label instead of six).
     #
-    # The head ratio alone is byte-uniform per LAYER, not per BLOCK, and a
-    # block spans its whole group. Gemma 4 has 50 sliding layers against 10
-    # full ones, so a sliding block covers 16 tokens x 50 layers (~12.5 MB)
-    # while a full block covers 32 x 10 (~2.5 MB) -- same pool, same id, 5x
-    # the bytes. Admission charges both groups out of that one pool
-    # (KvCacheCoordinator::BlocksNeededFor sums over groups), so every full
-    # block spent 80% of an id on nothing: an 811-token request was charged
-    # 51 + 26 = 77 ids where its bytes are worth 57, and the pool ran out at
-    # 21 concurrent sequences with prefix caching off (1480 / 70 measured).
+    # `ratio` IS NOT A FREE PARAMETER -- do not raise it. A layer's view of a
+    # slab row is re-counted by head count (`_layer_page_tokens` = page_size *
+    # head_num // heads_l, kv_cache/mha.py:932) while the write loc is
+    # `page_id * group_page_size + off` (backends/flat_groups.py:225). The two
+    # address the same bytes only when group_page_size == head_ratio *
+    # page_size. Any larger ratio walks the write loc off the end of the id's
+    # own byte range into the following ids' -- which is exactly why ratio 4
+    # (64), 8 (128) and 10 (160) each served one request and then died with a
+    # CUDA illegal memory access once a batch reached ~12 concurrent
+    # sequences. That is an out-of-bounds bug, not a "the plumbing is not
+    # built for a non-power-of-two group page" limitation: 128 is a power of
+    # two and faults too.
     #
-    # Fold the layer-count ratio in so a block is byte-uniform too. Inkling
-    # is unaffected: it splits its sliding layers into equal-count sub-groups,
-    # so its layer ratio is 1 and this collapses to the old expression.
+    # HISTORICAL NOTE, corrected 2026-08-13. This comment used to assert that
+    # admission over-charges gemma 4 because `KvCacheCoordinator::
+    # BlocksNeededFor` sums over groups whose slabs alias -- "an 811-token
+    # request charged 77 ids where its bytes are worth 57, ~34% more resident
+    # sequences if fixed". That is FALSE today, and its arithmetic described a
+    # layout we no longer build:
     #
-    # Correcting it is BLOCKED, not forgotten. Measured on gemma-4-31B:
-    # ratio 2 (page 32) serves; ratio 4 (64), 8 (128) and 10 (160) each pass
-    # a single request and then die with a CUDA illegal memory access once a
-    # batch reaches ~12 concurrent sequences -- 127 of 128 requests lost. So
-    # the per-group page-size path is only exercised at 2x (Inkling's layout
-    # and this one), and widening it needs the write-loc/block-table math
-    # fixed first. What it would buy, if fixed: an 811-token request charged
-    # 57 ids instead of 77, i.e. ~34% more resident sequences.
+    #   * It assumed ONE sliding group of 50 layers against a full group of
+    #     10, so a full block wasted 80% of an id. Gemma 4 now goes through
+    #     `split_groups_to_equal_depth` (configs/mha.py:114) into FIVE
+    #     `sliding_attention_<k>` groups of 10 layers plus `full_attention`
+    #     of 10 -- six EQUAL groups, hybrid_slab_group_size == 10. The running
+    #     server prints it: "KV layout: hybrid slab (10 slabs x 118432 rows;
+    #     ... 7400 ids)". The equal-depth port recorded below as having LOST
+    #     is what we now ship; it lost only because it ran after the KV
+    #     profile and sized the pool at 3.6 GB, which the "Must run BEFORE the
+    #     KV memory profile" contract on that helper now prevents.
+    #   * With equal depth, every slab is bound by exactly one layer of the
+    #     owning group, so an id has no dead slab rows whichever group holds
+    #     it. That is the entire point of the split (paged_cache_spec.py:196).
+    #   * Page ids are group-EXCLUSIVE, and the aliasing depends on it being
+    #     so: one BlockPool free list hands each id out at most once
+    #     (cache/block_pool.h:84), and cached-block keys are group-wrapped
+    #     (MakeKeyWithGroupId, scheduler/page_hasher.h:179), so no id is ever
+    #     shared across groups. Summing per-group counts therefore adds up
+    #     DISTINCT ids -- it is a count, not a double-count.
+    #   * The charge is byte-exact. 5 sliding groups at page 16 plus 1 full
+    #     group at page 32 is 5/16 + 1/32 = 0.34375 ids/token; an id is 10
+    #     slabs x 16 rows x 16 heads x 256 dim x 2 B x (K,V) = 2,621,440 B;
+    #     the product is 901,120 B/token. Gemma-4-31B's true per-token KV is
+    #     50*16*256*2*2 + 10*4*512*2*2 = 901,120 B. Ratio 1.000, not one
+    #     wasted byte. So there is no layer ratio left to fold in: gemma 4's
+    #     is 1, exactly as Inkling's is, and ratio = head_ratio is already the
+    #     only correct value.
     #
-    # Both reference layouts were then ported here and both LOST, on
-    # gemma-4-31B at concurrency 64 against this arrangement's 267.6 tok/s
-    # and 34 resident sequences:
+    # TRT-LLM's single pool with per-layer widths (`kv_cache_manager_v2.py:
+    # 3325`) was also ported and still loses -- 225.5 tok/s, 30 resident --
+    # because one group turns the hybrid slab off ("predicate returned None --
+    # non-uniform/single-group layer_types"): 60 separate buffers at 21.7 GB
+    # where 10 aliased slabs hold the same tokens in 18.1.
     #
-    #   vLLM's equal-depth groups (split the 50 sliding layers round-robin
-    #   into 5 sub-groups of 10, `_get_kv_cache_groups_uniform_page_size`)
-    #     -> 135.7 tok/s, 26 resident. The labels come out right and the
-    #        slabs drop 50 -> 10 as intended, but the pool sizes its id count
-    #        from a fixed token target, so it allocated 3.6 GB instead of
-    #        18.1 and still advertised 23,680 tokens it did not have.
-    #
-    #   TRT-LLM's single pool with per-layer widths
-    #   (`kv_cache_manager_v2.py:3325`) -> 225.5 tok/s, 30 resident, because
-    #        one group turns the hybrid slab off ("predicate returned None --
-    #        non-uniform/single-group layer_types"): 60 separate buffers at
-    #        21.7 GB where 50 aliased slabs held the same tokens in 18.1.
-    #
-    # Which names the real difference: WE ALIAS AND THEY DO NOT. vLLM and
-    # TRT-LLM give every layer its own buffer, so summing each group's block
-    # count is exact for them. Our paired layers share one slab, so the two
-    # groups' blocks are not independent and summing them double-counts
-    # storage that is already shared. The accounting was copied from a layout
-    # we do not have. The fix is in BlocksNeededFor, not in the grouping --
-    # and it is something neither reference engine needs.
+    # Where the gemma-4 throughput gap actually is, measured 2026-08-13 at
+    # C=32 on the RAG shape, same harness and card: ours 234.2 tok/s, 30
+    # resident, pool pinned at 7257-7395/7400. The pool is genuinely full and
+    # correctly charged -- vLLM allocates LESS KV for the same model at the
+    # same utilization (15.4 GiB / 18,312 tokens against our 18.08 GB /
+    # ~21.5k sub-window tokens) and still serves 456.2 tok/s. Median ITL is
+    # at parity (60.1 vs 57.7 ms); only the tail diverges (P99 ITL 1181.7 vs
+    # 60.6 ms, i.e. vLLM's tail equals its median and ours is 20x it). That
+    # is stall behaviour at a saturated pool -- one "flat retract ... to
+    # unwedge the pool" fired in an entire run -- not page accounting.
     ratio = head_ratio
     config.slot_tokens = config.page_size * ratio
     config.group_page_sizes = {"full_attention": config.page_size * ratio}

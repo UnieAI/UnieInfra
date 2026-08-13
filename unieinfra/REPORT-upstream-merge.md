@@ -163,6 +163,21 @@ but this repository's own notes say host-side timings run ~3.6x high here, so
 that instrument is the wrong one. `TOKENSPEED_LOG_MM_TIMING=1` on both builds
 would separate "less overhead per step" from "better kernel shape".
 
+## Two more capabilities the merge took, found while looking for headroom
+
+- **fp8 KV is gone.** `--kv-cache-dtype fp8_e4m3` fails at startup with
+  `NoKernelFoundError: No kernel found for attention.mha_extend_with_kvcache
+  (k_cache=dense[storage=torch.float8_e4m3fn], ...)`, and
+  `--attention-backend triton` does not help. The pool sizing works — logged
+  `token_capacity` doubles from 379392 to 758784 — so only the extend kernel is
+  missing. Our own notes record fp8 KV as worth 1.92x capacity and +19% here,
+  so this is real headroom that the merge removed rather than a setting nobody
+  tried.
+- **Speculative decoding is unavailable for this model.** The Qwen3.5-27B
+  checkpoint carries no MTP layers and no draft shards, and layer-truncation
+  self-speculation was ruled out for Qwen3 previously. Not a merge loss, but
+  it closes the other obvious route to the target.
+
 ## Hypotheses killed, so nobody re-runs them
 
 | hypothesis | how it died |

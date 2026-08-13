@@ -66,14 +66,40 @@ RAG shape, C=128, GMU 0.80, 256 requests, all gate-passing with 0 failed:
 |---|---|---|---|
 | merged, direct backend | 231.01 | 14590.9 | 75.9% |
 | + prefill alignment fix | 405.74 | 8115.6 | 79.7% |
-| + mixed batching | **500.71** | 7014.3 | 76.7% |
+| + mixed batching | 500.71 | 7014.3 | 76.7% |
+| + paged-extend plan restored | **511.86** | 6979.4 | 77.6% |
 | default backend + stream ordering | 468.89 | 7505.7 | — |
 | | | | |
 | f162d993 nomix target | 754.0 | 3905.8 | 66.5% |
-| f162d993 mix target | 1086.8 | 2227.6 | 85.8% |
+| f162d993 mix target (needs a deleted flag) | 1086.8 | 2227.6 | 85.8% |
 
-231 -> 501 over the session, and the default configuration serves again. Still
-66% of the nomix target and 46% of the mix target.
+231 -> 512 over the session, and the default configuration serves again. Still
+68% of the nomix target. The mix target was measured with
+`--mixed-prefill-decode-min-load 0`, which the merge deleted and upstream has no
+equivalent for, so it is not a configuration this tree can reproduce.
+
+### The one that nearly went in
+
+`TOKENSPEED_ENABLE_FI_GDN_SM120=1` measured **579.97 tok/s, +13.3%, mean TTFT
+-14.4%, 256/256 successful, 0 failed** — and every completion was
+`"!!!!!!!!!!!!!!!!!!!!"`. Qwen3.5-27B runs 48 GDN layers so the kernel is most
+of prefill, the numbers were the best of the day, and the default had already
+been flipped on with a commit message calling it the session's biggest win.
+
+Nothing else caught it. Not the request-failure gate (0 failed), not the
+latency numbers, not reuse. The harness `.sample` file caught it, which is the
+whole reason `AGENTS.local.md` requires a text sample beside any throughput
+claim.
+
+The raw kernel still agrees with the Triton scan to 3.1e-4, so the defect is in
+the wrapper — decay space, q/k normalisation, initial-state layout. Default
+back off (a10d7dc0), now for correctness.
+
+I also had to retract the reasoning around it. The file's existing note said
+the integrated path measured 30-134% slower and kept the kernel off; I argued
+that note was stale because this session had fixed things it might have been
+blocked behind. That was motivated reasoning with an attractive number
+attached, and the note was simply right.
 
 ## What is still unexplained
 
@@ -126,6 +152,8 @@ would separate "less overhead per step" from "better kernel shape".
 | per-block ordering beats blunt stream ordering | 464.97 against 468.89 — inside noise |
 | spanning the promotion boundary | reuse 76.7% -> 1.4% |
 | prefill forward count is the bottleneck | packing halved the steps (113 -> 63) and throughput went 500.71 -> 492.24 |
+| the paged-extend plan's 64 host syncs are the prefill gap | restoring it was +2.2%, not the predicted ~2x |
+| the flashinfer sm120 GDN kernel is a 13% win | it produces `!!!!!!` instead of text |
 
 ## Method notes that cost real time
 
@@ -150,6 +178,13 @@ would separate "less overhead per step" from "better kernel shape".
   reads like an engine fault rather than someone else's cleanup. Being on a
   different GPU is not isolation; the container is shared. Record the PIDs your
   own launch produced and kill only those.
+- **A throughput number cannot tell a working engine from a broken one, and
+  neither can a request-failure gate.** The GDN arm scored 0 failed requests,
+  passed the harness gate, and returned exclamation marks for every completion.
+  Read the `.sample`.
+- **When an old note says a measurement was bad, do not go looking for reasons
+  it is stale because the new number is attractive.** That is exactly the move
+  that nearly landed the broken kernel as a default.
 - **The root filesystem being full reads as a compiler bug.**
   `error writing to /tmp/ccXXXX.s: No space left on device` — `/workspace` is a
   different device with room. Set `TMPDIR` under `/workspace` for builds.

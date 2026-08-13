@@ -112,9 +112,18 @@ over Triton without it, and the combination measures **592.40 tok/s, mean TTFT
 under `torch.cuda.is_current_stream_capturing()` rather than letting a graph
 corrupt every reply (8eb78a11).
 
-Left open: the GDN mixer already carries `@break_point`, so it should be
-running eagerly under capture and this should not happen. Making that work
-would stack the graph's +8.4% on top of the kernel's +21.8%.
+Left open, and narrowed by elimination rather than solved. The GDN mixer
+already carries `@break_point`, so the kernel runs as an eager break — outside
+the capture — and this should not be possible. Three explanations were checked
+and killed: a stale identity-keyed plan (flashinfer's `gdn_kernels` has no
+caching of any kind), a rank difference making `_land_in` narrow the batch axis
+instead of the token axis (both kernels return `(1, T, H, V)`), and the
+numerics themselves (4.9e-4 against Triton on multi-sequence, live-state,
+off-chunk inputs).
+
+Whoever takes it needs instrumentation rather than reading: log what the kernel
+receives at capture versus at replay, behind a debug bypass of the startup
+guard. The payoff is the graph's +8.4% stacked on the kernel's +21.8%.
 
 ## What is still unexplained
 
@@ -169,6 +178,9 @@ would separate "less overhead per step" from "better kernel shape".
 | prefill forward count is the bottleneck | packing halved the steps (113 -> 63) and throughput went 500.71 -> 492.24 |
 | the paged-extend plan's 64 host syncs are the prefill gap | restoring it was +2.2%, not the predicted ~2x |
 | the flashinfer sm120 GDN kernel is a 13% win | it produces `!!!!!!` instead of text |
+| the GDN kernel is numerically broken | correct to 4.9e-4 on engine-shaped inputs; the prefill graph was breaking it |
+| a stale identity-keyed plan explains the graph corruption | flashinfer's gdn_kernels has no caching at all: 0 lru_cache, 0 globals, 0 module dicts |
+| the two kernels return different ranks, so `_land_in` narrows the wrong axis | both return `(1, T, H, V)` |
 
 ## Method notes that cost real time
 

@@ -119,6 +119,14 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # stale-table guard. drop the flag.
     uses_cache_groups: bool = True
 
+    # `init_forward_metadata` asserts `not forward_mode.is_mixed()`, so the
+    # declaration has to say so -- inheriting the base class's True let
+    # `--enable-mixed-batch` start a server that then failed every request on
+    # that assert. The fork carried an implementation here (64e632d8) against
+    # the pre-restructure backend; it did not survive the upstream merge, and
+    # re-porting it is unwritten work rather than a flag flip.
+    supports_mixed_batch: bool = False
+
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:

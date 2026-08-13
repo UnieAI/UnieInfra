@@ -1757,6 +1757,22 @@ class HybridLinearAttnBackend(AttentionBackend):
     # fixed scratch and publishes only the accepted position.
     uses_cache_groups: bool = True
 
+    @property
+    def supports_mixed_batch(self) -> bool:
+        """Defer to the full-attention half; the recurrent half adds nothing.
+
+        A decode row is an extend row of length 1 whose prefix is its history,
+        so the recurrent half serves a mixed plan as one valid extend batch
+        without splitting it. The only remaining constraint is the
+        full-attention half's -- which is where a mixed batch actually died,
+        `HybridLinearAttnBackend.init_forward_metadata` reaching
+        `MHAAttnBackend`'s `assert not forward_mode.is_mixed()`.
+
+        A property rather than a class attribute because the answer is a
+        property of the pair, not of this class.
+        """
+        return getattr(self.full_attn_backend, "supports_mixed_batch", True)
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,

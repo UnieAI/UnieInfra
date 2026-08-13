@@ -357,6 +357,34 @@ drives both): the decoder's sandwich norms keep attention and MLP on one
 residual stream, and a split would need a shard exchange the layer does not
 perform. A mismatch is refused at construction.
 
+The 50 sliding layers are relabelled into 5 equal-depth sub-groups
+(`sliding_attention_0..4`) so every cache group holds 10 layers, matching the
+10 full-attention ones. The hybrid slab binds the i-th layer of every group to
+slab i, so unequal depth leaves dead rows: before this, an 811-token request
+was charged 70 page ids where its bytes were worth 57, and the pool ran out at
+21 concurrent sequences. Groups only look uniform to the pool -- every geometry
+decision still keys off the checkpoint's own `layer_types`.
+
+The full-attention layers are 512 wide, which flashinfer's XQA decode kernel
+cannot compile (it takes multiples of 16 up to 256). Kernel selection routes
+per layer, so the sliding layers keep XQA and only the full ones fall through
+to Triton; `--attention-backend triton` puts every layer on Triton and is what
+vLLM does for this model, at a few percent. Either serves.
+
+Two knobs are worth setting deliberately, both measured on `gemma-4-31B-it`
+over HTTP with `vllm bench serve`, cold cache per arm:
+
+* **Host KV tier** (`--enable-kvstore`, on by default) is worth +22% request
+  throughput and -13% TTFT when the working set exceeds the GPU pool, and
+  costs ~11% when it does not -- it pays for eviction writes it never reads
+  back. Size the decision on the workload, not on the flag's default. A
+  shape whose live set fits in HBM should pass `--disable-kvstore`.
+* **fp8 KV** (`--kv-cache-dtype fp8_e4m3`) doubles the pool (7400 -> 14800
+  page ids on the same 18 GB) and serves correctly, but is a regression below
+  concurrency 128 on a RAG-shaped workload (232 against 409 tok/s at 32) --
+  the capacity buys nothing while the client caps concurrency under what the
+  pool already holds, and the dequantise is paid on every read.
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

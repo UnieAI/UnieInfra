@@ -141,7 +141,9 @@ def describe_engine(backend: str, engine, args) -> dict:
             ("max_num_seqs", "max_num_seqs"),
             ("chunked_prefill", "chunked_prefill_size"),
             ("mixed_batch", "enable_mixed_batch"),
-            ("mamba_ckpt_slots", "int8_mamba_ckpt_size"),
+            ("mamba_ckpt_pool", "enable_mamba_ckpt_pool"),
+            ("mamba_ckpt_dtype", "mamba_ckpt_dtype"),
+            ("mamba_ckpt_slots", "mamba_ckpt_size"),
         ):
             cfg[key] = getattr(sa, attr, "?") if sa is not None else "?"
     return cfg
@@ -311,12 +313,16 @@ def main() -> int:
     # Mixed prefill+decode in one step. Off by default in the engine, and the
     # hybrid models are exactly where it has never run.
     ap.add_argument("--enable-mixed-batch", action="store_true")
-    # Cached recurrent snapshots in their own int8 pool rather than the active
-    # one. The arm that tests whether the capacity ceiling is actually gone.
-    ap.add_argument("--enable-int8-mamba-checkpoint", action="store_true")
+    # Cached recurrent snapshots live in their own pool by default now. These
+    # switch its dtype and size: int8 is the arm that tests whether the capacity
+    # ceiling is gone, at the cost of an inexact resume.
+    ap.add_argument(
+        "--mamba-ckpt-dtype", default=None, choices=("float32", "bfloat16", "int8")
+    )
+    ap.add_argument("--no-mamba-ckpt-pool", action="store_true")
     ap.add_argument("--max-num-partial-prefills", type=int, default=None)
     ap.add_argument("--mixed-prefill-decode-min-load", type=float, default=None)
-    ap.add_argument("--int8-mamba-ckpt-size", type=int, default=None)
+    ap.add_argument("--mamba-ckpt-size", type=int, default=None)
     ap.add_argument("--shape", default="shared", choices=("shared", "unique", "rag"))
     ap.add_argument("--max-model-len", type=int, default=8192)
     args = ap.parse_args()
@@ -359,21 +365,21 @@ def main() -> int:
             model=args.model,
             dtype="bfloat16",
             max_model_len=args.max_model_len,
-            # Read on both sides, not just vLLM's: the int8 checkpoint pool is
-            # allocated from the headroom this leaves rather than out of the KV
-            # budget, so an arm that enables it needs the knob.
+            # Read on both sides, not just vLLM's. The checkpoint pool comes out
+            # of the recurrent-state budget, so this knob moves both pools.
             gpu_memory_utilization=float(os.environ.get("BENCH_GPU_UTIL", "0.88")),
             **({"max_num_seqs": args.max_num_seqs} if args.max_num_seqs else {}),
             **({"kv_cache_dtype": args.kv_cache_dtype} if args.kv_cache_dtype else {}),
             **({"enable_mixed_batch": True} if args.enable_mixed_batch else {}),
             **(
-                {"enable_int8_mamba_checkpoint": True}
-                if args.enable_int8_mamba_checkpoint
+                {"mamba_ckpt_dtype": args.mamba_ckpt_dtype}
+                if args.mamba_ckpt_dtype
                 else {}
             ),
+            **({"enable_mamba_ckpt_pool": False} if args.no_mamba_ckpt_pool else {}),
             **(
-                {"int8_mamba_ckpt_size": args.int8_mamba_ckpt_size}
-                if args.int8_mamba_ckpt_size
+                {"mamba_ckpt_size": args.mamba_ckpt_size}
+                if args.mamba_ckpt_size
                 else {}
             ),
         )

@@ -202,10 +202,39 @@ std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, std
     // Charge chunk + reserve in one query: unreserved, an exactly-filling prompt's own decode defers forever.
     // ext_real_pages composes exactly: extension pages are FULL, so they leave tail_avail 0.
     const bool decode_destination = config_.enable_flatkv_pd && config_.role == Role::kD;
+
+    // Charge the WHOLE prompt at admission, not just this chunk.
+    //
+    // Charging one chunk lets the scheduler admit far more work than the pool
+    // can hold: the only remaining bound is the request-slot count, i.e.
+    // `max_num_seqs`, which is a number the operator has no way to derive. On
+    // gemma-4-31B the pool holds about thirty sequences and the default 452 was
+    // accepted, so the pool ran 97-100% full and every request stalled together
+    // rather than a few being preempted -- P99 inter-token latency 1905 ms
+    // against a 61 ms median, while vLLM's P99 equalled its own median.
+    // Charging the prompt reproduces, without a static concurrency figure, what
+    // lowering max_num_seqs to the pool's real capacity achieved by hand:
+    // 219.6 -> 340.4 tok/s and P99 1905 -> 155 ms.
+    //
+    // vLLM does the same thing under `scheduler_reserve_full_isl` (default on).
+    // SGLang charges prompt plus expected output scaled by a feedback ratio it
+    // learns, and TRT-LLM charges through to completion so preemption cannot
+    // arise at all; both are strictly more conservative than this. See
+    // unieinfra/xref/25-admission.md for the five-way comparison.
+    //
+    // A prompt too large for an empty pool still streams a chunk at a time --
+    // otherwise it could never be admitted at all, and the gate would trade a
+    // stall for a hang.
+    const std::int32_t admit_tokens =
+        (config_.reserve_full_prompt_on_admit &&
+         coordinator_.BlocksNeededFor(static_cast<std::int32_t>(request->PrefillSize()) +
+                                      decode_reserve_tokens) <= block_pool_.TotalBlocks())
+            ? static_cast<std::int32_t>(request->PrefillSize())
+            : chunk_tokens;
     const std::int32_t blocks_needed =
         decode_destination
             ? coordinator_.BlocksNeededForDecodeDestination(request->PrefillSize(), chunk_tokens, decode_reserve_tokens)
-            : coordinator_.BlocksNeededFor(chunk_tokens + decode_reserve_tokens);
+            : coordinator_.BlocksNeededFor(admit_tokens + decode_reserve_tokens);
     // Device probe hits remain in the free list until admission commits; charge
     // the entries AcquirePrefix will remove. Host hits need fresh device pages.
     if (blocks_needed + device_free_hit_blocks + ext_real_pages > flatFreeBudget(request->Id())) {
@@ -217,7 +246,7 @@ std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, std
     }
     // Reserve need is computed on the post-prefill table shape now, never
     // recomputed against drifted state.
-    return decode_reserve_tokens > 0 ? blocks_needed - coordinator_.BlocksNeededFor(chunk_tokens) : 0;
+    return decode_reserve_tokens > 0 ? blocks_needed - coordinator_.BlocksNeededFor(admit_tokens) : 0;
 }
 
 // Same contract as flatAdmitFirstChunk, on live tables; num_computed_tokens matches the transition's slide.
@@ -1227,6 +1256,36 @@ bool Scheduler::shouldMixThisStep(const std::vector<Request*>& candidates) const
     // against 200+ at 256), and dividing by max_batch_size keeps the threshold
     // meaningful when the engine's capacity changes rather than pinning it to
     // one benchmark's request count.
+    // The load threshold below was tuned on a GDN hybrid, where mixing is
+    // expensive: a decode row inside a mixed batch degrades into a length-1
+    // extend row through the chunked scan. A model with no recurrent group pays
+    // none of that -- its decode rows stay decode rows -- so the threshold is a
+    // cost that does not apply, and applying it anyway has a specific and
+    // measured consequence.
+    //
+    // Prompt pages only enter the pool's hash index when their request is next
+    // scheduled, which on the unmixed path means after a decode step. Without
+    // mixing, `Prefilling -> Submitted -> Decoding` plus the break after any
+    // prefill means a burst of arrivals is admitted over consecutive
+    // prefill-only steps, none of them reaching the step that would publish
+    // their pages. Every request then prefills its own private copy of the same
+    // shared document. On gemma-4-31B at concurrency 32 that filled 7399 of
+    // 7400 pages, cut prefix reuse to 45.6%, and left the decode batch running
+    // 1-2 rows wide with a P99 inter-token latency of 644 ms.
+    //
+    // The threshold's denominator made this depend on `max_num_seqs`, which is
+    // unrelated: at the default 452 the load reads 0.07 and mixing never fires,
+    // while at 32 it reads 0.59 and fires immediately. That is why lowering
+    // `max_num_seqs` appeared to fix a page-accounting problem it has nothing to
+    // do with. Mixing whenever there is work of both kinds, on models that do
+    // not pay for it, gives 399.0 tok/s against 240.9, P99 153 ms against 644,
+    // and 70.9% reuse against 45.6% -- with `max_num_seqs` left at 452.
+    //
+    // Models WITH a recurrent group keep the tuned threshold unchanged.
+    if (!config_.enable_mamba) {
+        return running > 0 && waiting > 0;
+    }
+
     const double load = static_cast<double>(waiting) / static_cast<double>(config_.max_batch_size);
     if (std::getenv("TOKENSPEED_DEBUG_MIX") != nullptr) {
         static std::int64_t n = 0;

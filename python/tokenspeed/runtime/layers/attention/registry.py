@@ -424,6 +424,79 @@ def _resolve_kda_backend(kda_backend: str) -> str:
     return kda_backend
 
 
+def mamba_working_bytes_per_chunk(
+    conv_state_shape,
+    conv_dtype,
+    temporal_state_shape,
+    ssm_dtype,
+    num_mamba_layers: int,
+    speculative_num_draft_tokens: int = 0,
+) -> int:
+    """Bytes one working slot costs across every recurrent layer.
+
+    The unit the recurrent-state budget is divided by, and so the unit the
+    checkpoint pool's cost has to be quoted in: at 27B this is ~78MB, which is
+    what makes a float32 snapshot (~154MB) two working slots rather than the
+    rounding error a per-layer figure suggests.
+    """
+    per_layer = sum(
+        state_const_bytes(
+            conv_state_shape, conv_dtype, temporal_state_shape, ssm_dtype
+        ).values()
+    )
+    return num_mamba_layers * per_layer * (1 + speculative_num_draft_tokens)
+
+
+def resolve_mamba_ckpt_slots(
+    server_args: ServerArgs,
+    *,
+    mamba_pool_total_chunks: int,
+    working_bytes_per_chunk: int,
+    ckpt_bytes_per_slot: int,
+) -> int:
+    """How many retained snapshots ``--mamba-ckpt-memory-fraction`` buys.
+
+    The working pool has already been shrunk by the same fraction (see
+    ``_mamba_chunk_bytes_with_checkpoints``), so this converts the bytes that
+    were held back into slots at the checkpoint pool's own dtype. Explicit
+    ``--mamba-ckpt-size`` wins; it is then taken from whatever headroom is left
+    rather than from the working pool, and checked against free HBM at the call
+    site.
+    """
+    if server_args.mamba_ckpt_size is not None:
+        return max(int(server_args.mamba_ckpt_size), 1)
+    f = float(server_args.mamba_ckpt_memory_fraction)
+    if f <= 0.0 or ckpt_bytes_per_slot <= 0:
+        return 1
+    held_back = mamba_pool_total_chunks * working_bytes_per_chunk * f / (1.0 - f)
+    return max(int(held_back // ckpt_bytes_per_slot), 1)
+
+
+def _mamba_chunk_bytes_with_checkpoints(
+    server_args: ServerArgs, memory_per_mamba_chunk: int
+) -> int:
+    """Charge each working chunk for the checkpoint slots it implies.
+
+    The checkpoint pool comes out of the recurrent-state budget rather than out
+    of whatever ``--gpu-memory-utilization`` leaves spare, so the cost shows up
+    as a smaller ``mamba_pool_total_chunks`` in the startup log instead of an
+    allocation that succeeds on an idle card and fails on a busy one. Dividing
+    by ``1 - f`` scales the working pool by exactly ``1 - f``, whatever the
+    checkpoint dtype: the dtype decides how many snapshots the held-back bytes
+    buy, not how many bytes are held back.
+    """
+    if not server_args.enable_mamba_ckpt_pool:
+        return memory_per_mamba_chunk
+    if server_args.mamba_ckpt_size is not None:
+        # An explicit slot count is the operator overriding the budget split;
+        # honour it out of headroom and leave the working pool alone.
+        return memory_per_mamba_chunk
+    f = float(server_args.mamba_ckpt_memory_fraction)
+    if f <= 0.0:
+        return memory_per_mamba_chunk
+    return int(memory_per_mamba_chunk / (1.0 - f))
+
+
 def _create_hybrid_linear_attn(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -612,30 +685,44 @@ def _create_hybrid_linear_attn(
         )
         mamba_pool.is_kda_cache = is_kda
 
-        # Cached snapshots live in their own int8 pool when asked for. Sized and
+        # Cached snapshots live in their own pool, at their own dtype. Sized and
         # checked against free HBM before allocating, so an oversized request
         # fails with a number rather than a mid-allocation CUDA OOM.
-        if server_args.enable_int8_mamba_checkpoint:
+        if server_args.enable_mamba_ckpt_pool:
             from tokenspeed.runtime.cache.mamba_checkpoint_pool import (
                 MambaCheckpointPool,
+                resolve_ckpt_dtype,
             )
 
-            ckpt_slots = int(
-                server_args.int8_mamba_ckpt_size or (2 * mamba_pool_total_chunks)
-            )
-            # temporal_state_shape is K-last [Hv, V, K]; the store's scale
+            # temporal_state_shape is K-last [Hv, V, K]; the int8 store's scale
             # reduces over V, which is what makes it per-(head, k-channel).
             n_heads, head_v_dim, head_k_dim = temporal_state_shape
-            ckpt_kwargs = dict(
+            ckpt_dtype = resolve_ckpt_dtype(server_args.mamba_ckpt_dtype)
+            shape_kwargs = dict(
                 num_layers=len(mamba_layer_ids),
-                num_slots=ckpt_slots,
                 num_heads=n_heads,
                 head_v_dim=head_v_dim,
                 head_k_dim=head_k_dim,
                 conv_shapes=[tuple(conv_state_shape)],
                 conv_dtype=conv_dtype,
                 temporal_dtype=ssm_dtype,
+                ckpt_dtype=ckpt_dtype,
             )
+            ckpt_slots = resolve_mamba_ckpt_slots(
+                server_args,
+                mamba_pool_total_chunks=mamba_pool_total_chunks,
+                working_bytes_per_chunk=mamba_working_bytes_per_chunk(
+                    conv_state_shape,
+                    conv_dtype,
+                    temporal_state_shape,
+                    ssm_dtype,
+                    len(mamba_layer_ids),
+                ),
+                ckpt_bytes_per_slot=MambaCheckpointPool.bytes_per_slot_estimate(
+                    **shape_kwargs
+                ),
+            )
+            ckpt_kwargs = dict(num_slots=ckpt_slots, **shape_kwargs)
             est = MambaCheckpointPool.estimate_mem_usage_bytes(**ckpt_kwargs)
             free_bytes = None
             if str(config.device).startswith("cuda"):
@@ -645,22 +732,26 @@ def _create_hybrid_linear_attn(
                     free_bytes = None
             gb = 1 << 30
             logger.info(
-                "int8 mamba checkpoint pool: %d slots, %.2fGB "
-                "(qdata %.2f + scale %.2f + conv %.2f); active pool %d slots%s",
+                "mamba checkpoint pool: dtype=%s, %d slots, %.2fGB "
+                "(state %.2f + scale %.2f + conv %.2f), %.1fMB per slot; "
+                "active pool %d slots%s",
+                server_args.mamba_ckpt_dtype,
                 ckpt_slots,
                 est["total"] / gb,
                 est["qdata"] / gb,
                 est["scale"] / gb,
                 est["conv"] / gb,
+                est["total"] / max(ckpt_slots + 1, 1) / (1 << 20),
                 mamba_pool_size,
                 "" if free_bytes is None else f"; free HBM {free_bytes / gb:.2f}GB",
             )
             if free_bytes is not None and est["total"] >= free_bytes:
                 raise RuntimeError(
-                    f"int8 mamba checkpoint pool needs ~{est['total'] / gb:.2f}GB "
+                    f"mamba checkpoint pool needs ~{est['total'] / gb:.2f}GB "
                     f"but only {free_bytes / gb:.2f}GB HBM is free. Lower "
-                    f"--int8-mamba-ckpt-size (currently {ckpt_slots}) or "
-                    f"--gpu-memory-utilization."
+                    f"--mamba-ckpt-size (currently {ckpt_slots}), lower "
+                    f"--mamba-ckpt-memory-fraction, or pass "
+                    f"--mamba-ckpt-dtype int8."
                 )
             mamba_pool.ckpt_pool = MambaCheckpointPool(
                 device=config.device, **ckpt_kwargs
@@ -1486,15 +1577,19 @@ def create_attn_components(
             if server_args.speculative_algorithm is not None
             else 0
         )
-        per_layer_mamba_chunk_memory = sum(
-            state_const_bytes(
-                mamba_conv_state_shape,
-                mamba_conv_dtype,
-                mamba_temporal_state_shape,
-                mamba_ssm_dtype,
-            ).values()
-        ) * (1 + speculative_num_draft_tokens)
-        memory_per_mamba_chunk = num_mamba_layers * per_layer_mamba_chunk_memory
+        memory_per_mamba_chunk = mamba_working_bytes_per_chunk(
+            mamba_conv_state_shape,
+            mamba_conv_dtype,
+            mamba_temporal_state_shape,
+            mamba_ssm_dtype,
+            num_mamba_layers,
+            speculative_num_draft_tokens,
+        )
+        # Retained snapshots are charged here rather than taken from headroom,
+        # so `mamba_pool_total_chunks` below is the concurrency actually left.
+        budgeted_per_mamba_chunk = _mamba_chunk_bytes_with_checkpoints(
+            server_args, memory_per_mamba_chunk
+        )
         full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
         num_kv_layers = (
             len(full_attn_layer_ids)
@@ -1504,9 +1599,19 @@ def create_attn_components(
         kv_max_num_pages, mamba_pool_total_chunks = profile_cache_budget(
             **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
             mem_fraction_static=server_args.gpu_memory_utilization,
-            mamba_memory_per_chunk=memory_per_mamba_chunk,
+            mamba_memory_per_chunk=budgeted_per_mamba_chunk,
             mamba_ratio=server_args.mamba_full_memory_ratio,
         )
+        if budgeted_per_mamba_chunk != memory_per_mamba_chunk:
+            logger.info(
+                "mamba_pool_total_chunks=%d after holding back %.0f%% of the "
+                "recurrent-state budget for the checkpoint pool (%d without it)",
+                mamba_pool_total_chunks,
+                100.0 * server_args.mamba_ckpt_memory_fraction,
+                mamba_pool_total_chunks
+                * budgeted_per_mamba_chunk
+                // memory_per_mamba_chunk,
+            )
         max_num_tokens = _resolve_max_num_tokens(
             kv_max_num_pages,
             server_args.block_size,

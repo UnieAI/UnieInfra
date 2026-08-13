@@ -179,6 +179,14 @@ struct SchedulerConfig {
     Role role{Role::kFused};
     // Explicit opt-in for the Flat KV Prefill/Decode lifecycle. This keeps
     // legacy non-flat PD and Flat standalone scheduling unchanged.
+    // Charge a request's whole prompt against the pool when it is admitted,
+    // rather than only the chunk being scheduled. Without it the sole bound on
+    // admission is the request-slot count, so the pool oversubscribes and every
+    // request stalls together instead of a few being preempted. vLLM's
+    // equivalent (`scheduler_reserve_full_isl`) is also on by default; see
+    // unieinfra/xref/25-admission.md.
+    bool reserve_full_prompt_on_admit{true};
+
     bool enable_flatkv_pd{false};
 
     bool disable_prefix_cache{false};

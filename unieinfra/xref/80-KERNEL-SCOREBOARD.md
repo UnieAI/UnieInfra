@@ -9,6 +9,48 @@
 
 ---
 
+## 絕對刻度：離理論值還有多遠
+
+記分板其餘部分是**相對**的（對 vLLM 幾倍）。相對指標有一個結構性缺陷：**它永遠
+不會告訴你已經到頂了**。MoE decode 就是活例 —— eager 模式下量到「贏 2.4x」，換成
+CUDA graph 後是 1.07x，而真正的資訊兩者都沒說出來：**兩邊都在 65–69% of HBM
+peak，bf16 上不存在 3x 的空間**。那句話只有絕對刻度講得出來。
+
+理論值的算法，這張卡（HBM peak 1792 GB/s、188 SM）：
+
+- **memory-bound 的東西**（decode 的一切、elementwise、KV 讀寫）：`bytes / 1792 GB/s`
+- **decode 一整步**：`模型權重 bytes / 1792 GB/s` —— 每產生一個 token，權重就得
+  過一遍，這是物理下限，與 batch 無關（batch 只攤薄它）
+- **compute-bound 的東西**（大 M 的 GEMM、prefill attention）：`FLOP / 卡的 bf16
+  峰值`，此處尚未量到峰值，故留 `?` 而不是猜
+
+| 項目 | 理論值 | 實測 | 達成率 | 量測條件 |
+|---|---|---|---|---|
+| Qwen3.5-27B decode step | **31.0 ms**（55.6 GB） | 49.6 ms | **63%** | C=32，`.cq.sh` mean ITL |
+| 同上，vLLM | 31.0 ms | 53.5 ms | 58% | 同一支 harness |
+| gemma-4-31B decode step | 34.9 ms（62.5 GB） | `?` | `?` | 未量 |
+| Qwen3.6-35B-A3B decode step | `?`（MoE 只讀 top-8，非全部 71.9 GB） | `?` | `?` | 未量 |
+| MoE decode 一層（35B-A3B, bf16, T=1） | **0.028 ms**（50.3 MB） | 0.0405 ms | **69%** | CUDA graph，輪換專家集合避開 L2 |
+| 同上，vLLM `fused_experts` | 0.028 ms | 0.0433 ms | 65% | 同上 |
+| 同上，eager（無 graph） | 0.028 ms | 0.0618 ms | 45% | 差額即 launch 開銷 |
+| MoE gate/up 半邊 | `?` | — | 68% | 單獨量，未含 down |
+| 前綴重用（RAG shape, C=32） | **74.4%**（本批次結構）／84.1%（循序到達） | 44.0% | **59%** | oracle 由該批 64 個 prompt 實算 |
+| TTFT (C=32) | `?` | 1405 ms | `?` | 理論值需先定義：`重用後的 prefill token × 每 token 成本 / batch` + 排隊 |
+
+**目前離理論值最遠的兩項是前綴重用（59%）和 decode 達成率（63%）**，而且性質相反：
+前者是政策問題（該重用的沒重用，kernel 再快也補不回來），後者是 kernel 與 launch
+問題。
+
+decode 的理論值同時說死了它的改善路徑只有三條，因為 55.6 GB 每步都得讀：
+
+1. **讀更少** —— 量化（fp8 → 27.8 GB → roofline 15.5 ms）
+2. **一次讀多產出更多 token** —— 推測解碼（已量 +27~45%）
+3. **把 63% 推到 90%** —— kernel 與 launch 層面
+
+任何不屬於這三類的 decode 優化，對這個模型在這張卡上不可能有量級效果。
+
+---
+
 ## 記分板
 
 | kernel | 對 vLLM | 狀態 | 已整合 |

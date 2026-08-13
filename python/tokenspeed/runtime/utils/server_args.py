@@ -182,14 +182,25 @@ class ServerArgs:
     enable_log_requests: bool = False
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
-    enable_metrics: bool = False
+    # On by default. Every prefix-cache number this project has published was
+    # first computed by grepping `#cached-token` out of the engine's own log,
+    # because the counters that answer the same question directly were behind a
+    # flag nobody set. `tokenspeed:prefix_cache_hits / prompt_tokens` is the
+    # ratio vLLM reports as `vllm:prefix_cache_hits_total / queries_total`, so
+    # having it on is what makes the two engines comparable without parsing
+    # either one's log.
+    enable_metrics: bool = True
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
     app_key: str | None = None
 
     # API related
     api_key: str | None = None
-    enable_cache_report: bool = False
+    # On by default: per-request cached tokens in meta_info /
+    # usage.prompt_tokens_details, the same field vLLM fills, so a reuse
+    # comparison can be made request by request rather than in aggregate.
+    # test/runtime/test_prefix_cache_e2e.py already asserts against it.
+    enable_cache_report: bool = True
     kv_events_config: str | None = None
 
     # RL online weight sync (always on / ungated). NOTE: these endpoints can
@@ -1290,7 +1301,14 @@ class ServerArgs:
         parser.add_argument(
             "--enable-metrics",
             action="store_true",
+            default=ServerArgs.enable_metrics,
             help="Enable log metrics.",
+        )
+        parser.add_argument(
+            "--no-enable-metrics",
+            dest="enable_metrics",
+            action="store_false",
+            help="Disable log metrics.",
         )
         parser.add_argument(
             "--metrics-reporters",
@@ -1323,7 +1341,14 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cache-report",
             action="store_true",
+            default=ServerArgs.enable_cache_report,
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--no-enable-cache-report",
+            dest="enable_cache_report",
+            action="store_false",
+            help="Omit cached-token counts from the OpenAI usage block.",
         )
         parser.add_argument(
             "--kv-events-config",

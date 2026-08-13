@@ -166,7 +166,28 @@ def set_autotune_process_group(process_group) -> None:
         import flashinfer.autotuner
     except ImportError:
         return
-    flashinfer.autotuner.set_autotune_process_group(process_group)
+    setter = getattr(flashinfer.autotuner, "set_autotune_process_group", None)
+    if setter is None:
+        # Cross-rank tactic reduction arrived in flashinfer 0.6.16, which is
+        # what requirements/cuda.txt pins. An older flashinfer imports fine and
+        # then fails on the attribute, so "backend unavailable" has to mean the
+        # symbol as well as the module -- otherwise this raises AttributeError
+        # on the server startup path, which is where it was found.
+        #
+        # Degrading is right rather than fatal: without the group every rank
+        # tunes on its own timings, which is exactly the behaviour that
+        # predates this call. It only matters above one rank, so warn instead
+        # of staying silent -- a multi-rank run losing tactic agreement should
+        # not have to be inferred from divergent outputs.
+        if process_group is not None:
+            logger.warning(
+                "flashinfer has no set_autotune_process_group; autotuning "
+                "stays per-rank. Ranks may pick different tactics. Install "
+                "flashinfer-python>=0.6.16 to reduce tactic timings across "
+                "ranks."
+            )
+        return
+    setter(process_group)
 
 
 def load_flashinfer_tuning_cache(path: str) -> bool:

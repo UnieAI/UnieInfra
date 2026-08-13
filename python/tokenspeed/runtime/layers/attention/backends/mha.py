@@ -32,6 +32,11 @@ from tokenspeed_kernel import (
     mha_plan,
     mha_prefill,
 )
+from tokenspeed_kernel.ops.attention.flashinfer import (
+    clear_paged_extend_plan,
+    install_paged_extend_plan,
+    paged_extend_planning_enabled,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
 )
@@ -228,6 +233,49 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # Metadata initialization
     # ------------------------------------------------------------------
 
+    def _install_paged_extend_plan(self, metadata, extend_prefix_lens_cpu) -> None:
+        """Plan the FA2 paged extend kernel once for this forward.
+
+        The kernel can plan itself, but only by copying ``cache_seqlens`` to the
+        host to key the plan -- a sync per layer, which drains the queue the
+        previous layers just filled. On a 64-layer model that is 64 pipeline
+        stalls per prefill forward. Everything the plan needs is already on the
+        host here (prefix + extend lengths), so doing it once costs no sync at
+        all. This is where SGLang plans too (``init_forward_metadata``).
+
+        Installs on every extend forward, or clears; a plan is never allowed to
+        outlive the forward it was built for, which is what lets the kernel
+        match it by tensor identity alone.
+        """
+        if not paged_extend_planning_enabled():
+            return
+        clear_paged_extend_plan()
+        # Per-group page tables route the reads, and `_select_page_table` gives
+        # a layer its own group's, so plan one per group; the single-table path
+        # has exactly one. Planning the table the kernel will not be handed is
+        # what made the first version of this inert.
+        if metadata.page_tables:
+            tables = list(metadata.page_tables.values())
+        elif metadata.page_table is not None:
+            tables = [metadata.page_table]
+        else:
+            return
+        prefix_cpu = [int(x) for x in extend_prefix_lens_cpu.tolist()]
+        seq_lens_cpu = [p + e for p, e in zip(prefix_cpu, metadata.extend_seq_lens_cpu)]
+        # Only the BATCH is installed -- which rows, which pages, how long each
+        # is. The geometry (head count, head dim, page size) and the scale,
+        # window and soft cap are per LAYER, and this backend has only pool-wide
+        # values for them. The kernel plans each group's wrapper from what the
+        # layer actually hands it; passing guesses from here would only be
+        # something for it to disagree with.
+        for page_table in tables:
+            install_paged_extend_plan(
+                cu_seqlens_q=metadata.cu_extend_seq_lens,
+                cache_seqlens=metadata.seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                page_table=page_table,
+            )
+
     def init_forward_metadata(
         self,
         bs: int,
@@ -369,6 +417,10 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 mixed_total_tokens=(
                     cu_extend_seq_lens_cpu[-1] + (bs - num_extends) if is_mixed else 0
                 ),
+            )
+
+            self._install_paged_extend_plan(
+                self.forward_extend_metadata, extend_prefix_lens_cpu[:rows]
             )
 
             if is_mixed:

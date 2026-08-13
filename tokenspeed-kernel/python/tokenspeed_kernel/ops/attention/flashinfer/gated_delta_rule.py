@@ -199,33 +199,35 @@ def is_available() -> bool:
     # this measured the kernel, so the gap is most likely per-call conversion in
     # the wrapper below rather than the kernel.
     #
-    # 2026-08-13: the integrated measurement was run and the kernel is not just
-    # slower here, it is WRONG. On Qwen3.5-27B, RAG at C=128 through the HTTP
-    # harness, two arms, 256 requests and 0 failed on each:
+    # 2026-08-13: the integrated measurement was run, and the answer is that
+    # this kernel is CORRECT and FAST but not CUDA-graph-safe. Qwen3.5-27B, RAG
+    # at C=128 through the HTTP harness, 256 requests and 0 failed on all four:
     #
-    #                  triton      flashinfer sm120
-    #   throughput     511.86         579.97 tok/s   +13.3%
-    #   mean TTFT     6979.4          5975.4 ms      -14.4%
-    #   generated text  normal      "!!!!!!!!!!!!!!!!!!!!!!!!"
+    #                              tok/s    mean TTFT   generated text
+    #   triton,     prefill graph  511.86     6979 ms   normal
+    #   triton,     no graph       472.02     7452 ms   normal
+    #   flashinfer, prefill graph  579.97     5975 ms   "!!!!!!!!!!!!!!"
+    #   flashinfer, no graph       574.94     6042 ms   normal
     #
-    # Every completion under this kernel was a run of exclamation marks. The
-    # timing numbers are real and meaningless: they measure an engine producing
-    # nothing. Both flags-on arms did it; both Triton arms on the same build
-    # produced coherent text.
+    # Read the last two rows together: the kernel produces correct output the
+    # moment the prefill graph is off, so the earlier "it is wrong" reading was
+    # itself wrong -- the graph was breaking it. It plans from host-visible
+    # batch data, so a capture bakes the dummy batch's plan and every replay
+    # runs it against the real one.
     #
-    # This is why the repository requires a sample of the output next to any
-    # throughput claim. On the numbers alone this looked like the largest single
-    # win of the day and was minutes from being made the default.
+    # A direct A/B on engine-shaped inputs (multi-sequence cu_seqlens, live
+    # non-zero initial_state, off-chunk lengths) agrees with the Triton path to
+    # max|diff| 4.9e-4 on out and ~5e-3 on final_state, and both are equally
+    # sensitive to initial_state. There is nothing wrong with the numerics.
     #
-    # The raw-kernel agreement above (3.1e-4 against the Triton scan) still
-    # holds, which localises the defect to the wrapper below rather than the
-    # kernel -- the same per-call conversion the note already suspected. Whoever
-    # takes it should compare the wrapper's inputs against the Triton path's for
-    # one call: decay space, q/k normalisation, and the initial-state layout are
-    # where the two conventions differ.
+    # Net, on this shape: the prefill graph is worth +8.4% on Triton, and this
+    # kernel is worth +21.8% over Triton without it, so flashinfer-without-graph
+    # beats triton-with-graph by 12.3%. Making it a graph break point instead of
+    # disabling the graph would stack both, and is the work worth doing.
     #
-    # Default stays OFF, and now for a correctness reason rather than a
-    # performance one.
+    # Default stays OFF because the win requires --disable-prefill-graph and
+    # nothing here can enforce that; the wrapper raises under capture rather
+    # than letting a graph silently corrupt every reply.
     return os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120") == "1"
 
 
@@ -351,6 +353,21 @@ if is_available():
         The caller indexes directly with flashinfer-native offsets rather than
         rebuilding the FLA h tensor.
         """
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            # This kernel plans from host-visible batch data, so a capture bakes
+            # the DUMMY batch's plan and every replay runs it against the real
+            # one. The result is not an error -- it is a model that emits
+            # "!!!!!!!!" for every request while the timing numbers look better
+            # than the Triton path's, which is exactly how it nearly became the
+            # default. Fail loudly instead.
+            raise RuntimeError(
+                "flashinfer_gdn_chunk_prefill cannot be captured in a CUDA "
+                "graph: it plans from host data, so a replay would use the "
+                "capture batch's plan and silently produce garbage. Run with "
+                "--disable-prefill-graph, or leave "
+                "TOKENSPEED_ENABLE_FI_GDN_SM120 unset to use the Triton "
+                "chunked scan."
+            )
         batched = q.dim() == 4
         q3 = q.squeeze(0) if batched else q
         k3 = k.squeeze(0) if batched else k

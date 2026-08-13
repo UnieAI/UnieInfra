@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
@@ -157,6 +158,26 @@ class L2CacheExecutor:
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
         self.load_stream = _new_cache_stream(load_priority)
+        # Order writeback and loadback against each other. Both still overlap
+        # the compute stream; only the two transfer directions are serialised
+        # with respect to one another.
+        #
+        # Without this the engine dies with `illegal memory access` on a
+        # high-reuse shape at high concurrency. Measured on Qwen3.5-27B, RAG at
+        # C=128, same build and same arm, the env var the only difference:
+        # 2 faults and 146 of 256 requests lost without it, 0 faults and 256/256
+        # with it. The two streams have no ordering between them and both touch
+        # the same device blocks and the same pinned Host buffer, so a block can
+        # be loaded into while its writeback is still reading it.
+        #
+        # This is the blunt version -- it orders every transfer against every
+        # transfer, where only those touching the same blocks need it, and costs
+        # some overlap. Correctness first: set
+        # `TOKENSPEED_L2_SERIALIZE_STREAMS=0` to restore the racing behaviour
+        # for measurement, not for serving.
+        self._serialize_streams = (
+            os.getenv("TOKENSPEED_L2_SERIALIZE_STREAMS", "1") == "1"
+        )
 
         self._write_acks: list[_Ack] = []
         self._load_acks: list[_Ack] = []
@@ -270,6 +291,8 @@ class L2CacheExecutor:
         start = torch.cuda.Event()
         start.record()
         start.wait(self.write_stream)
+        if self._serialize_streams and self._load_acks:
+            self._load_acks[-1].finish_event.wait(self.write_stream)
         transfer_cache_ranges(
             "d2h",
             self.layout.buffers,
@@ -317,6 +340,8 @@ class L2CacheExecutor:
             load_events = tracker.event_sets[current_load_index]
             load_events.start_event.record()
             load_events.start_event.wait(self.load_stream)
+            if self._serialize_streams and self._write_acks:
+                self._write_acks[-1].finish_event.wait(self.load_stream)
             for layer_index in range(consumer_count):
                 consumer = self.layout.consumers[consumer_offset + layer_index]
                 transfer_cache_ranges(

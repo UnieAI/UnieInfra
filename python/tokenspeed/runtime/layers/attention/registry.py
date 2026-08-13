@@ -22,26 +22,12 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.flat_memory_plan import (
-    capacity_model,
-    components_from_layers,
-    equalized_block_size,
-    plan_component_tensors,
-    state_const_bytes,
-    state_snapshot_interval,
-)
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    hybrid_slab_group_size,
-    scheduler_ext_flat_kvcache,
-    state_group_page_sizes,
-)
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -49,17 +35,26 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.base import (
+    CachePool,
+    LayerMappedKVPool,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+    CacheModelFamily,
+    CachePoolSpec,
+    prepare_cache_setup,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_LAYER_TYPES,
+)
 from tokenspeed.runtime.layers.attention.utils import (
     profile_available_cache_memory_bytes,
-    profile_cache_budget,
-    profile_max_num_pages,
 )
-from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
 
-_CI_SMALL_KV_SIZE = envs.TOKENSPEED_CI_SMALL_KV_SIZE.get_set_value_or(None)
+_ORDINARY_CACHE_FAMILIES = frozenset({"mha", "mla", "dsa", "msa"})
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -67,44 +62,117 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def _kv_profile_layer_divisor(num_layers, layer_types, *, sliding_window_tokens=None):
-    """Attention layers to charge per token in the KV memory profile:
-    layers-per-group under the slab layout, else all layers (single
-    source: hybrid_slab_group_size)."""
-    gs = hybrid_slab_group_size(
-        layer_types,
-        sliding_window_tokens=sliding_window_tokens,
-    )
-    return gs if gs is not None else num_layers
+def _ordinary_cache_family(config: BaseAttnConfig | None) -> CacheModelFamily | None:
+    if type(config) is MHAConfig:
+        return "mha"
+    if type(config) is MLAConfig:
+        return "mla"
+    if isinstance(config, DSAConfig):
+        return "dsa"
+    if isinstance(config, MSAConfig):
+        return "msa"
+    return None
 
 
-def _resolve_max_num_tokens(
-    profiled_num_pages: int,
-    page_size: int,
-    max_total_tokens: int | None,
-) -> int:
-    profiled_tokens = profiled_num_pages * page_size
-    if max_total_tokens is None:
-        return profiled_tokens
-    requested_pages = max_total_tokens // page_size
-    if requested_pages < 1:
-        raise ValueError(
-            f"max_total_tokens={max_total_tokens} must contain at least one full page "
-            f"(page_size={page_size})"
+def _resolve_heterogeneous_draft_family(
+    target_family: CacheModelFamily,
+    draft_family: CacheModelFamily | None,
+    *,
+    pd_disaggregation_enabled: bool,
+) -> CacheModelFamily | None:
+    """Validate and return the supported heterogeneous draft family."""
+    if draft_family is None:
+        return None
+    if target_family == "kimi_k3":
+        if draft_family != "mla":
+            raise RuntimeError(
+                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+            )
+        if pd_disaggregation_enabled:
+            raise RuntimeError(
+                "PD disaggregation does not support heterogeneous target/draft "
+                "cache families"
+            )
+        return draft_family
+    if target_family not in _ORDINARY_CACHE_FAMILIES or draft_family == target_family:
+        return None
+    if draft_family != "mha":
+        raise RuntimeError(
+            "heterogeneous ordinary cache views currently require an MHA draft"
         )
-    return min(profiled_tokens, requested_pages * page_size)
+    if pd_disaggregation_enabled:
+        raise RuntimeError(
+            "PD disaggregation does not support heterogeneous target/draft "
+            "cache families"
+        )
+    return draft_family
 
 
-def _resolve_draft_cache_cell_size_for_profile(
-    draft_attn_config: BaseAttnConfig | None,
-    draft_model_config: ModelConfig | None,
-    draft_profile_cache_cell_size: int | None,
-) -> int:
-    if draft_profile_cache_cell_size is not None:
-        return draft_profile_cache_cell_size
-    if draft_attn_config is None or draft_model_config is None:
-        return 0
-    return draft_attn_config.cache_cell_size() * draft_model_config.num_attention_layers
+def _pool_allocated_bytes(pool) -> int:
+    buffer = getattr(pool, "buffer", None)
+    if buffer is not None:
+        return int(buffer.nbytes)
+    sizes = pool.get_kv_size_bytes()
+    if isinstance(sizes, tuple):
+        return sum(int(size) for size in sizes)
+    return int(sizes)
+
+
+def _cache_storage_report(
+    *,
+    configured_cache_bytes: int,
+    pool,
+    fixed_workspace_bytes: int = 0,
+) -> dict:
+    """Describe cache storage from allocated tensors, not scheduler counts."""
+    plan = getattr(pool, "plan", None)
+    if plan is None:
+        raise RuntimeError("cache pool has no memory plan; every pool is LCM-planned")
+    packing = {
+        group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
+    }
+    physical_token_capacity = (
+        int(plan.num_lcm_blocks)
+        * max(packing.values())
+        * int(plan.logical_block_tokens)
+    )
+    if physical_token_capacity != int(pool.size):
+        raise RuntimeError(
+            "LCM geometry capacity does not match the allocated pool size"
+        )
+    geometry = {
+        "logical_block_tokens": int(plan.logical_block_tokens),
+        "num_lcm_blocks": int(plan.num_lcm_blocks),
+        "cache_blocks_per_lcm_block": packing,
+        # Fraction of a parent each group's binding actually uses;
+        # aliased slabs are sized by their widest tenant, so a narrow
+        # binding strands the rest.
+        "binding_utilization": {
+            group_id: round(entry["binding_utilization"], 4)
+            for group_id, entry in plan.capacity_report().items()
+        },
+    }
+
+    # One pool: the draft "pool" is a layer-mapped view of the same buffer,
+    # so the one allocation already covers both models' layers.
+    arena_bytes = _pool_allocated_bytes(pool)
+    allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
+    if allocated_cache_bytes > configured_cache_bytes:
+        raise RuntimeError(
+            "allocated cache storage exceeds its profiled budget: "
+            f"{allocated_cache_bytes} > {configured_cache_bytes}"
+        )
+    return {
+        "configured_cache_bytes": int(configured_cache_bytes),
+        "allocated_cache_bytes": allocated_cache_bytes,
+        "physical_token_capacity": physical_token_capacity,
+        "capacity_source": "lcm_geometry",
+        "geometry": geometry
+        | {
+            "arena_bytes": arena_bytes,
+            "fixed_workspace_bytes": fixed_workspace_bytes,
+        },
+    }
 
 
 # ---------- backend registry ----------
@@ -126,30 +194,22 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5MoeForConditionalGenerationNextN",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5ForConditionalGenerationNextN",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForCausalLMNextN",
 }
-
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
-# They share the same HybridLinearAttnBackend wrapper + SimpleMambaPool; the
-# base sub-backend auto-resolves to MLA from the arch, and the linear
+# They share the same HybridLinearAttnBackend wrapper and cache-group pool;
+# the base sub-backend auto-resolves to MLA from the arch, and the linear
 # sub-backend runs the KDA kernels (MambaAttnBackend.is_kda branch).
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
 
-# Inkling stays on the plain dense path (thin sconv wrapper); deliberately NOT hybrid-GDN
+# Inkling stays on the MHA path plus its thin sconv wrapper; it is not hybrid-GDN.
 _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
-}
-
-# Gemma 4: per-layer KV GEOMETRY (not just head count) -- sliding layers are
-# num_key_value_heads x head_dim, full layers num_global_key_value_heads x
-# global_head_dim. Rides the same hetero-KV slot layout as Inkling; see
-# _apply_gemma4_hetero_kv.
-_GEMMA4_ARCHITECTURES = {
-    "Gemma4ForConditionalGeneration",
-    "Gemma4ForCausalLM",
 }
 
 
@@ -195,6 +255,32 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
     return cls
 
 
+def _validate_lcm_page_size(
+    config: BaseAttnConfig,
+    *,
+    logical_page_size: int,
+) -> None:
+    """Require the scheduler page to contain whole configured kernel pages."""
+    kernel_page_size = int(config.page_size)
+    if (
+        logical_page_size <= 0
+        or kernel_page_size <= 0
+        or logical_page_size % kernel_page_size
+    ):
+        raise ValueError(
+            "logical page size must be a positive multiple of kernel page "
+            f"size, got {logical_page_size} and {kernel_page_size}"
+        )
+
+
+def _set_cache_group_page_sizes(config: BaseAttnConfig, spec: CachePoolSpec) -> None:
+    """Publish scheduler page sizes to group-aware MHA backends."""
+    if not hasattr(config, "group_page_sizes"):
+        return
+    page_size = spec.memory_plan.logical_block_tokens
+    config.group_page_sizes = {group_id: page_size for group_id in spec.layer_group_ids}
+
+
 # ---------- arch -> config class ----------
 
 _CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
@@ -234,170 +320,19 @@ def _create_attn_backend_with_name(
         config.backend_name = original_name
 
 
-def _create_attn_pool(
-    config: BaseAttnConfig,
-    num_layers: int,
-    max_total_num_tokens: int,
-    rank: int,
-    enable_memory_saver: bool = False,
-) -> BaseTokenToKVPool:
-    return config.create_pool(
-        num_layers, max_total_num_tokens, rank, enable_memory_saver
-    )
-
-
-# Kimi-K3's effective FlatKV block size must be a multiple of every kernel page
-# constraint. An alignment of 128 covers the CuteDSL MLA page sizes (32/64).
-_KIMI_K3_FLAT_KERNEL_ALIGNMENT = 128
-
-
-def _create_kimi_k3_flat_plan(
-    server_args: ServerArgs,
-    model_config: ModelConfig,
-    config: BaseAttnConfig,
-    gpu_id: int,
-    gpu_memory: int,
-    *,
-    max_total_tokens_cap: int | None,
-    max_live_requests: int,
-    max_scheduled_tokens: int,
-    decode_input_tokens: int,
-    overlap_schedule_depth: int,
-):
-    """Plan the Kimi-K3 FlatKV cache from the profiled free-memory budget.
-
-    The byte budget is derived exactly like the other flat sizing paths
-    (``profile_available_cache_memory_bytes`` over
-    ``--gpu-memory-utilization``); the planner turns it into whole page sets
-    (24 aliased physical slabs per page). A user token cap
-    (``--max-total-tokens`` / CI small-KV override) re-plans with the byte
-    budget of the requested page count so the plan remains the single
-    geometry authority; a cap below the planner's minimum admission
-    requirement fails loudly.
-
-    Args:
-        server_args: Serving arguments (block size, memory fraction, mapping).
-        model_config: Target model config; its text config feeds the adapter.
-        config: The MLA attention config (dtype/quant/TP geometry source).
-        gpu_id: Profiling device ordinal.
-        gpu_memory: Total GPU memory bytes for the profile.
-        max_total_tokens_cap: Optional token-capacity cap.
-
-    Returns:
-        The validated ``FlatHybridCachePlan``.
-    """
-    from tokenspeed.runtime.configs.hybrid_cache_plan import (
-        format_flat_hybrid_cache_plan,
-    )
-    from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-        kimi_k3_shared_pool_pages,
-        kimi_k3_token_capacity_for_shared_pool,
-        plan_kimi_k3_flat_cache,
-    )
-
-    hf_config = model_config.hf_config
-    text_config = getattr(hf_config, "text_config", hf_config)
-    cache_memory = profile_available_cache_memory_bytes(
-        attn_config=config,
-        gpu_id=gpu_id,
-        tp_size=server_args.mapping.world_size,
-        gpu_memory_utilization=server_args.gpu_memory_utilization,
-        total_gpu_memory=gpu_memory,
-        world_group=server_args.mapping.world_group,
-    )
-    plan_kwargs = dict(
-        flat_kvcache_enabled=scheduler_ext_flat_kvcache(),
-        tp_size=config.attn_tp_size,
-        mla_cache_dtype=config.kv_cache_dtype,
-        mla_quant_method=config.kv_cache_quant_method or None,
-        preferred_block_size=server_args.block_size,
-        kernel_alignment=_KIMI_K3_FLAT_KERNEL_ALIGNMENT,
-    )
-    plan = plan_kimi_k3_flat_cache(
-        text_config, cache_budget_bytes=cache_memory, **plan_kwargs
-    )
-    sizing_kwargs = dict(
-        max_scheduled_tokens=max_scheduled_tokens,
-        max_live_requests=max_live_requests,
-        decode_input_tokens=decode_input_tokens,
-        overlap_schedule_depth=overlap_schedule_depth,
-    )
-    if max_total_tokens_cap is not None:
-        requested_token_pages = max_total_tokens_cap // plan.block_size
-        if requested_token_pages < 1:
-            raise ValueError(
-                f"max_total_tokens={max_total_tokens_cap} must contain at "
-                f"least one full flat page (block_size={plan.block_size})"
-            )
-        required_pages = kimi_k3_shared_pool_pages(
-            plan, token_capacity=max_total_tokens_cap, **sizing_kwargs
-        )
-        if required_pages < plan.usable_pages:
-            plan = plan_kimi_k3_flat_cache(
-                text_config,
-                cache_budget_bytes=(required_pages + 1)
-                * plan.diagnostics.bytes_per_page_set,
-                **plan_kwargs,
-            )
-        if required_pages <= plan.usable_pages:
-            token_capacity = max_total_tokens_cap
-        else:
-            token_capacity = kimi_k3_token_capacity_for_shared_pool(
-                plan,
-                usable_pages=plan.usable_pages,
-                upper_bound_tokens=max_total_tokens_cap,
-                **sizing_kwargs,
-            )
-            logger.warning(
-                "Kimi-K3 FlatKV max_total_tokens=%d requires %d shared pages, "
-                "but only %d were profiled; clamping token capacity to %d",
-                max_total_tokens_cap,
-                required_pages,
-                plan.usable_pages,
-                token_capacity,
-            )
-    else:
-        token_capacity = kimi_k3_token_capacity_for_shared_pool(
-            plan,
-            usable_pages=plan.usable_pages,
-            **sizing_kwargs,
-        )
-    plan = replace(plan, token_capacity=token_capacity)
-    logger.info(
-        "Kimi-K3 FlatKV plan: block_size=%d physical_page_bytes=%d "
-        "usable_pages=%d token_capacity=%d total_allocated_bytes=%d "
-        "(profiled budget %d bytes, cap %s)",
-        plan.block_size,
-        plan.physical_page_bytes,
-        plan.usable_pages,
-        plan.token_capacity,
-        plan.diagnostics.total_allocated_bytes,
-        cache_memory,
-        max_total_tokens_cap,
-    )
-    logger.debug("%s", format_flat_hybrid_cache_plan(plan))
-    return plan
-
-
-def _attention_use_fp4_indexer_cache(server_args: "ServerArgs", hf_config) -> bool:
-    if getattr(server_args, "attention_use_fp4_indexer_cache", None) is not None:
-        return bool(server_args.attention_use_fp4_indexer_cache)
-    attention_config = getattr(hf_config, "attention_config", None)
-    if isinstance(attention_config, dict):
-        return bool(attention_config.get("use_fp4_indexer_cache", False))
-    return bool(getattr(attention_config, "use_fp4_indexer_cache", False))
-
-
 def _resolve_kda_backend(kda_backend: str) -> str:
-    """Resolve the KDA prefill backend policy to a concrete choice.
+    """Resolve the KDA prefill backend policy.
 
-    ``auto`` picks the fastest available kernel — ``cutedsl_kda`` (the tokenspeed-cutedsl-kda AOT build
-    matching this device), then ``flashkda`` (optional source-built package),
-    falling back to the portable FLA scan. ``fla`` forces the portable scan.
-    Explicit choices are validated against availability and fail fast with an
-    install hint instead of silently mis-routing. Decode is unaffected either
-    way.
+    On AMD, the backend policy is ignored and compatible kernels are selected
+    using registry priority. On NVIDIA, ``auto`` picks the fastest available
+    kernel — ``cutedsl_kda``, then ``flashkda``, falling back to the portable
+    FLA scan. Explicit NVIDIA choices are validated against availability and
+    fail fast with an install hint. Decode is unaffected.
     """
+    if current_platform().is_amd:
+        # Named backend policies are NVIDIA-specific; let the registry decide.
+        return "auto"
+
     from tokenspeed_kernel.ops.attention.cutedsl_kda import is_cutedsl_kda_installed
     from tokenspeed_kernel.ops.attention.flash_kda import is_flash_kda_installed
 
@@ -424,139 +359,59 @@ def _resolve_kda_backend(kda_backend: str) -> str:
     return kda_backend
 
 
-def mamba_working_bytes_per_chunk(
-    conv_state_shape,
-    conv_dtype,
-    temporal_state_shape,
-    ssm_dtype,
-    num_mamba_layers: int,
-    speculative_num_draft_tokens: int = 0,
-) -> int:
-    """Bytes one working slot costs across every recurrent layer.
-
-    The unit the recurrent-state budget is divided by, and so the unit the
-    checkpoint pool's cost has to be quoted in: at 27B this is ~78MB, which is
-    what makes a float32 snapshot (~154MB) two working slots rather than the
-    rounding error a per-layer figure suggests.
-    """
-    per_layer = sum(
-        state_const_bytes(
-            conv_state_shape, conv_dtype, temporal_state_shape, ssm_dtype
-        ).values()
-    )
-    return num_mamba_layers * per_layer * (1 + speculative_num_draft_tokens)
-
-
-def resolve_mamba_ckpt_slots(
-    server_args: ServerArgs,
+def _resolve_hybrid_full_backend_name(
+    requested_name: str | None,
     *,
-    mamba_pool_total_chunks: int,
-    working_bytes_per_chunk: int,
-    ckpt_bytes_per_slot: int,
-) -> int:
-    """How many retained snapshots ``--mamba-ckpt-memory-fraction`` buys.
-
-    The working pool has already been shrunk by the same fraction (see
-    ``_mamba_chunk_bytes_with_checkpoints``), so this converts the bytes that
-    were held back into slots at the checkpoint pool's own dtype. Explicit
-    ``--mamba-ckpt-size`` wins; it is then taken from whatever headroom is left
-    rather than from the working pool, and checked against free HBM at the call
-    site.
-    """
-    if server_args.mamba_ckpt_size is not None:
-        return max(int(server_args.mamba_ckpt_size), 1)
-    f = float(server_args.mamba_ckpt_memory_fraction)
-    if f <= 0.0 or ckpt_bytes_per_slot <= 0:
-        return 1
-    held_back = mamba_pool_total_chunks * working_bytes_per_chunk * f / (1.0 - f)
-    return max(int(held_back // ckpt_bytes_per_slot), 1)
+    is_kda: bool,
+    has_cache_plan: bool,
+) -> str | None:
+    """Resolve the compute backend that consumes the hybrid history cache."""
+    name = _BACKEND_ALIASES.get(requested_name, requested_name)
+    if name == "hybrid_linear_attn":
+        name = None
+    # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
+    # generic MLA backend; explicit user choices remain authoritative.
+    if has_cache_plan and is_kda and name is None and not current_platform().is_amd:
+        return "tokenspeed_mla"
+    return name
 
 
-def _mamba_chunk_bytes_with_checkpoints(
-    server_args: ServerArgs, memory_per_mamba_chunk: int
-) -> int:
-    """Charge each working chunk for the checkpoint slots it implies.
-
-    The checkpoint pool comes out of the recurrent-state budget rather than out
-    of whatever ``--gpu-memory-utilization`` leaves spare, so the cost shows up
-    as a smaller ``mamba_pool_total_chunks`` in the startup log instead of an
-    allocation that succeeds on an idle card and fails on a busy one. Dividing
-    by ``1 - f`` scales the working pool by exactly ``1 - f``, whatever the
-    checkpoint dtype: the dtype decides how many snapshots the held-back bytes
-    buy, not how many bytes are held back.
-    """
-    if not server_args.enable_mamba_ckpt_pool:
-        return memory_per_mamba_chunk
-    if server_args.mamba_ckpt_size is not None:
-        # An explicit slot count is the operator overriding the budget split;
-        # honour it out of headroom and leave the working pool alone.
-        return memory_per_mamba_chunk
-    f = float(server_args.mamba_ckpt_memory_fraction)
-    if f <= 0.0:
-        return memory_per_mamba_chunk
-    return int(memory_per_mamba_chunk / (1.0 - f))
-
-
-def _create_hybrid_linear_attn(
+def _create_hybrid_linear_attn_backend(
     server_args: ServerArgs,
     model_config: ModelConfig,
     config: BaseAttnConfig,
-    arch: AttentionArch,
-    max_num_tokens: int,
-    rank: int,
-    enable_memory_saver: bool = False,
-    full_attn_backend_name: str = None,
-    mamba_pool_total_chunks: int = 0,
+    *,
+    pool,
+    full_attn_backend_name: str | None = None,
     is_kda: bool = False,
-    flat_contract_plan: object | None = None,
-) -> tuple[AttentionBackend, BaseTokenToKVPool, object]:
-    """Create a hybrid backend + pool for a linear-attention model.
+) -> AttentionBackend:
+    """Create a hybrid backend for a linear-attention model over one pool.
 
-    GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3, MLA base):
-    the ``MambaAttnBackend`` + ``SimpleMambaPool`` run the KDA per-channel kernels
-    instead of GDN. The base full-attention backend is arch-driven (MHA vs MLA).
-
-    ``flat_contract_plan`` (Kimi-K3 FlatKV only) selects the contract path:
-    a single ``FlatHybridCachePool`` built from the plan replaces both the
-    per-layer KV pool and the ``SimpleMambaPool`` — the recurrent state lives
-    in the plan's aliased state slabs, addressed by the flat group tables.
-    Missing FlatKV pieces on that path are errors, never fallback signals.
+    GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3,
+    MLA base). ``pool`` is the model's layer-mapped view over the one
+    shared cache pool; both sub-backends consume its per-group tables.
     """
     from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
         HybridLinearAttnBackend,
-        LayerMappedKVPool,
         MambaAttnBackend,
-        SimpleMambaPool,
     )
 
     hf_config = model_config.hf_config
     text_config = getattr(hf_config, "text_config", hf_config)
     full_attn_layers = text_config.full_attention_layer_ids
-
-    if (
-        flat_contract_plan is not None
-        and full_attn_backend_name is None
-        and not current_platform().is_amd
-    ):
-        # NVIDIA defaults to its CuteDSL FlatKV history consumer. AMD keeps the
-        # default ``mla`` backend, whose Gluon path consumes the same FlatKV
-        # history contract without changing compute kernels. Explicit choices
-        # remain authoritative and are checked by the family guard.
-        full_attn_backend_name = "tokenspeed_mla"
-
     # Create the full attention backend for standard MHA layers.
     # Use user's original choice if provided, otherwise auto-select.
     full_attn_backend = _create_attn_backend_with_name(
         full_attn_backend_name,
-        arch,
+        model_config.attention_arch,
         config,
     )
 
-    if flat_contract_plan is not None:
-        # FlatKV contract: see CuteDSLMLABackend.mark_flat_contract.
-        mark_flat_contract = getattr(full_attn_backend, "mark_flat_contract", None)
-        if mark_flat_contract is not None:
-            mark_flat_contract()
+    if is_kda:
+        # Paged cache contract: see CuteDSLMLABackend.mark_cache_contract.
+        mark_cache_contract = getattr(full_attn_backend, "mark_cache_contract", None)
+        if mark_cache_contract is not None:
+            mark_cache_contract()
 
     # Create mamba/linear attention backend. Only propagate the configured
     # verify width when spec-dec is actually enabled — matches MLAConfig /
@@ -566,76 +421,23 @@ def _create_hybrid_linear_attn(
     if server_args.speculative_algorithm is not None:
         config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
-    flat_kvcache = scheduler_ext_flat_kvcache()
-    if flat_contract_plan is not None:
-        # One Kimi-K3 FlatHybridCachePool
-        # owns the four groups' aliased raw slabs and publishes the runtime
-        # contract every downstream consumer keys off (scheduler geometry,
-        # per-step FlatCacheBatchMetadata, MLA/KDA component views). The
-        # plan binds GLOBAL layer ids, so no LayerMappedKVPool wrapper; the
-        # MLA latent split geometry enables the pool's MLA read adapters.
-        from tokenspeed.runtime.layers.attention.kv_cache.flat_hybrid import (
-            FlatHybridCachePool,
-        )
-
-        if not flat_kvcache:
-            raise RuntimeError(
-                "Kimi-K3 FlatKV contract pool requires a flat-built "
-                "tokenspeed_scheduler extension; legacy and radix fallbacks "
-                "are forbidden"
-            )
-        pool = FlatHybridCachePool(
-            plan=flat_contract_plan,
-            device=config.device,
-            enable_memory_saver=enable_memory_saver,
-            mla_kv_lora_rank=config.kv_lora_rank,
-            mla_qk_rope_head_dim=config.qk_rope_head_dim,
-        )
-    elif flat_kvcache:
-        # Flat path: the pool covers ALL layers, so pool indices == global
-        # layer ids, its layer_types line up with the state slabs, and the
-        # group specs publish both the "full_attention" and
-        # "linear_attention" groups. State layers carry NO k/v tensors
-        # (None slots, M18a T4) -- matching the plan sizing, which charges
-        # only full-layer KV + state rows. The identity mapping keeps
-        # the wrapper type identical to the radix path.
-        num_total_layers = len(text_config.layers_block_type)
-        inner_pool = config.create_pool(
-            num_total_layers, max_num_tokens, rank, enable_memory_saver
-        )
-        pool = LayerMappedKVPool(inner_pool, list(range(num_total_layers)))
-    else:
-        # Create KV cache pool (only for full attention layers)
-        num_full_attn_layers = len(full_attn_layers)
-        inner_pool = config.create_pool(
-            num_full_attn_layers, max_num_tokens, rank, enable_memory_saver
-        )
-        # Wrap with layer ID mapping (global layer IDs -> pool indices)
-        pool = LayerMappedKVPool(inner_pool, full_attn_layers)
-
     # Read mamba2_cache_params to decide whether this model actually has
     # any linear / mamba layers. A draft model on a hybrid-GDN target
     # (e.g. MTP on Qwen3.5) shares the same architecture class as the
     # target but commonly ships with *zero* mamba layers — in that case
-    # we skip the mamba backend / pool entirely so that its
+    # we skip the mamba backend entirely so that its
     # ``init_forward_metadata_*`` hooks do not run (they would otherwise
     # touch a zero-sized pool on the same persistent state_indices_list
     # as the target, which breaks the captured CUDA graph).
-    (
-        conv_state_shape,
-        temporal_state_shape,
-        conv_dtype,
-        ssm_dtype,
-        mamba_layer_ids,
-    ) = text_config.mamba2_cache_params
+    mamba_layer_ids = text_config.mamba2_cache_params[-1]
 
     if len(mamba_layer_ids) == 0:
         logger.info(
             "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
-            "attn layers (skipping mamba backend / pool)",
+            "attn layers (skipping mamba backend)",
             len(full_attn_layers),
         )
-        return full_attn_backend, pool, None
+        return full_attn_backend
 
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
@@ -644,122 +446,8 @@ def _create_hybrid_linear_attn(
         config, is_kda=is_kda, kda_backend=kda_backend
     )
 
-    if flat_kvcache:
-        # Flat mode never touches a SimpleMambaPool: the recurrent state
-        # lives in the KV pool's state slabs, addressed by the flat block
-        # tables (set_kv_pool below activates the dual-index state paging),
-        # so skip the pool and its set_pool binding entirely.
-        mamba_pool = None
-    else:
-        # Mamba radix cache uses C++ chunk indices. Without radix cache, the
-        # backend uses 1-based req_pool_indices directly, so keep slot 0 as
-        # padding.
-        per_rank_max_batch = server_args.max_num_seqs // max(
-            server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
-        )
-        req_pool_padding_index = per_rank_max_batch + 1
-        mamba_pool_size = (
-            mamba_pool_total_chunks + 1
-            if mamba_pool_total_chunks > 0
-            else per_rank_max_batch + 1
-        )
-        mamba_pool = SimpleMambaPool(
-            size=mamba_pool_size,
-            num_mamba_layers=len(mamba_layer_ids),
-            conv_state_shape=conv_state_shape,
-            temporal_state_shape=temporal_state_shape,
-            conv_dtype=conv_dtype,
-            ssm_dtype=ssm_dtype,
-            mamba_layer_ids=mamba_layer_ids,
-            device=config.device,
-            page_size=server_args.block_size,
-            speculative_num_draft_tokens=(
-                server_args.speculative_num_draft_tokens
-                if server_args.speculative_algorithm is not None
-                else 0
-            ),
-            # ``current_input_indices`` is keyed by the scheduler's rank-local,
-            # 1-based req_pool_idx; the row after that range is the CUDA graph
-            # padding sentinel.
-            max_req_pool_size=req_pool_padding_index,
-        )
-        mamba_pool.is_kda_cache = is_kda
-
-        # Cached snapshots live in their own pool, at their own dtype. Sized and
-        # checked against free HBM before allocating, so an oversized request
-        # fails with a number rather than a mid-allocation CUDA OOM.
-        if server_args.enable_mamba_ckpt_pool:
-            from tokenspeed.runtime.cache.mamba_checkpoint_pool import (
-                MambaCheckpointPool,
-                resolve_ckpt_dtype,
-            )
-
-            # temporal_state_shape is K-last [Hv, V, K]; the int8 store's scale
-            # reduces over V, which is what makes it per-(head, k-channel).
-            n_heads, head_v_dim, head_k_dim = temporal_state_shape
-            ckpt_dtype = resolve_ckpt_dtype(server_args.mamba_ckpt_dtype)
-            shape_kwargs = dict(
-                num_layers=len(mamba_layer_ids),
-                num_heads=n_heads,
-                head_v_dim=head_v_dim,
-                head_k_dim=head_k_dim,
-                conv_shapes=[tuple(conv_state_shape)],
-                conv_dtype=conv_dtype,
-                temporal_dtype=ssm_dtype,
-                ckpt_dtype=ckpt_dtype,
-            )
-            ckpt_slots = resolve_mamba_ckpt_slots(
-                server_args,
-                mamba_pool_total_chunks=mamba_pool_total_chunks,
-                working_bytes_per_chunk=mamba_working_bytes_per_chunk(
-                    conv_state_shape,
-                    conv_dtype,
-                    temporal_state_shape,
-                    ssm_dtype,
-                    len(mamba_layer_ids),
-                ),
-                ckpt_bytes_per_slot=MambaCheckpointPool.bytes_per_slot_estimate(
-                    **shape_kwargs
-                ),
-            )
-            ckpt_kwargs = dict(num_slots=ckpt_slots, **shape_kwargs)
-            est = MambaCheckpointPool.estimate_mem_usage_bytes(**ckpt_kwargs)
-            free_bytes = None
-            if str(config.device).startswith("cuda"):
-                try:
-                    free_bytes, _ = torch.cuda.mem_get_info(config.device)
-                except Exception:
-                    free_bytes = None
-            gb = 1 << 30
-            logger.info(
-                "mamba checkpoint pool: dtype=%s, %d slots, %.2fGB "
-                "(state %.2f + scale %.2f + conv %.2f), %.1fMB per slot; "
-                "active pool %d slots%s",
-                server_args.mamba_ckpt_dtype,
-                ckpt_slots,
-                est["total"] / gb,
-                est["qdata"] / gb,
-                est["scale"] / gb,
-                est["conv"] / gb,
-                est["total"] / max(ckpt_slots + 1, 1) / (1 << 20),
-                mamba_pool_size,
-                "" if free_bytes is None else f"; free HBM {free_bytes / gb:.2f}GB",
-            )
-            if free_bytes is not None and est["total"] >= free_bytes:
-                raise RuntimeError(
-                    f"mamba checkpoint pool needs ~{est['total'] / gb:.2f}GB "
-                    f"but only {free_bytes / gb:.2f}GB HBM is free. Lower "
-                    f"--mamba-ckpt-size (currently {ckpt_slots}), lower "
-                    f"--mamba-ckpt-memory-fraction, or pass "
-                    f"--mamba-ckpt-dtype int8."
-                )
-            mamba_pool.ckpt_pool = MambaCheckpointPool(
-                device=config.device, **ckpt_kwargs
-            )
-
-        linear_attn_backend.set_pool(mamba_pool)
-    # Flat state paging (dual-index) keys off the KV pool's state slabs +
-    # published "linear_attention" group; no-op on the radix path.
+    # Recurrent state lives in the LCM arena and is addressed by the
+    # per-group block tables, so no separate request-indexed Mamba pool exists.
     linear_attn_backend.set_kv_pool(pool)
 
     backend = HybridLinearAttnBackend(
@@ -769,308 +457,14 @@ def _create_hybrid_linear_attn(
         "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),
         len(mamba_layer_ids),
-        (
-            "flat state slabs (no mamba slot pool)"
-            if mamba_pool is None
-            else f"mamba pool size {mamba_pool.size}"
-        ),
+        "LCM state fields",
     )
-    return backend, pool, mamba_pool
+    return backend
 
 
-def _floor_tokens_to_layout_grid(max_num_tokens: int, config) -> int:
-    """Floor the memory-profiled token capacity onto the KV layout's grid.
-
-    The profile is memory-dependent (``--gpu-memory-utilization`` over the
-    free bytes at boot), so the raw value can land ANYWHERE on the 128-token
-    page grid — but the hetero slot layout is only viewable on a coarser
-    grid. With ``slot_tokens`` S and a largest group page P (both derived
-    from the config's KV head counts), the pool row counts that must divide
-    are:
-
-    - target hybrid slab: rows = size + S viewed at base-page granularity
-      after the per-layer head reinterpretation -> needs ``128 | size``
-      (any 128-grid value satisfies it);
-    - MTP draft pool: SAME page-id space and the SAME byte-uniform slot
-      layout (the draft is a depth-count miniature of the target pool, see
-      the Inkling draft branch below), so its full-attention view pages at
-      P likewise divide on the 128 grid. Flooring to ``size ≡ 0 (mod P)``
-      keeps the id count itself on the coarse grid.
-      (Historical: before the drafter consumed the table at P, the draft
-      pool held one 128-row slot per id and its P-row page view required
-      ``size ≡ 128 (mod 256)`` — an ODD id count. The 2026-07-14 cont. 9
-      boot lottery was literally the parity of the profiled id count.)
-
-    Flooring costs at most 255 tokens (~0.02%). No-op for layouts without
-    hetero head counts.
-    """
-    if not getattr(config, "layer_kv_head_counts", None):
-        return max_num_tokens
-    slot = int(getattr(config, "slot_tokens", 0) or config.page_size)
-    page_sizes = getattr(config, "group_page_sizes", None) or {}
-    largest_page = max([config.page_size, *page_sizes.values()])
-    # size ≡ 0 (mod largest_page). Degenerates to plain page flooring when
-    # every group shares the base page.
-    residue = 0
-    floored = max_num_tokens - ((max_num_tokens - residue) % largest_page)
-    if floored != max_num_tokens:
-        logger.info(
-            "KV capacity floored to the hetero layout grid: %d -> %d tokens "
-            "(slot %d, largest group page %d)",
-            max_num_tokens,
-            floored,
-            slot,
-            largest_page,
-        )
-    return floored
-
-
-def _apply_inkling_hetero_kv(config, model_config) -> None:
-    """Publish the byte-uniform slot layout: per-group page sizes and per-layer KV head counts.
-
-    A layer serving ``heads_l`` of the slab's ``num_kv_heads`` allocation
-    width reinterprets one slot's bytes as ``page_size * alloc // heads_l``
-    tokens -- the same ratio ``MHATokenToKVPool._layer_page_tokens`` applies
-    when it views the slab. Both sides derive from the config's KV head
-    counts rather than a fixed pairing, so any
-    ``swa_num_key_value_heads`` / ``ckpt_num_key_value_heads`` combination
-    stays consistent. A published page wider than the slot's bytes afford
-    would over-subscribe that group's ids.
-
-    ``alloc`` comes from ``config.num_kv_heads`` (what the pool receives as
-    ``kv_alloc_head_count``), not ``max(counts)``: an all-narrow pool whose
-    own layers never include an alloc-width layer is still allocated at the
-    config max and must keep its widened page.
-
-    Args:
-        config: The attention config to populate in place.
-        model_config: Model config supplying the Inkling text config.
-    """
-    from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
-
-    tc = model_config.hf_config.get_text_config()
-    counts = tuple(
-        inkling_kv_heads_for_layer(tc, i, True) for i in range(tc.num_hidden_layers)
-    )
-    alloc = config.num_kv_heads
-    page_tokens = {
-        label: config.page_size * alloc // heads
-        for label, heads in zip(tc.paged_cache_layer_types, counts, strict=True)
-    }
-    config.slot_tokens = max(page_tokens.values(), default=config.page_size)
-    config.group_page_sizes = {
-        label: pages
-        for label, pages in page_tokens.items()
-        if pages != config.page_size
-    }
-    config.layer_kv_head_counts = counts
-
-
-def gemma4_layer_kv_geometry(text_config) -> list[tuple[int, int]]:
-    """Per-layer ``(kv_heads, head_dim)`` for a Gemma 4 text config, PRE-TP.
-
-    Full-attention layers use ``num_global_key_value_heads`` x
-    ``global_head_dim``; sliding layers ``num_key_value_heads`` x
-    ``head_dim``. Both are read from the checkpoint config -- there is no
-    default that is right for both variants (31B: 16x256 / 4x512;
-    26B-A4B: 8x256 / 2x512).
-    """
-    swa = (
-        int(text_config.num_key_value_heads),
-        int(text_config.head_dim),
-    )
-    full = (
-        int(getattr(text_config, "num_global_key_value_heads", swa[0])),
-        int(getattr(text_config, "global_head_dim", None) or text_config.head_dim),
-    )
-    return [
-        full if label == "full_attention" else swa for label in text_config.layer_types
-    ]
-
-
-def _apply_gemma4_hetero_kv(config, model_config) -> bool:
-    """Enable heterogeneous KV for Gemma 4, or leave the pool uniform.
-
-    Gemma 4's full-attention layers carry HALF the KV bytes per token of its
-    sliding layers (31B: 4x512 = 2048 vs 16x256 = 4096). Without this, the
-    pool allocates every row at the sliding width and the full layers'
-    stores are silently truncated into it -- half of every full-attention K
-    and V lost, no exception (the store kernel copies src-width elements at
-    the dst row stride and never compares the two). The pool now REFUSES
-    that write, so this must run for Gemma 4 to serve at all.
-
-    Returns True when hetero KV was applied (the geometry is genuinely
-    non-uniform), False when every layer already shares one geometry and the
-    plain uniform pool is correct.
-    """
-    from tokenspeed.runtime.layers.attention.kv_cache.utils import (
-        normalize_layer_kv_geometry,
-    )
-
-    tc = model_config.hf_config.get_text_config()
-    geometry = gemma4_layer_kv_geometry(tc)
-    if len(set(geometry)) < 2:
-        return False
-    if not scheduler_ext_flat_kvcache():
-        # The per-group page sizes this layout needs are only honoured by the
-        # flat scheduler ext (the radix path has one page size for the whole
-        # pool), so publishing them here would produce write locs in the wrong
-        # units. Warning and continuing would leave the pool uniform, which
-        # cannot represent the full-attention geometry -- the store guard then
-        # refuses the first full-attention write, i.e. the server comes up and
-        # dies on the first request. Refuse here instead, where the message can
-        # still say what to rebuild.
-        raise RuntimeError(
-            f"Gemma 4 needs heterogeneous KV ({sorted(set(geometry))} per "
-            "layer) but the installed tokenspeed_scheduler ext is not "
-            "flat-built. The uniform KV pool cannot represent the "
-            "full-attention geometry and would refuse those writes on the "
-            "first request. Rebuild the ext with TOKENSPEED_FLAT_KVCACHE=ON."
-        )
-    alloc, counts = normalize_layer_kv_geometry(geometry)
-    head_ratio = alloc // min(counts)
-    # Byte-uniform slots: the widest layer's page is the base block, the
-    # narrower full layers page at `ratio` x that many token rows over the
-    # same bytes (identical to the Inkling layout, one label instead of six).
-    #
-    # `ratio` IS NOT A FREE PARAMETER -- do not raise it. A layer's view of a
-    # slab row is re-counted by head count (`_layer_page_tokens` = page_size *
-    # head_num // heads_l, kv_cache/mha.py:932) while the write loc is
-    # `page_id * group_page_size + off` (backends/flat_groups.py:225). The two
-    # address the same bytes only when group_page_size == head_ratio *
-    # page_size. Any larger ratio walks the write loc off the end of the id's
-    # own byte range into the following ids' -- which is exactly why ratio 4
-    # (64), 8 (128) and 10 (160) each served one request and then died with a
-    # CUDA illegal memory access once a batch reached ~12 concurrent
-    # sequences. That is an out-of-bounds bug, not a "the plumbing is not
-    # built for a non-power-of-two group page" limitation: 128 is a power of
-    # two and faults too.
-    #
-    # HISTORICAL NOTE, corrected 2026-08-13. This comment used to assert that
-    # admission over-charges gemma 4 because `KvCacheCoordinator::
-    # BlocksNeededFor` sums over groups whose slabs alias -- "an 811-token
-    # request charged 77 ids where its bytes are worth 57, ~34% more resident
-    # sequences if fixed". That is FALSE today, and its arithmetic described a
-    # layout we no longer build:
-    #
-    #   * It assumed ONE sliding group of 50 layers against a full group of
-    #     10, so a full block wasted 80% of an id. Gemma 4 now goes through
-    #     `split_groups_to_equal_depth` (configs/mha.py:114) into FIVE
-    #     `sliding_attention_<k>` groups of 10 layers plus `full_attention`
-    #     of 10 -- six EQUAL groups, hybrid_slab_group_size == 10. The running
-    #     server prints it: "KV layout: hybrid slab (10 slabs x 118432 rows;
-    #     ... 7400 ids)". The equal-depth port recorded below as having LOST
-    #     is what we now ship; it lost only because it ran after the KV
-    #     profile and sized the pool at 3.6 GB, which the "Must run BEFORE the
-    #     KV memory profile" contract on that helper now prevents.
-    #   * With equal depth, every slab is bound by exactly one layer of the
-    #     owning group, so an id has no dead slab rows whichever group holds
-    #     it. That is the entire point of the split (paged_cache_spec.py:196).
-    #   * Page ids are group-EXCLUSIVE, and the aliasing depends on it being
-    #     so: one BlockPool free list hands each id out at most once
-    #     (cache/block_pool.h:84), and cached-block keys are group-wrapped
-    #     (MakeKeyWithGroupId, scheduler/page_hasher.h:179), so no id is ever
-    #     shared across groups. Summing per-group counts therefore adds up
-    #     DISTINCT ids -- it is a count, not a double-count.
-    #   * The charge is byte-exact. 5 sliding groups at page 16 plus 1 full
-    #     group at page 32 is 5/16 + 1/32 = 0.34375 ids/token; an id is 10
-    #     slabs x 16 rows x 16 heads x 256 dim x 2 B x (K,V) = 2,621,440 B;
-    #     the product is 901,120 B/token. Gemma-4-31B's true per-token KV is
-    #     50*16*256*2*2 + 10*4*512*2*2 = 901,120 B. Ratio 1.000, not one
-    #     wasted byte. So there is no layer ratio left to fold in: gemma 4's
-    #     is 1, exactly as Inkling's is, and ratio = head_ratio is already the
-    #     only correct value.
-    #
-    # TRT-LLM's single pool with per-layer widths (`kv_cache_manager_v2.py:
-    # 3325`) was also ported and still loses -- 225.5 tok/s, 30 resident --
-    # because one group turns the hybrid slab off ("predicate returned None --
-    # non-uniform/single-group layer_types"): 60 separate buffers at 21.7 GB
-    # where 10 aliased slabs hold the same tokens in 18.1.
-    #
-    # Where the gemma-4 throughput gap actually is, measured 2026-08-13 at
-    # C=32 on the RAG shape, same harness and card: ours 234.2 tok/s, 30
-    # resident, pool pinned at 7257-7395/7400. The pool is genuinely full and
-    # correctly charged -- vLLM allocates LESS KV for the same model at the
-    # same utilization (15.4 GiB / 18,312 tokens against our 18.08 GB /
-    # ~21.5k sub-window tokens) and still serves 456.2 tok/s. Median ITL is
-    # at parity (60.1 vs 57.7 ms); only the tail diverges (P99 ITL 1181.7 vs
-    # 60.6 ms, i.e. vLLM's tail equals its median and ours is 20x it). That
-    # is stall behaviour at a saturated pool -- one "flat retract ... to
-    # unwedge the pool" fired in an entire run -- not page accounting.
-    ratio = head_ratio
-    config.slot_tokens = config.page_size * ratio
-    config.group_page_sizes = {"full_attention": config.page_size * ratio}
-    config.layer_kv_head_counts = counts
-    logger.info(
-        "Gemma 4 hetero KV: per-layer geometry %s -> alloc %d heads x %d, "
-        "layer head counts %s, slot %d tokens, full_attention page %d",
-        sorted(set(geometry)),
-        alloc,
-        min(d for _, d in geometry),
-        sorted(set(counts)),
-        config.slot_tokens,
-        config.group_page_sizes["full_attention"],
-    )
-    return True
-
-
-def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int, int]:
-    """Publish per-label kvconv (+ optional hiddenconv) paged groups.
-
-    Conv blocks scale with the KV element size (an fp8 slot holds half the bf16 column tokens).
-
-    Returns ``(conv_block_tokens, hidden_block_tokens)``.
-    """
-    from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
-
-    tc = model_config.hf_config.get_text_config()
-    bt = server_args.block_size
-    kv_elem = config.kv_cache_dtype.itemsize
-    conv_bt = bt * kv_elem // 2
-    slot_bytes = (
-        bt
-        * max(config.num_kv_heads // config.attn_tp_size, 1)
-        * config.head_dim
-        * kv_elem
-    )
-    # fp8 doubles the hiddenconv block (halves ids/token); must agree with the pool's conv_col_dtype
-    hcol_elem = 2 if os.environ.get("INKLING_FP8_SCONV", "1") == "0" else 1
-    hbt = 1
-    while hbt * 2 * tc.hidden_size * hcol_elem <= slot_bytes:
-        hbt *= 2
-    assert conv_bt > 0 and hbt * tc.hidden_size * hcol_elem <= slot_bytes
-    config.extra_paged_groups = tuple(
-        PagedCacheGroupSpec(
-            group_id=f"kvconv_{label}",
-            retention="sliding_window",
-            rows_per_page=conv_bt,
-            entry_stride_tokens=1,
-            sliding_window_tokens=conv_bt + tc.sconv_kernel_size,
-            family="history",
-            block_size=conv_bt,
-        )
-        for label in dict.fromkeys(tc.paged_cache_layer_types)
-    )
-    if (
-        True
-    ):  # paged hiddenconv is unconditional (INKLING_PAGED_HIDDENCONV gate retired 2026-07-15)
-        # ATTN cols ride the K slot, MLP the V slot; each new base needs a FlatInklingShapeSuite pass
-        config.extra_paged_groups = config.extra_paged_groups + tuple(
-            PagedCacheGroupSpec(
-                group_id=f"hiddenconv_{label}",
-                retention="sliding_window",
-                rows_per_page=hbt,
-                entry_stride_tokens=1,
-                sliding_window_tokens=hbt + tc.sconv_kernel_size,
-                family="history",
-                block_size=hbt,
-            )
-            for label in dict.fromkeys(tc.paged_cache_layer_types)
-        )
-    return conv_bt, hbt
-
-
-def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_draft):
+def _wrap_inkling_backend(
+    inner, text_config, attn_config, *, num_layers, is_draft, conv_columns
+):
     """Wrap a dense backend with the engine-side Inkling sconv state pool.
 
     The wrapper only adds conv metadata; all attention delegates to ``inner``.
@@ -1082,12 +476,20 @@ def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_dra
         InklingConvStatePool,
     )
 
+    kernel_size = text_config.sconv_kernel_size
+    spec_tokens = max(1, int(getattr(attn_config, "speculative_num_draft_tokens", 1)))
+    # Ring row of absolute position p is p % R. R must keep a round's
+    # pre-chunk tap reads and chunk-row writes disjoint mod R:
+    # (W-1) history taps + K chunk rows + the draft's lookback depth
+    # (spec steps - 1 = K - 2). Uniform across target and draft.
+    ring_size = (kernel_size - 1) + spec_tokens + max(spec_tokens - 2, 0)
     conv_pool = InklingConvStatePool(
         num_layers=num_layers,
         # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
         num_slots=attn_config.max_bs + 2,
         conv_dim=inkling_conv_total_dim(text_config, attn_config.attn_tp_size),
-        kernel_size=text_config.sconv_kernel_size,
+        kernel_size=kernel_size,
+        ring_size=ring_size,
         dtype=torch.bfloat16,
         device=attn_config.device,
     )
@@ -1101,52 +503,30 @@ def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_dra
     backend = InklingAttnBackend(
         inner,
         conv_pool,
+        conv_columns=conv_columns,
         spec_num_tokens=getattr(attn_config, "speculative_num_draft_tokens", 1),
         is_draft=is_draft,
     )
     return backend, conv_pool
 
 
-def _inkling_conv_columns(pool, text_config, conv_bt, hbt):
-    """kvconv-as-swa geometry for the backend (None if no kvconv pages).
-
-    Columns live in the layers' own K/V slots; backend gets only geometry + layer->group map.
-    """
+def _inkling_conv_columns(pool, text_config):
+    """Return the ShortConv checkpoint groups backed by the cache plan."""
     layer_labels = text_config.paged_cache_layer_types
-    labels = list(dict.fromkeys(layer_labels))
-    num_conv_blocks = sum(
-        pool.paged_cache_group_page_counts.get(f"kvconv_{label}", 0) for label in labels
-    )
-    if not num_conv_blocks:
-        logger.warning(
-            "paged sconv expected but no kvconv pages published;"
-            " rolling conv state only."
-        )
-        return None
-    paged_hidden = True  # unconditional (gate retired 2026-07-15)
+    block_tokens = pool.plan.logical_block_tokens
     conv_columns = {
-        "block_tokens": conv_bt,
-        "lcm_align": 256,
-        "conv_group_of_layer": tuple(f"kvconv_{label}" for label in layer_labels),
-        "hidden_block_tokens": hbt,
-        "hidden_group_of_layer": (
-            tuple(f"hiddenconv_{label}" for label in layer_labels)
-            if paged_hidden
-            else None
-        ),
-        # Per-group block sizes for the backend's table buffers.
+        "block_tokens": block_tokens,
+        "conv_group_of_layer": ("kvconv",) * len(layer_labels),
+        "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),
         "group_block_tokens": {
-            **{f"kvconv_{label}": conv_bt for label in labels},
-            **(
-                {f"hiddenconv_{label}": hbt for label in labels} if paged_hidden else {}
-            ),
+            "kvconv": block_tokens,
+            "hiddenconv": block_tokens,
         },
     }
     logger.info(
-        "Inkling kvconv-as-swa: %d groups, block %d%s",
-        len(labels),
-        conv_bt,
-        f" + hiddenconv block {hbt}" if paged_hidden else "",
+        "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
+        block_tokens,
+        tuple(conv_columns["group_block_tokens"]),
     )
     return conv_columns
 
@@ -1189,13 +569,194 @@ def _start_inkling_pool_probe(kv_pool, conv_pool, rank, probe_dir) -> None:
                 )
                 with open(path, "a") as f:
                     f.write(json.dumps(rec) + "\n")
-            except Exception as exc:  # diagnostics must not kill serving
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not kill serving
                 with open(path, "a") as f:
                     f.write(json.dumps({"error": repr(exc)}) + "\n")
             time.sleep(10)
 
     threading.Thread(target=_pool_probe, daemon=True).start()
     logger.info("Inkling pool probe enabled -> %s", probe_dir)
+
+
+def _create_target_components(
+    *,
+    server_args,
+    model_config,
+    config,
+    cache_spec: CachePoolSpec,
+    rank: int,
+    enable_memory_saver: bool,
+    full_attn_backend_name: str | None,
+    is_hybrid_linear: bool,
+    is_kda: bool,
+    is_inkling: bool,
+):
+    """The ONE cache pool (target + draft continuation layers) + target backend."""
+    # The merged spec includes the draft's continuation layers; the pool
+    # binds every planned field regardless of which model consumes it.
+    pool = create_cache_pool(
+        cache_spec,
+        config,
+        num_layers=len(cache_spec.layer_group_ids),
+        rank=rank,
+        enable_memory_saver=enable_memory_saver,
+    )
+    if is_hybrid_linear:
+        # Identity map, NOT a no-op: the wrapper is the per-view carrier of
+        # the MLA-write sanitize contract (LayerMappedKVPool.set_mla_kv_buffer
+        # forces sanitize=True for the hybrid chunked-prefill path). Target
+        # and draft share the ONE pool, so a pool-level flag could not
+        # express per-view sanitize semantics.
+        mapped = LayerMappedKVPool(pool, list(range(len(cache_spec.layer_group_ids))))
+        backend = _create_hybrid_linear_attn_backend(
+            server_args,
+            model_config,
+            config,
+            pool=mapped,
+            full_attn_backend_name=full_attn_backend_name,
+            is_kda=is_kda,
+        )
+        return backend, mapped
+
+    backend = _create_attn_backend(model_config.attention_arch, config)
+    if not is_inkling:
+        return backend, pool
+
+    text_config = model_config.hf_config.get_text_config()
+    backend, conv_pool = _wrap_inkling_backend(
+        backend,
+        text_config,
+        config,
+        num_layers=text_config.num_hidden_layers,
+        is_draft=False,
+        conv_columns=_inkling_conv_columns(pool, text_config),
+    )
+    probe_dir = os.environ.get("INKLING_POOL_PROBE_DIR")
+    if probe_dir:
+        _start_inkling_pool_probe(pool, conv_pool, rank, probe_dir)
+    return backend, pool
+
+
+def _create_draft_components(
+    *,
+    server_args,
+    model_config,
+    config,
+    pool,
+    cache_spec: CachePoolSpec | None,
+    num_target_layers: int,
+    full_attn_backend_name: str | None,
+    is_hybrid_linear: bool,
+    is_kda: bool,
+    is_inkling: bool,
+):
+    """Draft backend + the ONE pool viewed through the draft's layer window.
+
+    One big model, one pool: draft layers are continuation layers
+    (global ids ``num_target_layers..``) of the merged plan the target
+    pool already binds. The draft side needs no pool of its own — only a
+    LayerMappedKVPool translating its local layer ids onto the global
+    continuation range, exactly the mapping hybrid models already use.
+    """
+    if config is None:
+        return None, None
+    num_layers = model_config.num_attention_layers
+    if cache_spec is not None:
+        if is_hybrid_linear or is_inkling:
+            raise RuntimeError(
+                "heterogeneous cache views currently support ordinary drafts only"
+            )
+        # The draft pool is a compute view, not an allocation: it binds local
+        # layer 0..N to the merged plan's continuation fields while sharing
+        # the target's buffer and global field registry. Its transfer counter
+        # stays local/None; heterogeneous PD is rejected before construction.
+        draft_pool = create_cache_pool(
+            cache_spec,
+            config,
+            num_layers=num_layers,
+            rank=pool.rank,
+            enable_memory_saver=False,
+            field_layer_offset=num_target_layers,
+            backing_pool=pool,
+        )
+        backend = _create_attn_backend(model_config.attention_arch, config)
+        return backend, draft_pool
+    # Draft layers carry LOCAL ids (a NextN draft's one layer is layer 0);
+    # their planes are the merged plan's continuation range. The map must be
+    # {local: global} — the wrapper's default ({global: pool_idx}, the hybrid
+    # convention) is this map's INVERSE and would route every draft write to
+    # the target's first layers. Global ids (V4 MTP layers carry them) pass
+    # through _map's identity default unharmed.
+    draft_pool = LayerMappedKVPool(
+        pool,
+        [num_target_layers + local for local in range(num_layers)],
+        layer_map={local: num_target_layers + local for local in range(num_layers)},
+    )
+    if is_hybrid_linear:
+        backend = _create_hybrid_linear_attn_backend(
+            server_args,
+            model_config,
+            config,
+            pool=draft_pool,
+            full_attn_backend_name=full_attn_backend_name,
+            is_kda=is_kda,
+        )
+        return backend, draft_pool
+
+    backend = _create_attn_backend(model_config.attention_arch, config)
+    if is_inkling:
+        # Depth layers carry conv checkpoint fields as continuation tenants
+        # of the target's kvconv/hiddenconv groups; the draft gets the same
+        # paged bridges (publish/restore) the target wrapper gets.
+        text_config = model_config.hf_config.get_text_config()
+        backend, _ = _wrap_inkling_backend(
+            backend,
+            text_config,
+            config,
+            num_layers=num_layers,
+            is_draft=True,
+            conv_columns=_inkling_conv_columns(draft_pool, text_config),
+        )
+    return backend, draft_pool
+
+
+def _prepare_verify_workspace(
+    *,
+    server_args,
+    config,
+    backend,
+    draft_backend,
+    is_qwen_gdn: bool,
+    is_inkling: bool,
+    expected_bytes: int,
+) -> None:
+    if is_qwen_gdn and expected_bytes:
+        model_name = "GDN"
+        actual_bytes = backend.linear_attn_backend.preallocate_verify_workspace(
+            config.max_bs,
+            int(server_args.speculative_num_draft_tokens),
+        )
+    elif is_inkling:
+        model_name = "Inkling"
+        if draft_backend is not None:
+            lookback = (
+                int(server_args.speculative_num_steps) - 1
+                if int(server_args.speculative_num_steps) > 1
+                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
+                else 0
+            )
+            if lookback and not draft_backend.configure_draft_lookback(lookback):
+                raise RuntimeError("Inkling MTP draft rejected its planned lookback")
+        actual_bytes = backend.fixed_workspace_bytes()
+        if draft_backend is not None:
+            actual_bytes += draft_backend.fixed_workspace_bytes()
+    else:
+        return
+    if actual_bytes != expected_bytes:
+        raise RuntimeError(
+            f"planned {model_name} verify workspace does not match allocated tensors: "
+            f"{expected_bytes} planned, {actual_bytes} allocated"
+        )
 
 
 # ---------- public API ----------
@@ -1211,24 +772,33 @@ def create_attn_components(
     overlap_schedule_depth: int = 0,
 ) -> tuple[
     AttentionBackend,
-    BaseTokenToKVPool,
+    CachePool,
     AttentionBackend | None,
-    BaseTokenToKVPool | None,
+    CachePool | None,
     int,
-    int,
-    object | None,
+    dict | None,
 ]:
-    arch = model_config.attention_arch
-
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
+    is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
     is_hybrid_mla_kda = any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures)
     # Both take the hybrid-linear path; they differ only in the linear kernel
     # (GDN scalar decay vs KDA per-channel) and the base attn arch (MHA vs MLA).
     is_hybrid_linear = is_hybrid_gdn or is_hybrid_mla_kda
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
-    is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
-        draft_model_config.hf_config
+    draft_architectures = (
+        getattr(draft_model_config.hf_config, "architectures", None) or []
+        if draft_model_config is not None
+        else []
+    )
+    is_dspark_draft_model = any(
+        architecture == "DeepseekV4ForCausalLMDSpark"
+        for architecture in draft_architectures
+    )
+    is_deepseek_v4_draft_model = (
+        draft_model_config is not None
+        and not is_dspark_draft_model
+        and is_deepseek_v4(draft_model_config.hf_config)
     )
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
@@ -1250,607 +820,216 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
-    is_flat_gdn = getattr(config, "conv_state_shape", None) is not None
-    gdn_state_bytes = (
-        state_const_bytes(
-            config.conv_state_shape,
-            config.conv_dtype,
-            config.temporal_state_shape,
-            config.ssm_dtype,
+    if is_deepseek_v4_model:
+        config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
+    if is_inkling and server_args.disaggregation_mode in ("prefill", "decode"):
+        raise NotImplementedError("Inkling PD is not supported")
+    target_text_config = getattr(
+        model_config.hf_config, "text_config", model_config.hf_config
+    )
+    target_mamba_params = getattr(target_text_config, "mamba2_cache_params", None)
+    has_state = bool(
+        target_mamba_params
+        and target_mamba_params[-1]
+        and any(
+            layer_type in STATE_LAYER_TYPES
+            for layer_type in getattr(config, "layer_types", ())
         )
-        if is_flat_gdn
+    )
+    use_cache_gdn = is_hybrid_gdn and has_state
+    use_cache_k3 = is_hybrid_mla_kda
+    use_cache_inkling = is_inkling
+    if is_deepseek_v4_model:
+        cache_family = "deepseek_v4"
+    elif use_cache_gdn:
+        cache_family = "qwen_gdn"
+    elif use_cache_k3:
+        cache_family = "kimi_k3"
+    elif use_cache_inkling:
+        cache_family = "inkling"
+    elif type(config) is MHAConfig:
+        cache_family = "mha"
+    elif type(config) is MLAConfig:
+        cache_family = "mla"
+    elif isinstance(config, DSAConfig):
+        cache_family = "dsa"
+    elif isinstance(config, MSAConfig):
+        cache_family = "msa"
+    else:
+        cache_family = None
+    if cache_family is None:
+        raise RuntimeError(
+            "No cache recipe is registered for "
+            f"attention config {type(config).__name__}"
+        )
+    target_full_attn_backend_name = (
+        _resolve_hybrid_full_backend_name(
+            original_attn_backend,
+            is_kda=is_hybrid_mla_kda,
+            has_cache_plan=True,
+        )
+        if is_hybrid_linear
+        else config.backend_name
+    )
+    draft_attn_config = (
+        _create_attn_config(server_args, draft_model_config, is_draft=True)
+        if draft_model_config and not is_dspark_draft_model
         else None
     )
-    if is_flat_gdn:
-        equalized_block_size_value = equalized_block_size(
-            layer_types=list(config.layer_types),
-            kv_bytes_per_slot=config.cache_cell_size(),
-            state_const_bytes=gdn_state_bytes,
-            block_size=server_args.block_size,
-        )
-        if equalized_block_size_value != server_args.block_size:
-            logger.info(
-                "Setting attention block size to %d tokens to cover the GDN "
-                "state row (configured block size %d)",
-                equalized_block_size_value,
-                server_args.block_size,
-            )
-            server_args.block_size = equalized_block_size_value
-            config.page_size = equalized_block_size_value
-        # --mamba-track-interval: retained-snapshot stride N for the state
-        # group. N == block_size (the default, since 256 < 832) reproduces
-        # the previous geometry byte-for-byte; a larger N puts the state
-        # group on its own coarser grid so it pins ~T/N block ids instead of
-        # ~T/P. The price is prefix-hit granularity: the coordinator aligns
-        # every hit DOWN to the groups' lcm (SweepThenConverge), which
-        # becomes N. See docs/log.md E-numbered entry.
-        state_page_size_value = state_snapshot_interval(
-            block_size=server_args.block_size,
-            requested_interval=getattr(server_args, "mamba_track_interval", None),
-        )
-        gdn_state_page_sizes = state_group_page_sizes(
-            layer_types=list(config.layer_types),
-            page_size=server_args.block_size,
-            state_page_size=state_page_size_value,
-        )
-        if gdn_state_page_sizes:
-            merged = dict(getattr(config, "group_page_sizes", None) or {})
-            merged.update(gdn_state_page_sizes)
-            config.group_page_sizes = merged
-            cap_before = capacity_model(
-                components_from_layers(
-                    layer_types=list(config.layer_types),
-                    kv_bytes_per_slot=config.cache_cell_size(),
-                    state_const_bytes=gdn_state_bytes,
-                ),
-                block_size=server_args.block_size,
-            )
-            cap_after = capacity_model(
-                components_from_layers(
-                    layer_types=list(config.layer_types),
-                    kv_bytes_per_slot=config.cache_cell_size(),
-                    state_const_bytes=gdn_state_bytes,
-                ),
-                block_size=server_args.block_size,
-                state_interval=state_page_size_value,
-            )
-            logger.info(
-                "GDN state snapshot stride: %d tokens (attention page %d, "
-                "requested --mamba-track-interval %s); resident cost "
-                "%.0f -> %.0f bytes/token (%.2fx capacity), prefix-cache hit "
-                "granularity coarsens %d -> %d tokens",
-                state_page_size_value,
-                server_args.block_size,
-                getattr(server_args, "mamba_track_interval", None),
-                cap_before.bytes_per_token,
-                cap_after.bytes_per_token,
-                cap_before.bytes_per_token / cap_after.bytes_per_token,
-                server_args.block_size,
-                state_page_size_value,
-            )
-    draft_attn_config = None
-    if draft_model_config:
-        draft_attn_config = _create_attn_config(
-            server_args, draft_model_config, is_draft=True
-        )
-    num_layers = model_config.num_attention_layers
-    deepseek_v4_layout = None
-    draft_deepseek_v4_layout = None
-    profile_cache_cell_size = None
-    draft_profile_cache_cell_size = None
-    if is_deepseek_v4_model:
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            deepseek_v4_cache_layout_from_config,
-        )
-
-        deepseek_v4_layout = deepseek_v4_cache_layout_from_config(
-            model_config.hf_config,
-            page_size=server_args.block_size,
-            use_fp4_indexer_cache=_attention_use_fp4_indexer_cache(
-                server_args, model_config.hf_config
-            ),
-            layer_indices=range(num_layers),
-        )
-        profile_cache_cell_size = deepseek_v4_layout.cache_cell_size(num_layers)
     if is_deepseek_v4_draft_model:
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            deepseek_v4_cache_layout_from_config,
+        draft_attn_config.sliding_window_tokens = int(
+            draft_model_config.hf_config.sliding_window
         )
-
-        draft_layer_start = draft_model_config.num_hidden_layers
-        draft_num_layers = draft_model_config.num_attention_layers
-        draft_deepseek_v4_layout = deepseek_v4_cache_layout_from_config(
-            draft_model_config.hf_config,
-            page_size=server_args.block_size,
-            use_fp4_indexer_cache=_attention_use_fp4_indexer_cache(
-                server_args, draft_model_config.hf_config
-            ),
-            layer_indices=range(
-                draft_layer_start,
-                draft_layer_start + draft_num_layers,
-            ),
-        )
-        draft_profile_cache_cell_size = draft_deepseek_v4_layout.cache_cell_size(
-            draft_model_config.num_attention_layers
-        )
-
-    hf_config = getattr(model_config, "hf_config", None)
-    text_config = getattr(hf_config, "text_config", hf_config) if hf_config else None
-    mamba_cache_params = (
-        getattr(text_config, "mamba2_cache_params", None) if text_config else None
+    draft_is_hybrid_gdn = any(
+        architecture in _HYBRID_GDN_ARCHITECTURES
+        for architecture in draft_architectures
     )
-    # Unpack once with names; every consumer below reads these instead of
-    # indexing into the raw tuple.
-    if mamba_cache_params:
-        (
-            mamba_conv_state_shape,
-            mamba_temporal_state_shape,
-            mamba_conv_dtype,
-            mamba_ssm_dtype,
-            mamba_layer_ids,
-        ) = mamba_cache_params
-    else:
-        mamba_conv_state_shape = mamba_temporal_state_shape = None
-        mamba_conv_dtype = mamba_ssm_dtype = None
-        mamba_layer_ids = ()
-    has_mamba_layers = len(mamba_layer_ids) > 0
-    has_mamba = getattr(model_config, "mambaish_config", None) is not None or (
-        has_mamba_layers
+    draft_is_hybrid_mla_kda = any(
+        architecture in _HYBRID_MLA_KDA_ARCHITECTURES
+        for architecture in draft_architectures
     )
-    mamba_pool_total_chunks = 0
-    mamba_pool = None
-    # Kimi-K3 FlatKV contract plan; None on every other model's path.
-    kimi_flat_plan = None
-
-    _profile_kwargs = dict(
+    draft_full_attn_backend_name = None
+    if draft_attn_config is not None:
+        if draft_is_hybrid_gdn or draft_is_hybrid_mla_kda:
+            draft_full_attn_backend_name = _resolve_hybrid_full_backend_name(
+                draft_attn_config.backend_name,
+                is_kda=draft_is_hybrid_mla_kda,
+                has_cache_plan=True,
+            )
+        else:
+            draft_full_attn_backend_name = draft_attn_config.backend_name
+    draft_cache_family = _ordinary_cache_family(draft_attn_config)
+    heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
+        cache_family,
+        draft_cache_family,
+        pd_disaggregation_enabled=config.pd_disaggregation_enabled
+        or (
+            draft_attn_config is not None
+            and draft_attn_config.pd_disaggregation_enabled
+        ),
+    )
+    cache_memory = profile_available_cache_memory_bytes(
         attn_config=config,
         gpu_id=gpu_id,
         tp_size=server_args.mapping.world_size,
-        page_size=server_args.block_size,
-        num_attention_layers=num_layers,
+        gpu_memory_utilization=server_args.gpu_memory_utilization,
         total_gpu_memory=gpu_memory,
         world_group=server_args.mapping.world_group,
-        draft_attn_config=draft_attn_config if draft_attn_config else None,
-        draft_num_attention_layers=(
-            draft_model_config.num_attention_layers if draft_attn_config else None
-        ),
+    )
+    cache_setup = prepare_cache_setup(
+        family=cache_family,
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=config,
+        draft_model_config=draft_model_config,
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=cache_memory,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+    spec = cache_setup.spec
+    target_spec = spec
+    draft_view_spec = None
+    if heterogeneous_draft_family is not None:
+        target_spec = spec.layer_view(
+            first_layer=0,
+            num_layers=cache_setup.num_target_layers,
+        )
+        draft_view_spec = spec.layer_view(
+            first_layer=cache_setup.num_target_layers,
+            num_layers=cache_setup.num_draft_layers,
+            family=heterogeneous_draft_family,
+            publish_runtime_contract=False,
+        )
+    logical_page_size = spec.memory_plan.logical_block_tokens
+    _validate_lcm_page_size(
+        config,
+        logical_page_size=logical_page_size,
+    )
+    _set_cache_group_page_sizes(config, spec)
+    if draft_attn_config is not None:
+        _validate_lcm_page_size(
+            draft_attn_config,
+            logical_page_size=logical_page_size,
+        )
+        _set_cache_group_page_sizes(draft_attn_config, spec)
+    cache_budget_bytes = cache_setup.cache_budget_bytes
+    fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
+    max_num_tokens = spec.pool_size
+    logger.info(
+        "Cache profile: parent_bytes=%d, P=%d, parents=%d, token_capacity=%d, "
+        "layers=%d (draft %d), groups=%s",
+        spec.memory_plan.lcm_block_bytes,
+        spec.memory_plan.logical_block_tokens,
+        spec.memory_plan.num_lcm_blocks,
+        spec.token_capacity,
+        len(spec.layer_group_ids),
+        cache_setup.num_draft_layers,
+        {
+            group.group_id: group.cache_blocks_per_lcm_block
+            for group in spec.memory_plan.groups
+        },
     )
 
-    if is_deepseek_v4_model:
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            profile_deepseek_v4_max_num_pages,
-        )
-
-        draft_cache_cell_size = _resolve_draft_cache_cell_size_for_profile(
-            draft_attn_config,
-            draft_model_config,
-            draft_profile_cache_cell_size,
-        )
-        max_total_num_pages = profile_deepseek_v4_max_num_pages(
-            layout=deepseek_v4_layout,
-            hf_config=model_config.hf_config,
-            layer_num=num_layers,
-            max_live_requests=config.max_bs,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
-            max_context_len=config.context_len,
-            available_cache_memory_bytes=profile_available_cache_memory_bytes(
-                attn_config=config,
-                gpu_id=gpu_id,
-                tp_size=server_args.mapping.world_size,
-                gpu_memory_utilization=server_args.gpu_memory_utilization,
-                total_gpu_memory=gpu_memory,
-                world_group=server_args.mapping.world_group,
-            ),
-            draft_cache_cell_size=draft_cache_cell_size,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
-        logger.info(
-            "DeepSeek V4 grouped KV profile: max_live_requests=%s "
-            "(attn config max_bs=%s, attn_dp_size=%s), max_total_num_pages=%s",
-            config.max_bs,
-            config.max_bs,
-            server_args.mapping.attn.dp_size,
-            max_total_num_pages,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
-    elif is_hybrid_mla_kda:
-        # The Kimi-K3 FlatKV plan is the single cache-geometry authority; the
-        # SimpleMambaPool / radix mamba
-        # sizing arms below are structurally unreachable for this
-        # architecture. Excluded features fail loudly here instead of dying
-        # deep inside capture or the C++ scheduler.
-        token_caps = [
-            cap
-            for cap in (
-                server_args.max_total_tokens,
-                (
-                    int(_CI_SMALL_KV_SIZE)
-                    if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0
-                    else None
-                ),
-            )
-            if cap is not None
-        ]
-        kimi_flat_plan = _create_kimi_k3_flat_plan(
-            server_args,
-            model_config,
-            config,
-            gpu_id,
-            gpu_memory,
-            max_total_tokens_cap=min(token_caps) if token_caps else None,
-            max_live_requests=config.max_bs,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
-        max_num_tokens = kimi_flat_plan.token_capacity
-        if draft_model_config is not None:
-            # The MTP draft is a single MLA layer on a classic paged pool
-            # sharing the target's token-id space; the flat plan consumed the
-            # whole profiled budget, so re-plan with the draft's per-token
-            # bytes carved out (mirrors the flat-GDN draft_row_bytes charge).
-            draft_cell = _resolve_draft_cache_cell_size_for_profile(
-                draft_attn_config, draft_model_config, draft_profile_cache_cell_size
-            )
-            draft_bytes = draft_cell * max_num_tokens
-            token_caps.append(max_num_tokens)
-            kimi_flat_plan = _create_kimi_k3_flat_plan(
-                server_args,
-                model_config,
-                config,
-                gpu_id,
-                gpu_memory - draft_bytes,
-                max_total_tokens_cap=min(token_caps),
-                max_live_requests=config.max_bs,
-                max_scheduled_tokens=server_args.chunked_prefill_size,
-                decode_input_tokens=decode_input_tokens,
-                overlap_schedule_depth=overlap_schedule_depth,
-            )
-            max_num_tokens = kimi_flat_plan.token_capacity
-    elif has_mamba and is_flat_gdn:
-        draft_row_bytes = 0
-        if draft_attn_config is not None:
-            draft_row_bytes = (
-                _resolve_draft_cache_cell_size_for_profile(
-                    draft_attn_config, draft_model_config, draft_profile_cache_cell_size
-                )
-                * server_args.block_size
-            )
-        cache_memory = profile_available_cache_memory_bytes(
-            attn_config=config,
-            gpu_id=gpu_id,
-            tp_size=server_args.mapping.world_size,
-            gpu_memory_utilization=server_args.gpu_memory_utilization,
-            total_gpu_memory=gpu_memory,
-            world_group=server_args.mapping.world_group,
-        )
-        flat_plan = plan_component_tensors(
-            components_from_layers(
-                layer_types=list(config.layer_types),
-                kv_bytes_per_slot=config.cache_cell_size(),
-                state_const_bytes=gdn_state_bytes,
-            ),
-            block_size=server_args.block_size,
-            budget_bytes=cache_memory,
-            reserved_bytes_per_block=draft_row_bytes,
-        )
-        max_total_num_pages = flat_plan.geometry.num_blocks
-        logger.info(
-            "Flat GDN KV profile: block_bytes=%d (%d component tensors, "
-            "block_size=%d), max_total_num_pages=%d",
-            flat_plan.geometry.block_bytes,
-            len(flat_plan.tensors),
-            server_args.block_size,
-            max_total_num_pages,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages, server_args.block_size, server_args.max_total_tokens
-        )
-    elif has_mamba and server_args.max_mamba_cache_size is not None:
-        mamba_pool_total_chunks = server_args.max_mamba_cache_size
-        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
-        num_kv_layers = (
-            len(full_attn_layer_ids)
-            if full_attn_layer_ids is not None
-            else num_layers - len(mamba_layer_ids)
-        )
-        max_total_num_pages = profile_max_num_pages(
-            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
-            gpu_memory_utilization=server_args.gpu_memory_utilization,
-            cache_cell_size=profile_cache_cell_size,
-            draft_cache_cell_size=draft_profile_cache_cell_size,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
-    elif has_mamba and server_args.max_mamba_cache_size is None:
-        num_mamba_layers = len(mamba_layer_ids)
-        speculative_num_draft_tokens = (
-            server_args.speculative_num_draft_tokens
-            if server_args.speculative_algorithm is not None
-            else 0
-        )
-        memory_per_mamba_chunk = mamba_working_bytes_per_chunk(
-            mamba_conv_state_shape,
-            mamba_conv_dtype,
-            mamba_temporal_state_shape,
-            mamba_ssm_dtype,
-            num_mamba_layers,
-            speculative_num_draft_tokens,
-        )
-        # Retained snapshots are charged here rather than taken from headroom,
-        # so `mamba_pool_total_chunks` below is the concurrency actually left.
-        budgeted_per_mamba_chunk = _mamba_chunk_bytes_with_checkpoints(
-            server_args, memory_per_mamba_chunk
-        )
-        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
-        num_kv_layers = (
-            len(full_attn_layer_ids)
-            if full_attn_layer_ids is not None
-            else num_layers - num_mamba_layers
-        )
-        kv_max_num_pages, mamba_pool_total_chunks = profile_cache_budget(
-            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
-            mem_fraction_static=server_args.gpu_memory_utilization,
-            mamba_memory_per_chunk=budgeted_per_mamba_chunk,
-            mamba_ratio=server_args.mamba_full_memory_ratio,
-        )
-        if budgeted_per_mamba_chunk != memory_per_mamba_chunk:
-            logger.info(
-                "mamba_pool_total_chunks=%d after holding back %.0f%% of the "
-                "recurrent-state budget for the checkpoint pool (%d without it)",
-                mamba_pool_total_chunks,
-                100.0 * server_args.mamba_ckpt_memory_fraction,
-                mamba_pool_total_chunks
-                * budgeted_per_mamba_chunk
-                // memory_per_mamba_chunk,
-            )
-        max_num_tokens = _resolve_max_num_tokens(
-            kv_max_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
-    else:
-        # config.layer_types / config.sliding_window_tokens are the exact
-        # values forwarded to the KV pool, so sizing and layout consume
-        # identical inputs (MLA configs carry neither -> legacy divisor).
-        slab_divisor = _kv_profile_layer_divisor(
-            num_layers,
-            getattr(config, "layer_types", None),
-            sliding_window_tokens=getattr(config, "sliding_window_tokens", None),
-        )
-        if profile_cache_cell_size is not None and slab_divisor != num_layers:
-            # A cell-size override can't compose with the slab divisor.
-            logger.warning(
-                "hybrid slab sizing disabled: profile cache_cell_size "
-                "override is set; charging all %d layers instead of %d",
-                num_layers,
-                slab_divisor,
-            )
-            slab_divisor = num_layers
-        max_total_num_pages = profile_max_num_pages(
-            **{**_profile_kwargs, "num_attention_layers": slab_divisor},
-            gpu_memory_utilization=server_args.gpu_memory_utilization,
-            cache_cell_size=profile_cache_cell_size,
-            draft_cache_cell_size=draft_profile_cache_cell_size,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
-
-    if (
-        _CI_SMALL_KV_SIZE is not None
-        and int(_CI_SMALL_KV_SIZE) > 0
-        and kimi_flat_plan is None
-    ):
-        # The Kimi contract plan already folded the CI cap into its page
-        # budget above; clobbering here would desync tokens from the plan.
-        max_num_tokens = int(_CI_SMALL_KV_SIZE)
     if max_num_tokens <= 0:
         raise ValueError(
             f"KV cache token pool size must be positive, got {max_num_tokens}"
         )
 
-    if is_deepseek_v4_model:
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            DeepseekV4TokenToKVPool,
-        )
+    backend, pool = _create_target_components(
+        server_args=server_args,
+        model_config=model_config,
+        config=config,
+        cache_spec=target_spec,
+        rank=rank,
+        enable_memory_saver=enable_memory_saver,
+        full_attn_backend_name=target_full_attn_backend_name,
+        is_hybrid_linear=is_hybrid_linear,
+        is_kda=is_hybrid_mla_kda,
+        is_inkling=is_inkling,
+    )
+    draft_attn_backend, draft_pool = _create_draft_components(
+        server_args=server_args,
+        model_config=draft_model_config,
+        config=draft_attn_config,
+        pool=pool,
+        cache_spec=draft_view_spec,
+        num_target_layers=cache_setup.num_target_layers,
+        full_attn_backend_name=draft_full_attn_backend_name,
+        is_hybrid_linear=draft_is_hybrid_gdn or draft_is_hybrid_mla_kda,
+        is_kda=draft_is_hybrid_mla_kda,
+        is_inkling=any(a in _INKLING_ARCHITECTURES for a in draft_architectures),
+    )
 
-        backend = _create_attn_backend(arch, config)
-        pool = DeepseekV4TokenToKVPool(
-            size=max_num_tokens,
-            model_dtype=model_config.dtype,
-            layout=deepseek_v4_layout,
-            layer_num=num_layers,
-            device=config.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=config.max_bs,
-            max_context_len=config.context_len,
-            page_size=server_args.block_size,
-            rank=rank,
-            hf_config=model_config.hf_config,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
-    elif is_hybrid_linear:
-        resolved_original_backend = _BACKEND_ALIASES.get(
-            original_attn_backend, original_attn_backend
-        )
-        backend, pool, mamba_pool = _create_hybrid_linear_attn(
-            server_args,
-            model_config,
-            config,
-            arch,
-            max_num_tokens,
-            rank,
-            enable_memory_saver,
-            full_attn_backend_name=(
-                resolved_original_backend
-                if resolved_original_backend != "hybrid_linear_attn"
-                else None
-            ),
-            mamba_pool_total_chunks=mamba_pool_total_chunks,
-            is_kda=is_hybrid_mla_kda,
-            flat_contract_plan=kimi_flat_plan,
-        )
-    else:
-        is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
-        # Hetero KV + paged sconv are unconditional for Inkling (the
-        # INKLING_HETERO_KV / INKLING_PAGED_SCONV bisection gates were
-        # retired 2026-07-15 after the experiments settled).
-        paged_sconv = is_inkling
-        if is_inkling:
-            _apply_inkling_hetero_kv(config, model_config)
-            # Must run AFTER the hetero fields exist on the config.
-            max_num_tokens = _floor_tokens_to_layout_grid(max_num_tokens, config)
-        elif any(a in _GEMMA4_ARCHITECTURES for a in architectures):
-            if _apply_gemma4_hetero_kv(config, model_config):
-                max_num_tokens = _floor_tokens_to_layout_grid(max_num_tokens, config)
-        if paged_sconv:
-            _conv_bt, _hbt = _publish_inkling_conv_groups(
-                config, model_config, server_args
-            )
-        backend = _create_attn_backend(arch, config)
-        pool = _create_attn_pool(
-            config, num_layers, max_num_tokens, rank, enable_memory_saver
-        )
-        if is_inkling:
-            # Wrapper only adds sconv state keyed on req_pool_indices; attention stays on the dense backend
-            text_config = model_config.hf_config.get_text_config()
-            backend, conv_pool = _wrap_inkling_backend(
-                backend,
-                text_config,
-                config,
-                num_layers=text_config.num_hidden_layers,
-                is_draft=False,
-            )
-            _probe_dir = os.environ.get("INKLING_POOL_PROBE_DIR")
-            if _probe_dir:
-                _start_inkling_pool_probe(pool, conv_pool, rank, _probe_dir)
-            conv_columns = None
-            if paged_sconv:
-                conv_columns = _inkling_conv_columns(pool, text_config, _conv_bt, _hbt)
-            backend.conv_columns = conv_columns
-            if conv_columns is not None:
-                # Wrapper-owned conv groups: the attention mixin skips their write-loc math and capture fills
-                backend.inner.flat_engine_owned_group_ids = frozenset(
-                    conv_columns["group_block_tokens"]
-                )
-    draft_attn_backend = None
-    draft_pool = None
-    if draft_attn_config:
-        # Check if draft model is also a hybrid GDN model.
-        draft_archs = getattr(draft_model_config.hf_config, "architectures", None) or []
-        if is_deepseek_v4_draft_model:
-            from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-                DeepseekV4TokenToKVPool,
-            )
+    # A cache-group contract backend needs the contract marked before CUDA-graph
+    # state allocation (mark_cache_contract sizes the per-group write-location
+    # buffer). Composite/wrapper backends without the hook are a no-op.
+    for side_backend, side_pool in ((backend, pool), (draft_attn_backend, draft_pool)):
+        if side_backend is None or side_pool is None:
+            continue
+        side_backend.set_cache_pool(side_pool)
+        if getattr(side_pool, "runtime_contract", None) is None:
+            continue
+        mark_cache_contract = getattr(side_backend, "mark_cache_contract", None)
+        if mark_cache_contract is None:
+            continue
+        mark_cache_contract()
 
-            draft_attn_backend = _create_attn_backend(
-                draft_model_config.attention_arch, draft_attn_config
-            )
-            draft_pool = DeepseekV4TokenToKVPool(
-                size=max_num_tokens,
-                model_dtype=draft_model_config.dtype,
-                layout=draft_deepseek_v4_layout,
-                layer_num=draft_model_config.num_attention_layers,
-                device=draft_attn_config.device,
-                enable_memory_saver=enable_memory_saver,
-                max_batch_size=draft_attn_config.max_bs,
-                max_context_len=draft_attn_config.context_len,
-                page_size=server_args.block_size,
-                rank=rank,
-                hf_config=draft_model_config.hf_config,
-                max_scheduled_tokens=server_args.chunked_prefill_size,
-                decode_input_tokens=decode_input_tokens,
-                overlap_schedule_depth=overlap_schedule_depth,
-            )
-        elif any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
-            resolved_draft_backend = _BACKEND_ALIASES.get(
-                original_attn_backend, original_attn_backend
-            )
-            draft_attn_backend, draft_pool, _ = _create_hybrid_linear_attn(
-                server_args,
-                draft_model_config,
-                draft_attn_config,
-                draft_model_config.attention_arch,
-                max_num_tokens,
-                rank,
-                enable_memory_saver,
-                full_attn_backend_name=(
-                    resolved_draft_backend
-                    if resolved_draft_backend != "hybrid_linear_attn"
-                    else None
-                ),
-                mamba_pool_total_chunks=mamba_pool_total_chunks,
-            )
-        elif any(a in _INKLING_ARCHITECTURES for a in draft_archs):
-            draft_text_config = draft_model_config.hf_config.get_text_config()
-            num_depths = draft_model_config.num_attention_layers
-            if server_args.speculative_num_steps > num_depths:
-                raise ValueError(
-                    f"Inkling MTP has {num_depths} depth layers; "
-                    f"--speculative-num-steps {server_args.speculative_num_steps} "
-                    "would wrap depths with no trained meaning."
-                )
-            # Hetero KV, symmetric with the target pool: per-depth head
-            # counts come from the MTP text config's own local ids
-            # (ModelConfig swapped it in for the draft worker), giving the
-            # draft the same byte-uniform slot layout as the target. The pool
-            # shares the TARGET's page-id space (the drafter consumes the
-            # target's per-group flat tables), so it is sized at the same
-            # max_num_tokens; per-layer views turn the max-head allocation
-            # into the group geometry, and the profile's max-head draft charge
-            # prices exactly that allocation.
-            _apply_inkling_hetero_kv(draft_attn_config, draft_model_config)
-            logger.info(
-                "Inkling MTP draft pool: hetero KV layer head counts=%s, "
-                "layer types=%s, group page sizes=%s (%d depths, %d ids)",
-                draft_attn_config.layer_kv_head_counts,
-                draft_attn_config.layer_types,
-                draft_attn_config.group_page_sizes,
-                num_depths,
-                max_num_tokens // config.page_size,
-            )
-            draft_attn_backend = _create_attn_backend(
-                draft_model_config.attention_arch, draft_attn_config
-            )
-            draft_pool = _create_attn_pool(
-                draft_attn_config,
-                num_depths,
-                max_num_tokens,
-                rank,
-                enable_memory_saver,
-            )
-            draft_attn_backend, _ = _wrap_inkling_backend(
-                draft_attn_backend,
-                draft_text_config,
-                draft_attn_config,
-                num_layers=num_depths,
-                is_draft=True,
-            )
-        else:
-            draft_attn_backend = _create_attn_backend(
-                draft_model_config.attention_arch, draft_attn_config
-            )
-            draft_layers = draft_model_config.num_attention_layers
-            draft_pool = _create_attn_pool(
-                draft_attn_config,
-                draft_layers,
-                max_num_tokens,
-                rank,
-                enable_memory_saver,
-            )
+    _prepare_verify_workspace(
+        server_args=server_args,
+        config=config,
+        backend=backend,
+        draft_backend=draft_attn_backend,
+        is_qwen_gdn=use_cache_gdn,
+        is_inkling=use_cache_inkling,
+        expected_bytes=fixed_workspace_bytes,
+    )
+
+    cache_storage = _cache_storage_report(
+        configured_cache_bytes=cache_budget_bytes,
+        pool=pool,
+        fixed_workspace_bytes=fixed_workspace_bytes,
+    )
 
     return (
         backend,
@@ -1858,6 +1037,5 @@ def create_attn_components(
         draft_attn_backend,
         draft_pool,
         max_num_tokens,
-        mamba_pool_total_chunks,
-        mamba_pool,
+        cache_storage,
     )

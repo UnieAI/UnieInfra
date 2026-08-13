@@ -27,7 +27,7 @@ import numpy as np
 import requests
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.flatkv import FlatKVPDPeerLayout
+from tokenspeed.runtime.pd.cache_protocol import CachePDPeerLayout
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.utils import DisaggregationMode
@@ -44,12 +44,11 @@ logger = get_colorful_logger(__name__)
 class PrefillParallelInfo:
     tp_size: int
     dp_size: int
-    enable_mla_l1_5_cache: bool
     kv_item_lens: tuple[int, ...] = ()
     kv_unit_lens: tuple[int, ...] = ()
     state_item_lens: tuple[int, ...] = ()
     state_unit_lens: tuple[int, ...] = ()
-    flat_layout: FlatKVPDPeerLayout | None = None
+    cache_layout: CachePDPeerLayout | None = None
 
     @property
     def prefill_tp_size_per_dp_rank(self):

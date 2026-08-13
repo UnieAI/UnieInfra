@@ -1,24 +1,13 @@
-"""hybrid_slab_group_size: the single activation predicate for the unified
-KV slab pool (M12), and its two consumers (registry sizing divisor and
-MHATokenToKVPool buffer layout).
-
-The predicate returns the common layers-per-group count exactly when the
-slab layout may activate (flat ext, >= 2 equal-size known groups) and None
-otherwise (legacy per-layer layout). The installed ext's
-real build flavor must not decide these tests, so the
-scheduler_ext_flat_kvcache probe is patched per case.
-"""
+"""Hybrid slab sizing and buffer-layout tests."""
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import itertools
 import os
 import pathlib
 import sys
 import unittest
-from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,17 +15,15 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-_CONFIGS_DIR = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "python"
-    / "tokenspeed"
-    / "runtime"
-    / "configs"
+_RUNTIME_DIR = (
+    pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
 )
+_KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
+_RECIPES_DIR = _KV_CACHE_DIR / "recipes"
 
 
-def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
+def _load(mod_name: str, file_path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec: on py3.9 @dataclass + `from __future__ import
@@ -46,8 +33,20 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_pcs = _load("paged_cache_spec_slab_under_test", "paged_cache_spec.py")
+# spec.py is self-contained: load it from the repo file under a private
+# name (no real package import, no sys.modules shadowing needed).
+_pcs = _load("kv_cache_spec_slab_under_test", _RECIPES_DIR / "spec.py")
 hybrid_slab_group_size = _pcs.hybrid_slab_group_size
+
+
+def _real_spec():
+    # The REAL package module (not the file-loaded shadow above): pool
+    # constructions need specs whose class passes the contract's
+    # isinstance check.
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
+
+    return spec
+
 
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 
@@ -62,221 +61,104 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
     """Each case pins exactly ONE reason the predicate returns None (or the
     single shape where it activates)."""
 
-    @contextlib.contextmanager
-    def _flat_ext(self, value: bool):
-        # The predicate resolves the probe from its own module globals at
-        # call time, so the patch must target the path-loaded module.
-        with mock.patch.object(_pcs, "scheduler_ext_flat_kvcache", return_value=value):
-            yield
-
     def test_gpt_oss_shape_returns_group_size(self):
         # gpt-oss: 12 sliding + 12 full, alternating -> 12 layers per group.
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES),
-                12,
-            )
-
-    def test_none_when_radix_ext(self):
-        with self._flat_ext(False):
-            self.assertIsNone(hybrid_slab_group_size(GPT_OSS_LAYER_TYPES))
+        self.assertEqual(
+            hybrid_slab_group_size(GPT_OSS_LAYER_TYPES),
+            12,
+        )
 
     def test_none_when_single_group(self):
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(("full_attention",) * 24))
+        self.assertIsNone(hybrid_slab_group_size(("full_attention",) * 24))
 
     def test_unequal_groups_return_largest_count(self):
         # Unequal groups (e.g. Inkling: 55 sliding + 11 full): the slab
         # count is the largest group's layer count; slabs past the smaller
         # group's count are single-layer.
         lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
-        with self._flat_ext(True):
-            self.assertEqual(hybrid_slab_group_size(lt), 16)
+        self.assertEqual(hybrid_slab_group_size(lt), 16)
         lt_inkling = ("sliding_attention",) * 55 + ("full_attention",) * 11
-        with self._flat_ext(True):
-            self.assertEqual(hybrid_slab_group_size(lt_inkling), 55)
+        self.assertEqual(hybrid_slab_group_size(lt_inkling), 55)
 
     def test_sliding_subgroups_return_group_size(self):
         # Inkling step 2.5: 5 sliding sub-groups + full, all count 11 ->
         # 11 slabs, every slab bound by one layer of each of the 6 groups.
         lt = SUBGROUP_LAYER_BLOCK * 11
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(lt, sliding_window_tokens=512),
-                11,
-            )
+        self.assertEqual(
+            hybrid_slab_group_size(lt, sliding_window_tokens=512),
+            11,
+        )
 
     def test_none_when_subgroup_suffix_not_digit(self):
         lt = GPT_OSS_LAYER_TYPES + ("sliding_attention_x",)
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(lt))
+        self.assertIsNone(hybrid_slab_group_size(lt))
 
     def test_none_when_unknown_label(self):
         # Unknown input degrades to None (safe legacy layout), never raises;
         # loud rejection is group_specs_from_layer_types' job.
         lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(lt))
+        self.assertIsNone(hybrid_slab_group_size(lt))
 
     def test_none_when_empty(self):
         # Plain models pass empty or None layer_types.
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(()))
-            self.assertIsNone(hybrid_slab_group_size(None))
+        self.assertIsNone(hybrid_slab_group_size(()))
+        self.assertIsNone(hybrid_slab_group_size(None))
 
     def test_none_when_multi_window_sequence(self):
-        with self._flat_ext(True):
-            it = itertools.cycle((4, 512))
-            windows = [
-                next(it) if t == "sliding_attention" else None
-                for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertIsNone(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                )
+        it = itertools.cycle((4, 512))
+        windows = [
+            next(it) if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
+        ]
+        self.assertIsNone(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=windows,
             )
+        )
 
     def test_uniform_window_sequence_stays_active(self):
-        with self._flat_ext(True):
-            windows = [
-                None if t == "full_attention" else 128 for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertEqual(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                ),
-                12,
-            )
+        windows = [None if t == "full_attention" else 128 for t in GPT_OSS_LAYER_TYPES]
+        self.assertEqual(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=windows,
+            ),
+            12,
+        )
 
     def test_scalar_window_stays_active(self):
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=128,
-                ),
-                12,
-            )
+        self.assertEqual(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=128,
+            ),
+            12,
+        )
 
     def test_none_when_window_sequence_length_mismatch(self):
-        with self._flat_ext(True):
-            self.assertIsNone(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=[128],
-                )
+        self.assertIsNone(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=[128],
             )
+        )
 
     def test_garbage_elements_ignored_not_raised(self):
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
-                ),
-                12,
-            )
-
-
-class KvProfileLayerDivisorTest(unittest.TestCase):
-    """Registry sizing consumer: _kv_profile_layer_divisor charges
-    layers-per-group exactly when the predicate activates, all layers
-    otherwise. Imports the real registry, so skips on a bare interpreter.
-    Patch target is the PACKAGE paged_cache_spec probe -- the path-loaded
-    _pcs copy above is a distinct module object the registry never sees.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        try:
-            import tokenspeed.runtime.configs.paged_cache_spec as pkg_pcs
-            from tokenspeed.runtime.layers.attention import registry
-        except ImportError as exc:
-            raise unittest.SkipTest(f"real attention registry unimportable here: {exc}")
-        cls._registry = registry
-        cls._pkg_pcs = pkg_pcs
-
-    @contextlib.contextmanager
-    def _pkg_flat_ext(self, value: bool):
-        with mock.patch.object(
-            self._pkg_pcs, "scheduler_ext_flat_kvcache", return_value=value
-        ):
-            yield
-
-    def test_gpt_oss_flat_ext_charges_group_size(self):
-        # 24 layers, 12+12 alternating -> charge 12 (per-token bytes halve).
-        with self._pkg_flat_ext(True):
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, GPT_OSS_LAYER_TYPES),
-                12,
-            )
-
-    def test_all_layers_when_radix_ext(self):
-        with self._pkg_flat_ext(False):
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, GPT_OSS_LAYER_TYPES),
-                24,
-            )
-
-    def test_all_layers_when_no_layer_types(self):
-        # () from MHAConfig's default, None from MLA configs via getattr.
-        with self._pkg_flat_ext(True):
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, ()),
-                24,
-            )
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, None),
-                24,
-            )
-
-    def test_all_layers_when_multi_window_sequence(self):
-        # M14: the registry must forward sliding_window_tokens so sizing
-        # matches the pool's layout decision (divergence is the hazard).
-        with self._pkg_flat_ext(True):
-            it = itertools.cycle((4, 512))
-            windows = [
-                next(it) if t == "sliding_attention" else None
-                for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24,
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                ),
-                24,
-            )
-
-    def test_group_size_when_uniform_window_sequence(self):
-        with self._pkg_flat_ext(True):
-            windows = [
-                128 if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24,
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                ),
-                12,
-            )
-
-
-_PKG_FLAT_PROBE = (
-    "tokenspeed.runtime.configs.paged_cache_spec.scheduler_ext_flat_kvcache"
-)
+        self.assertEqual(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
+            ),
+            12,
+        )
 
 
 class MHAPoolSlabLayoutTest(unittest.TestCase):
-    """Layout consumer (kv_cache/mha.py _create_buffers): when the predicate
-    activates, paired layers bind to the SAME slab tensors; otherwise the
-    legacy per-layer layout holds and the PD guard never fires.
+    """The memory plan may alias fields while MHA keeps one view per layer.
+
+    When placement sharing is active, paired layer views address the same
+    bytes without sharing a Python tensor object.
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
-    Patch target is the PACKAGE paged_cache_spec probe (see above).
     """
 
     def setUp(self):
@@ -291,74 +173,81 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.torch = torch
         self.MHATokenToKVPool = MHATokenToKVPool
 
-    def _pool(self, *, flat_ext: bool = True, **overrides):
-        kwargs = dict(
-            size=32,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            layer_num=24,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=16,
-            rank=0,
-            layer_types=GPT_OSS_LAYER_TYPES,
-            sliding_window_tokens=128,
-            enable_alt_stream=False,
-        )
-        kwargs.update(overrides)
-        with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
-            return self.MHATokenToKVPool(**kwargs)
+    def _pool(self, **overrides):
+        from cache_pool_test_utils import make_layer_group_ids, make_mha_memory_plan
 
-    def test_slab_pairing_binds_same_tensor(self):
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 24,
+            "device": "cpu",
+            "enable_memory_saver": False,
+            "page_size": 16,
+            "rank": 0,
+            "layer_types": GPT_OSS_LAYER_TYPES,
+            "sliding_window_tokens": 128,
+        }
+        kwargs.update(overrides)
+        kwargs["memory_plan"] = make_mha_memory_plan(
+            size=kwargs["size"],
+            page_size=kwargs["page_size"],
+            layer_num=kwargs["layer_num"],
+            kv_heads=kwargs["head_num"],
+            head_dim=kwargs["head_dim"],
+            dtype=kwargs["dtype"],
+            layer_types=kwargs.get("layer_types", ()),
+            sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+        )
+        kwargs.setdefault(
+            "layer_group_ids",
+            make_layer_group_ids(
+                layer_num=kwargs["layer_num"],
+                layer_types=kwargs.get("layer_types", ()),
+                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+            ),
+        )
+        kwargs.pop("sliding_window_tokens", None)
+        return self.MHATokenToKVPool(**kwargs)
+
+    def test_plan_aliases_distinct_layer_views(self):
         pool = self._pool()
-        # 24 layer entries alias 12 slabs: accessors stay layer-indexed.
         self.assertEqual(len(pool.k_buffer), 24)
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 12)
-        self.assertEqual(len({id(t) for t in pool.v_buffer}), 12)
-        # The i-th sliding layer (2i) pairs the i-th full layer (2i+1) on
-        # the SAME tensor object -- shared storage, not a copy or a view.
+        self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
+        self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
         for i in range(12):
-            self.assertIs(pool.k_buffer[2 * i], pool.k_buffer[2 * i + 1])
-            self.assertIs(pool.v_buffer[2 * i], pool.v_buffer[2 * i + 1])
+            self.assertIsNot(pool.k_buffer[2 * i], pool.k_buffer[2 * i + 1])
+            self.assertIsNot(pool.v_buffer[2 * i], pool.v_buffer[2 * i + 1])
             self.assertEqual(
                 pool.k_buffer[2 * i].data_ptr(),
                 pool.k_buffer[2 * i + 1].data_ptr(),
             )
-        # Every slab is referenced by exactly one layer of EACH group.
         for buffers in (pool.k_buffer, pool.v_buffer):
-            slab_to_layers: dict[int, list[int]] = {}
+            address_to_layers: dict[int, list[int]] = {}
             for layer_id, tensor in enumerate(buffers):
-                slab_to_layers.setdefault(id(tensor), []).append(layer_id)
-            self.assertEqual(len(slab_to_layers), 12)
-            for layer_ids in slab_to_layers.values():
+                address_to_layers.setdefault(tensor.data_ptr(), []).append(layer_id)
+            self.assertEqual(len(address_to_layers), 12)
+            for layer_ids in address_to_layers.values():
                 sliding = [lid for lid in layer_ids if lid % 2 == 0]
                 full = [lid for lid in layer_ids if lid % 2 == 1]
                 self.assertEqual(len(sliding), 1)
                 self.assertEqual(len(full), 1)
-        # Distinct slabs own distinct storage.
         self.assertEqual(len({t.data_ptr() for t in pool.k_buffer}), 12)
         self.assertEqual(len({t.data_ptr() for t in pool.v_buffer}), 12)
-        # Per-layer host (L2) copies would alias shared slabs, so the slab
-        # pool opts out of the hierarchical cache surface.
-        self.assertFalse(pool.supports_hierarchical_kv_cache)
 
     def test_fallback_matrix_keeps_24_buffers(self):
-        cases = dict(
-            radix_ext=dict(flat_ext=False),
-            single_group=dict(
-                layer_types=("full_attention",) * 24,
-                sliding_window_tokens=None,
-            ),
-        )
+        cases = {
+            "single_group": {
+                "layer_types": ("full_attention",) * 24,
+                "sliding_window_tokens": None,
+            }
+        }
         for name, overrides in cases.items():
             with self.subTest(name):
                 pool = self._pool(**overrides)
                 self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
                 self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
-                self.assertTrue(pool.supports_hierarchical_kv_cache)
 
     def test_unequal_groups_pair_smaller_into_larger(self):
         # 8 sliding + 16 full -> 16 slabs: the 8 sliding layers alias the
@@ -368,15 +257,19 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=("sliding_attention",) * 8 + ("full_attention",) * 16
         )
         self.assertEqual(len(pool.k_buffer), 24)
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 16)
-        self.assertEqual(len({id(t) for t in pool.v_buffer}), 16)
+        self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
+        self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
+        self.assertEqual(len({t.data_ptr() for t in pool.k_buffer}), 16)
+        self.assertEqual(len({t.data_ptr() for t in pool.v_buffer}), 16)
         for i in range(8):
-            # sliding layer i (id i) pairs full layer i (id 8 + i).
-            self.assertIs(pool.k_buffer[i], pool.k_buffer[8 + i])
-            self.assertIs(pool.v_buffer[i], pool.v_buffer[8 + i])
-        solo = [id(t) for t in pool.k_buffer[16:]]
+            self.assertEqual(
+                pool.k_buffer[i].data_ptr(), pool.k_buffer[8 + i].data_ptr()
+            )
+            self.assertEqual(
+                pool.v_buffer[i].data_ptr(), pool.v_buffer[8 + i].data_ptr()
+            )
+        solo = [t.data_ptr() for t in pool.k_buffer[16:]]
         self.assertEqual(len(set(solo)), 8)
-        self.assertFalse(pool.supports_hierarchical_kv_cache)
 
     def test_sliding_subgroups_six_way_binding(self):
         # (s0..s4, full) x 2 -> 6 groups of 2 layers -> 2 slabs, each bound
@@ -387,36 +280,176 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             sliding_window_tokens=512,
         )
         self.assertEqual(len(pool.k_buffer), 12)
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 2)
-        self.assertEqual(len({id(t) for t in pool.v_buffer}), 2)
-        # Occurrence pairing: layers 0..5 (first occurrence of each label)
-        # bind slab 0; layers 6..11 bind slab 1.
+        self.assertEqual(len({id(t) for t in pool.k_buffer}), 12)
+        self.assertEqual(len({id(t) for t in pool.v_buffer}), 12)
+        self.assertEqual(len({t.data_ptr() for t in pool.k_buffer}), 2)
+        self.assertEqual(len({t.data_ptr() for t in pool.v_buffer}), 2)
         for i in range(6):
-            self.assertIs(pool.k_buffer[i], pool.k_buffer[0])
-            self.assertIs(pool.k_buffer[6 + i], pool.k_buffer[6])
-            self.assertIs(pool.v_buffer[i], pool.v_buffer[0])
-            self.assertIs(pool.v_buffer[6 + i], pool.v_buffer[6])
-        self.assertIsNot(pool.k_buffer[0], pool.k_buffer[6])
-        self.assertFalse(pool.supports_hierarchical_kv_cache)
+            self.assertEqual(pool.k_buffer[i].data_ptr(), pool.k_buffer[0].data_ptr())
+            self.assertEqual(
+                pool.k_buffer[6 + i].data_ptr(), pool.k_buffer[6].data_ptr()
+            )
+            self.assertEqual(pool.v_buffer[i].data_ptr(), pool.v_buffer[0].data_ptr())
+            self.assertEqual(
+                pool.v_buffer[6 + i].data_ptr(), pool.v_buffer[6].data_ptr()
+            )
+        self.assertNotEqual(pool.k_buffer[0].data_ptr(), pool.k_buffer[6].data_ptr())
 
-    def test_guard_raises_on_pd_with_slab(self):
+    def test_guard_raises_on_pd_with_aliased_plan(self):
         with self.assertRaisesRegex(
             RuntimeError,
-            r"hybrid slab KV layout is incompatible with PD disaggregation"
-            r".*radix-built",
+            r"aliased MHA cache layout is incompatible with PD disaggregation"
+            r".*disaggregation_mode='null'",
         ):
             self._pool(pd_disaggregation_enabled=True)
 
-    def test_no_guard_when_fallback(self):
-        # The flag only conflicts with the slab layout, not the legacy one.
-        pool = self._pool(
-            flat_ext=False,
-            pd_disaggregation_enabled=True,
+    def test_constructor_without_specs_publishes_no_contract(self):
+        # The recipe is the single source of group specs; a pool constructed
+        # without them (tests, partial harnesses) publishes no contract.
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 1,
+            "device": "cpu",
+            "enable_memory_saver": False,
+            "page_size": 16,
+            "rank": 0,
+            "layer_types": ("full_attention",),
+            "layer_group_ids": ("full_attention",),
+        }
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        kwargs["memory_plan"] = make_mha_memory_plan(
+            size=kwargs["size"],
+            page_size=kwargs["page_size"],
+            layer_num=kwargs["layer_num"],
+            kv_heads=kwargs["head_num"],
+            head_dim=kwargs["head_dim"],
+            dtype=kwargs["dtype"],
+            layer_types=kwargs["layer_types"],
         )
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
+        pool = self.MHATokenToKVPool(**kwargs)
+
+        self.assertEqual(pool.paged_cache_group_specs, ())
+        self.assertIsNone(pool.runtime_contract)
+
+    def test_constructor_aligns_recipe_specs_with_plan(self):
+        # Recipe specs carry default packing; the pool overwrites it (and the
+        # page counts) from the memory plan before publishing the contract.
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 1,
+            "device": "cpu",
+            "enable_memory_saver": False,
+            "page_size": 16,
+            "rank": 0,
+            "layer_types": ("full_attention",),
+            "layer_group_ids": ("full_attention",),
+        }
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        kwargs["memory_plan"] = make_mha_memory_plan(
+            size=kwargs["size"],
+            page_size=kwargs["page_size"],
+            layer_num=kwargs["layer_num"],
+            kv_heads=kwargs["head_num"],
+            head_dim=kwargs["head_dim"],
+            dtype=kwargs["dtype"],
+            layer_types=kwargs["layer_types"],
+        )
+        kwargs["paged_cache_group_specs"] = _real_spec().build_paged_cache_group_specs(
+            layer_types=kwargs["layer_types"],
+            group_ids=kwargs["layer_group_ids"],
+            sliding_window_tokens=None,
+            page_size=kwargs["page_size"],
+        )
+        pool = self.MHATokenToKVPool(**kwargs)
+
+        self.assertIsNotNone(pool.runtime_contract)
+        self.assertEqual(
+            [spec.group_id for spec in pool.paged_cache_group_specs],
+            ["full_attention"],
+        )
+        plan_group = kwargs["memory_plan"].group("full_attention")
+        self.assertEqual(
+            pool.paged_cache_group_page_counts["full_attention"],
+            plan_group.page_count,
+        )
+        self.assertEqual(pool.runtime_contract.token_capacity, kwargs["size"])
 
 
-GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
+class MLAPoolAllocationHookTest(unittest.TestCase):
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
+                MLATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.MLATokenToKVPool = MLATokenToKVPool
+
+    def test_constructor_uses_overridable_buffer_allocation(self):
+        torch = self.torch
+        from cache_pool_test_utils import make_mla_memory_plan
+
+        class PoolWithCustomAllocation(self.MLATokenToKVPool):
+            def _create_buffers(self):
+                self.allocation_hook_called = True
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        pool = PoolWithCustomAllocation(
+            size=8,
+            model_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            quant_method=None,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            page_size=4,
+            rank=0,
+            memory_plan=make_mla_memory_plan(
+                size=8,
+                page_size=4,
+                layer_num=1,
+                latent_width=6,
+                dtype=torch.bfloat16,
+            ),
+            layer_group_ids=("full_attention",),
+            paged_cache_group_specs=_real_spec().build_paged_cache_group_specs(
+                layer_types=(),
+                group_ids=("full_attention",),
+                sliding_window_tokens=None,
+                page_size=4,
+            ),
+        )
+
+        self.assertTrue(pool.allocation_hook_called)
+        self.assertEqual(tuple(pool.kv_buffer[0].shape), (12, 1, 6))
+        self.assertEqual(
+            [spec.group_id for spec in pool.paged_cache_group_specs],
+            ["full_attention"],
+        )
+        self.assertGreater(
+            pool.paged_cache_group_page_counts["full_attention"],
+            1,
+        )
 
 
 class StatePagedCacheGroupPageCountTest(unittest.TestCase):
@@ -437,15 +470,16 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
     def _counts(self, **overrides):
         specs = _pcs.group_specs_from_layer_types(
             layer_types=("linear_attention", "full_attention"),
+            group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
             page_size=16,
         )
-        params = dict(
-            max_live_requests=2,
-            max_scheduled_tokens=64,
-            max_total_tokens=1024,
-            max_context_len=4096,
-        )
+        params = {
+            "max_live_requests": 2,
+            "max_scheduled_tokens": 64,
+            "max_total_tokens": 1024,
+            "max_context_len": 4096,
+        }
         params.update(overrides)
         return _pcs.compute_paged_cache_group_page_counts(specs, **params)
 
@@ -462,244 +496,144 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
         self.assertLess(counts["linear_attention"], counts["full_attention"])
 
 
-class MHAPoolStateSlabTest(unittest.TestCase):
-    """State-slab consumer (kv_cache/mha.py): a GDN hybrid keeps a per-layer
-    KV layout on attention layers (state layers carry None slots, M18a),
-    and flat ext + provided mamba2 shapes add one (conv, ssm) slab pair per
-    state LAYER, row-indexed by page id (row 0 = null page, never written).
-    Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
-    Patch target is the PACKAGE paged_cache_spec probe (see above).
-    """
-
-    CONV_SHAPE = (4, 8)
-    SSM_SHAPE = (2, 4, 4)
-
+class CachePoolFieldBindingTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from cache_pool_test_utils import plan_fields
 
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+                HybridMHATokenToKVPool,
+            )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
+                qwen_gdn_cache_fields,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
-        self.MHATokenToKVPool = MHATokenToKVPool
+        self.pool_cls = HybridMHATokenToKVPool
+        self.mha_pool_cls = MHATokenToKVPool
+        fields = qwen_gdn_cache_fields(
+            layer_types=("linear_attention", "full_attention"),
+            layer_group_ids=("linear_attention_0", "full_attention"),
+            logical_block_tokens=4,
+            kv_shape=(4, 1, 2),
+            kv_element_size=2,
+            conv_shape=(2, 2),
+            conv_element_size=2,
+            ssm_shape=(1, 2, 2),
+            ssm_element_size=2,
+        )
+        self.plan = plan_fields(
+            fields,
+            logical_block_tokens=4,
+            budget_bytes=64,
+            alignment=2,
+        )
 
-    def _pool(self, *, flat_ext: bool = True, **overrides):
-        kwargs = dict(
-            size=32,
+    def _pool(self):
+        return self.pool_cls(
+            size=8,
             dtype=self.torch.bfloat16,
             head_num=1,
-            head_dim=8,
-            layer_num=4,
+            head_dim=2,
+            layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=16,
+            page_size=4,
             rank=0,
-            layer_types=GDN_LAYER_TYPES,
-            sliding_window_tokens=None,
-            enable_alt_stream=False,
-            conv_state_shape=self.CONV_SHAPE,
-            temporal_state_shape=self.SSM_SHAPE,
-            conv_dtype=self.torch.float32,
-            ssm_dtype=self.torch.float32,
+            layer_types=("linear_attention", "full_attention"),
+            state_field_dtypes={
+                "layer.0.conv": self.torch.bfloat16,
+                "layer.0.ssm": self.torch.bfloat16,
+            },
+            memory_plan=self.plan,
+            layer_group_ids=("linear_attention_0", "full_attention"),
+            paged_cache_group_specs=_real_spec().build_paged_cache_group_specs(
+                layer_types=("linear_attention", "full_attention"),
+                group_ids=("linear_attention_0", "full_attention"),
+                sliding_window_tokens=None,
+                page_size=4,
+            ),
         )
-        kwargs.update(overrides)
-        with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
-            return self.MHATokenToKVPool(**kwargs)
 
-    def test_state_slabs_one_pair_per_state_layer(self):
+    def _ordinary_pool(self):
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        return self.mha_pool_cls(
+            size=8,
+            dtype=self.torch.bfloat16,
+            head_num=1,
+            head_dim=2,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            page_size=4,
+            rank=0,
+            layer_types=("linear_attention", "full_attention"),
+            layer_group_ids=("linear_attention", "full_attention"),
+            memory_plan=make_mha_memory_plan(
+                size=8,
+                page_size=4,
+                layer_num=2,
+                kv_heads=1,
+                head_dim=2,
+                dtype=self.torch.bfloat16,
+                layer_types=("linear_attention", "full_attention"),
+            ),
+        )
+
+    def test_pool_binds_history_and_state_views_from_one_arena(self):
         pool = self._pool()
-        # KV side stays per-layer (no aliasing), but flat GDN state layers
-        # (0/2) carry no KV tensors -- None slots (M18a T4).
-        self.assertEqual(len(pool.k_buffer), 4)
+
+        conv, ssm = pool.get_state_buffers(0)
         self.assertIsNone(pool.k_buffer[0])
-        self.assertIsNone(pool.k_buffer[2])
-        self.assertEqual(len({id(t) for t in pool.k_buffer if t is not None}), 2)
-        self.assertEqual(len(pool.state_slabs), 2)
-        num_pages_with_null = 32 // 16 + 1  # row 0 = null page
-        for conv, ssm in pool.state_slabs:
-            self.assertEqual(conv.shape, (num_pages_with_null, *self.CONV_SHAPE))
-            self.assertEqual(ssm.shape, (num_pages_with_null, *self.SSM_SHAPE))
-            self.assertEqual(conv.dtype, self.torch.float32)
-            self.assertEqual(ssm.dtype, self.torch.float32)
+        self.assertIsNone(pool.v_buffer[0])
+        self.assertIsNotNone(pool.k_buffer[1])
+        self.assertIsNotNone(pool.v_buffer[1])
+        self.assertEqual(
+            conv.untyped_storage().data_ptr(),
+            pool.field("layer.0.conv", self.torch.bfloat16)
+            .untyped_storage()
+            .data_ptr(),
+        )
+        self.assertEqual(
+            ssm.untyped_storage().data_ptr(),
+            pool.field("layer.0.ssm", self.torch.bfloat16).untyped_storage().data_ptr(),
+        )
 
-    def test_get_state_buffers_occurrence_indexed(self):
+    def test_pool_publishes_runtime_contract_and_component_mapping(self):
         pool = self._pool()
-        # Layers 0 and 2 are the 0th/1st linear layers -> pairs 0/1.
-        self.assertIs(pool.get_state_buffers(0)[0], pool.state_slabs[0][0])
-        self.assertIs(pool.get_state_buffers(0)[1], pool.state_slabs[0][1])
-        self.assertIs(pool.get_state_buffers(2)[0], pool.state_slabs[1][0])
-        self.assertIs(pool.get_state_buffers(2)[1], pool.state_slabs[1][1])
-        with self.assertRaisesRegex(ValueError, r"not a state layer"):
+
+        self.assertEqual(pool.runtime_contract.block_size, 4)
+        self.assertEqual(pool.runtime_contract.num_lcm_blocks, 1)
+        self.assertEqual(
+            pool.runtime_contract.group_page_counts,
+            {"linear_attention_0": 3, "full_attention": 2},
+        )
+        self.assertEqual(pool.group_id_for_layer(0), "linear_attention_0")
+        conv, ssm = pool.get_state_buffers(0)
+        self.assertIs(pool.get_component(0, "conv_state"), conv)
+        self.assertIs(pool.get_component(0, "recurrent_state"), ssm)
+
+    def test_pool_rejects_unknown_state_layer_and_field(self):
+        pool = self._pool()
+
+        with self.assertRaisesRegex(ValueError, "not a state layer"):
             pool.get_state_buffers(1)
+        with self.assertRaisesRegex(ValueError, "not planned"):
+            pool.field("missing", self.torch.bfloat16)
 
-    def test_no_state_shapes_no_slabs(self):
-        pool = self._pool(
-            conv_state_shape=None,
-            temporal_state_shape=None,
-            conv_dtype=None,
-            ssm_dtype=None,
-        )
-        self.assertEqual(pool.state_slabs, [])
+    def test_ordinary_pool_keeps_ordinary_per_layer_kv(self):
+        pool = self._ordinary_pool()
 
-    def test_radix_ext_no_slabs(self):
-        pool = self._pool(flat_ext=False)
-        self.assertEqual(pool.state_slabs, [])
-
-    def test_under_equalized_page_size_raises(self):
-        # conv row 4096 B vs 512 B linear KV row (32 B/slot * P=16): the
-        # plan would inflate P to 132, so the pre-equalized check rejects.
-        with self.assertRaisesRegex(ValueError, r"pre-equalized.*need >= "):
-            self._pool(conv_state_shape=(1024,))
-
-    def test_published_state_group_count_positive_and_bounded(self):
-        pool = self._pool()
-        counts = pool.paged_cache_group_page_counts
-        self.assertGreater(counts["linear_attention"], 0)
-        self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
-
-
-# Qwen3.5-ish interleaving: 3 linear layers then 1 full, times 12 (48 layers).
-QWEN_LIKE_LAYER_TYPES = (("linear_attention",) * 3 + ("full_attention",)) * 12
-
-
-class FlatGDNStateLayerNoKVTest(unittest.TestCase):
-    """M18a T4: under the flat GDN predicate the pool allocates NO per-layer
-    KV tensors on state layers (`k_buffer[lid] is None`); the component plan
-    (registry sizing) already charges only full-layer KV + state rows, so
-    keeping the tensors would oversubscribe the layout. Every None-exposed
-    surface must either skip (pointer tables, size accounting, clear) or
-    reject loudly (per-layer accessors, PD transfer). Radix pools keep the
-    full per-layer KV coverage (zero impact pin).
-    Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
-    Patch target is the PACKAGE paged_cache_spec probe (see above).
-    """
-
-    CONV_SHAPE = (4, 8)
-    SSM_SHAPE = (2, 4, 4)
-    NUM_LAYERS = 48
-    NUM_FULL = 12
-    SIZE = 32
-    PAGE_SIZE = 16
-
-    def setUp(self):
-        try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-                MHATokenToKVPool,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.MHATokenToKVPool = MHATokenToKVPool
-
-    def _pool(self, *, flat_ext: bool = True, **overrides):
-        kwargs = dict(
-            size=self.SIZE,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            layer_num=self.NUM_LAYERS,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=self.PAGE_SIZE,
-            rank=0,
-            layer_types=QWEN_LIKE_LAYER_TYPES,
-            sliding_window_tokens=None,
-            enable_alt_stream=False,
-            conv_state_shape=self.CONV_SHAPE,
-            temporal_state_shape=self.SSM_SHAPE,
-            conv_dtype=self.torch.float32,
-            ssm_dtype=self.torch.float32,
-        )
-        kwargs.update(overrides)
-        with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
-            return self.MHATokenToKVPool(**kwargs)
-
-    def test_flat_gdn_state_layers_have_no_kv(self):
-        pool = self._pool()
-        rows = self.SIZE + self.PAGE_SIZE  # +page_size dummy page
-        self.assertEqual(len(pool.k_buffer), self.NUM_LAYERS)
-        self.assertEqual(len(pool.v_buffer), self.NUM_LAYERS)
-        for layer_id, label in enumerate(QWEN_LIKE_LAYER_TYPES):
-            if label == "linear_attention":
-                self.assertIsNone(pool.k_buffer[layer_id])
-                self.assertIsNone(pool.v_buffer[layer_id])
-            else:
-                self.assertEqual(pool.k_buffer[layer_id].shape[0], rows)
-                self.assertEqual(pool.v_buffer[layer_id].shape[0], rows)
-        # State slabs still cover every state layer.
-        self.assertEqual(len(pool.state_slabs), self.NUM_LAYERS - self.NUM_FULL)
-
-    def test_flat_gdn_data_ptrs_exclude_none(self):
-        # _kv_copy launches one block per data_ptrs entry (grid = numel), so
-        # a placeholder entry for a skipped layer would be dereferenced --
-        # the pointer/stride tables must carry the REAL tensors only.
-        pool = self._pool()
-        self.assertEqual(pool.k_data_ptrs.numel(), self.NUM_FULL)
-        self.assertEqual(pool.v_data_ptrs.numel(), self.NUM_FULL)
-        self.assertEqual(pool.data_ptrs.numel(), 2 * self.NUM_FULL)
-        self.assertEqual(pool.data_strides.numel(), 2 * self.NUM_FULL)
-        self.assertTrue(bool((pool.data_strides > 0).all()))
-
-    def test_flat_gdn_kv_size_counts_only_real_tensors(self):
-        pool = self._pool()
-        # (rows, head_num=1, head_dim=8) bf16 per full-attention layer.
-        per_tensor = (self.SIZE + self.PAGE_SIZE) * 1 * 8 * 2
-        k_size, v_size = pool.get_kv_size_bytes()
-        self.assertEqual(k_size, self.NUM_FULL * per_tensor)
-        self.assertEqual(v_size, self.NUM_FULL * per_tensor)
-
-    def test_flat_gdn_get_key_buffer_raises_on_state_layer(self):
-        pool = self._pool()
-        with self.assertRaisesRegex(ValueError, r"state layer"):
-            pool.get_key_buffer(0)
-        with self.assertRaisesRegex(ValueError, r"state layer"):
-            pool.get_value_buffer(0)
-        # Full-attention layers stay served (layer 3 is the first full one).
-        self.assertIsNotNone(pool.get_key_buffer(3))
-        self.assertIsNotNone(pool.get_value_buffer(3))
-
-    def test_flat_gdn_pd_transfer_rejected(self):
-        # PD disaggregation registers per-layer buffer pointers; with state
-        # layers carrying no KV that surface must reject loudly.
-        pool = self._pool()
-        with self.assertRaisesRegex(ValueError, r"PD disaggregation"):
-            pool.get_contiguous_buf_infos()
-
-    def test_flat_gdn_disables_hierarchical_offload(self):
-        # Structural pin: event_loop builds the radix MemoryExecutor (even
-        # with the kvstore off, for retraction offload) only when the pool
-        # advertises hierarchical support. State layers carry no per-layer
-        # KV, so the flat GDN pool must opt out rather than rely on
-        # cache-op-kind rejection to keep layer-indexed derefs unreachable.
-        pool = self._pool()
-        self.assertFalse(pool.supports_hierarchical_kv_cache)
-
-    def test_flat_gdn_clear_buffers_survives_none(self):
-        pool = self._pool()
-        self.assertIsNone(pool.k_buffer[0])  # None entries really present
-        pool.k_buffer[3].fill_(1.0)
-        pool.clear_kv_buffers()  # sleep/wake repair path; must not raise
-        self.assertEqual(pool.k_buffer[3].abs().sum().item(), 0.0)
-
-    def test_radix_pool_unaffected(self):
-        # Zero-impact pin: without the flat ext the same layer_types keep
-        # full per-layer KV coverage and no state slabs.
-        pool = self._pool(flat_ext=False)
-        self.assertTrue(all(t is not None for t in pool.k_buffer))
-        self.assertTrue(all(t is not None for t in pool.v_buffer))
-        self.assertEqual(pool.data_ptrs.numel(), 2 * self.NUM_LAYERS)
-        self.assertEqual(pool.state_slabs, [])
-        pool.get_contiguous_buf_infos()  # PD surface stays available
-        self.assertTrue(pool.supports_hierarchical_kv_cache)
+        self.assertTrue(all(buffer is not None for buffer in pool.k_buffer))
+        self.assertTrue(all(buffer is not None for buffer in pool.v_buffer))
+        self.assertFalse(hasattr(pool, "lcm_pool"))
+        self.assertFalse(hasattr(pool, "state_slabs"))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     dense_tensor_format,
     format_signature,
@@ -42,6 +42,8 @@ def moe_sigmoid_bias_topk(
     *,
     routed_scaling_factor: float = 1.0,
     normalize_topk_weights: bool = True,
+    logical_to_physical_map: torch.Tensor | None = None,
+    weights_dtype: torch.dtype = torch.float32,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
@@ -52,11 +54,17 @@ def moe_sigmoid_bias_topk(
         topk: Number of experts selected per token.
         routed_scaling_factor: Scale applied after optional normalization.
         normalize_topk_weights: Normalize selected sigmoid scores when true.
+        logical_to_physical_map: Optional ``[experts]`` integer map applying
+            static expert-location dispatch to the selected ids (fused into
+            the specialized decode kernel; a gather elsewhere).
+        weights_dtype: Output dtype for the route weights (selection always
+            runs in FP32).
         solution: Optional implementation override.
 
     Returns:
         ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
-        are FP32 and ids are INT32.
+        are ``weights_dtype`` and ids are INT32 (physical ids when a dispatch
+        map is given).
     """
     if router_logits.dim() != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -65,44 +73,107 @@ def moe_sigmoid_bias_topk(
         raise ValueError("correction_bias must have shape [experts]")
     if correction_bias.device != router_logits.device:
         raise ValueError("correction_bias and router_logits must share a device")
+    if logical_to_physical_map is not None and (
+        logical_to_physical_map.shape != (experts,)
+        or logical_to_physical_map.dtype not in (torch.int32, torch.int64)
+        or logical_to_physical_map.device != router_logits.device
+        or not logical_to_physical_map.is_contiguous()
+    ):
+        raise ValueError(
+            "logical_to_physical_map must be contiguous colocated INT32/INT64 "
+            "[experts]"
+        )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
     if tokens == 0:
         shape = (0, topk)
         return (
-            torch.empty(shape, device=router_logits.device, dtype=torch.float32),
+            torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
             torch.empty(shape, device=router_logits.device, dtype=torch.int32),
         )
+    platform = Platform.get()
     if (
         solution is None
-        and Platform.get().is_cdna4
+        and (platform.is_cdna4 or platform.is_nvidia)
         and router_logits.shape == (1, 896)
         and router_logits.dtype == torch.float32
         and correction_bias.dtype == torch.float32
         and topk == 16
     ):
-        return kimi3_sigmoid_bias_topk(
+        # The packed-key single-CTA kernel wins on both vendors for the K3
+        # decode shape: one bitonic top-16 instead of the grouped multi-pass
+        # (NVIDIA B300: 3.7us vs 7.0us for the minimax path, bit-identical
+        # selection and weights).
+        topk_weights, topk_ids = kimi3_sigmoid_bias_topk(
             router_logits,
             correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
+            logical_to_physical_map=(
+                logical_to_physical_map
+                if logical_to_physical_map is not None
+                and logical_to_physical_map.dtype == torch.int32
+                else None
+            ),
+            weights_dtype=weights_dtype,
         )
+        if (
+            logical_to_physical_map is not None
+            and logical_to_physical_map.dtype == torch.int64
+        ):
+            topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+        return topk_weights, topk_ids
     if solution is None and not _gluon_eligible(router_logits, correction_bias, topk):
         solution = "torch"
+
+    signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
+    traits = {"tokens": tokens, "experts": experts, "topk": topk}
+    if (
+        logical_to_physical_map is not None
+        and logical_to_physical_map.dtype == torch.int32
+        and solution is None
+    ):
+        try:
+            mapped_kernel = select_kernel(
+                "moe",
+                "sigmoid_bias_topk_mapped",
+                signature,
+                traits=traits,
+            )
+        except NoKernelFoundError:
+            mapped_kernel = None
+        if mapped_kernel is not None:
+            topk_weights, topk_ids = mapped_kernel(
+                router_logits=router_logits,
+                correction_bias=correction_bias,
+                topk=topk,
+                routed_scaling_factor=routed_scaling_factor,
+                normalize_topk_weights=normalize_topk_weights,
+                logical_to_physical_map=logical_to_physical_map,
+            )
+            if topk_weights.dtype != weights_dtype:
+                topk_weights = topk_weights.to(weights_dtype)
+            return topk_weights, topk_ids
 
     kernel = select_kernel(
         "moe",
         "sigmoid_bias_topk",
-        format_signature(router_logits=dense_tensor_format(router_logits.dtype)),
+        signature,
+        traits=traits,
         solution=solution,
     )
-    return kernel(
+    topk_weights, topk_ids = kernel(
         router_logits=router_logits,
         correction_bias=correction_bias,
         topk=topk,
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
     )
+    if logical_to_physical_map is not None:
+        topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+    if topk_weights.dtype != weights_dtype:
+        topk_weights = topk_weights.to(weights_dtype)
+    return topk_weights, topk_ids
 
 
 @register_kernel(
@@ -146,6 +217,8 @@ def triton_minimax_sigmoid_bias_topk(
         routed_scaling_factor=routed_scaling_factor,
         weights_dtype=torch.float32,
     )
+    if not normalize_topk_weights:
+        topk_weights.mul_(routed_scaling_factor)
     return topk_weights, topk_ids.to(torch.int32)
 
 
@@ -176,10 +249,11 @@ def torch_sigmoid_bias_topk(
     topk_weights = scores.gather(1, topk_ids)
     if normalize_topk_weights:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights * routed_scaling_factor
+    topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.float(), topk_ids.to(torch.int32)
 
 
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk  # noqa: E402,F401
+import tokenspeed_kernel.ops.moe.triton.decode_sigmoid_topk  # noqa: E402,F401
 
 __all__ = ["moe_sigmoid_bias_topk"]

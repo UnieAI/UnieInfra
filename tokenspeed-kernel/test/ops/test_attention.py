@@ -30,6 +30,7 @@ from tokenspeed_kernel import (
     mha_extend_with_kvcache,
     mha_prefill,
 )
+from tokenspeed_kernel.platform import current_platform
 
 torch.manual_seed(42)
 
@@ -49,6 +50,10 @@ def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16-d64"),
         pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
+        pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="e4m3-d64"),
+        pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="e4m3-d128"),
+        pytest.param(torch.float8_e5m2, 64, 8, 2, id="e5m2-d64"),
+        pytest.param(torch.float8_e5m2, 128, 8, 2, id="e5m2-d128"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "gluon"])
@@ -334,26 +339,28 @@ def test_mha_decode_with_kvcache(
     require,
 ) -> None:
     require("attention", "mha_decode_with_kvcache", solution, dtype, "q")
+    if solution == "gluon" and current_platform().is_cdna5 and seqlen_q != 1:
+        pytest.skip("GFX1250 Gluon decode currently supports one query token")
 
     batch_size = 4
     page_size = 64
     max_cache_seqlen = 256
-    prefix_seqlens = torch.tensor([63, 129, 17, 191], device=device, dtype=torch.int32)
+    prefix_seqlens = torch.tensor([63, 129, 17, 191], dtype=torch.int32)
     cache_seqlens = prefix_seqlens + seqlen_q
     num_blocks_per_seq = (cache_seqlens + page_size - 1) // page_size
     max_num_blocks_per_seq = (max_cache_seqlen + page_size - 1) // page_size
     total_num_blocks = int(num_blocks_per_seq.sum().item())
 
+    # Build inputs on CPU for the SDPA reference below.
     q = _randn(
         (batch_size * seqlen_q, num_q_heads, head_dim),
-        device=device,
+        device="cpu",
         dtype=dtype,
     )
 
     page_table = torch.zeros(
         batch_size,
         max_num_blocks_per_seq,
-        device=device,
         dtype=torch.int32,
     )
     next_block = 0
@@ -361,7 +368,6 @@ def test_mha_decode_with_kvcache(
         page_table[batch_idx, :num_blocks] = torch.arange(
             next_block,
             next_block + num_blocks,
-            device=device,
             dtype=torch.int32,
         )
         next_block += num_blocks
@@ -371,7 +377,6 @@ def test_mha_decode_with_kvcache(
         page_size,
         num_kv_heads,
         head_dim,
-        device=device,
         dtype=dtype,
     )
     v_cache = torch.zeros(
@@ -379,7 +384,6 @@ def test_mha_decode_with_kvcache(
         page_size,
         num_kv_heads,
         head_dim,
-        device=device,
         dtype=dtype,
     )
     for batch_idx, total_kv_len in enumerate(cache_seqlens.tolist()):
@@ -393,16 +397,40 @@ def test_mha_decode_with_kvcache(
                     tokens_in_block,
                     num_kv_heads,
                     head_dim,
-                    device=device,
                     dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
                 ).to(dtype)
                 v_cache[physical_block, :tokens_in_block] = torch.randn(
                     tokens_in_block,
                     num_kv_heads,
                     head_dim,
-                    device=device,
                     dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
                 ).to(dtype)
+
+    expected_out = None
+    if seqlen_q == 1:
+        group_size = num_q_heads // num_kv_heads
+        expected = []
+        for batch_idx, cache_len in enumerate(cache_seqlens.tolist()):
+            num_blocks = int(num_blocks_per_seq[batch_idx].item())
+            physical_blocks = page_table[batch_idx, :num_blocks].long()
+            k_i = k_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)
+            v_i = v_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)
+            k_i = k_i[:cache_len].repeat_interleave(group_size, dim=1)
+            v_i = v_i[:cache_len].repeat_interleave(group_size, dim=1)
+            expected.append(
+                torch.nn.functional.scaled_dot_product_attention(
+                    q[batch_idx : batch_idx + 1].float().unsqueeze(2),
+                    k_i.float().permute(1, 0, 2).unsqueeze(0),
+                    v_i.float().permute(1, 0, 2).unsqueeze(0),
+                ).squeeze(2)
+            )
+        expected_out = torch.cat(expected, dim=0)
+
+    q = q.to(device)
+    k_cache = k_cache.to(device)
+    v_cache = v_cache.to(device)
+    page_table = page_table.to(device)
+    cache_seqlens = cache_seqlens.to(device)
 
     out = mha_decode_with_kvcache(
         q=q,
@@ -417,6 +445,96 @@ def test_mha_decode_with_kvcache(
 
     assert out.shape == q.shape
     assert not torch.isnan(out).any()
+    expected_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
+    assert out.dtype == expected_dtype
+    if expected_out is not None:
+        tol = 3e-1 if dtype in _FP8_DTYPES else 3e-2
+        torch.testing.assert_close(out.float().cpu(), expected_out, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize(
+    "cache_seqlen,adversarial_inputs",
+    [
+        pytest.param(9 * 64, False, id="uneven-peeled-split"),
+        pytest.param(64, True, id="inactive-peeled-tiles"),
+    ],
+)
+def test_mha_decode_with_kvcache_gluon_peeled_split(
+    device: str,
+    cache_seqlen: int,
+    adversarial_inputs: bool,
+    require,
+) -> None:
+    require(
+        "attention",
+        "mha_decode_with_kvcache",
+        "gluon",
+        torch.bfloat16,
+        "q",
+    )
+
+    batch_size = 1
+    num_q_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 64
+    num_pages = 9
+    max_seqlen_k = num_pages * page_size
+
+    if adversarial_inputs:
+        q = torch.full(
+            (batch_size, num_q_heads, head_dim),
+            16.0,
+            dtype=torch.bfloat16,
+        )
+        k_cache = torch.full(
+            (num_pages, page_size, num_kv_heads, head_dim),
+            -16.0,
+            dtype=torch.bfloat16,
+        )
+    else:
+        q = torch.randn(
+            batch_size,
+            num_q_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+        )
+        k_cache = torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+        )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(num_pages, dtype=torch.int32).reshape(1, num_pages)
+    cache_seqlens = torch.full((batch_size,), cache_seqlen, dtype=torch.int32)
+
+    group_size = num_q_heads // num_kv_heads
+    k_ref = k_cache.reshape(max_seqlen_k, num_kv_heads, head_dim)[:cache_seqlen]
+    v_ref = v_cache.reshape(max_seqlen_k, num_kv_heads, head_dim)[:cache_seqlen]
+    k_ref = k_ref.repeat_interleave(group_size, dim=1)
+    v_ref = v_ref.repeat_interleave(group_size, dim=1)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.unsqueeze(2),
+        k_ref.permute(1, 0, 2).unsqueeze(0),
+        v_ref.permute(1, 0, 2).unsqueeze(0),
+    ).squeeze(2)
+
+    out = mha_decode_with_kvcache(
+        q=q.to(device),
+        k_cache=k_cache.to(device),
+        v_cache=v_cache.to(device),
+        page_table=page_table.to(device),
+        cache_seqlens=cache_seqlens.to(device),
+        max_seqlen_k=max_seqlen_k,
+        max_seqlen_q=1,
+        solution="gluon",
+    )
+
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out.cpu(), expected, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.parametrize("op", ["decode", "extend"])

@@ -42,6 +42,8 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3_5 import (
@@ -51,6 +53,18 @@ from tokenspeed.runtime.models.qwen3_5 import (
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_mtp_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    # ModelOpt recipes may leave the MTP subtree unquantized even when the
+    # target model is NVFP4. Honor that checkpoint contract during construction.
+    if quant_config is not None and should_exclude_quant_module(
+        "mtp.layers.0", quant_config.exclude_modules
+    ):
+        return None
+    return quant_config
 
 
 class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
@@ -111,6 +125,8 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
         seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        # Publish: the backend owns its buffer, so in-graph edits need a copy.
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
     def _maybe_narrow_residual(
         self,
@@ -162,6 +178,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
             config = config.text_config
+
+        quant_config = _resolve_mtp_quant_config(quant_config)
 
         self.config = config
         self.mapping = mapping
@@ -274,6 +292,15 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes
+        (it only processes MTP-branch weights), so shards without any MTP
+        tensor are skipped entirely.
+        """
+        return "mtp" in name
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
@@ -409,7 +436,12 @@ class Qwen3_5MoeForConditionalGenerationNextN(Qwen3_5ForConditionalGenerationNex
         )
 
 
+class Qwen3_5MoeForCausalLMNextN(Qwen3_5MoeForConditionalGenerationNextN):
+    """MTP draft head for text-only flat checkpoints."""
+
+
 EntryClass = [
     Qwen3_5ForConditionalGenerationNextN,
     Qwen3_5MoeForConditionalGenerationNextN,
+    Qwen3_5MoeForCausalLMNextN,
 ]

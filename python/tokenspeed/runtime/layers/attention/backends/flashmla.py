@@ -38,10 +38,16 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
+    MlaCacheGroupMixin,
+)
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
@@ -58,15 +64,23 @@ if TYPE_CHECKING:
 @dataclass
 class FlashMLADecodeMetadata:
     num_extends: int = 0
-    flashmla_metadata: tuple | None = None
-    num_splits: torch.Tensor | None = None
+    flashmla_metadata: object | None = None
     block_table: torch.Tensor | None = None
+    seq_lens_k: torch.Tensor | None = None
+    # Paged cache only: absolute latent write locations, request-major, with
+    # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
+    # None on the classic page_table path.
+    group_out_cache_loc: torch.Tensor | None = None
+    group_q_len_per_req: int = 1
 
 
 @dataclass
 class _PrefillMetadata:
     prefill_wrapper: BatchMLAPagedAttentionWrapper
     use_ragged: bool
+    # Paged cache only: packed absolute latent write locations for the extend
+    # tokens (query order). None on the classic page_table path.
+    group_out_cache_loc: torch.Tensor | None = None
 
 
 @dataclass
@@ -89,12 +103,19 @@ class _ChunkedPrefillMetadata:
 _global_workspace_buffer = None
 
 
-class FlashMLABackend(AttentionBackend):
+class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     """FlashMLA attention backend for TokenSpeed scheduling.
 
     Uses the FlashMLA kernel for decode (any q_len); uses FlashInfer's MLA
     prefill wrappers for the EXTEND path.
+
+    Decode consumes the LCM full-history table when bound to a paged-cache
+    contract (see :class:`MlaCacheGroupMixin`); otherwise it reads the classic
+    ``page_table`` table. The FlashMLA kernel walks pages at a fixed
+    ``PAGE_SIZE`` stride, so that is the backend's kernel page size.
     """
+
+    draft_seq_lens_attr: str = "cuda_graph_seq_lens_k"
 
     def __init__(self, config: MLAConfig):
         super().__init__(config)
@@ -103,6 +124,19 @@ class FlashMLABackend(AttentionBackend):
         self.max_context_len = config.context_len
         self.kv_cache_quant_method = config.kv_cache_quant_method
         self.cache_dtype = config.kv_cache_dtype
+
+        # Cache-group (LCM) state. Latched on the first paged-cache metadata;
+        # the FlashMLA kernel's page stride is PAGE_SIZE, so that is the kernel
+        # page size the group-table expansion targets.
+        self._cache_groups_bound = False
+        self._cache_contract_bound = False
+        # A draft consumes its history group table from the wrapper's
+        # per-group distribution (_draft_group_tables); the target reads the
+        # richer cache_metadata instead and must stay off the block_tables
+        # path (its capture/eager guards key on this flag).
+        self.uses_cache_groups = bool(config.is_draft)
+        self.page_size = PAGE_SIZE
+        self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
         # MLA-specific dimensions
         self.kv_lora_rank = config.kv_lora_rank
@@ -119,6 +153,10 @@ class FlashMLABackend(AttentionBackend):
 
         # FlashMLA-specific
         self.draft_token_num = 0
+        # A block drafter (DFLASH/DSpark) drafts a whole block per pass; its
+        # captured decode graph seeds block-end lengths via
+        # ``fill_block_decode_seq_lens`` (see the drafter's is_capturing path).
+        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
         if self.kv_cache_quant_method == "per_token_head":
             raise NotImplementedError(
@@ -165,6 +203,18 @@ class FlashMLABackend(AttentionBackend):
         self.forward_prefill_metadata: _PrefillMetadata | None = None
         self.chunked_prefill_metadata: _ChunkedPrefillMetadata | None = None
         self.last_seq_lens_sum: int | None = None
+        # FlashMLA builds its tile schedule lazily inside the FIRST
+        # flash_mla_with_kvcache call (from that call's cache_seqlens) and then
+        # freezes it on the FlashMLASchedMeta object. So a sched object must not
+        # be reused across calls whose cache_seqlens differ, or the kernel keeps
+        # attending the stale (first-seen) sequence length. Eager decode takes a
+        # fresh object every step; under CUDA graph a fresh object is created at
+        # capture time (see init_forward_metadata_capture_cuda_graph) so the
+        # schedule build is recorded into the graph and recomputed from the live
+        # cache_seqlens buffer on each replay. Strong refs to every sched captured
+        # into a graph, so none is GC'd while its graph is alive (multiple sampling
+        # variants may capture the same bs).
+        self._decode_tile_metadata_keepalive: list[object] = []
 
     # ------------------------------------------------------------------
     # Metadata init
@@ -177,21 +227,47 @@ class FlashMLABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         **kwargs,
     ):
+        cache_metadata = kwargs.pop("cache_metadata", None)
+        forward_batch = kwargs.pop("forward_batch", None)
+        kwargs.pop("block_tables", None)
+        group_table = None
+        if cache_metadata is not None:
+            self._cache_groups_bound = True
+            group_table = self._resolve_full_history_table(
+                cache_metadata, forward_batch, bs
+            )
+        elif self._draft_reads_batch_pages(bs, forward_mode):
+            # The drafter drives this draft backend directly and passes no cache
+            # metadata; it hands over the batch-ordered draft page table (row i
+            # is batch position i). DraftPageStaging.publish already expanded the
+            # target's full-history scheduler pages into this backend's kernel
+            # pages, so the ids are ALREADY in kernel-page units here.
+            self._cache_groups_bound = True
+            group_table = page_table[:bs]
+        elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
+            raise RuntimeError(
+                "FlashMLABackend is bound to Paged cache but received no paged "
+                "cache metadata; refusing the legacy page_table path"
+            )
+
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 req_pool_indices=req_pool_indices[:num_extends],
                 seq_lens=seq_lens[:num_extends],
-                req_to_page=req_to_page,
+                page_table=page_table,
                 extend_with_prefix=extend_with_prefix,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
+                group_table=(
+                    group_table[:num_extends] if group_table is not None else None
+                ),
             )
         # Under is_draft, also fill decode_metadata under any forward_mode so
         # the drafter's multi-step loop has metadata. Wrapper pre-writes
@@ -203,7 +279,13 @@ class FlashMLABackend(AttentionBackend):
             or (forward_mode.is_extend() and self.is_draft)
         ):
             self._init_decode_metadata(
-                bs, num_extends, req_pool_indices, seq_lens, req_to_page
+                bs,
+                num_extends,
+                req_pool_indices,
+                seq_lens,
+                page_table,
+                group_table=group_table,
+                q_len_per_req=self._verify_q_len(forward_mode),
             )
 
     @contextmanager
@@ -216,51 +298,119 @@ class FlashMLABackend(AttentionBackend):
         finally:
             self.forward_decode_metadata.num_extends = prev
 
+    def _new_eager_tile_metadata(self):
+        """Return a fresh (uninitialized) FlashMLASchedMeta for one eager decode.
+
+        FlashMLA freezes its tile schedule from the FIRST kernel call's
+        cache_seqlens, so eager decode must hand the kernel a fresh object every
+        step — reusing one would keep attending the first step's sequence length.
+        The object itself is cheap; the schedule build happens inside the kernel.
+        """
+        return get_mla_metadata()[0]
+
+    def _capture_decode_tile_metadata(self, bs: int):
+        """Return the FlashMLASchedMeta to record into the CUDA graph for ``bs``.
+
+        Must be called *inside* graph capture: a fresh (uninitialized) object is
+        created so the schedule build is captured and re-executed from the live
+        cache_seqlens buffer on every replay. The object is kept alive for the
+        lifetime of the graph that recorded it (a graph replays the recorded
+        schedule-build kernel against this object's tensors).
+        """
+        tile_metadata = get_mla_metadata()[0]
+        self._decode_tile_metadata_keepalive.append(tile_metadata)
+        return tile_metadata
+
     def _init_decode_metadata(
         self,
         bs: int,
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
+        group_table: torch.Tensor | None = None,
+        q_len_per_req: int = 1,
     ):
-        if req_to_page is not None:
-            block_table = req_to_page[req_pool_indices]
+        if group_table is not None:
+            # The table is already in FlashMLA's PAGE_SIZE kernel pages; resolve
+            # the write locations. Target verify writes the whole spec window
+            # (seq-N..seq-1); plain decode writes position seq-1.
+            block_table = group_table[:bs]
+            group_out_cache_loc = self._cache_decode_out_cache_loc(
+                group_table,
+                seq_lens,
+                batch_size=bs,
+                validate_pages=cache_debug_enabled(),
+                q_len_per_req=q_len_per_req,
+            )
         else:
-            block_table = None
-
-        # When spec-dec is active (self.spec_num_tokens > 1), advance per-row
-        # seq_lens by the worst-case verify width so the tile planner covers
-        # the longest path.
-        if self.spec_num_tokens > 1:
-            plan_seq_lens = seq_lens + self.draft_token_num
-            num_heads_plan = self.draft_token_num * self.num_q_heads
-        else:
-            plan_seq_lens = seq_lens
-            num_heads_plan = self.num_q_heads
-
-        mla_metadata, num_splits = get_mla_metadata(
-            plan_seq_lens.to(torch.int32),
-            num_heads_plan,
-            1,
-        )
+            # No group table: the idle/warmup forward before the backend binds
+            # to the contract (a live LCM batch always resolves a group table
+            # from the target's cache metadata or the draft's batch-ordered
+            # page table; init_forward_metadata raises if a bound backend gets
+            # neither). page_table is only an empty/dummy placeholder here,
+            # batch-ordered like the draft table.
+            block_table = page_table[:bs]
+            group_out_cache_loc = None
         self.forward_decode_metadata = FlashMLADecodeMetadata(
             num_extends=num_extends,
-            flashmla_metadata=mla_metadata,
-            num_splits=num_splits,
+            flashmla_metadata=self._new_eager_tile_metadata(),
             block_table=block_table,
+            seq_lens_k=seq_lens,
+            group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=q_len_per_req,
         )
+
+    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
+        """Group-derived latent write location on the paged-cache path.
+
+        Identity when not cache-group bound (classic page_table path) or when
+        idle. Decode writes one location per request (position seq-1); extend
+        writes the packed [prefix, seq) locations per request in query order.
+        """
+        if (
+            not self._cache_groups_bound
+            or forward_mode is None
+            or forward_mode.is_idle()
+        ):
+            return out_cache_loc
+        if self.is_draft:
+            # A draft (MTP/EAGLE chain) owns its per-step write locations and
+            # passes num_extends == bs by its own convention; the group metadata
+            # holds no draft locations, so honor the caller's out_cache_loc.
+            return out_cache_loc
+        if forward_mode.is_decode():
+            metadata = self.forward_decode_metadata
+            if metadata is None or metadata.group_out_cache_loc is None:
+                raise RuntimeError("FlashMLA decode write locations are missing")
+            # Locations are request-major with group_q_len_per_req entries per
+            # row, so a mixed batch skips whole verify windows, not single rows.
+            locs = metadata.group_out_cache_loc[
+                metadata.num_extends * metadata.group_q_len_per_req :
+            ]
+        else:
+            metadata = self.forward_prefill_metadata
+            if metadata is None or metadata.group_out_cache_loc is None:
+                raise RuntimeError("FlashMLA prefill write locations are missing")
+            locs = metadata.group_out_cache_loc
+        if out_cache_loc is not None and locs.shape[0] != out_cache_loc.shape[0]:
+            raise RuntimeError(
+                f"FlashMLA write locations cover {locs.shape[0]} tokens but "
+                f"the caller provided {out_cache_loc.shape[0]}"
+            )
+        return locs
 
     def _init_prefill_metadata(
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         extend_with_prefix: bool,
         extend_prefix_lens: torch.Tensor | None,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        group_table: torch.Tensor | None = None,
     ):
         # EXTEND path — flashinfer ragged/paged prefill.
         if extend_prefix_lens is None:
@@ -277,17 +427,57 @@ class FlashMLABackend(AttentionBackend):
             not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
         )
 
+        # Paged cache path needs two differently-shaped views of the kernel
+        # full-history table:
+        #   * flashinfer paged prefill (plan page_size=1) walks a PER-TOKEN slot
+        #     table, so expand each token to its absolute latent slot.
+        #   * chunked prefix replay (create_chunked_cache_kv_indices_paged) walks
+        #     the PAGE table directly, deriving slot = page_id*p + pos%p
+        #     in-kernel.
+        # New-token write locations come from _extend_out_cache_loc either way.
+        group_out_cache_loc = None
+        if group_table is not None:
+            prefill_table = self._group_per_token_slot_table(
+                group_table,
+                batch_size=seq_lens.shape[0],
+                page_size=self.page_size,
+                max_context_len=self.max_context_len,
+            ).to(torch.int32)
+            prefill_req_pool_indices = torch.arange(
+                seq_lens.shape[0], dtype=torch.int64, device=prefill_table.device
+            )
+            chunk_table = group_table[: seq_lens.shape[0]]
+            chunk_page_size = self.page_size
+            group_out_cache_loc = self._extend_out_cache_loc(
+                group_table[: seq_lens.shape[0]],
+                extend_prefix_lens_cpu,
+                extend_seq_lens_cpu,
+                validate_pages=cache_debug_enabled(),
+            )
+        else:
+            # No group table: the autotune/warmup dummy prefill (uses_cache_groups
+            # is False for FlashMLA, so the prefill_graph dummy builds no cache
+            # metadata). It never reads real KV, so page_table is an empty/dummy
+            # batch-ordered placeholder here (row i == batch position i). A live
+            # LCM batch always resolves a group table.
+            prefill_table = page_table
+            prefill_req_pool_indices = torch.arange(
+                seq_lens.shape[0], dtype=torch.int64, device=page_table.device
+            )
+            chunk_table = page_table
+            chunk_page_size = PAGE_SIZE
+
         self.indices_updater_prefill.update(
-            req_pool_indices,
+            prefill_req_pool_indices,
             seq_lens,
             seq_lens_sum,
             extend_prefix_lens,
-            req_to_page=req_to_page,
+            page_table=prefill_table,
             prefill_wrapper_paged=self.prefill_wrapper_paged,
             use_ragged=use_ragged,
         )
         self.forward_prefill_metadata = _PrefillMetadata(
-            self.prefill_wrapper_paged, use_ragged
+            self.prefill_wrapper_paged, use_ragged, group_out_cache_loc
         )
 
         num_extends = extend_seq_lens.shape[0]
@@ -305,16 +495,16 @@ class FlashMLABackend(AttentionBackend):
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
-            req_to_page,
-            req_pool_indices,
-            PAGE_SIZE,
+            chunk_table,
+            prefill_req_pool_indices,
+            chunk_page_size,
         )
         self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            req_pool_indices=req_pool_indices,
+            req_pool_indices=prefill_req_pool_indices,
             cum_extend_seq_lens=cum_extend_seq_lens,
             max_extend_seq_len=max_extend_seq_len,
             chunked_loop_num=chunked_loop_num,
@@ -328,40 +518,32 @@ class FlashMLABackend(AttentionBackend):
     # CUDA graph (decode only, any q_len)
     # ------------------------------------------------------------------
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        del seq_lens_buf  # flashmla allocates its own buffers.
+    def init_cuda_graph_state(self, max_bs: int):
         max_context_len = self.max_context_len + PAGE_SIZE - 1
         # 4 PAGES are reserved for speculation
-        cuda_graph_kv_indices = torch.full(
+        self.cuda_graph_kv_indices = torch.full(
             (max_bs, (max_context_len + 4 * PAGE_SIZE) // PAGE_SIZE),
             1,
             dtype=torch.int32,
             device="cuda",
         )
-
-        if self.draft_token_num:
-            (
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits,
-            ) = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.draft_token_num * self.num_q_heads,
-                1,
+        # Own the persistent cache_seqlens buffer the captured decode kernel reads from
+        self.cuda_graph_seq_lens_k = torch.zeros(
+            max_bs, dtype=torch.int32, device="cuda"
+        )
+        # Paged cache contract: persistent write-location buffer whose address
+        # the captured graph records; replay refreshes it in place from the
+        # live full-history table. Only allocated when the backend is a cache
+        # contract sub-backend.
+        if self._cache_contract_bound:
+            # Target verify records spec_num_tokens write locations per request.
+            self.cuda_graph_group_out_cache_loc = torch.zeros(
+                max_bs * max(1, self.spec_num_tokens),
+                dtype=torch.int64,
+                device="cuda",
             )
         else:
-            (
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits,
-            ) = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.num_q_heads,
-                1,
-            )
-        self.cuda_graph_kv_indices = cuda_graph_kv_indices
+            self.cuda_graph_group_out_cache_loc = None
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -369,8 +551,11 @@ class FlashMLABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        **kwargs,
     ):
-        block_table = self.cuda_graph_kv_indices[:bs]
+        # cache_group_ids arrives for the draft (uses_cache_groups); the
+        # persistent kv-indices buffer already exists, nothing to allocate.
+        decode_no_spec = forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
             and not self.is_draft
@@ -381,89 +566,132 @@ class FlashMLABackend(AttentionBackend):
             and self.is_draft
             and self.spec_num_tokens > 1
         )
+        if not (decode_no_spec or is_target_verify or is_draft_extend):
+            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
 
-        if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
-            )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.cuda_graph_kv_indices[:bs].copy_(block_table)
-            self.forward_decode_metadata = FlashMLADecodeMetadata(
-                num_extends=0,
-                flashmla_metadata=self.cuda_graph_mla_metadata,
-                num_splits=self.cuda_graph_num_splits[: bs + 1],
-                block_table=self.cuda_graph_kv_indices[:bs, :],
-            )
-        elif is_target_verify or is_draft_extend:
-            seq_lens = seq_lens + self.draft_token_num
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.draft_token_num * self.num_q_heads,
-                1,
-            )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.cuda_graph_kv_indices[:bs].copy_(block_table)
-            self.forward_decode_metadata = FlashMLADecodeMetadata(
-                num_extends=0,
-                flashmla_metadata=self.cuda_graph_mla_metadata,
-                num_splits=self.cuda_graph_num_splits[: bs + 1],
-                block_table=self.cuda_graph_kv_indices[:bs],
+        # Seed before building the tile schedule: it is recorded against these
+        # lengths, and the capture run reads them before any replay. Verify rows
+        # span seq-N..seq-1, so a length below N would start the window before
+        # the sequence.
+        capture_q_len = self._graph_verify_q_len()
+        if capture_q_len > 1:
+            self.cuda_graph_seq_lens_k[:bs].copy_(
+                seq_lens[:bs].clamp_min(capture_q_len)
             )
         else:
-            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
+            self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs])
+        group_out_cache_loc = None
+        if self._cache_contract_bound:
+            if self.cuda_graph_group_out_cache_loc is None:
+                raise RuntimeError(
+                    "FlashMLA Paged cache graph capture buffer was not "
+                    "allocated; mark_cache_contract must run before "
+                    "init_cuda_graph_state"
+                )
+            group_out_cache_loc = self.cuda_graph_group_out_cache_loc[
+                : bs * capture_q_len
+            ]
+            group_out_cache_loc.zero_()
+        self.forward_decode_metadata = FlashMLADecodeMetadata(
+            num_extends=0,
+            flashmla_metadata=self._capture_decode_tile_metadata(bs),
+            block_table=self.cuda_graph_kv_indices[:bs],
+            seq_lens_k=self.cuda_graph_seq_lens_k[:bs],
+            group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=capture_q_len,
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor,
         **kwargs,
     ):
         if forward_mode is None or not forward_mode.is_decode_or_idle():
             raise RuntimeError(f"Not supported forward mode: {forward_mode}")
 
-        req_pool_indices = req_pool_indices[:bs]
-        if req_to_page is not None:
-            block_table = req_to_page[req_pool_indices]
+        # Verify rows span seq-N..seq-1; clamp so a request shorter than the
+        # window does not resolve locations before its start. Width was baked
+        # into the captured buffer view at capture time.
+        q_len = self.forward_decode_metadata.group_q_len_per_req
+        if q_len > 1:
+            self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
         else:
-            block_table = self.cuda_graph_kv_indices[:bs]
-        seq_lens = seq_lens[:bs]
+            self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs])
 
-        is_target_verify = not self.is_draft and self.spec_num_tokens > 1
-        is_draft_extend = self.is_draft and self.spec_num_tokens > 1
-
-        if self.spec_num_tokens == 1:
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
+        cache_metadata = kwargs.get("cache_metadata")
+        # Refresh from cache metadata whenever this backend is a contract
+        # sub-backend. Gating on _cache_groups_bound alone breaks a PD decode
+        # node: that flag is only latched in the eager init path, but a
+        # decode-only node receives its KV over the transfer and never runs an
+        # eager extend/decode forward — it only replays decode graphs. The flag
+        # would stay False, this refresh would be skipped, and the captured
+        # kernel would read a stale/zero kv-index table (the null page 0)
+        # instead of the transferred KV. _cache_contract_bound is set by the
+        # registry at startup for every contract sub-backend, so it is the
+        # correct gate here; latch _cache_groups_bound for the write-loc path.
+        if (
+            self._cache_groups_bound or self._cache_contract_bound
+        ) and cache_metadata is not None:
+            self._cache_groups_bound = True
+            # Refresh the block table and per-request write locations in place
+            # from the live full-history table (paged-cache path).
+            table = self._resolve_full_history_table(
+                cache_metadata, kwargs.get("forward_batch"), 0
             )
-        elif is_target_verify or is_draft_extend:
-            seq_lens = seq_lens + self.draft_token_num
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.draft_token_num * self.num_q_heads,
-                1,
-            )
-        else:
-            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
+            real_bs = min(int(table.shape[0]), bs)
+            if real_bs > 0:
+                self.cuda_graph_kv_indices[:real_bs, : table.shape[1]].copy_(
+                    table[:real_bs]
+                )
+                self._cache_decode_out_cache_loc(
+                    table,
+                    self.cuda_graph_seq_lens_k,
+                    batch_size=real_bs,
+                    validate_pages=cache_debug_enabled(),
+                    out=self.cuda_graph_group_out_cache_loc,
+                    q_len_per_req=q_len,
+                )
+            # Padded rows resolve to the null page 0.
+            self.cuda_graph_kv_indices[real_bs:bs].zero_()
+            if self.cuda_graph_group_out_cache_loc is not None:
+                self.cuda_graph_group_out_cache_loc[
+                    real_bs * q_len : bs * q_len
+                ].zero_()
+            return
 
-        self.cuda_graph_mla_metadata.copy_(mla_metadata)
-        self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-        self.cuda_graph_kv_indices[:bs].copy_(block_table)
-        self.forward_decode_metadata.num_extends = 0
-        self.forward_decode_metadata.flashmla_metadata = self.cuda_graph_mla_metadata
-        self.forward_decode_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
-        self.forward_decode_metadata.block_table = self.cuda_graph_kv_indices[:bs]
+        if self._draft_reads_batch_pages(bs, forward_mode):
+            # Draft replay: DraftPageStaging.publish already expanded the target
+            # full-history table into this backend's kernel pages, so the
+            # batch-ordered draft page table holds kernel-page ids. Copy them
+            # as-is (identity), matching the eager draft path.
+            block_table = page_table[:bs]
+            self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
+            return
 
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
+        # Idle/warmup replay before the backend binds: page_table is an empty
+        # batch-ordered placeholder. A live LCM batch takes one of the branches
+        # above.
+        block_table = page_table[:bs]
+        self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """Publish block-end cache lengths inside a captured draft graph.
+
+        A block drafter runs its multi-token pass inside the captured graph and
+        writes the per-request block-end length here (one row per request; the
+        block's ``draft_query_width`` queries share it, non-causal). ``forward_decode``
+        repeats each row across the block's queries, so the graph keeps ``bs``
+        rows -- mirrors ``TRTLLMMLABackend.fill_block_decode_seq_lens``.
+        """
+        if not self.draft_block_decode:
+            raise RuntimeError("Block decode sequence lengths require DFLASH mode.")
+        self.cuda_graph_seq_lens_k[:bs].copy_(
+            block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -478,72 +706,25 @@ class FlashMLABackend(AttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
-        seq_lens: torch.Tensor | None = None,
-        forward_mode: ForwardMode | None = None,
+        save_kv_cache: bool,
+        forward_mode: ForwardMode,
         **kwargs,
     ):
-        q_len_per_req = q.shape[0] // bs if bs > 0 else 1
-        is_target_verify = (
-            forward_mode is not None
-            and forward_mode.is_decode_or_idle()
-            and not self.is_draft
-            and q_len_per_req > 1
-        )
-        is_draft_extend = (
-            forward_mode is not None
-            and forward_mode.is_decode_or_idle()
-            and self.is_draft
-            and q_len_per_req > 1
-        )
+        assert forward_mode is not None and forward_mode.is_extend()
 
-        if forward_mode is None or forward_mode.is_extend():
-            # Prefill: dispatch to ragged (MHA-style) or absorbed (MQA) path.
-            if self.forward_prefill_metadata.use_ragged:
-                return self._forward_normal_extend(q, k, v, layer, save_kv_cache)
-            else:
-                return self._forward_absorbed_extend(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    out_cache_loc,
-                    token_to_kv_pool,
-                    save_kv_cache,
-                )
-
-        assert is_target_verify or is_draft_extend
-        if k is not None:
-            assert v is not None
-            if save_kv_cache:
-                token_to_kv_pool.set_kv_buffer(layer, out_cache_loc, k, v)
-
-        metadata = self.forward_decode_metadata
-        num_extends = metadata.num_extends
-        bs = (
-            q.shape[0]
-            if is_draft_extend
-            else metadata.block_table.shape[0] - num_extends
-        )
-        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-
-        assert (
-            layer.tp_q_head_num == self.num_q_heads
-        ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
-        reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
-
-        o, _ = flash_mla_with_kvcache(
-            q=reshape_q,
-            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=metadata.block_table[num_extends : num_extends + bs],
-            cache_seqlens=seq_lens.to(torch.int32) + self.draft_token_num,
-            head_dim_v=self.kv_lora_rank,
-            tile_scheduler_metadata=metadata.flashmla_metadata,
-            num_splits=metadata.num_splits,
-            softmax_scale=layer.scaling,
-            causal=True,
-        )
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # Prefill: dispatch to ragged (MHA-style) or absorbed (MQA) path.
+        if self.forward_prefill_metadata.use_ragged:
+            return self._forward_normal_extend(q, k, v, layer, save_kv_cache)
+        else:
+            return self._forward_absorbed_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                save_kv_cache,
+            )
 
     def forward_extend_chunked(
         self,
@@ -596,57 +777,31 @@ class FlashMLABackend(AttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
-        seq_lens: torch.Tensor | None = None,
+        save_kv_cache: bool,
         **kwargs,
     ) -> torch.Tensor:
         # Multi-token decode (target verify or drafter compound) reuses
         # the multi-token kernel path in forward_extend.
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
         if q_len_per_req > 1:
-            return self.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                seq_lens=seq_lens,
-                forward_mode=ForwardMode.DECODE,
-                **kwargs,
+            metadata = self.forward_decode_metadata
+            num_extends = metadata.num_extends
+            bs = (
+                q.shape[0]
+                if self.is_draft
+                else metadata.block_table.shape[0] - num_extends
             )
 
-        if k is not None:
-            assert v is not None
-            if save_kv_cache:
-                token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    out_cache_loc,
-                    k,
-                    v,
-                )
-        bs = q.shape[0]
-        metadata = self.forward_decode_metadata
-        num_extends = metadata.num_extends
-        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-        assert (
-            layer.tp_q_head_num == self.num_q_heads
-        ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
-        reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
-        cache_lens = seq_lens
-
-        o, _ = flash_mla_with_kvcache(
-            q=reshape_q,
-            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=metadata.block_table[num_extends : num_extends + bs],
-            cache_seqlens=cache_lens.to(torch.int32),
-            head_dim_v=self.kv_lora_rank,
-            tile_scheduler_metadata=metadata.flashmla_metadata,
-            num_splits=metadata.num_splits,
-            softmax_scale=layer.scaling,
-            causal=True,
+        o, _ = self._run_flash_mla_decode(
+            q,
+            k,
+            v,
+            layer,
+            out_cache_loc,
+            token_to_kv_pool,
+            bs,
+            save_kv_cache=save_kv_cache,
+            cache_seqlens_offset=self.draft_token_num,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -713,6 +868,58 @@ class FlashMLABackend(AttentionBackend):
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _run_flash_mla_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        *,
+        save_kv_cache: bool,
+        cache_seqlens_offset: int,
+    ):
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                token_to_kv_pool.set_kv_buffer(layer, out_cache_loc, k, v)
+
+        metadata = self.forward_decode_metadata
+        num_extends = metadata.num_extends
+        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        assert (
+            layer.tp_q_head_num == self.num_q_heads
+        ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
+        reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
+
+        block_table = metadata.block_table[num_extends : num_extends + bs]
+        cache_seqlens = metadata.seq_lens_k.to(torch.int32) + cache_seqlens_offset
+        # Draft block-decode: forward_decode flattened q to one kernel row per
+        # drafted block position (bs == bs_orig * draft_query_width), but the
+        # group table and seq_lens carry one entry per request. Repeat each
+        # request's row across its block positions so every block query attends
+        # the whole block (block-diffusion), mirroring tokenspeed_mla's
+        # _expand_block_decode_metadata; the FlashMLA kernel requires
+        # cache_seqlens to be shape (num_kernel_rows).
+        src_rows = block_table.shape[0]
+        if self.is_draft and 0 < src_rows < bs and bs % src_rows == 0:
+            width = bs // src_rows
+            block_table = block_table.repeat_interleave(width, dim=0)
+            cache_seqlens = cache_seqlens.repeat_interleave(width)
+
+        return flash_mla_with_kvcache(
+            q=reshape_q,
+            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=self.kv_lora_rank,
+            tile_scheduler_metadata=metadata.flashmla_metadata,
+            softmax_scale=layer.scaling,
+            causal=True,
+        )
+
 
 class _PrefillIndicesUpdater:
     """Plans FlashInfer MLA prefill wrappers for the EXTEND path."""
@@ -739,7 +946,7 @@ class _PrefillIndicesUpdater:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper = None,
         use_ragged: bool = False,
     ):
@@ -761,7 +968,7 @@ class _PrefillIndicesUpdater:
             self.kv_indptr,
             self.qo_indptr,
             use_ragged,
-            req_to_page=req_to_page,
+            page_table=page_table,
         )
 
     def _call_begin_forward(
@@ -776,7 +983,7 @@ class _PrefillIndicesUpdater:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -792,15 +999,15 @@ class _PrefillIndicesUpdater:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-        if req_to_page is not None:
+        if page_table is not None:
             create_flashinfer_kv_indices_triton[(bs,)](
-                req_to_page,
+                page_table,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
                 None,
                 kv_indices,
-                req_to_page.shape[1],
+                page_table.shape[1],
             )
         torch.cumsum(seq_lens - prefix_lens, dim=0, out=qo_indptr[1 : bs + 1])
         qo_indptr = qo_indptr[: bs + 1]

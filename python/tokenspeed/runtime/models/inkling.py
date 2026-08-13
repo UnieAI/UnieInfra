@@ -81,12 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.conv import (
-    sconv_decode,
-    sconv_decode_paged,
-    sconv_prefill,
-    sconv_prefill_paged,
-)
+from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -105,7 +100,10 @@ from tokenspeed.runtime.configs.inkling_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -144,10 +142,6 @@ _is_hopper_plus = current_platform().is_hopper_plus
 
 # Escape hatch: disable the rel-logits aux-stream fork (serial pre-attention).
 _ATTN_RELFORK = os.environ.get("INKLING_ATTN_RELFORK", "1") == "1"
-# Paged conv decode: signal PDL dependents after y, overlapping the pool-persist tail.
-_SCONV_EARLY_RELEASE = os.environ.get("INKLING_SCONV_EARLY_RELEASE", "0") == "1"
-
-
 # Hetero KV (#647 byte-uniform slots): full layers keep their native half KV
 # head count. Unconditional since 2026-07-15 (INKLING_HETERO_KV gate retired).
 _HETERO_KV = True
@@ -376,120 +370,44 @@ def _sconv_apply(
     layer_id: int,
     channel_offset: int,
     dim: int,
-    conv_group: str | None = None,
+    conv_group: str,
 ) -> torch.Tensor:
     """Run one sconv stream (or several adjacent ones fused) over ``x``.
 
     ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
     channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
-    is just a wider ``dim`` with concatenated weights.
+    is just a wider ``dim`` with concatenated weights. The paged bridges are
+    mandatory and fused: extend chunks tap the checkpoint at their aligned
+    start (the prefill kernel never reads the ring), decode rounds tap the
+    ring (the decode kernel never reads the paged cache), and both publish
+    every covered boundary in-kernel.
     """
     backend = ctx.attn_backend
     md = backend.conv_metadata
 
-    geo = backend.conv_columns if md.col_page_table is not None else None
-    if geo is not None and conv_group in ("attnconv", "mlpconv"):
-        if geo.get("hidden_group_of_layer") is None:
-            geo = None  # hidden sites stay rolling without their groups
-        else:
-            # Hidden-conv-as-swa: ATTN site's columns ride the layer's K slot, MLP site's its V slot.
-            table = md.col_page_table[geo["hidden_group_of_layer"][layer_id]]
-            bt = geo["hidden_block_tokens"]
-            cols = ctx.token_to_kv_pool.conv_slot_view(
-                layer_id, "k" if conv_group == "attnconv" else "v", bt, dim
-            )
-            if md.is_decode:
-                return sconv_decode_paged(
-                    x,
-                    weight,
-                    cols,
-                    table,
-                    md.col_seq_lens,
-                    block_tokens=bt,
-                    col_offset=0,
-                    activation=None,
-                    use_residual=True,
-                    enable_pdl=pdl_enabled(),
-                    early_release=_SCONV_EARLY_RELEASE,
-                )
-            return sconv_prefill_paged(
-                x,
-                weight,
-                cols,
-                table,
-                md.seq_idx,
-                md.query_start_loc,
-                md.col_prefix_lens,
-                block_tokens=bt,
-                col_offset=0,
-                lcm_align=geo["lcm_align"],
-                activation=None,
-                use_residual=True,
-            )
+    # Channel slice of the layer's [slots, R, conv_dim] ring.
+    state = backend.conv_pool.layer_state_wd(layer_id)[
+        :, :, channel_offset : channel_offset + dim
+    ]
 
-    if geo is not None and conv_group == "kvconv":
-        # kvconv-as-swa: columns stay 3D views — a 2D reshape would silently COPY, breaking persistence.
-        table = md.col_page_table[geo["conv_group_of_layer"][layer_id]]
-        k_cols, v_cols = ctx.token_to_kv_pool.kvconv_slot_views_for_layer(
-            layer_id, geo["block_tokens"]
+    if conv_group == "kvconv":
+        checkpoint_group = "kvconv"
+        checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(layer_id)
+    elif conv_group in ("attnconv", "mlpconv"):
+        checkpoint_group = "hiddenconv"
+        checkpoint_buffers = (
+            ctx.token_to_kv_pool.hiddenconv_checkpoint_buffer(layer_id, conv_group),
         )
-        half = dim // 2
-        if md.is_decode:
-            return sconv_decode_paged(
-                x,
-                weight,
-                k_cols,
-                table,
-                md.col_seq_lens,
-                block_tokens=geo["block_tokens"],
-                col_offset=0,
-                col_pool2=v_cols,
-                half_d=half,
-                activation=None,
-                use_residual=True,
-                enable_pdl=pdl_enabled(),
-                early_release=_SCONV_EARLY_RELEASE,
-            )
-        return sconv_prefill_paged(
-            x,
-            weight,
-            k_cols,
-            table,
-            md.seq_idx,
-            md.query_start_loc,
-            md.col_prefix_lens,
-            block_tokens=geo["block_tokens"],
-            col_offset=0,
-            col_pool2=v_cols,
-            half_d=half,
-            lcm_align=geo["lcm_align"],
-            activation=None,
-            use_residual=True,
-        )
-
-    # Channel slice of the layer's [slots, W-1, conv_dim] state buffer.
-    # Draft lookback window passes re-run the last D committed rows, so
-    # their conv init state is the LAGGED window (D rows behind); the
-    # backend's valid_len update then advances both windows off it.
-    pool_state = (
-        backend.draft_lag_conv_state_wd(layer_id)
-        if md.lookback > 0
-        else backend.conv_pool.layer_state_wd(layer_id)
+    else:
+        raise ValueError(f"unknown sconv stream group {conv_group!r}")
+    backend.register_shortconv_checkpoint_stream(
+        layer_id=layer_id,
+        channel_offset=channel_offset,
+        dim=dim,
+        group_id=checkpoint_group,
+        buffers=checkpoint_buffers,
     )
-    state = pool_state[:, :, channel_offset : channel_offset + dim]
-
-    if md.is_decode:
-        # Fused conv + residual + in-place cache shift.
-        return sconv_decode(
-            x,
-            weight,
-            state,
-            md.cache_indices,
-            activation=None,
-            use_residual=True,
-            enable_pdl=pdl_enabled(),
-        )
-    y = sconv_prefill(
+    return inkling_ring_sconv(
         x,
         weight,
         state,
@@ -497,20 +415,14 @@ def _sconv_apply(
         md.seq_idx,
         md.cache_indices,
         md.has_initial_state,
-        activation=None,
-        use_residual=True,
+        md.seq_lens,
+        md.col_page_table[checkpoint_group],
+        checkpoint_buffers[0],
+        checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
+        num_extends=md.num_extends,
+        page_size=backend.conv_columns["block_tokens"],
+        enable_pdl=pdl_enabled(),
     )
-    # Backend owns the window write: mode-dependent under spec decoding (verify stash / catch-up).
-    backend.apply_conv_state_update(
-        x,
-        state,
-        md,
-        layer_id,
-        channel_offset,
-        dim,
-        accept_lengths=getattr(ctx, "accept_lengths", None),
-    )
-    return y
 
 
 class InklingRelLogitsProj(nn.Module):
@@ -672,10 +584,11 @@ class InklingAttention(nn.Module):
         qkvr, _ = self.qkvr(hidden_states)
         q, kv, r = qkvr.split([self.q_size, 2 * self.kv_size, self.r_size], dim=-1)
 
-        # Fork the R-slice-only rel projection onto the aux stream (capture
-        # only; joins before attention). INKLING_ATTN_RELFORK=0 = serial.
+        # Warm the R-slice projection serially on the capture topology, then
+        # overlap it during capture. INKLING_ATTN_RELFORK=0 stays serial.
         with self.stream_fork.scope(
-            enable=_ATTN_RELFORK and get_is_capture_mode()
+            enable=_ATTN_RELFORK and get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
                 rel_logits = self.rel_logits_proj(
@@ -1023,8 +936,11 @@ class InklingSparseMoeBlock(nn.Module):
             num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(
                 ctx
             )
-            # Shared experts depend only on x: fork before the gate (capture-only, allocator stream safety).
-            with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            # Warm this branch serially on the aux stream, then overlap it with
+            # the gate during capture.
+            with self.stream_fork.scope(
+                enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+            ) as fork:
                 with fork.branch():
                     shared_out = self.shared_experts(x, do_finalize=False)
                 weights, topk_ids, router_logits = self.gate(x)
@@ -1066,7 +982,9 @@ class InklingSparseMoeBlock(nn.Module):
                     topk_ids=topk_ids,
                     router_logits=router_logits,
                 )
-                with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+                with self.stream_fork.scope(
+                    enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+                ) as fork:
                     routed_out = self.experts(
                         hidden_states=x,
                         topk_output=topk_output,
@@ -1410,6 +1328,23 @@ class InklingVisionTower(nn.Module):
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(vision_features)
 
+    def make_warmup_items(self) -> list[MultimodalDataItem]:
+        """Build one independent hMLP patch, which exercises the whole tower."""
+        encoder = self.vision_encoder
+        return [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=torch.zeros(
+                    1,
+                    encoder.temporal_patch_size,
+                    encoder.patch_size,
+                    encoder.patch_size,
+                    encoder.n_channels,
+                    dtype=next(encoder.parameters()).dtype,
+                ),
+            )
+        ]
+
 
 class InklingAudioTower(nn.Module):
     """dMel audio tower (checkpoint key ``audio``).
@@ -1452,6 +1387,15 @@ class InklingAudioTower(nn.Module):
         if self.final_norm is not None:
             hidden_states = self.final_norm(hidden_states)
         return hidden_states
+
+    def make_warmup_items(self) -> list[MultimodalDataItem]:
+        """Build one independent dMel frame, which exercises the whole tower."""
+        return [
+            MultimodalDataItem(
+                modality=Modality.AUDIO,
+                feature=torch.zeros(1, self.n_mel_bins, dtype=torch.long),
+            )
+        ]
 
 
 class InklingTextModel(nn.Module):
@@ -1630,6 +1574,8 @@ class InklingForConditionalGeneration(nn.Module):
             if (self.audio is not None or self.visual is not None)
             else None
         )
+        self.image_encoder = self.get_image_feature if self.visual is not None else None
+        self.audio_encoder = self.get_audio_feature if self.audio is not None else None
 
         self.lm_head = ParallelLMHead(
             text_config.padded_vocab_size,
@@ -1691,6 +1637,20 @@ class InklingForConditionalGeneration(nn.Module):
         dmel = torch.cat([item.feature for item in items], dim=0)
         return self.audio(dmel)
 
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        specs = {}
+        if self.visual is not None:
+            specs[Modality.IMAGE] = EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.visual.make_warmup_items,
+            )
+        if self.audio is not None:
+            specs[Modality.AUDIO] = EncoderSpec(
+                self.audio_encoder,
+                make_warmup_items=self.audio.make_warmup_items,
+            )
+        return specs
+
     def _embed_multimodal(self, ctx, input_ids, multimodal_context):
         """Run the shared MM embed pipeline; ``None`` -> text-only path."""
         if (
@@ -1706,16 +1666,11 @@ class InklingForConditionalGeneration(nn.Module):
                 "no audio/vision towers (audio_config/vision_config "
                 "decoder_dmodel unset) or runs with --language-model-only."
             )
-        encoders = {}
-        if self.visual is not None:
-            encoders[Modality.IMAGE] = EncoderSpec(self.get_image_feature)
-        if self.audio is not None:
-            encoders[Modality.AUDIO] = EncoderSpec(self.get_audio_feature)
         input_embeds, _ = self.vision_embedder.apply(
             input_ids=input_ids,
             text_embedding=self.model.mm_text_embedding(),
             ctx=multimodal_context,
-            encoders=encoders,
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         return input_embeds

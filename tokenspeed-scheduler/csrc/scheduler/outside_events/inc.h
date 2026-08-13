@@ -20,18 +20,19 @@
 
 #pragma once
 
-#include <cstdint>
-#include <variant>
 #include <string>
+#include <variant>
 #include <vector>
 
-#include "scheduler/outside_events/pd.h"
 #include "scheduler/outside_events/cache.h"
 #include "scheduler/outside_events/forward.h"
-#include "resource/types.h"
+#include "scheduler/outside_events/pd.h"
 
 namespace tokenspeed {
 
-using Event = std::variant<CacheEvent, ForwardEvent, PDEvent>;
+// Keep concrete events grouped by CacheEvent, ForwardEvent, and PDEvent.
+using Event = std::variant<cache::WriteBackDone, cache::LoadBackDone, forward::ExtendResult, forward::Finish,
+                           forward::Abort, forward::UpdateReserveNumTokens, pd::BootstrappedEvent, pd::FailedEvent,
+                           pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
 
 }  // namespace tokenspeed

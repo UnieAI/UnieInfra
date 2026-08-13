@@ -25,7 +25,6 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Callable, Generator
 
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
@@ -47,8 +46,6 @@ __all__ = [
     "set_selection_policy",
     "register_oracle",
     "kernel_override",
-    "load_config_overrides",
-    "clear_config_overrides",
     "explain_selection",
     "spec_matches_traits",
     "ref_compatible_with_spec",
@@ -511,7 +508,19 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
 
 
 def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
-    """Return whether a spec's alignment traits match a concrete shape."""
+    """Return whether a spec's dimension traits match a concrete shape."""
+    exact_traits: dict[str, tuple[str, ...]] = {
+        "batch": ("B", "batch"),
+        "m": ("M",),
+        "n": ("N",),
+        "k": ("K",),
+    }
+    for trait_name, dim_names in exact_traits.items():
+        values = spec.traits.get(trait_name)
+        dim = next((shape[name] for name in dim_names if name in shape), None)
+        if values is not None and dim is not None and dim not in values:
+            return False
+
     alignment_traits: dict[str, tuple[str, int]] = {
         "n_align_16": ("N", 16),
         "n_align_64": ("N", 64),
@@ -650,28 +659,7 @@ def select_kernel(
     """
     platform = platform or current_platform()
 
-    # --- Override resolution (lowest → highest priority) ---
-
-    # 1. Config file (lowest priority)
-    config_entry = _get_config_override(family, mode)
-    if config_entry is not None:
-        if override is None and solution is None:
-            if config_entry.name:
-                override = config_entry.name
-            elif config_entry.solution:
-                solution = config_entry.solution
-        if config_entry.objective and objective == SelectionObjective.DEFAULT:
-            try:
-                objective = SelectionObjective(config_entry.objective)
-            except ValueError:
-                logger.warning(
-                    "Invalid objective '%s' in overrides config for %s.%s",
-                    config_entry.objective,
-                    family,
-                    mode,
-                )
-
-    # 2. Context-manager global overrides
+    # Context-manager global overrides
     global_override = _global_overrides.get((family, mode))
     if global_override:
         override = global_override

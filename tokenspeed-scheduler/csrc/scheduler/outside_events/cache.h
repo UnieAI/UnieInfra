@@ -20,30 +20,20 @@
 
 #pragma once
 
-#include <string>
+#include <cstdint>
 #include <variant>
-#include "resource/types.h"
 
 namespace tokenspeed {
 namespace cache {
-struct PrefetchDone {
-    bool success;
-    cache_op_id op_id{};
-    std::string request_id;
-    std::int32_t completed_pages{0};
-};
-
 struct WriteBackDone {
-    cache_op_id op_id{};
-    bool success;
+    std::uint32_t op_id{};
 };
 
 struct LoadBackDone {
-    cache_op_id op_id{0};
-    bool success{true};
+    std::uint32_t op_id{0};
 };
 
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::PrefetchDone, cache::LoadBackDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone>;
 }  // namespace tokenspeed

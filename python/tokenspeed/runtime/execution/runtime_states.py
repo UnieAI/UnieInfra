@@ -21,10 +21,6 @@
 
 import torch
 
-from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
-    fused_mamba_state_copy,
-    fused_mamba_state_zero,
-)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -36,11 +32,9 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
-        context_len: int,
         vocab_size: int,
         output_length: int,
         device: str = "cuda",
-        mamba_pool=None,
     ):
         self.device = device
         self.vocab_size = vocab_size
@@ -61,7 +55,6 @@ class RuntimeStates:
         self.scaling_penalties = torch.ones(
             (req_pool_size + 1, vocab_size), dtype=torch.float32, device=device
         )
-        self.mamba_pool = mamba_pool
 
     def update_valid_cache_length(
         self, req_pool_indices: torch.Tensor, increment_lengths: torch.Tensor

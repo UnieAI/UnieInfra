@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-gpt-oss-120b-mxfp4-gpqa-diamond
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -12,11 +13,9 @@ runner:
     b200-2gpu:
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     amd-mi35x-2gpu-test:
-      GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
       GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
-  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps.sh
 server:
@@ -28,7 +27,7 @@ server:
     --max-model-len 80000
     --trust-remote-code
     --reasoning-parser base
-    ${GPT_OSS_EVAL_DISABLE_KVSTORE:+--disable-kvstore}
+    --disable-kvstore
     --enable-cache-report
     --host 127.0.0.1
     --port 8000
@@ -50,11 +49,20 @@ eval:
   # hit on --repeats duplicates, further reducing TTFT. Net effect: roughly
   # cancels the 3x sample cost, making this change cost-neutral overall.
   command: >-
+    if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ];
+    then GPQA_DATASET_HUB=modelscope;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"AI-ModelScope/gpqa_diamond"}}';
+    else GPQA_DATASET_HUB=huggingface;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"Idavidrein/gpqa","subset_list":["gpqa_diamond"]}}';
+    fi;
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model ${GPT_OSS_EVAL_MODEL}
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
+    --dataset-hub "$GPQA_DATASET_HUB"
+    --dataset-args "$GPQA_DATASET_ARGS"
     --eval-batch-size 64
     --repeats 3
 report:

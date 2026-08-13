@@ -30,7 +30,7 @@
 #include "scheduler/scheduler.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
-#include "scheduler/operations/cache.h"
+#include "cache/tier/transfer.h"
 #include "scheduler/operations/inc.h"
 #include "scheduler/types.h"
 
@@ -48,8 +48,15 @@ protected:
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
-        cfg.enable_l3_storage = true;
-        cfg.prefetch_threshold = 2;
+        cfg.enable_l3_storage = false;
+        cfg.paged_cache_groups.push_back(PagedCacheGroupConfig{
+            .group_id = "full_attention",
+            .rows_per_page = cfg.block_size,
+            .entry_stride_tokens = 1,
+            .total_pages = cfg.device_allocator.total_pages,
+            .retention = PagedCacheGroupConfig::Retention::FullHistory,
+            .family = PagedCacheGroupFamily::History,
+        });
         return cfg;
     }
 
@@ -60,22 +67,11 @@ protected:
 
     const SchedulerConfig& Config() const { return config_; }
     std::int32_t PageSize() const { return config_.block_size; }
-    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, token_t start = 1) {
+    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, std::int32_t start = 1) {
         auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
         return RequestSpec{
             .request_id = id,
             .tokens = tokens,
-        };
-    }
-
-    RequestSpec MakePrefetchableSpec(const std::string& id, std::int32_t num_pages, std::int32_t storage_hit_pages,
-                                     token_t start = 1) {
-        auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
-        return RequestSpec{
-            .request_id = id,
-            .tokens = tokens,
-            .rolling_hashes = MakePageHashes(storage_hit_pages, "rh"),
-            .storage_hit_pages = storage_hit_pages,
         };
     }
 
@@ -111,31 +107,29 @@ protected:
         return FilterByKind<Kind>(ExtractCacheOps(plan));
     }
 
-    void SendWriteBackDone(cache_op_id op_id, bool success = true) {
+    void SendWriteBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(CacheEvent{cache::WriteBackDone{
+        event.With(cache::WriteBackDone{
             .op_id = op_id,
-            .success = success,
-        }});
+        });
         scheduler_->Advance(std::move(event));
     }
 
-    void SendLoadBackDone(cache_op_id op_id, bool success = true) {
+    void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(CacheEvent{cache::LoadBackDone{
+        event.With(cache::LoadBackDone{
             .op_id = op_id,
-            .success = success,
-        }});
+        });
         scheduler_->Advance(std::move(event));
     }
 
     // Send ExtendResult (new decode tokens) to the scheduler.
     void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens) {
         ExecutionEvent event;
-        event.With(ForwardEvent{forward::ExtendResult{
+        event.With(forward::ExtendResult{
             .request_id = request_id,
             .tokens = tokens,
-        }});
+        });
         scheduler_->Advance(std::move(event));
     }
 
@@ -143,9 +137,15 @@ protected:
     // This triggers FinishEvent: Decoding → Draining (or Finished if no writeback needed).
     void SendFinish(const std::string& request_id) {
         ExecutionEvent event;
-        event.With(ForwardEvent{forward::Finish{
+        event.With(forward::Finish{
             .request_id = request_id,
-        }});
+        });
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendAbortEvent(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(forward::Abort{.request_id = request_id});
         scheduler_->Advance(std::move(event));
     }
 
@@ -153,12 +153,10 @@ protected:
     std::unique_ptr<Scheduler> scheduler_;
 };
 
-#if TOKENSPEED_FLAT_KVCACHE
-
-// Returns the first FlatForwardOperation in `plan`, or nullptr if none.
-inline const FlatForwardOperation* FindFlatOp(const ExecutionPlan& plan) {
+// Returns the first ForwardBatch in `plan`, or nullptr if none.
+inline const ForwardBatch* FindForwardBatch(const ExecutionPlan& plan) {
     for (const auto& op : plan.Operations()) {
-        if (const auto* flat = std::get_if<FlatForwardOperation>(&op)) return flat;
+        if (const auto* batch = std::get_if<ForwardBatch>(&op)) return batch;
     }
     return nullptr;
 }
@@ -188,10 +186,10 @@ inline std::size_t CollectDisjointRealPages(const std::vector<std::vector<std::i
     return real_entries;
 }
 
-// Kimi-K3-shaped flat KV-cache fixture: one full-attention (history) group
+// Kimi-K3-shaped KV-cache fixture: one full-attention (history) group
 // plus three linear-attention (state) groups drawing from one global pool.
-// Shared by test_flat_kvcache_lifecycle.cpp and test_flat_kvcache_scenarios.cpp.
-class FlatKimiFourGroupSuite : public SchedulerTestSuite {
+// Shared by test_kv_cache_lifecycle.cpp and test_kv_cache_scenarios.cpp.
+class KimiFourGroupSuite : public SchedulerTestSuite {
 protected:
     static const std::array<std::string, 4>& GroupIds() {
         static const std::array<std::string, 4> ids{"full_attention", "linear_attention_0", "linear_attention_1",
@@ -223,13 +221,7 @@ protected:
         return cfg;
     }
 
-    void AbortRequest(const std::string& id) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::Abort{.request_id = id}});
-        scheduler_->Advance(std::move(event));
-    }
+    void AbortRequest(const std::string& id) { SendAbortEvent(id); }
 };
-
-#endif  // TOKENSPEED_FLAT_KVCACHE
 
 }  // namespace tokenspeed::test

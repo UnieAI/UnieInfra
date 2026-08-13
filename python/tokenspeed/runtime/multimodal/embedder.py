@@ -32,8 +32,8 @@ Three sequential phases:
      writes each item's output back onto the item itself (``item.encoded`` /
      ``item.encoded_deepstack``). In weight-TP mode every rank encodes the
      full miss list together. In item-DP mode each rank encodes a deterministic
-     subset of whole items and collects the variable-length results with
-     exact-size broadcasts.
+     subset of whole items and collects the variable-length results without
+     padding them to the largest rank output.
 
   3. ``_assemble`` runs the text-token embedding lookup and slices the
      encoder-token ranges into the right positions using the plan's
@@ -68,16 +68,19 @@ from tokenspeed.runtime.distributed.mapping import VisionTowerMapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager,
 )
+from tokenspeed.runtime.multimodal.encoder_feature_transport import (
+    EncoderFeatureTransport,
+)
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
     MultimodalForwardContext,
     MultimodalInputs,
 )
-from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
+EncoderWarmupItemsFactory = Callable[[], list[MultimodalDataItem]]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
@@ -89,11 +92,61 @@ class EncoderSpec:
 
     Bundles the encoder callable with whether its output needs to be
     split into a main + deepstack pair via the model's
-    ``separate_deepstack_embeds`` hook.
+    ``separate_deepstack_embeds`` hook. ``make_warmup_items`` is optional so
+    each encoder family can describe its native startup input without the
+    startup path assuming a particular modality or feature layout.
     """
 
     fn: EncoderFn
     deepstack: bool = False
+    make_warmup_items: EncoderWarmupItemsFactory | None = None
+
+
+def warmup_multimodal_encoders(
+    model: Any,
+    *,
+    device: str | torch.device,
+) -> None:
+    """Run each registered encoder family's native synthetic input."""
+    if not getattr(model, "is_multimodal_active", False):
+        return
+
+    get_specs = getattr(model, "get_multimodal_encoder_specs", None)
+    if not callable(get_specs):
+        return
+
+    warmup_device = torch.device(device)
+    specs: dict[Modality, EncoderSpec] = get_specs()
+    for modality, spec in specs.items():
+        if spec.make_warmup_items is None:
+            continue
+        items = spec.make_warmup_items()
+        if not items:
+            continue
+
+        start = time.perf_counter()
+        try:
+            with torch.inference_mode():
+                output = spec.fn(items)
+                del output
+                if warmup_device.type == "cuda":
+                    torch.cuda.synchronize(warmup_device)
+        except Exception:
+            logger.exception(
+                "Multimodal encoder warmup failed: modality=%s",
+                modality.name.lower(),
+            )
+            raise
+        logger.info(
+            "Multimodal encoder warmup complete: modality=%s "
+            "feature_shapes=%s elapsed=%.3f ms",
+            modality.name.lower(),
+            [
+                tuple(item.feature.shape) if item.feature is not None else None
+                for item in items
+            ],
+            (time.perf_counter() - start) * 1000.0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +291,7 @@ class MultimodalEmbedder:
         self._encoder_dp_rank = (
             encoder_mapping.dp_rank if encoder_mapping is not None else 0
         )
-        self._h2d_stream: torch.cuda.Stream | None = None
+        self._feature_transport = EncoderFeatureTransport(encoder_mapping)
 
     @property
     def has_encoder_dp(self) -> bool:
@@ -477,7 +530,7 @@ class MultimodalEmbedder:
         spec: EncoderSpec,
         device: torch.device,
     ) -> torch.Tensor:
-        self._move_features_to_device(items, device)
+        self._feature_transport.move_to_device(items, device)
         return spec.fn(items)
 
     def _encode_data_parallel(
@@ -491,6 +544,9 @@ class MultimodalEmbedder:
         assert self._encoder_dp_group is not None
         per_item_lens = tuple(_item_token_count(item) for item in items)
         assignment = _assign_encoder_items(per_item_lens, len(self._encoder_dp_group))
+        self._feature_transport.route_to_item_owners(
+            items, assignment.item_indices_by_rank
+        )
         local_indices = assignment.item_indices_by_rank[self._encoder_dp_rank]
         local_items = [items[index] for index in local_indices]
         local_rows = assignment.token_counts_by_rank[self._encoder_dp_rank]
@@ -524,6 +580,13 @@ class MultimodalEmbedder:
     def _gather_encoder_outputs(
         self, local_output: torch.Tensor, token_counts_by_rank: Sequence[int]
     ) -> torch.Tensor:
+        """Collect rank-major item-DP outputs directly into their final buffer.
+
+        A lone owner uses one exact-size broadcast. Equal non-empty outputs use
+        NCCL all-gather directly, while uneven outputs use C10d's coalesced
+        exact-size broadcasts through the uneven ``all_gather`` API. None of
+        the paths pads outputs to the largest rank-local row count.
+        """
         assert self._encoder_dp_group is not None
         total_rows = sum(token_counts_by_rank)
         output_width = local_output.shape[-1]
@@ -535,22 +598,49 @@ class MultimodalEmbedder:
         process_group = process_group_manager.get_process_group(
             "nccl", self._encoder_dp_group
         )
-        cursor = 0
-        for owner_rank, rows in enumerate(token_counts_by_rank):
-            if rows == 0:
-                continue
-            rank_output = gathered[cursor : cursor + rows]
+        nonempty_owner_ranks = [
+            rank for rank, rows in enumerate(token_counts_by_rank) if rows > 0
+        ]
+        if not nonempty_owner_ranks:
+            return gathered
+
+        if len(nonempty_owner_ranks) == 1:
+            owner_rank = nonempty_owner_ranks[0]
             if owner_rank == self._encoder_dp_rank:
-                rank_output.copy_(local_output)
-            # A sequence of exact-size broadcasts avoids max-row padding. In
-            # the common single-large-item case this reduces the temporary
-            # DP8 embedding buffer from 8x the result size to exactly 1x.
+                gathered.copy_(local_output)
+            # Avoid issuing one zero-count broadcast per idle rank through the
+            # uneven all-gather fallback. This is the common single-item case.
             torch.distributed.broadcast(
-                rank_output,
+                gathered,
                 src=self._encoder_dp_group[owner_rank],
                 group=process_group,
             )
+            return gathered
+
+        local_output = local_output.contiguous()
+        first_rank_rows = token_counts_by_rank[0]
+        if all(rows == first_rank_rows for rows in token_counts_by_rank):
+            # The flat API writes NCCL's equal-size all-gather directly into
+            # the final contiguous rank-major output buffer.
+            torch.distributed.all_gather_into_tensor(
+                gathered,
+                local_output,
+                group=process_group,
+            )
+            return gathered
+
+        rank_outputs: list[torch.Tensor] = []
+        cursor = 0
+        for rows in token_counts_by_rank:
+            rank_outputs.append(gathered.narrow(0, cursor, rows))
             cursor += rows
+        # PyTorch 2.11 implements uneven NCCL all-gather as one C10d call
+        # containing coalesced exact-size broadcasts, including zero-row views.
+        torch.distributed.all_gather(
+            rank_outputs,
+            local_output,
+            group=process_group,
+        )
         return gathered
 
     @staticmethod
@@ -633,60 +723,15 @@ class MultimodalEmbedder:
 
         return input_embeds, kwargs
 
-    # --- device helpers ----------------------------------------------------
-
-    def _h2d_stream_on(self, device: torch.device) -> torch.cuda.Stream:
-        if self._h2d_stream is None:
-            self._h2d_stream = torch.cuda.Stream(device=device)
-        return self._h2d_stream
-
-    def _move_features_to_device(
-        self, items: list[MultimodalDataItem], device: torch.device
-    ) -> None:
-        """Stage encoder features onto ``device`` on a dedicated H2D stream.
-
-        Inputs that originate from the SHM transport are pinned, so the
-        H2D copy can actually run async with respect to the LM kernels
-        already queued on the current stream. We synchronise the current
-        stream with the H2D stream so the encoder sees the moved tensors,
-        then record that consumer stream for allocator-safe reuse.
-        """
-        pending = [
-            it
-            for it in items
-            if isinstance(it.feature, (torch.Tensor, ShmTensorHandle))
-            and (isinstance(it.feature, ShmTensorHandle) or it.feature.device != device)
-        ]
-        if not pending:
-            return
-
-        for it in pending:
-            if isinstance(it.feature, ShmTensorHandle):
-                it.feature = it.feature.consume()
-
-        if device.type != "cuda":
-            for it in pending:
-                if isinstance(it.feature, torch.Tensor):
-                    it.feature = it.feature.to(device, non_blocking=True)
-            return
-
-        h2d = self._h2d_stream_on(device)
-        current = torch.cuda.current_stream(device)
-        with torch.cuda.stream(h2d):
-            for it in pending:
-                if isinstance(it.feature, torch.Tensor):
-                    it.feature = it.feature.to(device, non_blocking=True)
-        current.wait_stream(h2d)
-        for it in pending:
-            if isinstance(it.feature, torch.Tensor):
-                it.feature.record_stream(current)
+    # --- feature cleanup -------------------------------------------------
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:
-        if item.feature is None:
+        if item.feature is None and item.feature_shm is None:
             return False
-        if isinstance(item.feature, ShmTensorHandle):
-            item.feature.release()
+        if item.feature_shm is not None:
+            item.feature_shm.release()
+            item.feature_shm = None
         item.feature = None
         return True
 

@@ -19,36 +19,75 @@ def _up(x: torch.Tensor) -> tuple[torch.Tensor, None]:
     return torch.cat((x, torch.zeros_like(x)), dim=-1), None
 
 
-_TRACE_FNS = {
-    "router": lambda x: x[:, :2].float(),
-    "down": lambda x: x[:, :2],
-    "norm": lambda x: x + 3,
-    "up": _up,
-    "shared": lambda x: x * 4,
-}
+class _Router(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states[:, :2].float()
 
 
-class _Trace(nn.Module):
-    def __init__(self, events: list[str], name: str) -> None:
+class _Down(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states[:, :2]
+
+
+class _Norm(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + 3
+
+
+class _Up(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return _up(hidden_states)
+
+
+class _Shared(nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        down_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        result = hidden_states * 4
+        if down_out is not None:
+            down_out.copy_(result)
+            return down_out
+        return result
+
+
+class _Add3Up(nn.Module):
+    def __init__(self) -> None:
         super().__init__()
-        self.events, self.name = events, name
+        self.weight = nn.Parameter(torch.ones(4, 2))
+        self.fused_norm = False
 
-    def forward(self, hidden_states: torch.Tensor):
-        self.events.append(self.name)
-        return _TRACE_FNS[self.name](hidden_states)
+    def forward_add3(
+        self,
+        routed_latent: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        shared_output: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        eps: float | None = None,
+    ) -> torch.Tensor:
+        if norm_weight is not None:
+            assert eps == 1e-6
+            self.fused_norm = True
+            routed_latent = routed_latent + 3
+        routed_output, _ = _up(routed_latent)
+        return prefix_sum + routed_output + shared_output
+
+
+class _WeightedNorm(_Norm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2))
+        self.variance_epsilon = 1e-6
 
 
 class _TopK(nn.Module):
-    def __init__(self, events: list[str]) -> None:
-        super().__init__()
-        self.events = events
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> StandardTopKOutput:
-        self.events.append("topk")
         tokens = hidden_states.shape[0]
         weights = torch.ones(tokens, 1, device=hidden_states.device)
         ids = torch.zeros(tokens, 1, dtype=torch.int32, device=hidden_states.device)
@@ -70,9 +109,7 @@ class _TopK(nn.Module):
 
 
 class _Experts(nn.Module):
-    def __init__(self, events: list[str]) -> None:
-        super().__init__()
-        self.events = events
+    hidden_size = 2
 
     def forward(
         self,
@@ -81,18 +118,22 @@ class _Experts(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        self.events.append("experts")
         assert topk_output.topk_ids.shape == (hidden_states.shape[0], 1)
         assert num_global_tokens == hidden_states.shape[0]
         assert max_num_tokens_per_gpu == hidden_states.shape[0]
-        return hidden_states + 1
+        result = hidden_states + 1
+        output = getattr(self, "_situ_output_buffer", None)
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
 
 
-def test_kimi3_reduce_fused_moe_selects_lane_norm(
+def test_kimi3_join_reduce_moe_selects_lane_norm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fused = torch.arange(6, dtype=torch.float32).view(1, 6)
-    norm = _Trace([], "norm")
+    lane = torch.arange(6, dtype=torch.float32).view(1, 6)
+    norm = _Norm()
     norm.weight = nn.Parameter(torch.ones(2))
     norm.variance_epsilon = 1e-6
     monkeypatch.setattr(
@@ -106,8 +147,10 @@ def test_kimi3_reduce_fused_moe_selects_lane_norm(
         lambda *_args, **_kwargs: pytest.fail("lane norm must own the reduction"),
     )
 
-    routed, shared = latent_module.kimi3_reduce_fused_moe(
-        fused,
+    routed, shared = latent_module.kimi3_join_reduce_moe(
+        lane[:, :2],
+        lane[:, 2:],
+        lane=lane,
         routed_hidden=2,
         routed_norm=norm,
         group=(0, 1),
@@ -115,23 +158,26 @@ def test_kimi3_reduce_fused_moe_selects_lane_norm(
         max_token_num=8,
     )
 
-    torch.testing.assert_close(routed, fused[:, :2] + 10)
-    torch.testing.assert_close(shared, fused[:, 2:] + 10)
+    torch.testing.assert_close(routed, lane[:, :2] + 10)
+    torch.testing.assert_close(shared, lane[:, 2:] + 10)
 
 
-def test_kimi3_reduce_fused_moe_falls_back_for_multiple_tokens(
+def test_kimi3_join_reduce_moe_cats_small_partials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fused = torch.arange(12, dtype=torch.float32).view(2, 6)
-    norm = _Trace([], "norm")
+    routed_partial = torch.arange(4, dtype=torch.float32).view(2, 2)
+    shared_partial = torch.arange(8, dtype=torch.float32).view(2, 4)
+    norm = _Norm()
     monkeypatch.setattr(
         latent_module,
         "all_reduce",
         lambda value, _group: value + 10,
     )
 
-    routed, shared = latent_module.kimi3_reduce_fused_moe(
-        fused,
+    routed, shared = latent_module.kimi3_join_reduce_moe(
+        routed_partial,
+        shared_partial,
+        lane=None,
         routed_hidden=2,
         routed_norm=norm,
         group=(0, 1),
@@ -139,21 +185,101 @@ def test_kimi3_reduce_fused_moe_falls_back_for_multiple_tokens(
         max_token_num=8,
     )
 
-    torch.testing.assert_close(routed, fused[:, :2] + 13)
-    torch.testing.assert_close(shared, fused[:, 2:] + 10)
+    torch.testing.assert_close(routed, routed_partial + 13)
+    torch.testing.assert_close(shared, shared_partial + 10)
+
+
+def test_kimi3_join_reduce_moe_grouped_reduce_for_large_partials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routed_partial = torch.arange(4, dtype=torch.float32).view(2, 2)
+    shared_partial = torch.arange(8, dtype=torch.float32).view(2, 4)
+    norm = _Norm()
+    monkeypatch.setattr(latent_module, "COMM_ONESHOT_MAX_BYTES", 1)
+    monkeypatch.setattr(
+        latent_module,
+        "all_reduce",
+        lambda values, group: tuple(value + 20 for value in values),
+    )
+
+    routed, shared = latent_module.kimi3_join_reduce_moe(
+        routed_partial,
+        shared_partial,
+        lane=None,
+        routed_hidden=2,
+        routed_norm=norm,
+        group=(0, 1),
+        enable_lane_norm=True,
+        max_token_num=8,
+    )
+
+    torch.testing.assert_close(routed, routed_partial + 23)
+    torch.testing.assert_close(shared, shared_partial + 20)
+
+
+def test_latent_expert_shared_acquires_outputs_and_reduces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden_states = torch.empty(2, 3)
+    shared_staging = torch.empty(2, 5)
+    routed_staging = torch.empty(2, 3)
+    reduced_shared = torch.full_like(shared_staging, 7)
+    reduced_routed = torch.full_like(routed_staging, 11)
+
+    def fake_acquire(shapes, like, group):
+        assert shapes == ((2, 5), (2, 3))
+        assert like is hidden_states
+        assert group == (0, 1)
+        return shared_staging, routed_staging
+
+    def fake_all_reduce(outputs, group):
+        assert outputs[0] is shared_staging
+        assert outputs[1] is routed_staging
+        assert group == (0, 1)
+        return reduced_shared, reduced_routed
+
+    def fake_producer(*_args, routed_out, shared_out, **_kwargs):
+        assert routed_out is routed_staging
+        assert shared_out is shared_staging
+        return routed_out, shared_out
+
+    monkeypatch.setattr(latent_module, "acquire_all_reduce_outputs", fake_acquire)
+    monkeypatch.setattr(latent_module, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(latent_module, "latent_moe_expert_shared", fake_producer)
+    placeholder = torch.empty(1)
+
+    routed, shared = latent_module.latent_moe_expert_shared_all_reduce(
+        hidden_states,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        torch.empty(5, 1),
+        activation_clamp=1.0,
+        linear_clamp=None,
+        expert_start=0,
+        w13_interleaved=False,
+        group=(0, 1),
+    )
+
+    assert routed is reduced_routed
+    assert shared is reduced_shared
 
 
 def _layer(
-    events: list[str],
     experts: nn.Module | None = None,
     **kwargs,
 ) -> LatentMoELayer:
+    routed_up_proj = kwargs.pop("routed_up_proj", _Up())
     return LatentMoELayer(
-        router=_Trace(events, "router"),
-        topk=_TopK(events),
-        routed_down_proj=_Trace(events, "down"),
-        experts=experts or _Experts(events),
-        routed_up_proj=_Trace(events, "up"),
+        router=_Router(),
+        topk=_TopK(),
+        routed_down_proj=_Down(),
+        experts=experts or _Experts(),
+        routed_up_proj=routed_up_proj,
         **kwargs,
     )
 
@@ -176,7 +302,7 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
 
     with mock.patch.object(
         latent_module,
-        "kimi3_native_moe_available",
+        "native_latent_moe_available",
         return_value=True,
     ):
         plan = Kimi3MoEExecutionPlan.build(
@@ -187,12 +313,12 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
         )
 
     assert plan.use_native
-    assert not plan.use_sidecar
+    assert not plan.use_trtllm
     assert plan.use_precomputed_topk
     assert plan.joint_moe_reduce
 
 
-def test_kimi3_moe_execution_policy_preserves_nvidia_sidecar() -> None:
+def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
     mapping = SimpleNamespace(
         moe=SimpleNamespace(
             tp_size=8,
@@ -205,11 +331,12 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_sidecar() -> None:
     backend = SimpleNamespace(
         is_auto=lambda: True,
         is_flashinfer_trtllm=lambda: False,
+        is_marlin=lambda: False,
     )
 
     with mock.patch.object(
         latent_module,
-        "kimi3_native_moe_available",
+        "native_latent_moe_available",
         return_value=False,
     ):
         plan = Kimi3MoEExecutionPlan.build(
@@ -220,7 +347,7 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_sidecar() -> None:
         )
 
     assert not plan.use_native
-    assert plan.use_sidecar
+    assert plan.use_trtllm
     assert plan.use_precomputed_topk
     assert not plan.overlap_shared_experts
     assert not plan.joint_moe_reduce
@@ -238,7 +365,7 @@ def test_kimi3_moe_execution_plan_prepares_latent_fusions(
     )
     plan = Kimi3MoEExecutionPlan(
         use_native=False,
-        use_sidecar=True,
+        use_trtllm=True,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
     )
@@ -273,20 +400,15 @@ def test_kimi3_moe_execution_plan_prepares_latent_fusions(
 
 
 def test_latent_moe_runtime_preserves_widths_and_reduction_order() -> None:
-    events: list[str] = []
-
     def latent_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
-        events.append("latent_reduce")
         return hidden_states * 2
 
     def shared_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
-        events.append("shared_reduce")
         return hidden_states + 5
 
     layer = _layer(
-        events,
-        routed_norm=_Trace(events, "norm"),
-        shared_experts=_Trace(events, "shared"),
+        routed_norm=_Norm(),
+        shared_experts=_Shared(),
         latent_reduce=latent_reduce,
         shared_reduce=shared_reduce,
     )
@@ -298,37 +420,79 @@ def test_latent_moe_runtime_preserves_widths_and_reduction_order() -> None:
     routed = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
     expected = routed + hidden_states * 4 + 5
     torch.testing.assert_close(actual, expected)
-    routed_events = [event for event in events if not event.startswith("shared")]
-    assert routed_events == [
-        "router",
-        "topk",
-        "down",
-        "experts",
-        "latent_reduce",
-        "norm",
-        "up",
-    ]
-    # The shared branch is independent and may execute before or concurrently
-    # with routed work; its reduction remains ordered after the branch joins.
-    assert events.index("shared") < events.index("shared_reduce")
-    assert events[-1] == "shared_reduce"
 
 
-def test_latent_moe_jointly_reduces_shared_and_routed_partials() -> None:
-    events: list[str] = []
-
-    def joint_reduce(
-        shared: torch.Tensor,
-        routed: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        events.append("joint_reduce")
-        return shared + 5, routed * 2
+def test_latent_moe_uses_injected_input_projections() -> None:
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    input_projections = mock.Mock(
+        return_value=(
+            hidden_states[:, :2].float(),
+            hidden_states[:, :2] + 10,
+            hidden_states * 6,
+        )
+    )
 
     layer = _layer(
-        events,
-        routed_norm=_Trace(events, "norm"),
-        shared_experts=_Trace(events, "shared"),
-        joint_reduce=joint_reduce,
+        routed_norm=_Norm(),
+        shared_experts=_Shared(),
+        input_projections=input_projections,
+    )
+
+    actual = layer(hidden_states)
+
+    latent = hidden_states[:, :2] + 10 + 1 + 3
+    expected = torch.cat((latent, torch.zeros_like(latent)), dim=-1) + hidden_states * 6
+    torch.testing.assert_close(actual, expected)
+    input_projections.assert_called_once_with(hidden_states, None)
+
+
+def test_latent_moe_falls_back_when_input_projections_declines() -> None:
+    input_projections = mock.Mock(return_value=None)
+
+    layer = _layer(
+        routed_norm=_Norm(),
+        shared_experts=_Shared(),
+        input_projections=input_projections,
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    actual = layer(hidden_states)
+
+    latent = hidden_states[:, :2] + 1 + 3
+    expected = torch.cat((latent, torch.zeros_like(latent)), dim=-1) + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    input_projections.assert_called_once_with(hidden_states, None)
+
+
+def test_latent_moe_rejects_input_projections_without_shared_experts() -> None:
+    with pytest.raises(ValueError, match="input_projections requires shared_experts"):
+        _layer(input_projections=lambda hidden_states, shared_out: None)
+
+
+def test_latent_moe_acquires_shared_and_routed_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acquisitions = []
+
+    def acquire_outputs(shapes, like, group):
+        assert group == (0,)
+        outputs = tuple(like.new_empty(shape) for shape in shapes)
+        acquisitions.append(outputs)
+        return outputs
+
+    def reduce_outputs(outputs, group):
+        assert outputs is acquisitions[0]
+        assert group == (0,)
+        return outputs[0] + 5, outputs[1] * 2
+
+    monkeypatch.setattr(latent_module, "acquire_all_reduce_outputs", acquire_outputs)
+    monkeypatch.setattr(latent_module, "all_reduce", reduce_outputs)
+
+    layer = _layer(
+        routed_norm=_Norm(),
+        shared_experts=_Shared(),
+        joint_reduce=True,
+        expert_parallel_group=(0,),
     )
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
 
@@ -338,16 +502,12 @@ def test_latent_moe_jointly_reduces_shared_and_routed_partials() -> None:
     routed = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
     expected = routed + hidden_states * 4 + 5
     torch.testing.assert_close(actual, expected)
-    assert events.count("joint_reduce") == 1
-    assert events.index("experts") < events.index("joint_reduce")
-    assert events.index("joint_reduce") < events.index("norm")
+    assert len(acquisitions) == 1
 
 
 def test_latent_moe_can_return_separate_residual_components() -> None:
-    events: list[str] = []
     layer = _layer(
-        events,
-        shared_experts=_Trace(events, "shared"),
+        shared_experts=_Shared(),
         return_separate_outputs=True,
     )
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
@@ -360,22 +520,92 @@ def test_latent_moe_can_return_separate_residual_components() -> None:
     torch.testing.assert_close(shared, hidden_states * 4)
 
 
-def test_latent_moe_rejects_joint_and_individual_reducers() -> None:
-    events: list[str] = []
+def test_latent_moe_fuses_output_projection_addends_without_norm() -> None:
+    layer = _layer(
+        shared_experts=_Shared(),
+        routed_up_proj=_Add3Up(),
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
 
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed_latent = hidden_states[:, :2] + 1
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+
+
+def test_latent_moe_fuses_norm_output_projection_addends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        latent_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    layer = _layer(
+        routed_norm=_WeightedNorm(),
+        shared_experts=_Shared(),
+        routed_up_proj=_Add3Up(),
+    )
+    hidden_states = torch.arange(4, dtype=torch.float32).view(1, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed_latent = hidden_states[:, :2] + 4
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    assert layer.routed_up_proj.fused_norm
+
+
+@pytest.mark.parametrize(("tokens", "is_cdna4"), [(1, False), (3, True)])
+def test_latent_moe_preserves_unfused_norm_add3_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens: int,
+    is_cdna4: bool,
+) -> None:
+    monkeypatch.setattr(
+        latent_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=is_cdna4),
+    )
+    layer = _layer(
+        routed_norm=_WeightedNorm(),
+        shared_experts=_Shared(),
+        routed_up_proj=_Add3Up(),
+    )
+    hidden_states = torch.arange(tokens * 4, dtype=torch.float32).view(tokens, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed_latent = hidden_states[:, :2] + 4
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    assert not layer.routed_up_proj.fused_norm
+
+
+def test_latent_moe_prefix_requires_shared_experts() -> None:
+    with pytest.raises(ValueError, match="prefix_sum requires shared_experts"):
+        _layer()(torch.ones(2, 4), prefix_sum=torch.ones(2, 4))
+
+
+def test_latent_moe_rejects_joint_and_individual_reducers() -> None:
     with pytest.raises(ValueError, match="joint_reduce cannot be combined"):
         _layer(
-            events,
-            shared_experts=_Trace(events, "shared"),
+            shared_experts=_Shared(),
             latent_reduce=lambda x: x,
-            joint_reduce=lambda shared, routed: (shared, routed),
+            joint_reduce=True,
+            expert_parallel_group=(0,),
         )
 
 
 def test_latent_moe_runtime_rejects_wrong_latent_reduction_shape() -> None:
-    events: list[str] = []
     layer = _layer(
-        events,
         latent_reduce=lambda x: x[:, :1],
     )
 
@@ -384,8 +614,8 @@ def test_latent_moe_runtime_rejects_wrong_latent_reduction_shape() -> None:
 
 
 class _EpExperts(_Experts):
-    def __init__(self, events: list[str], ep_size: int, num_experts: int = 8) -> None:
-        super().__init__(events)
+    def __init__(self, ep_size: int, num_experts: int = 8) -> None:
+        super().__init__()
         self.ep_size = ep_size
         self.num_experts = num_experts
         self.num_local_experts = num_experts // ep_size
@@ -397,19 +627,16 @@ def test_latent_moe_ep_all_reduces_before_norm(
     monkeypatch: pytest.MonkeyPatch,
     ep_size: int,
 ) -> None:
-    events: list[str] = []
     group = tuple(range(ep_size))
 
     def fake_all_reduce(value: torch.Tensor, *, group: tuple[int, ...]):
         assert group == tuple(range(ep_size))
-        events.append("ep_all_reduce")
         return value * ep_size
 
     monkeypatch.setattr(latent_module, "all_reduce", fake_all_reduce)
     layer = _layer(
-        events,
-        _EpExperts(events, ep_size),
-        routed_norm=_Trace(events, "norm"),
+        _EpExperts(ep_size),
+        routed_norm=_Norm(),
         expert_parallel_group=group,
     )
     hidden_states = torch.arange(8, dtype=torch.float32).view(2, 4)
@@ -419,21 +646,17 @@ def test_latent_moe_ep_all_reduces_before_norm(
     latent = (hidden_states[:, :2] + 1) * ep_size + 3
     expected = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
     torch.testing.assert_close(actual, expected)
-    assert events.index("experts") < events.index("ep_all_reduce")
-    assert events.index("ep_all_reduce") < events.index("norm")
 
 
 def test_latent_moe_ep_requires_group_or_explicit_reducer() -> None:
-    events: list[str] = []
     with pytest.raises(ValueError, match="expert_parallel_group"):
-        _layer(events, _EpExperts(events, 2))
+        _layer(_EpExperts(2))
 
 
 def test_latent_moe_infers_ep_group_from_experts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    events: list[str] = []
-    experts = _EpExperts(events, 2)
+    experts = _EpExperts(2)
     experts.ep_group = (2, 3)
     calls: list[tuple[int, ...]] = []
 
@@ -442,7 +665,7 @@ def test_latent_moe_infers_ep_group_from_experts(
         return value
 
     monkeypatch.setattr(latent_module, "all_reduce", fake_all_reduce)
-    layer = _layer(events, experts)
+    layer = _layer(experts)
 
     layer(torch.ones(2, 4))
 
@@ -450,10 +673,8 @@ def test_latent_moe_infers_ep_group_from_experts(
 
 
 def test_latent_moe_rejects_ep_above_eight() -> None:
-    events: list[str] = []
     with pytest.raises(ValueError, match="ep_size in"):
         _layer(
-            events,
-            _EpExperts(events, 16, num_experts=16),
+            _EpExperts(16, num_experts=16),
             latent_reduce=lambda x: x,
         )

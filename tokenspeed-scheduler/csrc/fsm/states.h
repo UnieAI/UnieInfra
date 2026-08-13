@@ -20,16 +20,24 @@
 
 #pragma once
 
+#include <utility>
 #include <variant>
 
-#include "fsm/pd_states.h"
 #include "fsm/forward_states.h"
-#include "fsm/cache_states.h"
+#include "fsm/pd_states.h"
 
 // Put resources into each particular state
 namespace tokenspeed::fsm {
 
-using State = std::variant<Bootstrapping, Submitted, Prefetching, PrefetchDone, Aborting, Prefilling, PrefillDone,
-                           Decoding, Draining, WritingBack, Retracting, Retracted, Finished>;
+using State = std::variant<Bootstrapping, Submitted, Prefilling, PrefillDone, Decoding, Retracted, Finished>;
+
+inline State ToState(State state) {
+    return state;
+}
+
+template <typename... StateTs>
+State ToState(std::variant<StateTs...>&& state) {
+    return std::visit([](auto&& inner) -> State { return State{std::move(inner)}; }, std::move(state));
+}
 
 }  // namespace tokenspeed::fsm

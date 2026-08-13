@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Sequence
 
 import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
 import torch
@@ -662,7 +663,6 @@ if _ragged_prefill_available():
 # FA2 kernels is the closest available equivalent.
 
 _paged_prefill_wrappers: dict[tuple, "BatchPrefillWithPagedKVCacheWrapper"] = {}
-_paged_prefill_plans: dict[int, tuple] = {}
 # 512 MB, matching the trtllm path above rather than the 128 MB the ragged
 # sibling uses. flashinfer sizes batch_prefill_tmp_v from the batch and head
 # geometry, and 128 MB is enough for an 8B at one request but overflows on
@@ -673,13 +673,24 @@ _paged_prefill_plans: dict[int, tuple] = {}
 # benchmark cannot find.
 _PAGED_PREFILL_WORKSPACE_BYTES = 512 * 1024 * 1024
 
-# Plans installed by the runtime for the forward that is about to run, so the
-# 36 layers of that forward do not each rebuild one. A list rather than a single
-# entry because the flat KV path gives each state group its own page table, and
-# a layer is served by its group's -- so there is one plan per group, not per
-# forward. Matched by tensor identity, scanned linearly (groups number in the
-# low single digits). See `install_paged_extend_plan`.
+# Batches installed by the runtime for the forward that is about to run, each
+# with a wrapper of its own, so the 60 layers of that forward do not each
+# rebuild a plan. A list rather than a single entry because the flat KV path
+# gives each cache group its own page table and a layer is served by its
+# group's -- so there is one entry per group, not per forward. Its wrapper is
+# planned on first use and re-planned only when the LAYER's geometry or scale
+# changes; sharing a wrapper between two groups is the whole bug this
+# arrangement exists to prevent. Matched by tensor identity, scanned linearly
+# (groups number in the low single digits). See `install_paged_extend_plan`.
 _installed_paged_plans: list[dict] = []
+
+# Wrapper slot for calls that arrive with NO installed plan. It must never
+# collide with an installed group's slot (0, 1, 2, ...): planning a wrapper
+# overwrites whatever plan it held, so a fallback call that borrowed slot 0
+# would silently re-point group 0's installed plan at its own pages, and the
+# next group-0 layer would then attend over them. Negative slots are unreachable
+# from `len(_installed_paged_plans)`.
+_PAGED_FALLBACK_SLOT = -1
 
 
 def _paged_prefill_wrapper(device: torch.device, slot: int = 0):
@@ -750,6 +761,68 @@ def _paged_plan_key(
     )
 
 
+def _plan_paged_extend(
+    wrapper,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens_cpu: Sequence[int],
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    is_causal: bool,
+    softmax_scale: float,
+    window_left: int,
+    logit_cap: float,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    """Plan `wrapper` for one page table at one layer geometry.
+
+    `page_size` is the LAYER'S, not the pool's: a heterogeneous-KV model (Gemma
+    4) pages its full-attention group at a different granularity from its
+    sliding groups, so the page count per request is a function of the caller's
+    cache view and cannot be precomputed from a pool-wide constant.
+
+    Everything here is derived from `seq_lens_cpu` (host-side) and `page_table`
+    (device-side, gathered without a read-back), so no call syncs.
+    """
+    pages_per_seq = [(int(n) + page_size - 1) // page_size for n in seq_lens_cpu]
+    kv_indptr = [0]
+    for n in pages_per_seq:
+        kv_indptr.append(kv_indptr[-1] + n)
+    last_page_len = [
+        max(1, int(n) - (p - 1) * page_size) if p else 1
+        for n, p in zip(seq_lens_cpu, pages_per_seq)
+    ]
+    device = page_table.device
+    kv_indices = torch.cat([page_table[i, :p] for i, p in enumerate(pages_per_seq)]).to(
+        torch.int32
+    )
+    # The wrapper's internal buffers are allocated on first use. When the caller
+    # plans from `init_forward_metadata` that happens outside inference mode,
+    # and writing to an inference tensor from normal mode raises; entering it
+    # here makes both call sites agree.
+    with torch.inference_mode():
+        wrapper.plan(
+            cu_seqlens_q.to(torch.int32),
+            torch.tensor(kv_indptr, dtype=torch.int32, device=device),
+            kv_indices,
+            torch.tensor(last_page_len, dtype=torch.int32, device=device),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=is_causal,
+            sm_scale=softmax_scale,
+            window_left=window_left,
+            logits_soft_cap=logit_cap,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+        )
+
+
 def _run_paged_extend(
     wrapper,
     q: torch.Tensor,
@@ -803,24 +876,13 @@ def install_paged_extend_plan(
     *,
     cu_seqlens_q: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    seq_lens_cpu: list[int],
+    seq_lens_cpu: Sequence[int],
     page_table: torch.Tensor,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    is_causal: bool,
-    softmax_scale: float,
-    window_left: int,
-    logit_cap: float,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
 ) -> None:
-    """Plan the FA2 paged extend wrapper once for the forward about to run.
+    """Reserve a wrapper for one page table of the forward about to run.
 
-    Without this the kernel plans per call, and the expensive part is not
-    `plan()` -- that is content-keyed and already hits its cache after layer 0 --
-    but the `cache_seqlens.to("cpu")` needed to build the key. On CUDA that
+    Without this the kernel plans per call, and the expensive part is the
+    `cache_seqlens.to("cpu")` needed to describe the batch. On CUDA that
     synchronises, so every layer drains the queue that the previous layers just
     filled, serialising exactly the CPU/GPU overlap the engine is built around.
     SGLang avoids it by planning in `init_forward_metadata`
@@ -830,73 +892,42 @@ def install_paged_extend_plan(
     already has it (prefix + extend, both CPU-side in the extend metadata), so
     computing it here costs no sync.
 
-    The kernel accepts the installed plan only when the tensors it was handed are
-    the very objects named here (`is`, not equality), so a plan can never be
-    applied to a different batch.
+    What is installed is the batch description and a wrapper of its own, NOT a
+    finished plan. The per-layer geometry (head count, head dim, page size) and
+    the softmax scale, window and soft cap are the LAYER'S, and a caller that
+    plans a forward cannot know them: a heterogeneous-KV model has more than one
+    geometry across the layers sharing this forward (Gemma 4: 16 x 256 at page
+    16 on its sliding groups, 4 x 512 at page 32 on its full-attention one), and
+    the scale is a model constant the backend does not carry (Gemma 4 declares
+    1.0, not `head_dim ** -0.5`). So the first layer to use a page table plans
+    its wrapper with the values it was actually handed, and the remaining layers
+    of that group reuse it. Planning from `seq_lens_cpu` costs no sync wherever
+    it happens, which is what makes deferring it free.
+
+    The kernel accepts the installed entry only when the tensors it was handed
+    are the very objects named here (`is`, not equality), so an entry can never
+    be applied to a different batch -- and, critically, never to a different
+    page table: one wrapper per table is what keeps one cache group's pages out
+    of another's attention.
     """
     if not _paged_prefill_available():
         _installed_paged_plans.clear()
         return
 
-    pages_per_seq = [(n + page_size - 1) // page_size for n in seq_lens_cpu]
-    kv_indptr = [0]
-    for n in pages_per_seq:
-        kv_indptr.append(kv_indptr[-1] + n)
-    last_page_len = [
-        max(1, n - (p - 1) * page_size) if p else 1
-        for n, p in zip(seq_lens_cpu, pages_per_seq)
-    ]
-
-    device = page_table.device
-    wrapper = _paged_prefill_wrapper(device, len(_installed_paged_plans))
-    # The wrapper's internal buffers are allocated on first use, which happens
-    # inside the model forward and therefore under inference mode. Planning from
-    # `init_forward_metadata` runs outside it, and writing to an inference
-    # tensor from normal mode raises. Enter it here so both paths agree.
-    with torch.inference_mode():
-        kv_indices = torch.cat(
-            [page_table[i, :p] for i, p in enumerate(pages_per_seq)]
-        ).to(torch.int32)
-        wrapper.plan(
-            cu_seqlens_q.to(torch.int32),
-            torch.tensor(kv_indptr, dtype=torch.int32, device=device),
-            kv_indices,
-            torch.tensor(last_page_len, dtype=torch.int32, device=device),
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            causal=is_causal,
-            sm_scale=softmax_scale,
-            window_left=window_left,
-            logits_soft_cap=logit_cap,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-        )
     _installed_paged_plans.append(
         {
-            "wrapper": wrapper,
+            "wrapper": _paged_prefill_wrapper(
+                page_table.device, len(_installed_paged_plans)
+            ),
             "cu_seqlens_q": cu_seqlens_q,
             "cache_seqlens": cache_seqlens,
             "page_table": page_table,
+            "seq_lens_cpu": [int(n) for n in seq_lens_cpu],
             "total_q": int(cu_seqlens_q[-1]) if cu_seqlens_q.numel() else 0,
-            "shape": _paged_plan_key(
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                page_size,
-                is_causal,
-                window_left,
-                q_dtype,
-                kv_dtype,
-            ),
-            "softmax_scale": float(softmax_scale),
-            "logit_cap": float(logit_cap),
+            # Filled in by the first layer that uses this table; see above.
+            "planned": None,
         }
     )
-    # `plan()` above already keyed the wrapper's own cache; keep the per-call
-    # path's bookkeeping in step so it does not re-plan on top of this.
-    _paged_prefill_plans.pop(id(wrapper), None)
 
 
 if _paged_prefill_available():
@@ -967,101 +998,98 @@ if _paged_prefill_available():
             q.dtype,
             k_cache.dtype,
         )
-        # Fast path: the runtime planned this forward already. Identity checks
-        # only -- no `.tolist()`, no `.to("cpu")`, so no sync. The runtime
-        # installs or clears on every extend forward, so a match here cannot be
-        # a leftover from an earlier one.
+        # Fast path: the runtime reserved a wrapper for this batch and this page
+        # table. Identity checks only -- no `.tolist()`, no `.to("cpu")`, so no
+        # sync. The runtime installs or clears on every extend forward, so a
+        # match here cannot be a leftover from an earlier one.
+        #
+        # The match is on the BATCH (which rows, which pages), never on the
+        # layer's geometry or scale: those belong to the caller and are re-planned
+        # below whenever they change. Folding them into the match instead sends
+        # any layer that disagrees with the installed values down the per-call
+        # path -- which is where the pages got crossed (see there).
         for installed in _installed_paged_plans:
-            if (
+            if not (
                 installed["cu_seqlens_q"] is cu_seqlens_q
                 and installed["cache_seqlens"] is cache_seqlens
                 and installed["page_table"] is page_table
-                and installed["shape"] == shape_key
-                # Compared with a tolerance, not for equality: the caller's
-                # scale and the plan's are the same quantity written two ways
-                # (`head_dim ** -0.5` vs `1 / sqrt(head_dim)`), and those differ
-                # in the last bit. Exact comparison silently disabled this whole
-                # fast path once already. 1e-12 relative is ~4 orders above that
-                # difference and still rejects any genuinely different scale.
-                and math.isclose(
-                    installed["softmax_scale"], softmax_scale, rel_tol=1e-12
-                )
-                and math.isclose(installed["logit_cap"], logit_cap, abs_tol=1e-12)
             ):
-                return _run_paged_extend(
+                continue
+            want = (shape_key, float(softmax_scale), float(logit_cap))
+            if installed["planned"] != want:
+                _plan_paged_extend(
                     installed["wrapper"],
-                    q,
-                    installed["total_q"],
-                    k_cache,
-                    v_cache,
-                    return_lse,
-                    k_scale,
-                    v_scale,
+                    cu_seqlens_q=cu_seqlens_q,
+                    page_table=page_table,
+                    seq_lens_cpu=installed["seq_lens_cpu"],
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    is_causal=is_causal,
+                    softmax_scale=softmax_scale,
+                    window_left=window_left,
+                    logit_cap=logit_cap,
+                    q_dtype=q.dtype,
+                    kv_dtype=k_cache.dtype,
                 )
+                installed["planned"] = want
+            return _run_paged_extend(
+                installed["wrapper"],
+                q,
+                installed["total_q"],
+                k_cache,
+                v_cache,
+                return_lse,
+                k_scale,
+                v_scale,
+            )
 
+        # No reservation for this batch: describe it here instead. `cache_seqlens`
+        # is on device, so this costs one host copy -- a sync per layer, which is
+        # why SGLang builds it once per forward in `init_forward_metadata` and why
+        # `install_paged_extend_plan` exists.
+        #
+        # This path plans EVERY call, and it must. A plan is a page list, and the
+        # only cheap description of a page list is the table it came from -- which
+        # is a device tensor, so nothing that can be compared here without another
+        # sync. A cache keyed on the batch's SHAPE instead (page counts, last-page
+        # fills, query offsets, geometry) collides between any two page tables of
+        # equal shape, and the flat KV path hands out one table per cache group:
+        # gemma-4-31B publishes six (five sliding sub-groups plus full_attention),
+        # all with identical page counts for a given request. Under that key the
+        # first group planned the shared wrapper and the other four ran on ITS
+        # pages -- fluent output, entirely the wrong sequence, nothing raised.
+        # Measured directly: two tables over disjoint pages, same shape, gave
+        # bit-identical outputs where the Triton kernel differed by 2.78.
+        #
         # The runtime hands over a q padded up to a graph bucket and relies on
         # the kernel ignoring the tail (see `_scrub_extend_padding` in the MHA
         # backend); the trtllm and Triton kernels do. This one asserts
         # `q.shape[0] == qo_indptr[-1]` instead, so trim to the real tokens and
         # give the padded rows back untouched.
-        cu_q_cpu = cu_seqlens_q.tolist()
-        total_q = int(cu_q_cpu[-1])
-
-        # flashinfer wants the page list as a CSR-style (indptr, indices) pair
-        # rather than a rectangular table, plus how full the last page is.
-        # `cache_seqlens` is on device; the one host copy per call is what the
-        # plan needs, and it is why SGLang builds this once per forward in
-        # `init_forward_metadata` rather than once per layer. Doing the same
-        # here is the next step, not this one -- this port keeps the kernel
-        # boundary where the registry expects it.
+        total_q = int(cu_seqlens_q[-1]) if cu_seqlens_q.numel() else 0
         seqlens_cpu = cache_seqlens.to("cpu", non_blocking=False)
-        pages_per_seq = (seqlens_cpu + (page_size - 1)) // page_size
-        kv_indptr_cpu = torch.zeros(pages_per_seq.numel() + 1, dtype=torch.int32)
-        torch.cumsum(pages_per_seq, dim=0, out=kv_indptr_cpu[1:])
-        last_page_len_cpu = seqlens_cpu - (pages_per_seq - 1) * page_size
-        last_page_len_cpu = last_page_len_cpu.clamp(min=1).to(torch.int32)
-
-        plan_key = (
-            tuple(kv_indptr_cpu.tolist()),
-            tuple(last_page_len_cpu.tolist()),
-            tuple(cu_q_cpu),
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            bool(is_causal),
-            float(softmax_scale),
-            int(window_left),
-            float(logit_cap),
-            q.dtype,
-            k_cache.dtype,
+        # A dedicated wrapper: planning one overwrites the plan it held, so
+        # borrowing an installed group's slot would re-point that group at this
+        # call's pages.
+        wrapper = _paged_prefill_wrapper(q.device, _PAGED_FALLBACK_SLOT)
+        _plan_paged_extend(
+            wrapper,
+            cu_seqlens_q=cu_seqlens_q,
+            page_table=page_table,
+            seq_lens_cpu=seqlens_cpu.tolist(),
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            is_causal=is_causal,
+            softmax_scale=softmax_scale,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            q_dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
         )
-        wrapper = _paged_prefill_wrapper(q.device)
-        if _paged_prefill_plans.get(id(wrapper)) != plan_key:
-            kv_indices = torch.cat(
-                [
-                    page_table[i, : int(pages_per_seq[i])]
-                    for i in range(pages_per_seq.numel())
-                ]
-            ).to(torch.int32)
-            wrapper.plan(
-                cu_seqlens_q.to(torch.int32),
-                kv_indptr_cpu.to(q.device),
-                kv_indices,
-                last_page_len_cpu.to(q.device),
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                page_size,
-                causal=is_causal,
-                sm_scale=softmax_scale,
-                window_left=window_left,
-                logits_soft_cap=logit_cap,
-                q_data_type=q.dtype,
-                kv_data_type=k_cache.dtype,
-            )
-            _paged_prefill_plans[id(wrapper)] = plan_key
-
         return _run_paged_extend(
             wrapper, q, total_q, k_cache, v_cache, return_lse, k_scale, v_scale
         )

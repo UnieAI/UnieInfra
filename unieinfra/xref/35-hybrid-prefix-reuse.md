@@ -240,3 +240,136 @@ TPS 升 12%–162%**，且 conc=16 的 TTFT p99 從 6.4 s 降到 742 ms —— �
 
 再跑 `e2e_concurrency.py --shape shared`（注意：那個形狀量的是完全重複，RAG 要用
 `reuse_probe` 或新增一個 shape），確認 TTFT 下降、TPS 上升。
+
+---
+
+## 文獻對照（讀於 2026-08-11）：我們實作的東西在論文裡叫 `Balanced`
+
+三篇，一篇有 code。它們把上面「為什麼是 0」與「K 取多少」兩節從工程判斷變成有名字的
+已知問題，並指出我們選的那個點不是最佳解。
+
+### 1. 我們的 0 是一個退化解，不是 bug
+
+*Sparse Prefix Caching for Hybrid and Recurrent LLM Serving*（arXiv 2605.05219，
+Shirokikh & Nikolenko，2026-05）把這題形式化。給定快照集合 `C = {c_1 < … < c_M}`，
+一個重疊深度為 `t` 的請求能接續的最深快照是：
+
+```
+ℓ(t; C) = max({0} ∪ {c ∈ C : c ≤ t})
+```
+
+需要重算 `r(t; C) = t − ℓ(t; C)` 個 token 的遞迴工作。
+
+那個 `∪ {0}` 就是本文件開頭那件事的數學版：**只有一個快照、而且它坐在比 `t` 深的位置
+時，集合是空的，`ℓ = 0`，整段重算。** `MambaCheckpointPublishDepth` 把唯一的快照發在
+`final_len` 附近，對任何在中途分岔的請求都是子孫節點 —— 所以 RAG 形狀必然是 0，
+而完全重複必然是滿的。兩個極端是同一個式子的兩端，不是兩個 bug。
+
+論文另外證明（Remark 1）**從快照重放是輸出精確的**：遞迴更新是決定性的，從 `c` 重放
+`c+1…t` 得到的狀態與從 0 全跑相同，他們跨資料集驗過 bit-exact。這與本文件
+`rag_correct.py` 的逐字相同是同一個保證，可以互相佐證。
+
+### 2. `G = 512` 等距 = 論文的 `Balanced`，而它只在重疊均勻時最佳
+
+論文比較五種配置策略。對照本文件「K 取多少」那節：
+
+| 論文策略 | 快照位置 | 我們 |
+|---|---|---|
+| No cache | — | 修改前 |
+| **Balanced** | `⌊i(L+1)/(M+1)⌋` 等距 | **現在（G = 512）** |
+| Block | `B, 2B, …, ⌊L/B⌋B` | — |
+| Sqrt | `⌊√L⌋` 間隔 | — |
+| DP-optimal | 依重疊分布解 Thm 2 | — |
+
+**Theorem 1**：balanced 在**均勻重疊**與**最差情況**下最佳，最差重算
+`⌈(L+1)/(M+1)⌉ − 1` —— 這正是本文件表格裡「G=512 → 最差重用 2048」那一欄，我們當時
+是手算出來的。
+
+**但 Fig 1 顯示真實重疊分布離均勻很遠**：QuALITY（單文件多問題，**就是我們的 RAG 形狀**）
+在文件全長附近有一個尖峰；System Prompts 的質量集中在短前綴。分布集中時，把 5 個快照
+均勻鋪開是在浪費預算 —— 該把它們堆在分岔點附近。
+
+**Theorem 2** 給出精確的 O(NM) DP（convex hull trick），用歷史重疊直方圖估分布，
+每 10 個請求重解一次，離線算完不上服務路徑。Thm 3/4 給了用經驗直方圖取代真分布的
+plug-in 保證與漂移界。
+
+**結果**：NarrativeQA 上 DP 版在整個 budget 範圍壓過 Balanced/Block/Sqrt/Logarithmic，
+recurrent-work reduction 最高 ~3.2x，而且**預算越低差距越大**。我們 K=5 正是低預算端。
+
+> **評測強度要打折**：RTX 2080 Super 8GB + HuggingFace Transformers（不是 serving
+> engine），wall-clock 只量「代表性層組」= Qwen-3.5-0.8B 的 1 個 full attention + 3 個
+> GDN 層。作者自己寫明這不能當完整模型的 serving benchmark。快照擷取還是在另一次
+> **不計時**的 run 裡做的，因為 FLA 沒有暴露非最後位置的擷取 API —— 而我們的
+> `gdn_chunk_prefill(output_h=True)` 已經有（見「已經確認可用的東西」），
+> **這一項我們領先論文的原型。** 沒有 code release。
+
+### 3. Marconi：我們 TODO 裡「快取池配額與 LRU 淘汰」那一格的答案
+
+*Marconi: Prefix Caching for the Era of Hybrid LLMs*（MLSys'25 Outstanding Paper
+佳作，Princeton + AWS，<https://github.com/ruipeterpan/marconi>）與上一篇**正交**：
+上一篇決定「一個 entry 內部快照放哪」，Marconi 決定「**哪些 entry 值得留**」。
+
+它量化了本文件開頭那個現象（7B 模型，Fig 3a）：
+
+| block size | KV block 重用率 | 遞迴狀態重用率 | 差距 |
+|---|---|---|---|
+| 32 | 25.0% | **0.4%** | **65.3x** |
+| 64 | — | — | 27.9x |
+| 128 | — | 3.3% | 11.1x |
+
+記憶體側：block size 16 時單一 SSM 層的狀態是同 block 內 Attention 層 KV 的 4 倍；
+7B 模型單一 10K token 序列吃 **17.4 GB**，是同尺寸 Transformer 的 3.3 倍。
+**細粒度快照會把池子打爆**，這是我們把 G 訂在 512 而不是 64 的獨立佐證。
+
+兩個機制：
+
+- **Admission（推測性插入）**：把前綴重用分成「純輸入」（system prompt、few-shot —— 跨
+  請求共享、會分岔）與「輸入+輸出」（對話歷史 —— 只往後接、不分岔）。prefill 前先把
+  輸入 token 試插進 radix tree，**只有會產生中間節點（分岔點）的位置才值得下錨**。
+  最後一個 decoded token 無論如何都存。
+- **Eviction（FLOP-aware）**：不只看 recency，看重用時能省多少計算、再除以佔用空間。
+  刻意犧牲短序列命中率換長序列。
+
+**結果**：token hit rate 比擴充過 hybrid 支援的 vLLM/SGLang 高 **4.5–34.4x**，
+P95 TTFT 低 **36.1–71.1%**（103.3–617.0 ms）。
+
+Marconi 明講**當時沒有任何既有系統支援 hybrid 的 prefix caching**，vLLM/SGLang 的對照組
+是他們自己擴充的 —— 這與本文件開頭那則更正（vLLM 在 Qwen3.5 上 `enable_prefix_caching`
+靜默解析成 False）是同一件事的兩個來源。
+
+### 4. 第三條路：不要存狀態
+
+*KVBuffer: IO-aware Serving for Linear Attention*（arXiv 2605.19049，Yale，2026-05）
+的 §6 提出另一個位置：**遞迴狀態可以從緩衝的 K/V 重建**。所以與其快取狀態，不如快取
+選定前綴的 K/V，命中時再把狀態算出來。狀態太大導致快照只能粗粒度、難以在任意位置切分
+—— 那個限制在這條路上不存在。
+
+代價是命中時要付重建的計算，而且它要求引擎有 chunkwise 的 KV 緩衝機制（該論文的主體）。
+
+### 5. 三個位置
+
+| | 主張 | 我們的狀態 |
+|---|---|---|
+| **Sparse**（2605.05219） | 存狀態，選好 entry **內部**的位置 | 已實作 `Balanced`；DP 版未試 |
+| **Marconi**（MLSys'25） | 存狀態，選好留**哪些 entry** | 未實作（= TODO 的池配額／淘汰） |
+| **KVBuffer** §6（2605.19049） | **不存狀態**，存 K/V 現場重建 | 未評估 |
+
+三者不互斥。Sparse 與 Marconi 作者互相確認正交，可直接疊。
+
+### 6. 可測候選
+
+| 候選 | 量什麼 | 為什麼值得 |
+|---|---|---|
+| P1 分岔點對齊 | 把快照從等距改成「靠近實際分岔深度」，同樣 K=5 | `reuse_probe` 現在拿 2560/2690，損失 130 是 stride 向下取整；分岔深度會變時損失更大 |
+| P2 重疊深度直方圖 | 在 RAG／shared 形狀上記錄實際重疊深度分布 | Thm 2 的輸入。分布若真的是尖峰，DP 相對 Balanced 的增益就是論文說的低預算大增益 |
+| P3 Marconi admission | 只在會產生 radix 分岔的節點下錨，取代固定 G | 直接減少快照數；池壓力是我們把 G 訂大的唯一理由 |
+| P4 FLOP-aware 淘汰 | 對照 LRU | TODO 那一格，有現成參考實作 |
+
+### 7. 未解格
+
+- 本文件「四家的策略」表裡我們那列仍寫「保留幾個：**一個**／RAG 重用：**無**」，
+  那是修改前的狀態，與「結果（已實作）」矛盾。表要更新，但要先確認 G=512 在
+  當前 build 上仍成立（見下）。
+- **上面所有量測數字的時間戳是 2026-07-25 前後，而本分支此後有 41 個 commit**，
+  其中包含 scheduler 優先權重排（`d1018671`，commit message 自陳未量測）。
+  引用本文件任何 ms 數之前先重跑。

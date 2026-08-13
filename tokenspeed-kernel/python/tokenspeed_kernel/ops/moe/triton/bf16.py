@@ -42,6 +42,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import torch
+from tokenspeed_kernel.ops.moe.triton.bf16_decode import (
+    DECODE_MAX_PAIRS,
+    decode_moe_body,
+)
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (  # noqa: E402
     _local_topk_for_ep,
     _routing,
@@ -159,6 +163,19 @@ def triton_bf16_moe_apply(
     n_tokens = x.shape[0]
 
     topk_weights, topk_ids, num_experts = _local_topk_for_ep(topk_weights, topk_ids, w)
+
+    # Decode shapes have nothing for a grouped-GEMM tiling to parallelise over:
+    # with a handful of tokens there is no M to tile, and tiling N alone leaves
+    # each block walking the reduction serially. `bf16_decode` splits the
+    # reduction instead. Measured on Qwen3.6-35B-A3B (hidden 2048, 256 experts,
+    # top-8, intermediate 512), one token, CUDA graph, fresh expert set per
+    # iteration so the 128 MB L2 cannot hold the working set:
+    #   roofline 0.028 ms   this path 0.0405 ms (69% of HBM peak)
+    #   vLLM fused_experts on the same harness 0.0433 ms (65%)
+    # Eager the same comparison reads 2.4x rather than 1.07x; that difference is
+    # launch cost, which decode does not pay because the step is captured.
+    if topk_ids.numel() <= DECODE_MAX_PAIRS:
+        return decode_moe_body(x, w, topk_weights, topk_ids)
     ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
         topk_weights,
         topk_ids,

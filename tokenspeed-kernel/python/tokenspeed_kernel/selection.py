@@ -750,6 +750,15 @@ def select_kernel(
 
     impl = registry.get_impl(winner.name)
     result = SelectedKernel(name=winner.name, impl=impl)
+    # Log which kernel won, once per distinct selection. Every performance
+    # number this project has published names the model and the concurrency but
+    # not the kernel that produced it, and the cost is real: a 35B-A3B MoE
+    # measurement was attributed to the cutlass path from a scoreboard entry of
+    # 3.18 ms/layer, while the end-to-end step was 6.30 ms for all 40 layers of
+    # everything -- twenty times too fast for that attribution to hold, and no
+    # log said otherwise. Selection is cached, so this prints once per shape,
+    # not per call.
+    logger.info("[KERNEL] %s.%s -> %s", family, mode, getattr(result, "name", result))
     registry.cache_put(cache_key, result)
     return result
 

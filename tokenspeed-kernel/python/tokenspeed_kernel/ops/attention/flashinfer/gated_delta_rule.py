@@ -297,7 +297,12 @@ if is_available():
         qk_l2norm: bool = False,
         output_final_state: bool = True,
         output_h: bool = False,
+        h_dtype: torch.dtype | None = None,
     ):
+        # `h_dtype` is accepted for signature parity and ignored: this
+        # backend's checkpoints are float32 already, which is the widest the
+        # caller can ask for.
+        del h_dtype
         """Run one chunked GDN prefill on the sm100 kernel.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.

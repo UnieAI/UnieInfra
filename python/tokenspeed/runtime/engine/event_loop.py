@@ -519,9 +519,17 @@ class EventLoop:
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             # Non-zero moves tree-owned snapshots into their own index space,
             # so the cache stops competing with running sequences for slots.
+            # Read off the pool that was actually built rather than recomputed
+            # from ServerArgs: the two index spaces have to agree exactly, and
+            # a second copy of the sizing rule is a second place to get it
+            # wrong.
             mamba_ckpt_pool_slots=(
-                int(server_args.int8_mamba_ckpt_size or (2 * mamba_pool_total_chunks))
-                if (has_mamba and server_args.enable_int8_mamba_checkpoint)
+                int(mamba_pool.ckpt_pool.num_slots)
+                if (
+                    has_mamba
+                    and mamba_pool is not None
+                    and getattr(mamba_pool, "ckpt_pool", None) is not None
+                )
                 else 0
             ),
             enable_mamba_l2=server_args.enable_mamba_l2,

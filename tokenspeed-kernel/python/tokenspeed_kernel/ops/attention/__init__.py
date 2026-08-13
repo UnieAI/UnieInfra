@@ -464,6 +464,7 @@ def gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
+    h_dtype: torch.dtype | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> GdnChunkPrefillResult:
@@ -485,6 +486,14 @@ def gdn_chunk_prefill(
         output_final_state: Whether to return the final recurrent state.
         output_h: Whether to return intermediate recurrent checkpoints in the
             selected backend's native layout.
+        h_dtype: Storage dtype for those checkpoints. ``None`` leaves each
+            backend at its own default. Pass ``torch.float32`` when a
+            checkpoint will be published to a prefix cache and resumed from:
+            the scan carries its state in an fp32 accumulator, so a narrower
+            checkpoint rounds the state before anything downstream can keep it,
+            and a resumed prefill then disagrees with a cold one. Costs one
+            extra byte per element of ``h``, which is why it is not the
+            default.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -550,6 +559,7 @@ def gdn_chunk_prefill(
             qk_l2norm=qk_l2norm,
             output_final_state=output_final_state,
             output_h=output_h,
+            h_dtype=h_dtype,
         )
 
 

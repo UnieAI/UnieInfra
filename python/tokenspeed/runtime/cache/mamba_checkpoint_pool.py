@@ -21,36 +21,50 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-"""int8 store for *cached* linear-attention recurrent states.
+"""Separate store for *cached* linear-attention recurrent states.
 
-The point is the separation, not the compression. This engine files a retained
-snapshot in the same pool that live requests take their working and checkpoint
-slots from, so retaining several snapshots per chunk turned into
+The point is the separation, not the compression. This engine used to file a
+retained snapshot in the same pool that live requests take their working and
+checkpoint slots from, so retaining several snapshots per chunk turned into
 ``SchedulePrefillEvent: failed to allocate Mamba checkpoint slot`` at 64
 concurrent requests, and the fixes that followed only arbitrated a contention
 that does not have to exist. SGLang does not have that failure mode because a
-cached state lives *here* -- a separate pool, quantized -- and never competes
-with a running sequence.
+cached state lives *here* -- a separate pool -- and never competes with a
+running sequence.
+
+Separation buys a second thing SGLang does not use it for, and it is the reason
+this pool is on by default: **the snapshot no longer has to share the working
+state's dtype.** The working state is bf16 because the active pool is sized in
+bytes and its dtype sets how many sequences can run at once. A snapshot is not
+sized that way -- there are far fewer of them -- and bf16 is exactly wrong for
+one, because a resumed prefill starts from it while a cold prefill carries the
+same state in an fp32 accumulator and never rounds it. Measured on a GDN hybrid:
+a bf16 round trip moves the state by 2.3e-3 relative, the first generated
+token's logprob by 0.04-0.07, and at 2048 characters of prompt it flips the
+argmax, so the same prompt returns different text depending on whether it hit
+the cache. At fp32 the resumed output is bit-identical to the cold one.
 
 Per cached slot:
-  * the SSM temporal state in **int8**, symmetric per (head, k-channel)
+  * the SSM temporal state at ``ckpt_dtype`` -- float32 by default (exact), or
+    **int8** (symmetric per (head, k-channel)) for four times the slots
   * the conv1d window at its native dtype (W-1 tokens; too small to be worth
-    quantizing)
+    either widening or quantizing, and exact there already)
 
-Why int8 rather than fp8: a cached checkpoint is loaded once on a hit and
-decoding continues at full precision, so the only error is a single rounding of
-S -- it never re-enters the recurrence as a quantize/dequantize loop. The
-temporal state is roughly uniform, so int8 with a per-(head, k-channel) scale
-beats fp8-e4m3 at the same byte, which spends bits on an exponent. The scale
-axis reduces over d_v, matching the per-k-channel decay ``diag(alpha)``, so the
-large entries keep roughly bf16 precision and the error lands on small entries
-that barely move the readout.
+Why int8 rather than fp8 when compression is wanted: a cached checkpoint is
+loaded once on a hit and decoding continues at full precision, so the only error
+is a single rounding of S -- it never re-enters the recurrence as a
+quantize/dequantize loop. The temporal state is roughly uniform, so int8 with a
+per-(head, k-channel) scale beats fp8-e4m3 at the same byte, which spends bits
+on an exponent. The scale axis reduces over d_v, matching the per-k-channel
+decay ``diag(alpha)``, so the large entries keep roughly bf16 precision and the
+error lands on small entries that barely move the readout. It is still a
+lossy choice, and it is the capacity trade, not the default.
 
 Deviations from the source, both because the surrounding engine differs rather
 than because a different design was wanted:
 
 * The factory is not ported. SGLang's reads its global ``get_exec().mamba``
-  context; ours will be built from ``ServerArgs`` at the call site.
+  context; ours is built from ``ServerArgs`` at the call site.
 * ``MambaSlotAllocator`` is ported inline rather than imported, because this
   engine's active slots are owned by the C++ ``MambaChunkAllocator`` and only
   the checkpoint pool needs a Python-side free list. Slot 0 stays reserved so
@@ -64,6 +78,27 @@ import logging
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Names accepted by ``--mamba-ckpt-dtype``, in the order a help string should
+# list them: exact first, then the capacity trades.
+CKPT_DTYPES: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "int8": torch.int8,
+}
+
+
+def resolve_ckpt_dtype(name: str | torch.dtype) -> torch.dtype:
+    """``"float32"`` -> ``torch.float32``; a dtype passes through."""
+    if isinstance(name, torch.dtype):
+        return name
+    try:
+        return CKPT_DTYPES[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown mamba checkpoint dtype {name!r}; "
+            f"expected one of {sorted(CKPT_DTYPES)}"
+        ) from None
 
 
 class MambaSlotAllocator:
@@ -123,6 +158,7 @@ class Int8CheckpointStore:
     """
 
     QMAX = 127
+    is_quantized = True
 
     def __init__(
         self,
@@ -246,12 +282,95 @@ class Int8CheckpointStore:
         return self.mem_usage_bytes() // max(1, self.num_slots)
 
 
+class DenseCheckpointStore:
+    """Unquantized store for cached multi-layer linear-attention states.
+
+    One tensor, ``data : [L, num_slots, H, d_v, d_k]`` at ``dtype``, indexed by
+    a slot handed out by the caller's allocator. The interface is
+    ``Int8CheckpointStore``'s so the pool above can hold either without knowing
+    which; the difference is that at ``torch.float32`` this one is *exact*, and
+    exactness is the whole reason a cached snapshot is stored apart from the
+    working state instead of inside it.
+    """
+
+    is_quantized = False
+
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        num_slots: int,
+        num_heads: int,
+        head_v_dim: int,
+        head_k_dim: int,
+        device: str,
+        dtype: torch.dtype,
+    ):
+        self.num_layers = num_layers
+        self.num_slots = num_slots
+        self.H = num_heads
+        self.d_v = head_v_dim
+        self.d_k = head_k_dim
+        self.device = device
+        self.dtype = dtype
+        self.data = torch.empty(
+            num_layers,
+            num_slots,
+            num_heads,
+            head_v_dim,
+            head_k_dim,
+            dtype=dtype,
+            device=device,
+        )
+
+    def store(self, slots: torch.Tensor, state: torch.Tensor) -> None:
+        """``state``: [L, N, H, d_v, d_k], or [L, H, d_v, d_k] for one slot."""
+        if state.dim() == 4:
+            state = state.unsqueeze(1)
+        self.data[:, slots] = state.to(self.dtype)
+
+    def load(self, slots: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        return self.data[:, slots].to(out_dtype)
+
+    def store_layer(self, layer: int, slots: torch.Tensor, state: torch.Tensor) -> None:
+        self.data[layer, slots] = state.to(self.dtype)
+
+    def load_layer(
+        self, layer: int, slots: torch.Tensor, out_dtype: torch.dtype
+    ) -> torch.Tensor:
+        return self.data[layer, slots].to(out_dtype)
+
+    def copy_to_pool(
+        self,
+        dst_temporal: torch.Tensor,
+        src_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+    ) -> None:
+        dst_temporal[:, dst_slots] = self.load(src_slots, dst_temporal.dtype)
+
+    def store_from_pool(
+        self,
+        src_temporal: torch.Tensor,
+        src_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+    ) -> None:
+        self.store(dst_slots, src_temporal[:, src_slots])
+
+    def mem_usage_bytes(self) -> int:
+        return self.data.numel() * self.data.element_size()
+
+    def bytes_per_slot(self) -> int:
+        return self.mem_usage_bytes() // max(1, self.num_slots)
+
+
 class MambaCheckpointPool:
     """The radix cache's store for retained recurrent states.
 
-    Separate from the active pool by construction: ``alloc`` here cannot take a
-    slot a running sequence needs, which is the property the engine's own
-    single-pool arrangement lacks.
+    Separate from the active pool by construction, in two ways that matter:
+    ``alloc`` here cannot take a slot a running sequence needs, and the
+    temporal state is stored at ``ckpt_dtype`` rather than at the active pool's
+    ``ssm_dtype``. The default is float32 -- see the module docstring for what
+    bf16 costs a cache hit.
     """
 
     def __init__(
@@ -266,20 +385,42 @@ class MambaCheckpointPool:
         conv_dtype: torch.dtype,
         device: str,
         temporal_dtype: torch.dtype | None = None,
+        ckpt_dtype: torch.dtype | str = torch.float32,
     ):
+        """
+        Args:
+            temporal_dtype: The *active* pool's SSM dtype. Only int8 uses it,
+                as the scale dtype, so quantize and dequantize share a scale.
+            ckpt_dtype: Storage dtype for the cached temporal state.
+                ``torch.int8`` selects the quantized store; anything else the
+                dense one.
+        """
+        ckpt_dtype = resolve_ckpt_dtype(ckpt_dtype)
         self.num_slots = num_slots
         self.device = device
-        self.temporal = Int8CheckpointStore(
-            num_layers=num_layers,
-            num_slots=num_slots + 1,  # slot 0 reserved, as in MambaSlotAllocator
-            num_heads=num_heads,
-            head_v_dim=head_v_dim,
-            head_k_dim=head_k_dim,
-            device=device,
-            scale_dtype=(
-                temporal_dtype if temporal_dtype is not None else torch.bfloat16
-            ),
-        )
+        self.ckpt_dtype = ckpt_dtype
+        if ckpt_dtype is torch.int8:
+            self.temporal = Int8CheckpointStore(
+                num_layers=num_layers,
+                num_slots=num_slots + 1,  # slot 0 reserved, as in MambaSlotAllocator
+                num_heads=num_heads,
+                head_v_dim=head_v_dim,
+                head_k_dim=head_k_dim,
+                device=device,
+                scale_dtype=(
+                    temporal_dtype if temporal_dtype is not None else torch.bfloat16
+                ),
+            )
+        else:
+            self.temporal = DenseCheckpointStore(
+                num_layers=num_layers,
+                num_slots=num_slots + 1,  # slot 0 reserved
+                num_heads=num_heads,
+                head_v_dim=head_v_dim,
+                head_k_dim=head_k_dim,
+                device=device,
+                dtype=ckpt_dtype,
+            )
         # Conv windows stay at their native dtype: one buffer per conv tensor.
         self.conv = [
             torch.empty(
@@ -345,15 +486,27 @@ class MambaCheckpointPool:
         conv_shapes: list[tuple],
         conv_dtype: torch.dtype,
         temporal_dtype: torch.dtype,
+        ckpt_dtype: torch.dtype | str = torch.float32,
     ) -> dict:
         """Footprint in bytes *without* allocating, so a caller can check it
         against free memory first and fail with an actionable message rather
-        than a mid-allocation CUDA OOM."""
+        than a mid-allocation CUDA OOM.
+
+        ``qdata``/``scale`` are the int8 store's two tensors; the dense store
+        reports its single tensor as ``qdata`` and ``scale`` 0, so a caller can
+        log the same three fields either way.
+        """
+        ckpt_dtype = resolve_ckpt_dtype(ckpt_dtype)
         slots = num_slots + 1  # slot 0 reserved
-        scale_isz = torch.empty((), dtype=temporal_dtype).element_size()
         conv_isz = torch.empty((), dtype=conv_dtype).element_size()
-        qdata = num_layers * slots * num_heads * head_v_dim * head_k_dim  # int8
-        scale = num_layers * slots * num_heads * head_k_dim * scale_isz
+        state_elems = num_layers * slots * num_heads * head_v_dim * head_k_dim
+        if ckpt_dtype is torch.int8:
+            scale_isz = torch.empty((), dtype=temporal_dtype).element_size()
+            qdata = state_elems  # int8
+            scale = num_layers * slots * num_heads * head_k_dim * scale_isz
+        else:
+            qdata = state_elems * torch.empty((), dtype=ckpt_dtype).element_size()
+            scale = 0
         conv = 0
         for shape in conv_shapes:
             n = 1
@@ -366,6 +519,17 @@ class MambaCheckpointPool:
             "conv": conv,
             "total": qdata + scale + conv,
         }
+
+    @staticmethod
+    def bytes_per_slot_estimate(**kwargs) -> int:
+        """``estimate_mem_usage_bytes`` divided by the slots it was asked for.
+
+        Sizing code needs one slot's cost before it knows how many to ask for,
+        which is the wrong way round for the estimator above.
+        """
+        kwargs = {**kwargs, "num_slots": 1}
+        est = MambaCheckpointPool.estimate_mem_usage_bytes(**kwargs)
+        return est["total"] // 2  # `num_slots=1` allocates 2 rows (slot 0)
 
     def store_layer_from_active(
         self,
@@ -401,3 +565,123 @@ class MambaCheckpointPool:
     def mem_usage_bytes(self) -> int:
         conv_bytes = sum(c.numel() * c.element_size() for c in self.conv)
         return self.temporal.mem_usage_bytes() + conv_bytes
+
+    def bytes_per_slot(self) -> int:
+        return self.mem_usage_bytes() // max(1, self.num_slots + 1)
+
+    # -- The two paths the engine's step actually takes ---------------------
+    #
+    # Both take whole-pool tensors and index vectors that may carry -1, and
+    # both must convert rather than alias: the active pool is bf16 and this one
+    # is not. Writing `ckpt[dst] = active[src]` with mismatched dtypes would
+    # either raise or, with a view in the way, reinterpret bytes.
+
+    def store_from_active_indexed(
+        self,
+        active_conv: torch.Tensor,
+        active_temporal: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        cache_lengths: torch.Tensor | None = None,
+        page_size: int = 0,
+    ) -> None:
+        """Publish working slots ``src`` into checkpoint slots ``dst``.
+
+        ``src`` indexes the active pool, ``dst`` indexes this one -- two index
+        spaces, so ``src == dst`` is an ordinary copy here and must not be
+        skipped as a self-copy. Entries out of range (the -1 the scheduler
+        writes when it had no slot to give) are dropped, and when
+        ``page_size > 0`` so are rows whose ``cache_lengths`` is not on a page
+        boundary.
+        """
+        from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (  # noqa: E501
+            fused_mamba_state_copy,
+        )
+
+        fused_mamba_state_copy(
+            active_conv,
+            src_indices,
+            dst_indices,
+            cache_lengths=cache_lengths,
+            page_size=page_size,
+            dst_pool=self.conv[0],
+        )
+        if not self.temporal.is_quantized:
+            fused_mamba_state_copy(
+                active_temporal,
+                src_indices,
+                dst_indices,
+                cache_lengths=cache_lengths,
+                page_size=page_size,
+                dst_pool=self.temporal.data,
+            )
+            return
+
+        # Quantizing needs the values on the Python side, so this arm gathers
+        # per layer. Invalid rows are steered to slot 0 -- the reserved dummy --
+        # rather than masked out, because masking would need `.any()` and this
+        # runs inside the overlap-scheduled decode step, where a device sync
+        # costs more than a wasted write.
+        keep = self._keep_mask(
+            src_indices, dst_indices, active_temporal.shape[1], cache_lengths, page_size
+        )
+        src = torch.where(keep, src_indices.long(), 0)
+        dst = torch.where(keep, dst_indices.long(), 0)
+        for layer in range(self.temporal.num_layers):
+            self.temporal.store_layer(layer, dst, active_temporal[layer][src])
+
+    def load_to_active_indexed(
+        self,
+        active_conv: torch.Tensor,
+        active_temporal: torch.Tensor,
+        ckpt_indices: torch.Tensor,
+        active_indices: torch.Tensor,
+    ) -> None:
+        """Seed working slots ``active_indices`` from checkpoints ``ckpt_indices``.
+
+        The copy-on-write a cache hit performs. Rows whose source is -1 keep
+        whatever the working slot already held.
+        """
+        from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (  # noqa: E501
+            fused_mamba_state_copy,
+        )
+
+        fused_mamba_state_copy(
+            self.conv[0],
+            ckpt_indices,
+            active_indices,
+            dst_pool=active_conv,
+        )
+        if not self.temporal.is_quantized:
+            fused_mamba_state_copy(
+                self.temporal.data,
+                ckpt_indices,
+                active_indices,
+                dst_pool=active_temporal,
+            )
+            return
+
+        keep = self._keep_mask(
+            ckpt_indices, active_indices, self.temporal.num_slots, None, 0
+        )
+        if not bool(keep.any()):
+            return
+        src = ckpt_indices.long()[keep]
+        dst = active_indices.long()[keep]
+        for layer in range(self.temporal.num_layers):
+            active_temporal[layer][dst] = self.temporal.load_layer(
+                layer, src, active_temporal.dtype
+            )
+
+    @staticmethod
+    def _keep_mask(
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        src_pool_size: int,
+        cache_lengths: torch.Tensor | None,
+        page_size: int,
+    ) -> torch.Tensor:
+        keep = (src_indices >= 0) & (dst_indices >= 0) & (src_indices < src_pool_size)
+        if page_size > 0 and cache_lengths is not None:
+            keep = keep & (cache_lengths % page_size == 0)
+        return keep

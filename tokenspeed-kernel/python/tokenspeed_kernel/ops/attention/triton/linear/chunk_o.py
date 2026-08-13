@@ -105,7 +105,12 @@ def chunk_fwd_kernel_o(
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o += tl.dot(b_q, b_h)
+        # `h` may be wider than `q`: the recurrent checkpoints it carries are
+        # published to the prefix cache, where a bf16 rounding of the scan's
+        # fp32 accumulator is what makes a resumed prefill disagree with a cold
+        # one. Rounding here instead keeps this dot bit-identical to the narrow
+        # `h` it had before -- the same value, rounded at the same place.
+        b_o += tl.dot(b_q, b_h.to(b_q.dtype))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
 

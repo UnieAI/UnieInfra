@@ -31,24 +31,34 @@ import triton.language as tl
 
 @triton.jit
 def _mamba_state_snapshot_kernel(
-    pool_ptr,
+    src_pool_ptr,
+    dst_pool_ptr,
     src_indices_ptr,  # [num_valid]
     dst_indices_ptr,  # [num_valid]
     cache_lengths_ptr,  # [num_valid] or nullptr (0 when page_size==0)
     page_size,  # 0 means no page filtering
     elem_per_entry: tl.constexpr,
-    layer_stride,
-    req_stride,
-    pool_size,
+    src_layer_stride,
+    src_req_stride,
+    src_pool_size,
+    dst_layer_stride,
+    dst_req_stride,
+    dst_pool_size,
+    SAME_POOL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    In-place copy kernel: pool[:, dst[i], :] = pool[:, src[i], :]
+    Copy kernel: dst_pool[:, dst[i], :] = src_pool[:, src[i], :]
     Skips copy if page_size > 0 and cache_lengths[i] % page_size != 0.
 
     Grid: (num_valid, num_layers) — loops over elem_per_entry internally.
     Invalid entries early-return wasting only 1 block instead of
     ceil(elem_per_entry / BLOCK_SIZE) blocks.
+
+    ``SAME_POOL`` guards the self-copy skip: when the two pools are distinct,
+    ``src == dst`` names two different slots and dropping it would silently
+    lose one row in every ``pool_size``. It also gates nothing else -- the
+    dtypes may differ either way, and the store rounds to the destination's.
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1).to(tl.int64)
@@ -56,9 +66,10 @@ def _mamba_state_snapshot_kernel(
     src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
     dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
 
-    # Skip self-copy (no-op)
-    if src_idx == dst_idx:
-        return
+    # Skip self-copy (no-op) -- only meaningful within one pool
+    if SAME_POOL:
+        if src_idx == dst_idx:
+            return
 
     # Page-boundary filter: skip if not aligned
     if page_size > 0:
@@ -68,18 +79,25 @@ def _mamba_state_snapshot_kernel(
 
     # Bounds check
     if not (
-        (src_idx >= 0) & (src_idx < pool_size) & (dst_idx >= 0) & (dst_idx < pool_size)
+        (src_idx >= 0)
+        & (src_idx < src_pool_size)
+        & (dst_idx >= 0)
+        & (dst_idx < dst_pool_size)
     ):
         return
 
-    src_offset = pid_layer * layer_stride + src_idx * req_stride
-    dst_offset = pid_layer * layer_stride + dst_idx * req_stride
+    src_offset = pid_layer * src_layer_stride + src_idx * src_req_stride
+    dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
 
     for start in tl.static_range(0, elem_per_entry, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < elem_per_entry
-        data = tl.load(pool_ptr + src_offset + offsets, mask=mask)
-        tl.store(pool_ptr + dst_offset + offsets, data, mask=mask)
+        data = tl.load(src_pool_ptr + src_offset + offsets, mask=mask)
+        tl.store(
+            dst_pool_ptr + dst_offset + offsets,
+            data.to(dst_pool_ptr.dtype.element_ty),
+            mask=mask,
+        )
 
 
 def fused_mamba_state_copy(
@@ -89,14 +107,22 @@ def fused_mamba_state_copy(
     cache_lengths: torch.Tensor | None = None,  # [num_valid], for page filter
     page_size: int = 0,  # 0 means no page filtering
     single_layer: bool | None = None,
+    dst_pool: torch.Tensor | None = None,
 ):
     """
-    Copy mamba states: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
+    Copy mamba states: dst[:, dst_indices[i], :] = pool[:, src_indices[i], :]
 
     Handles both COW copy and checkpoint snapshot. Invalid indices (< 0 or
     >= pool_size) are skipped inside the kernel. When page_size > 0 and
     cache_lengths is provided, also skips entries where
     cache_lengths[i] % page_size != 0.
+
+    ``dst_pool`` names a *different* tensor to write into -- the checkpoint
+    pool, which has its own slot count and its own dtype (see
+    ``MambaCheckpointPool``). The store rounds to that dtype, so this is the
+    one copy that may widen bf16 working state to fp32 or narrow it back. With
+    ``dst_pool`` given, ``src_indices[i] == dst_indices[i]`` is an ordinary
+    copy between two index spaces rather than a self-copy to skip.
 
     Supports both 3D pool tensors ``[num_layers, pool_size, *state_shape]``
     and 2D per-layer slices ``[pool_size, *state_shape]`` (which may be
@@ -118,6 +144,8 @@ def fused_mamba_state_copy(
         page_size: When > 0, only copy entries where cache_lengths[i] is
             aligned to page_size. Set to 0 to disable filtering (used by
             COW copy where all valid entries must be copied).
+        dst_pool: Destination tensor when it is not ``pool`` itself. Same
+            layout and per-slot element count; slot count and dtype may differ.
     """
     num_valid = src_indices.shape[0]
     if num_valid == 0:
@@ -132,6 +160,12 @@ def fused_mamba_state_copy(
             f"indices length mismatch: {src_indices.shape[0]} vs {dst_indices.shape[0]}"
         )
 
+    same_pool = dst_pool is None
+    if same_pool:
+        dst_pool = pool
+    elif not dst_pool.is_cuda:
+        raise ValueError("fused_mamba_state_copy only supports CUDA tensors.")
+
     if single_layer is None:
         single_layer = pool.ndim == 2
 
@@ -141,12 +175,25 @@ def fused_mamba_state_copy(
         elem_per_entry = pool.numel() // pool_size
         layer_stride = 0
         req_stride = pool.stride(0)
+        dst_pool_size = dst_pool.shape[0]
+        dst_layer_stride = 0
+        dst_req_stride = dst_pool.stride(0)
+        dst_elem_per_entry = dst_pool.numel() // dst_pool_size
     else:
         num_layers = pool.shape[0]
         pool_size = pool.shape[1]
         elem_per_entry = pool.numel() // (num_layers * pool_size)
         layer_stride = pool.stride(0)
         req_stride = pool.stride(1)
+        dst_pool_size = dst_pool.shape[1]
+        dst_layer_stride = dst_pool.stride(0)
+        dst_req_stride = dst_pool.stride(1)
+        dst_elem_per_entry = dst_pool.numel() // (dst_pool.shape[0] * dst_pool_size)
+    if dst_elem_per_entry != elem_per_entry:
+        raise ValueError(
+            "src and dst slots must hold the same number of elements: "
+            f"{elem_per_entry} vs {dst_elem_per_entry}"
+        )
 
     if not src_indices.is_contiguous():
         src_indices = src_indices.contiguous()
@@ -166,6 +213,7 @@ def fused_mamba_state_copy(
 
     _mamba_state_snapshot_kernel[grid](
         pool,
+        dst_pool,
         src_indices,
         dst_indices,
         cache_lengths,
@@ -174,6 +222,10 @@ def fused_mamba_state_copy(
         layer_stride,
         req_stride,
         pool_size,
+        dst_layer_stride,
+        dst_req_stride,
+        dst_pool_size,
+        SAME_POOL=same_pool,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=8,
     )

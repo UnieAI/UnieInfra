@@ -79,6 +79,7 @@ def triton_gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
+    h_dtype: torch.dtype | None = None,
 ) -> GdnChunkPrefillResult:
     # initial_state arrives K-last [N, H, V, K] (the shared contract); this
     # backend's FLA math needs [N, H, K, V], so transpose in (materialized:
@@ -97,6 +98,7 @@ def triton_gdn_chunk_prefill(
         head_first=False,
         use_qk_l2norm_in_kernel=qk_l2norm,
         output_h=output_h,
+        h_dtype=h_dtype,
     )
     if output_h:
         out, final_state, h = result

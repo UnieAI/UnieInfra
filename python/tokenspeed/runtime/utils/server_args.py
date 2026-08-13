@@ -126,13 +126,6 @@ class ServerArgs:
     # against 15.8s. vLLM has no equivalent trade because its Mamba and KV
     # blocks come out of one pool.
     mamba_full_memory_ratio: float = 2.0
-    # Cached recurrent snapshots in their own int8 pool, ported from SGLang.
-    #
-    # Off keeps them in the active pool at full precision, where a retained
-    # snapshot competes with every running sequence's working slot -- measured
-    # as "failed to allocate Mamba checkpoint slot" at 64 concurrent requests
-    # on the unique-prompt shape, and again at 512 after the eviction fix.
-    # On gives them a separate index space at roughly a quarter the bytes.
     # Running-set load above which a step may mix prefill with decode.
     #
     # Neither always-mix nor never-mix wins across the curve: measured over HTTP
@@ -150,11 +143,63 @@ class ServerArgs:
     # step. Caps each request's stride rather than the number of requests, so
     # several advance together inside the same token budget. 0 = unbounded.
     long_prefill_token_threshold: int = 0
-    enable_int8_mamba_checkpoint: bool = False
-    # Slots in that pool. None means twice the active pool, matching SGLang's
-    # default: a cached state is the cheap one, so there should be more of them
-    # than there are live sequences.
-    int8_mamba_ckpt_size: int | None = None
+    # Cached recurrent snapshots in their own pool rather than in the active
+    # one, the arrangement ported from SGLang. Two things it buys:
+    #
+    # 1. A retained snapshot in the active pool competes with every running
+    #    sequence's working slot -- measured as "failed to allocate Mamba
+    #    checkpoint slot" at 64 concurrent requests on the unique-prompt shape,
+    #    and again at 512 after the eviction fix.
+    # 2. Sharing the pool forces sharing the dtype. `mamba_ssm_dtype` is bf16
+    #    because the active pool is sized in bytes, and a snapshot stored at
+    #    bf16 is a rounding of the state the scan carried in fp32: measured at
+    #    the kernel, resuming from the bf16 value moves the output 2.2e-3
+    #    relative, while resuming from the fp32 one is bit-identical to a cold
+    #    run. A separate pool lets the snapshot be exact while the working state
+    #    stays cheap.
+    #
+    # OFF by default, because (2) does not survive the end-to-end measurement it
+    # was proposed to fix. On Qwen3.5-2B, first-token logprob against a cold run
+    # differed by 0.0035 / 0.040 / 0.091 / 0.023 at 512 / 1024 / 2048 / 3600
+    # characters of prompt, and those four numbers are IDENTICAL to six decimals
+    # with snapshots in the active bf16 pool, with them in a separate float32
+    # pool, and with the whole recurrent path at float32 (--mamba-ssm-dtype
+    # float32). A dense Qwen3-0.6B, which has no recurrent layer to snapshot at
+    # all, shows the same perturbation relative to its own logprob scale. So the
+    # cache-hit difference is in the paths a prefix cache changes for every
+    # model -- attention over restored KV, and the different token counts each
+    # forward sees -- not in the recurrent state, and paying 20% of the
+    # recurrent budget for it by default is not supported by a measurement.
+    # See the "state itself" probes if you want the kernel-level property back.
+    enable_mamba_ckpt_pool: bool = False
+    # Storage dtype for a cached snapshot. float32 makes the recurrent handoff
+    # exact against a cold prefill; bfloat16 is the single-pool precision at
+    # half the bytes; int8 (symmetric, per (head, k-channel), SGLang's choice)
+    # is the capacity trade -- roughly a quarter of float32, so four times the
+    # retained snapshots for the same memory, at one rounding on the way in.
+    #
+    # Note that float32 here is only half the chain: the restore writes back
+    # through the working slot, which is `mamba_ssm_dtype`, so the resumed
+    # kernel still receives a bf16 initial state unless that is float32 too.
+    # Closing that last hop is unwritten work, and the measurement above says
+    # it is not worth writing yet.
+    mamba_ckpt_dtype: str = "float32"
+    # Slots in that pool. None derives it from `mamba_ckpt_memory_fraction`.
+    #
+    # NOT twice the active pool, which is SGLang's default and was this
+    # engine's: at 27B a snapshot spans all 48 recurrent layers, so one float32
+    # slot is ~154MB against ~78MB for a working chunk. Twice the active pool
+    # would be 442 slots and 68GB -- more than the card. Read the resolved
+    # numbers out of the "mamba checkpoint pool" log line rather than assuming
+    # a snapshot is small.
+    mamba_ckpt_size: int | None = None
+    # Share of the recurrent-state memory budget the checkpoint pool takes when
+    # `mamba_ckpt_size` is None. It comes out of the same budget as the working
+    # pool, not out of whatever headroom `--gpu-memory-utilization` happens to
+    # leave, so the cost is visible as a smaller `mamba_pool_total_chunks` at
+    # startup instead of an allocation that fails on a fuller card. 0.2 costs
+    # 20% of the working slots by construction.
+    mamba_ckpt_memory_fraction: float = 0.2
     enable_mamba_l2: bool = False
     mamba_l2_host_slots: int = 0
     mamba_l2_ratio: float = 2.0
@@ -609,22 +654,32 @@ class ServerArgs:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
         # The host tier moves recurrent state by slot index between the device
-        # pool and MambaHostAllocator's rows. With the int8 checkpoint pool on,
-        # a tree-owned snapshot is not in the device pool at all -- it is an
-        # int8 row in a different index space -- so the write-back would read
-        # the wrong pool at the wrong precision, and the indices are not even
-        # in range. Nothing would raise; the state would simply be wrong.
+        # pool and MambaHostAllocator's rows. With the checkpoint pool on, a
+        # tree-owned snapshot is not in the device pool at all -- it is a row of
+        # a different width in a different index space -- so the write-back
+        # would read the wrong pool at the wrong precision, and the indices are
+        # not even in range. Nothing would raise; the state would simply be
+        # wrong.
         #
         # SGLang rejects the same pair for the same reason
         # (server_args.py:6023 _handle_int8_mamba_checkpoint: "they would read
         # int8 checkpoint slots as bf16 active slots"). Making the host tier
-        # int8-aware is the work that would lift this.
-        if self.enable_int8_mamba_checkpoint and self.enable_mamba_l2:
+        # checkpoint-aware is the work that would lift this.
+        if self.enable_mamba_ckpt_pool and self.enable_mamba_l2:
             raise ValueError(
-                "--enable-int8-mamba-checkpoint cannot be combined with "
+                "--enable-mamba-ckpt-pool cannot be combined with "
                 "--enable-mamba-l2: the host tier reads slot indices as active "
-                "device-pool rows, and an int8 checkpoint slot is neither. Pick "
-                "one until the host path is made int8-aware."
+                "device-pool rows, and a checkpoint slot is neither. Pick one "
+                "until the host path is made checkpoint-aware."
+            )
+        if self.enable_mamba_ckpt_pool and not self.enable_prefix_caching:
+            # Nothing publishes a snapshot with the cache off, so the pool would
+            # be memory taken from the working slots for nothing.
+            self.enable_mamba_ckpt_pool = False
+        if not 0.0 <= self.mamba_ckpt_memory_fraction < 1.0:
+            raise ValueError(
+                "--mamba-ckpt-memory-fraction must be in [0, 1), got "
+                f"{self.mamba_ckpt_memory_fraction}"
             )
 
         if self.mm_encoder_tp_mode == "data":
@@ -1151,20 +1206,67 @@ class ServerArgs:
                 "--max-num-partial-prefills is vLLM's arrangement."
             ),
         )
+        ckpt_pool_group = parser.add_mutually_exclusive_group()
+        ckpt_pool_group.add_argument(
+            "--enable-mamba-ckpt-pool",
+            action="store_true",
+            default=ServerArgs.enable_mamba_ckpt_pool,
+            help=(
+                "Keep cached recurrent snapshots in a separate pool instead of "
+                "the active state pool, so a cached state cannot take the slot a "
+                "running sequence needs and can be stored at its own precision. "
+                "Costs --mamba-ckpt-memory-fraction of the recurrent-state "
+                "budget, and therefore that share of concurrency."
+            ),
+        )
+        ckpt_pool_group.add_argument(
+            "--no-enable-mamba-ckpt-pool",
+            dest="enable_mamba_ckpt_pool",
+            action="store_false",
+            help="Keep snapshots in the active pool at --mamba-ssm-dtype.",
+        )
+        parser.add_argument(
+            "--mamba-ckpt-dtype",
+            type=str,
+            default=ServerArgs.mamba_ckpt_dtype,
+            choices=["float32", "bfloat16", "int8"],
+            help=(
+                "Storage dtype for a cached recurrent snapshot. float32 resumes "
+                "bit-identically to a cold prefill; int8 holds about four times "
+                "as many snapshots per byte and rounds the state once."
+            ),
+        )
+        parser.add_argument(
+            "--mamba-ckpt-size",
+            type=int,
+            default=ServerArgs.mamba_ckpt_size,
+            help=(
+                "Slots in the checkpoint pool. Defaults to whatever "
+                "--mamba-ckpt-memory-fraction buys."
+            ),
+        )
+        parser.add_argument(
+            "--mamba-ckpt-memory-fraction",
+            type=float,
+            default=ServerArgs.mamba_ckpt_memory_fraction,
+            help=(
+                "Share of the recurrent-state memory budget the checkpoint pool "
+                "takes, and so the fraction of concurrency it costs."
+            ),
+        )
+        # Deprecated spelling of the pair above, kept because measurement
+        # scripts pass it. int8 is now one dtype among three rather than the
+        # only reason to have a second pool.
         parser.add_argument(
             "--enable-int8-mamba-checkpoint",
             action="store_true",
-            help=(
-                "Keep cached recurrent snapshots in a separate int8 pool instead "
-                "of the active state pool, so a cached state cannot take the slot "
-                "a running sequence needs."
-            ),
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--int8-mamba-ckpt-size",
             type=int,
-            default=ServerArgs.int8_mamba_ckpt_size,
-            help="Slots in the int8 checkpoint pool. Defaults to twice the active pool.",
+            default=None,
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--enable-mamba-l2",
@@ -2130,6 +2232,21 @@ class ServerArgs:
                     "--tensor-parallel-size is an alias for --attn-tp-size."
                 )
             args.attn_tp_size = tensor_parallel_size
+
+        # --enable-int8-mamba-checkpoint / --int8-mamba-ckpt-size are the old
+        # spelling from when int8 was the only reason for a second pool. They
+        # now select a dtype in a pool that is on by default.
+        if getattr(args, "enable_int8_mamba_checkpoint", False):
+            args.mamba_ckpt_dtype = "int8"
+            args.enable_mamba_ckpt_pool = True
+        int8_ckpt_size = getattr(args, "int8_mamba_ckpt_size", None)
+        if int8_ckpt_size is not None:
+            if getattr(args, "mamba_ckpt_size", None) is not None:
+                raise ValueError(
+                    "Cannot specify both --int8-mamba-ckpt-size and "
+                    "--mamba-ckpt-size; the first is the deprecated spelling."
+                )
+            args.mamba_ckpt_size = int8_ckpt_size
 
         # Only pass fields that argparse actually produced. Falling back to
         # ``None`` for missing attrs would silently clobber dataclass defaults

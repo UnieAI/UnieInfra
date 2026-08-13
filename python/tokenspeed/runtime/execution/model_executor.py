@@ -1100,12 +1100,17 @@ class ModelExecutor:
         track_indices: torch.Tensor,
         sentinel: torch.Tensor,
         page_size: int,
+        same_pool: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fused elementwise pipeline computing snapshot src/dst for MTP.
 
         All operations are batched and fused by torch.compile into a single
         Triton kernel (plus the two gathers), eliminating the ~14 individual
         elementwise kernel launches of the eager implementation.
+
+        ``same_pool`` says whether the checkpoint destination lives in the
+        active pool. When it does not, ``src == dst`` names two slots in two
+        index spaces and is a copy to make, not a no-op to drop.
         """
         new_cl = valid_cache_lengths[req_pool_indices]
         old_cl = new_cl - accept_lengths.to(new_cl.dtype)
@@ -1121,12 +1126,10 @@ class ModelExecutor:
         dst_raw = track_indices.to(torch.int64)
 
         invalid = (
-            (first_boundary > new_cl)
-            | (dst_raw < 0)
-            | (src_raw < 0)
-            | (src_raw == dst_raw)
-            | (step_raw < 0)
+            (first_boundary > new_cl) | (dst_raw < 0) | (src_raw < 0) | (step_raw < 0)
         )
+        if same_pool:
+            invalid = invalid | (src_raw == dst_raw)
         src = torch.where(invalid, sentinel, src_raw)
         dst = torch.where(invalid, sentinel, dst_raw)
         return src, dst
@@ -1165,6 +1168,10 @@ class ModelExecutor:
         page_size = self.config.block_size
         dev = req_pool_indices.device
         sentinel = self._sentinel_neg1
+        # With a checkpoint pool configured, `track_indices` addresses it, not
+        # the active pool, so a destination equal to the source is a different
+        # slot entirely.
+        same_pool = getattr(self.runtime_states.mamba_pool, "ckpt_pool", None) is None
 
         if self.drafter is not None:
             # -- MTP path: find the output slot at the crossed boundary --
@@ -1186,6 +1193,7 @@ class ModelExecutor:
                 track_indices,
                 sentinel,
                 page_size,
+                same_pool,
             )
 
             self.runtime_states.snapshot_mamba_checkpoints(
@@ -1202,7 +1210,9 @@ class ModelExecutor:
             )
             dst_raw = track_indices.to(device=dev, dtype=torch.int64)
 
-            invalid = (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
+            invalid = (src_raw < 0) | (dst_raw < 0)
+            if same_pool:
+                invalid = invalid | (src_raw == dst_raw)
             src = torch.where(invalid, sentinel, src_raw)
             dst = torch.where(invalid, sentinel, dst_raw)
 
@@ -1258,6 +1268,10 @@ class ModelExecutor:
                 cache_lengths=None,
                 page_size=0,
                 num_valid=bs,
+                # Draft row -> working row: both ends are active slots, so this
+                # one must not be routed to the checkpoint pool even when one
+                # exists.
+                into_checkpoint=False,
             )
 
     def execute_forward_op_with_log(

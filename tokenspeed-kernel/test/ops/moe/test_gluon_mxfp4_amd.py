@@ -1,0 +1,349 @@
+from types import SimpleNamespace
+
+import pytest
+import tokenspeed_kernel
+import torch
+import torch.nn.functional as F
+from kimi3_reference import dequantize_mxfp4
+from utils import is_amd, is_cdna4, is_cdna5
+
+if not is_amd():
+    pytest.skip(
+        "An AMD GPU is required for MXFP4-weight Gluon MoE tests",
+        allow_module_level=True,
+    )
+
+
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
+    gluon_mxfp_dynamic_mxfp4_fused_moe,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
+    gluon_mxfp_fused_moe as _gfx950_static_moe,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
+    gluon_a16w4_situ_warp_decode_ep_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
+    preprocess_gluon_mxfp4_gfx950_moe_weights,
+)
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
+    gluon_mxfp_precomputed_mxfp4_fused_moe as _gfx1250_static_moe,
+)
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # noqa: E402
+    preprocess_gluon_mxfp4_gfx1250_moe_weights,
+)
+
+
+def _dequantize_dynamic_mxfp4(x: torch.Tensor) -> torch.Tensor:
+    packed, scale = tokenspeed_kernel.quantize_mxfp4(
+        x, scale_layout="linear", solution="triton"
+    )
+    return dequantize_mxfp4(packed, scale).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_dynamic_mxfp4_activation_moe(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
+    if not is_cdna4():
+        pytest.skip("Dynamic MXFP4 activation is unavailable on this GPU")
+
+    generator = torch.Generator(device="cuda").manual_seed(20260812)
+    num_experts = 4
+    hidden_size = 256
+    intermediate_size = 256
+    top_k = 2
+    raw_w13 = torch.randint(
+        0,
+        256,
+        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    raw_w2 = torch.randint(
+        0,
+        256,
+        (num_experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    raw_w13_scale = torch.full(
+        (num_experts, 2 * intermediate_size, hidden_size // 32),
+        120,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    raw_w2_scale = torch.full(
+        (num_experts, hidden_size, intermediate_size // 32),
+        120,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    module = torch.nn.Module()
+    module.w13_input_layout = "interleaved"
+    module.quant_config = SimpleNamespace(use_dynamic_mxfp4_activations=True)
+    module.w13_weight = torch.nn.Parameter(
+        raw_w13.clone(),
+        requires_grad=False,
+    )
+    module.w2_weight = torch.nn.Parameter(
+        raw_w2.clone(),
+        requires_grad=False,
+    )
+    module.w13_weight_scale = torch.nn.Parameter(
+        raw_w13_scale.clone(),
+        requires_grad=False,
+    )
+    module.w2_weight_scale = torch.nn.Parameter(
+        raw_w2_scale.clone(),
+        requires_grad=False,
+    )
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
+
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    router_logits = torch.tensor(
+        [[4, 3, 2, 1], [1, 4, 3, 2], [2, 1, 4, 3], [3, 2, 1, 4]],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )[:num_tokens]
+
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import (
+        decode_stage1,
+        decode_stage2,
+    )
+
+    stages = []
+    stage1 = decode_stage1.invoke_stage1_mxfp4_mfma_decode_gluon
+    stage2 = decode_stage2.invoke_stage2_mxfp4_mfma_decode_gluon
+
+    def record_stage1(*args, **kwargs):
+        stages.append(1)
+        return stage1(*args, **kwargs)
+
+    def record_stage2(*args, **kwargs):
+        stages.append(2)
+        return stage2(*args, **kwargs)
+
+    monkeypatch.setattr(
+        decode_stage1, "invoke_stage1_mxfp4_mfma_decode_gluon", record_stage1
+    )
+    monkeypatch.setattr(
+        decode_stage2, "invoke_stage2_mxfp4_mfma_decode_gluon", record_stage2
+    )
+    actual = gluon_mxfp_dynamic_mxfp4_fused_moe(
+        hidden_states,
+        router_logits,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        top_k=top_k,
+        correction_bias=None,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+    )
+
+    torch.cuda.synchronize()
+    assert stages == [1, 2]
+    assert actual.shape == hidden_states.shape
+
+    scores = torch.softmax(router_logits.float(), dim=-1)
+    topk_weights, topk_ids = torch.topk(scores, top_k, dim=-1)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    hidden = _dequantize_dynamic_mxfp4(hidden_states)
+    w13 = dequantize_mxfp4(raw_w13, raw_w13_scale).to(torch.bfloat16)
+    w2 = dequantize_mxfp4(raw_w2, raw_w2_scale).to(torch.bfloat16)
+    expected = torch.zeros_like(actual, dtype=torch.float32)
+    for token in range(num_tokens):
+        for slot in range(top_k):
+            expert = int(topk_ids[token, slot])
+            gate_up = F.linear(hidden[token].float(), w13[expert].float())
+            gate = gate_up[0::2].clamp(max=7.0)
+            linear = gate_up[1::2].clamp(-7.0, 7.0)
+            inter = (gate / (1.0 + torch.exp(-1.702 * gate))) * (linear + 1.0)
+            inter = _dequantize_dynamic_mxfp4(inter.to(torch.bfloat16)[None])[0]
+            partial = F.linear(inter.float(), w2[expert].float()).to(torch.bfloat16)
+            expected[token] += (
+                partial * topk_weights[token, slot].to(torch.bfloat16)
+            ).float()
+
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_bf16_activation_situ_moe() -> None:
+    if not is_cdna4():
+        pytest.skip("BF16 SiTU activation is unavailable on this GPU")
+
+    num_tokens = 1
+    num_experts = 2
+    hidden_size = 3584
+    intermediate_size = 3072
+    top_k = 2
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    w13_weight = torch.zeros(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size // 2,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = torch.full(
+        (num_experts, 2 * intermediate_size, hidden_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2_weight = torch.zeros(
+        num_experts,
+        hidden_size,
+        intermediate_size // 2,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2_scale = torch.full(
+        (num_experts, hidden_size, intermediate_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    topk_weights = torch.full(
+        (num_tokens, top_k), 1.0 / top_k, dtype=torch.float32, device="cuda"
+    )
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+
+    actual = gluon_a16w4_situ_warp_decode_ep_gfx950(
+        hidden_states,
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        linear_weights=True,
+        w13_interleaved=True,
+    )
+
+    torch.cuda.synchronize()
+    assert actual.shape == hidden_states.shape
+    torch.testing.assert_close(actual, torch.zeros_like(actual), atol=0, rtol=0)
+
+
+def test_static_fp8_activation_moe() -> None:
+    cdna4 = is_cdna4()
+    if cdna4:
+        hidden_size = 256
+        intermediate_size = 256
+        preprocess = preprocess_gluon_mxfp4_gfx950_moe_weights
+    elif is_cdna5():
+        hidden_size = 128
+        intermediate_size = 128
+        preprocess = preprocess_gluon_mxfp4_gfx1250_moe_weights
+    else:
+        pytest.skip("Static FP8 activation is unavailable on this GPU")
+
+    num_tokens = 4
+    num_experts = 4
+    top_k = 2
+    module = torch.nn.Module()
+    module.w13_input_layout = "interleaved"
+    module.w13_weight = torch.nn.Parameter(
+        torch.zeros(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size // 2,
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        requires_grad=False,
+    )
+    module.w2_weight = torch.nn.Parameter(
+        torch.zeros(
+            num_experts,
+            hidden_size,
+            intermediate_size // 2,
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        requires_grad=False,
+    )
+    module.w13_weight_scale = torch.nn.Parameter(
+        torch.full(
+            (num_experts, 2 * intermediate_size, hidden_size // 32),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        requires_grad=False,
+    )
+    module.w2_weight_scale = torch.nn.Parameter(
+        torch.full(
+            (num_experts, hidden_size, intermediate_size // 32),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        requires_grad=False,
+    )
+    module.w13_input_scale = torch.nn.Parameter(
+        torch.ones(1, dtype=torch.float32, device="cuda"), requires_grad=False
+    )
+    module.w2_input_scale = torch.nn.Parameter(
+        torch.ones(1, dtype=torch.float32, device="cuda"), requires_grad=False
+    )
+    preprocess({}, module)
+
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    if cdna4:
+        router_logits = torch.randn(
+            num_tokens, num_experts, dtype=torch.bfloat16, device="cuda"
+        )
+        actual = _gfx950_static_moe(
+            hidden_states,
+            router_logits,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            w13_act_scale=module.w13_act_scale,
+            w2_act_scale=module.w2_act_scale,
+            top_k=top_k,
+        )
+    else:
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / top_k,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        topk_ids = torch.tensor(
+            [[0, 1], [2, 3], [1, 2], [3, 0]], dtype=torch.int32, device="cuda"
+        )
+        actual = _gfx1250_static_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        )
+
+    torch.cuda.synchronize()
+    assert actual.shape == hidden_states.shape
+    torch.testing.assert_close(actual, torch.zeros_like(actual), atol=0, rtol=0)

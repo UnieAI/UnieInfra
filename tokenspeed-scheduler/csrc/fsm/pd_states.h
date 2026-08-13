@@ -20,9 +20,9 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "core/token_container.h"
-#include "resource/radix_tree/tree_node.h"
-#include "resource/allocator/req_pool_allocator.h"
 
 namespace tokenspeed {
 namespace fsm {

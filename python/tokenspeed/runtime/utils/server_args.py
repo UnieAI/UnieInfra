@@ -25,6 +25,7 @@ import dataclasses
 import json
 import os
 import random
+import socket
 from typing import Literal
 
 from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
@@ -41,11 +42,26 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
+from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
+
+# Spec-decode overshoot spans the physical KV extent must absorb past the
+# logical context_len. The overlap scheduler steps a finished request at most
+# ONE extra iteration (event_loop_overlap commits the previous step every
+# round, so the Finish event reaches the C++ scheduler before the next plan),
+# and termination is checked CPU-side against max_new_tokens, so verify can
+# commit past context_len for exactly that window:
+#   1. the finishing step's own accept (up to spec_num_tokens past the limit),
+#   2. the single lingering step's accept,
+#   3. the lingering step laying out its next draft block after that accept.
+# Hence 3 spans. Everything written past context_len belongs to a request
+# whose output is already truncated by max_new_tokens; the garbage KV is
+# evicted with the request one step later.
+_SPEC_OVERSHOOT_SPANS = 3
 
 
 def str_to_bool(value: str | bool) -> bool:
@@ -57,6 +73,21 @@ def str_to_bool(value: str | bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
+
+
+def _uint16(value: str) -> int:
+    """argparse type for values packed as a two-byte identity (``<H``)."""
+    index = int(value)
+    if not 0 <= index <= 0xFFFF:
+        raise argparse.ArgumentTypeError(f"value must be in [0, 65535], got {value}")
+    return index
+
+
+def _nonempty_str(value: str) -> str:
+    """argparse type for string flags that must not be empty."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("value must be a non-empty string")
+    return value
 
 
 @dataclasses.dataclass
@@ -79,6 +110,20 @@ class ServerArgs:
     revision: str | None = None
     language_model_only: bool = False
 
+    # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
+    # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
+    # output sockets) over the msgpack wire. Default OFF;
+    # SMG tokenizes/detokenizes, so pair with --skip-tokenizer-init.
+    zmq_msgpack: bool = False
+    # The frontend handshake endpoint the scheduler dials; becomes the
+    # data-parallel rendezvous when DP is supported.
+    data_parallel_address: str = "127.0.0.1"
+    # Default chosen to avoid the 20000-29999 range used for derived
+    # per-worker handshake ports and common rendezvous defaults of
+    # co-located services.
+    data_parallel_rpc_port: int = 30500
+    zmq_engine_index: int = 0
+
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 8000
@@ -90,122 +135,11 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
-    # KV page size. 16 to match vLLM (SGLang goes further, to 1) -- nobody else
-    # pages this coarsely, and 64 was costing real latency for nothing
-    # measurable in return. A partial prefix hit can only reuse whole pages, so
-    # 64 throws away up to 63 tokens at every boundary: on Qwen3-8B with a
-    # 3890-token shared prefix it reused 3840 against vLLM's 3888, then paid to
-    # recompute the difference. Measured on the RAG shape, 64 -> 16 moves TTFT
-    # 37.85 -> 32.94 ms, and on an exact repeat -- where no extra tokens are
-    # computed at all, so this is page-table cost rather than reuse -- 22.62 ->
-    # 19.46 ms. Batch-64 throughput moves -0.5% to -1.1%, i.e. within noise.
-    #
-    # Nothing structural wanted 64: the only interaction is
-    # mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, block_size), and
-    # FLA_CHUNK_SIZE is itself 64, so the recurrent side is unchanged by
-    # construction. Validated on dense models only -- the hybrid checkpoint
-    # cannot start in this container at either page size (flashinfer's xqa
-    # kernel fails to JIT), so that path is argued from the max() above rather
-    # than measured.
-    block_size: int = 16
+    # Kernel page size. Flat scheduler logical pages come from the LCM
+    # runtime contract and must not overwrite this value.
+    block_size: int = 64
     # special kv cache
-    # bfloat16, not float32: the recurrent state pool is sized in bytes, so the
-    # dtype sets how many sequences can run at once. float32 gave 80 slots
-    # against --max-num-seqs 452 on Qwen3.5-27B, and admission then refused new
-    # work at 1.45 requests per step while 141 waited and the step filled 1029
-    # of its 8192-token budget. bf16 doubles the pool and every number
-    # downstream moves with it. vLLM's default is bf16 for the same reason.
-    mamba_ssm_dtype: str = "bfloat16"
-    mamba_track_interval: int = 256
-    max_mamba_cache_size: int | None = None
-    # 2.0, not 0.9: the recurrent state pool and the KV pool are split by this
-    # ratio before either is sized, and the state pool is what binds. Measured
-    # on the real RAG dataset, 0.5 (110 slots / 265K KV tokens) is worse at
-    # every concurrency than 0.9 (157 / 209K), and 2.0 (221 / 132K) is better
-    # again: 596.9 tok/s at 256 concurrent against 516.4, with TTFT 10.0s
-    # against 15.8s. vLLM has no equivalent trade because its Mamba and KV
-    # blocks come out of one pool.
-    mamba_full_memory_ratio: float = 2.0
-    # Running-set load above which a step may mix prefill with decode.
-    #
-    # Neither always-mix nor never-mix wins across the curve: measured over HTTP
-    # on Qwen3.5-27B, always mixing costs 96 -> 60 tok/s at 64 and 128
-    # concurrent, and never mixing drops 346 of 512 requests at 256 because
-    # prefill never gets a turn. 1.0 disables mixing in practice, 0.0 always
-    # mixes.
-    mixed_prefill_decode_min_load: float = 0.35
-    # vLLM's max_num_partial_prefills (its default is 1). Caps how many prompts
-    # a single step may prefill, which is how vLLM keeps mixing on
-    # unconditionally without prefill crowding decode out. 0 = unbounded, the
-    # behaviour before this knob existed.
-    max_num_partial_prefills: int = 0
-    # vLLM's long_prefill_token_threshold: how far ONE prefill may advance in a
-    # step. Caps each request's stride rather than the number of requests, so
-    # several advance together inside the same token budget. 0 = unbounded.
-    long_prefill_token_threshold: int = 0
-    # Cached recurrent snapshots in their own pool rather than in the active
-    # one, the arrangement ported from SGLang. Two things it buys:
-    #
-    # 1. A retained snapshot in the active pool competes with every running
-    #    sequence's working slot -- measured as "failed to allocate Mamba
-    #    checkpoint slot" at 64 concurrent requests on the unique-prompt shape,
-    #    and again at 512 after the eviction fix.
-    # 2. Sharing the pool forces sharing the dtype. `mamba_ssm_dtype` is bf16
-    #    because the active pool is sized in bytes, and a snapshot stored at
-    #    bf16 is a rounding of the state the scan carried in fp32: measured at
-    #    the kernel, resuming from the bf16 value moves the output 2.2e-3
-    #    relative, while resuming from the fp32 one is bit-identical to a cold
-    #    run. A separate pool lets the snapshot be exact while the working state
-    #    stays cheap.
-    #
-    # OFF by default, because (2) does not survive the end-to-end measurement it
-    # was proposed to fix. On Qwen3.5-2B, first-token logprob against a cold run
-    # differed by 0.0035 / 0.040 / 0.091 / 0.023 at 512 / 1024 / 2048 / 3600
-    # characters of prompt, and those four numbers are IDENTICAL to six decimals
-    # with snapshots in the active bf16 pool, with them in a separate float32
-    # pool, and with the whole recurrent path at float32 (--mamba-ssm-dtype
-    # float32). A dense Qwen3-0.6B, which has no recurrent layer to snapshot at
-    # all, shows the same perturbation relative to its own logprob scale. So the
-    # cache-hit difference is in the paths a prefix cache changes for every
-    # model -- attention over restored KV, and the different token counts each
-    # forward sees -- not in the recurrent state, and paying 20% of the
-    # recurrent budget for it by default is not supported by a measurement.
-    # See the "state itself" probes if you want the kernel-level property back.
-    enable_mamba_ckpt_pool: bool = False
-    # Storage dtype for a cached snapshot. float32 makes the recurrent handoff
-    # exact against a cold prefill; bfloat16 is the single-pool precision at
-    # half the bytes; int8 (symmetric, per (head, k-channel), SGLang's choice)
-    # is the capacity trade -- roughly a quarter of float32, so four times the
-    # retained snapshots for the same memory, at one rounding on the way in.
-    #
-    # Note that float32 here is only half the chain: the restore writes back
-    # through the working slot, which is `mamba_ssm_dtype`, so the resumed
-    # kernel still receives a bf16 initial state unless that is float32 too.
-    # Closing that last hop is unwritten work, and the measurement above says
-    # it is not worth writing yet.
-    mamba_ckpt_dtype: str = "float32"
-    # Slots in that pool. None derives it from `mamba_ckpt_memory_fraction`.
-    #
-    # NOT twice the active pool, which is SGLang's default and was this
-    # engine's: at 27B a snapshot spans all 48 recurrent layers, so one float32
-    # slot is ~154MB against ~78MB for a working chunk. Twice the active pool
-    # would be 442 slots and 68GB -- more than the card. Read the resolved
-    # numbers out of the "mamba checkpoint pool" log line rather than assuming
-    # a snapshot is small.
-    mamba_ckpt_size: int | None = None
-    # Share of the recurrent-state memory budget the checkpoint pool takes when
-    # `mamba_ckpt_size` is None. It comes out of the same budget as the working
-    # pool, not out of whatever headroom `--gpu-memory-utilization` happens to
-    # leave, so the cost is visible as a smaller `mamba_pool_total_chunks` at
-    # startup instead of an allocation that fails on a fuller card. 0.2 costs
-    # 20% of the working slots by construction.
-    mamba_ckpt_memory_fraction: float = 0.2
-    enable_mamba_l2: bool = False
-    mamba_l2_host_slots: int = 0
-    mamba_l2_ratio: float = 2.0
-    mamba_l2_layout: str = "layer_first"
-    mamba_l2_io_backend: str = "kernel"
-    mamba_l2_host_gb: int = 0
+    mamba_ssm_dtype: str = "float32"
 
     # Other runtime options
     stream_interval: int = 1
@@ -227,25 +161,14 @@ class ServerArgs:
     enable_log_requests: bool = False
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
-    # On by default. Every prefix-cache number this project has published was
-    # first computed by grepping `#cached-token` out of the engine's own log,
-    # because the counters that answer the same question directly were behind a
-    # flag nobody set. `tokenspeed:prefix_cache_hits / prompt_tokens` is the
-    # ratio vLLM reports as `vllm:prefix_cache_hits_total / queries_total`, so
-    # having it on is what makes the two engines comparable without parsing
-    # either one's log.
-    enable_metrics: bool = True
+    enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
     app_key: str | None = None
 
     # API related
     api_key: str | None = None
-    # On by default: per-request cached tokens in meta_info /
-    # usage.prompt_tokens_details, the same field vLLM fills, so a reuse
-    # comparison can be made request by request rather than in aggregate.
-    # test/runtime/test_prefix_cache_e2e.py already asserts against it.
-    enable_cache_report: bool = True
+    enable_cache_report: bool = False
     kv_events_config: str | None = None
 
     # RL online weight sync (always on / ungated). NOTE: these endpoints can
@@ -306,12 +229,12 @@ class ServerArgs:
     kvstore_mem_layout: str = "layer_first"
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
-    enable_mla_l1_5_cache: bool = False
 
-    # Multi-node distributed serving
+    # Multi-node distributed serving. ``None`` means "not given by the user",
+    # which is what lets the launcher environment fill them in.
     dist_init_addr: str | None = None
-    nnodes: int = 1
-    node_rank: int = 0
+    nnodes: int | None = None
+    node_rank: int | None = None
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
@@ -320,7 +243,6 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = None
     kda_backend: str = "auto"
-    moe_activation_dtype: str = "bf16"
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
     dp_sampling: bool = False
@@ -367,10 +289,10 @@ class ServerArgs:
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
+    disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
@@ -427,8 +349,22 @@ class ServerArgs:
     def mamba_cache_chunk_size(self) -> int:
         return max(FLA_CHUNK_SIZE, self.block_size)
 
+    @property
+    def spec_context_pad(self) -> int:
+        """Tokens the physical KV extent must hold past the logical context_len.
+
+        Zero without speculative decoding; see _SPEC_OVERSHOOT_SPANS for the
+        derivation. Sizing consumers (page tables, graph capture widths) add
+        this pad; user-semantic consumers (input validation, max_new_tokens
+        folding, stop checks) keep the logical context_len.
+        """
+        if self.speculative_algorithm is None:
+            return 0
+        return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
+
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
@@ -460,6 +396,18 @@ class ServerArgs:
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
 
+        # Classify explicit DSpark arguments before cache validation, matching
+        # the speculative-config path below. Model aliases that resolve to the
+        # target checkpoint must use the same fail-closed cache contract.
+        if self.speculative_config is None and self.speculative_algorithm == "DSPARK":
+            explicit_draft_model = self.speculative_draft_model_path
+            if (
+                self.draft_model_path_use_base
+                or explicit_draft_model is None
+                or maybe_model_redirect(explicit_draft_model) == self.model
+            ):
+                self.draft_model_path_use_base = True
+
         if self.speculative_config is not None:
             try:
                 config = json.loads(self.speculative_config)
@@ -477,13 +425,29 @@ class ServerArgs:
             if draft_model is not None and self.speculative_draft_model_path is None:
                 self.speculative_draft_model_path = str(draft_model)
 
+            dspark_draft_model = self.speculative_draft_model_path
+            dspark_uses_base_model = self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or dspark_draft_model is None
+                or maybe_model_redirect(dspark_draft_model) == self.model
+            )
+            if dspark_uses_base_model:
+                self.draft_model_path_use_base = True
+
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
-                if self.speculative_algorithm == "DFLASH":
+                if self.speculative_algorithm == "DFLASH" or (
+                    self.speculative_algorithm == "DSPARK"
+                    and not dspark_uses_base_model
+                ):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
                     self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                elif self.speculative_algorithm == "DSPARK":
+                    self.speculative_num_steps = num_speculative_tokens
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = num_speculative_tokens + 1
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
@@ -559,6 +523,42 @@ class ServerArgs:
             else:
                 self.sampling_backend = "greedy"
 
+    def resolve_launcher_topology(self):
+        """Fill in unset multi-node arguments from the launcher environment."""
+        topology = detect_topology()
+        if topology is None:
+            self.nnodes = 1 if self.nnodes is None else self.nnodes
+            self.node_rank = 0 if self.node_rank is None else self.node_rank
+            return
+
+        for flag, given, found in (
+            ("--nnodes", self.nnodes, topology.nnodes),
+            ("--node-rank", self.node_rank, topology.node_rank),
+        ):
+            if given is not None and given != found:
+                raise ValueError(
+                    f"{flag}={given} contradicts the {topology.source} environment, "
+                    f"which reports {found}. Drop the flag to use the launcher's "
+                    f"value, or correct the launch."
+                )
+
+        derived = []
+        if self.nnodes is None:
+            self.nnodes = topology.nnodes
+            derived.append(f"--nnodes {self.nnodes}")
+        if self.node_rank is None:
+            self.node_rank = topology.node_rank
+            derived.append(f"--node-rank {self.node_rank}")
+        if self.dist_init_addr is None:
+            check_dist_init_port(topology.dist_init_port)
+            self.dist_init_addr = topology.dist_init_addr
+            derived.append(f"--dist-init-addr {self.dist_init_addr}")
+        if derived:
+            logger.info(
+                f"node {self.node_rank}/{self.nnodes} on {socket.gethostname()}: "
+                f"derived from {topology.source}: {' '.join(derived)}"
+            )
+
     def resolve_parallelism(self):
         world_size = self.world_size
         nprocs_per_node = self.nprocs_per_node
@@ -594,12 +594,15 @@ class ServerArgs:
             world_size, attn_tp_size, attn_cp_size, attn_dp_size
         )
 
-        # Dense layers still default to full TP participation when no
-        # dedicated dense_tp_size is provided.
+        # Dense layers default to the attention replica's TP width
+        # (attn_tp_size x attn_cp_size == world_size // attn_dp_size). Without
+        # DP attention this is the full world, unchanged from before; with DP
+        # attention it keeps each dense all-reduce inside one replica (matching
+        # attn) instead of spanning the whole world, which would otherwise cross
+        # nodes and force attn_tp != dense_tp. Pass --dense-tp-size to override.
         dense_tp_size = self.dense_tp_size
         if self.dense_tp_size is None:
-            # dense always do tp now.
-            dense_tp_size = world_size
+            dense_tp_size = attn_tp_size * attn_cp_size
         dense_dp_size = None
 
         # --enable-expert-parallel auto-sets ep_size = world_size
@@ -653,35 +656,6 @@ class ServerArgs:
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
-        # The host tier moves recurrent state by slot index between the device
-        # pool and MambaHostAllocator's rows. With the checkpoint pool on, a
-        # tree-owned snapshot is not in the device pool at all -- it is a row of
-        # a different width in a different index space -- so the write-back
-        # would read the wrong pool at the wrong precision, and the indices are
-        # not even in range. Nothing would raise; the state would simply be
-        # wrong.
-        #
-        # SGLang rejects the same pair for the same reason
-        # (server_args.py:6023 _handle_int8_mamba_checkpoint: "they would read
-        # int8 checkpoint slots as bf16 active slots"). Making the host tier
-        # checkpoint-aware is the work that would lift this.
-        if self.enable_mamba_ckpt_pool and self.enable_mamba_l2:
-            raise ValueError(
-                "--enable-mamba-ckpt-pool cannot be combined with "
-                "--enable-mamba-l2: the host tier reads slot indices as active "
-                "device-pool rows, and a checkpoint slot is neither. Pick one "
-                "until the host path is made checkpoint-aware."
-            )
-        if self.enable_mamba_ckpt_pool and not self.enable_prefix_caching:
-            # Nothing publishes a snapshot with the cache off, so the pool would
-            # be memory taken from the working slots for nothing.
-            self.enable_mamba_ckpt_pool = False
-        if not 0.0 <= self.mamba_ckpt_memory_fraction < 1.0:
-            raise ValueError(
-                "--mamba-ckpt-memory-fraction must be in [0, 1), got "
-                f"{self.mamba_ckpt_memory_fraction}"
-            )
-
         if self.mm_encoder_tp_mode == "data":
             if self.disaggregation_mode not in ("null", "prefill"):
                 raise ValueError(
@@ -689,9 +663,7 @@ class ServerArgs:
                     "--disaggregation-mode null (aggregate serving) or prefill"
                 )
             if self.mapping.nnodes != 1:
-                raise ValueError(
-                    "--mm-encoder-tp-mode data currently supports a single node only"
-                )
+                logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
             if self.mapping.has_attn_cp:
                 raise ValueError(
                     "--mm-encoder-tp-mode data does not currently support "
@@ -714,7 +686,7 @@ class ServerArgs:
             self.drafter_attention_backend = self.attention_backend
 
         if (
-            self.speculative_algorithm == "MTP"
+            self.speculative_algorithm in ("MTP", "DSPARK")
             and self.speculative_draft_model_path is None
         ):
             self.draft_model_path_use_base = True
@@ -728,13 +700,14 @@ class ServerArgs:
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
             if self.speculative_num_steps == ServerArgs.speculative_num_steps:
                 self.speculative_num_steps = expected_steps
             elif self.speculative_num_steps != expected_steps:
                 raise ValueError(
-                    "DFLASH requires speculative_num_steps to equal "
+                    f"{self.speculative_algorithm} requires "
+                    "speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
                     f"{self.speculative_num_draft_tokens=}."
@@ -812,7 +785,7 @@ class ServerArgs:
                 )
 
     def _handle_kvstore(self):
-        if self.disaggregation_mode in ("decode", "encode"):
+        if self.disaggregation_mode == "encode":
             self.enable_kvstore = False
             logger.info(
                 "%s instance has set enable_kvstore to False!",
@@ -836,7 +809,29 @@ class ServerArgs:
                 )
 
     def validate_cache_options(self):
-        if self.enable_kvstore and not self.enable_prefix_caching:
+        speculative_algorithm = getattr(self, "speculative_algorithm", None)
+        draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
+        speculative_draft_model_path = getattr(
+            self, "speculative_draft_model_path", None
+        )
+        if (
+            self.enable_kvstore
+            and speculative_algorithm == "DSPARK"
+            and (
+                draft_model_path_use_base
+                or speculative_draft_model_path is None
+                or speculative_draft_model_path == self.model
+            )
+        ):
+            raise ValueError(
+                "DSPARK same-checkpoint decoding does not support KVStore; "
+                "use --disable-kvstore."
+            )
+        if (
+            self.enable_kvstore
+            and not self.enable_prefix_caching
+            and self.disaggregation_mode != "decode"
+        ):
             raise ValueError(
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
@@ -941,6 +936,41 @@ class ServerArgs:
             default=ServerArgs.language_model_only,
             help="Skip vision/audio encoders on a multimodal checkpoint and "
             "run text-only. Multimodal requests are rejected.",
+        )
+        parser.add_argument(
+            "--zmq-msgpack",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.zmq_msgpack,
+            help="Drive the scheduler directly from SMG over the msgpack ZMQ "
+            "wire instead of the Python tokenizer_manager (pickle IPC). SMG "
+            "binds the handshake/input/output sockets; the scheduler connects "
+            "in. Pair with --skip-tokenizer-init.",
+        )
+        parser.add_argument(
+            "--data-parallel-address",
+            type=_nonempty_str,
+            default=ServerArgs.data_parallel_address,
+            help="Host of the frontend-bound handshake ROUTER the scheduler "
+            "connects to under --zmq-msgpack (default "
+            f"{ServerArgs.data_parallel_address}).",
+        )
+        parser.add_argument(
+            "--data-parallel-rpc-port",
+            type=_uint16,
+            default=ServerArgs.data_parallel_rpc_port,
+            help="Port of the frontend-bound handshake ROUTER (default "
+            f"{ServerArgs.data_parallel_rpc_port}, outside the smg frontend's "
+            "derived-port band 20000..=29999). `smg serve --backend "
+            "tokenspeed --connection-mode zmq` passes an explicit port "
+            "derived from the worker's ipc:// URL instead.",
+        )
+        parser.add_argument(
+            "--zmq-engine-index",
+            type=_uint16,
+            default=ServerArgs.zmq_engine_index,
+            help="This engine's index under --zmq-msgpack; used as the two-byte "
+            "little-endian ZMQ routing identity SMG addresses it by "
+            "(0..65535).",
         )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(
@@ -1093,6 +1123,7 @@ class ServerArgs:
             metavar="BLOCK_SIZE",
             type=int,
             default=ServerArgs.block_size,
+            help="Kernel cache page size in tokens.",
         )
 
         # KVStore
@@ -1147,11 +1178,6 @@ class ServerArgs:
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
-        parser.add_argument(
-            "--enable-mla-l1-5-cache",
-            action="store_true",
-            help="Enable MLA L1.5 cache in disaggregation paths.",
-        )
         # Mamba Cache
         parser.add_argument(
             "--mamba-ssm-dtype",
@@ -1160,152 +1186,6 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="It is used to tune mamba ssm dtype",
         )
-        parser.add_argument(
-            "--mamba-track-interval",
-            type=int,
-            default=ServerArgs.mamba_track_interval,
-            help="The interval to track the mamba state during decode.",
-        )
-        parser.add_argument(
-            "--max-mamba-cache-size",
-            type=int,
-            default=ServerArgs.max_mamba_cache_size,
-            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
-        )
-        parser.add_argument(
-            "--mamba-full-memory-ratio",
-            type=float,
-            default=ServerArgs.mamba_full_memory_ratio,
-            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
-        )
-        parser.add_argument(
-            "--long-prefill-token-threshold",
-            type=int,
-            default=ServerArgs.long_prefill_token_threshold,
-            help=(
-                "Cap on how far one prefill advances per step (vLLM's knob of "
-                "the same name). 0 leaves it unbounded."
-            ),
-        )
-        parser.add_argument(
-            "--max-num-partial-prefills",
-            type=int,
-            default=ServerArgs.max_num_partial_prefills,
-            help=(
-                "How many prompts one step may prefill (vLLM's default is 1). "
-                "0 leaves it unbounded."
-            ),
-        )
-        parser.add_argument(
-            "--mixed-prefill-decode-min-load",
-            type=float,
-            default=ServerArgs.mixed_prefill_decode_min_load,
-            help=(
-                "Queue depth over max_batch_size above which a step mixes "
-                "prefill with decode. 0.0 always mixes, which with "
-                "--max-num-partial-prefills is vLLM's arrangement."
-            ),
-        )
-        ckpt_pool_group = parser.add_mutually_exclusive_group()
-        ckpt_pool_group.add_argument(
-            "--enable-mamba-ckpt-pool",
-            action="store_true",
-            default=ServerArgs.enable_mamba_ckpt_pool,
-            help=(
-                "Keep cached recurrent snapshots in a separate pool instead of "
-                "the active state pool, so a cached state cannot take the slot a "
-                "running sequence needs and can be stored at its own precision. "
-                "Costs --mamba-ckpt-memory-fraction of the recurrent-state "
-                "budget, and therefore that share of concurrency."
-            ),
-        )
-        ckpt_pool_group.add_argument(
-            "--no-enable-mamba-ckpt-pool",
-            dest="enable_mamba_ckpt_pool",
-            action="store_false",
-            help="Keep snapshots in the active pool at --mamba-ssm-dtype.",
-        )
-        parser.add_argument(
-            "--mamba-ckpt-dtype",
-            type=str,
-            default=ServerArgs.mamba_ckpt_dtype,
-            choices=["float32", "bfloat16", "int8"],
-            help=(
-                "Storage dtype for a cached recurrent snapshot. float32 resumes "
-                "bit-identically to a cold prefill; int8 holds about four times "
-                "as many snapshots per byte and rounds the state once."
-            ),
-        )
-        parser.add_argument(
-            "--mamba-ckpt-size",
-            type=int,
-            default=ServerArgs.mamba_ckpt_size,
-            help=(
-                "Slots in the checkpoint pool. Defaults to whatever "
-                "--mamba-ckpt-memory-fraction buys."
-            ),
-        )
-        parser.add_argument(
-            "--mamba-ckpt-memory-fraction",
-            type=float,
-            default=ServerArgs.mamba_ckpt_memory_fraction,
-            help=(
-                "Share of the recurrent-state memory budget the checkpoint pool "
-                "takes, and so the fraction of concurrency it costs."
-            ),
-        )
-        # Deprecated spelling of the pair above, kept because measurement
-        # scripts pass it. int8 is now one dtype among three rather than the
-        # only reason to have a second pool.
-        parser.add_argument(
-            "--enable-int8-mamba-checkpoint",
-            action="store_true",
-            help=argparse.SUPPRESS,
-        )
-        parser.add_argument(
-            "--int8-mamba-ckpt-size",
-            type=int,
-            default=None,
-            help=argparse.SUPPRESS,
-        )
-        parser.add_argument(
-            "--enable-mamba-l2",
-            action="store_true",
-            help="Enable host-memory L2 cache for Mamba state slots.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-slots",
-            type=int,
-            default=ServerArgs.mamba_l2_host_slots,
-            help="Number of host Mamba L2 slots. If 0, derive from --mamba-l2-host-gb or --mamba-l2-ratio.",
-        )
-        parser.add_argument(
-            "--mamba-l2-ratio",
-            type=float,
-            default=ServerArgs.mamba_l2_ratio,
-            help="Mamba host L2 slot ratio relative to device Mamba slots when host slots are not explicit.",
-        )
-        parser.add_argument(
-            "--mamba-l2-layout",
-            type=str,
-            choices=["layer_first"],
-            default=ServerArgs.mamba_l2_layout,
-            help="Mamba host L2 memory layout.",
-        )
-        parser.add_argument(
-            "--mamba-l2-io-backend",
-            type=str,
-            choices=["direct", "kernel"],
-            default=ServerArgs.mamba_l2_io_backend,
-            help="IO backend for Mamba L2 host/device transfers.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-gb",
-            type=int,
-            default=ServerArgs.mamba_l2_host_gb,
-            help="Mamba L2 host memory budget in GiB. Overrides --mamba-l2-ratio when host slots are not explicit.",
-        )
-
         parser.add_argument(
             "--max-prefill-tokens",
             metavar="MAX_PREFILL_TOKENS",
@@ -1403,14 +1283,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-metrics",
             action="store_true",
-            default=ServerArgs.enable_metrics,
             help="Enable log metrics.",
-        )
-        parser.add_argument(
-            "--no-enable-metrics",
-            dest="enable_metrics",
-            action="store_false",
-            help="Disable log metrics.",
         )
         parser.add_argument(
             "--metrics-reporters",
@@ -1443,14 +1316,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cache-report",
             action="store_true",
-            default=ServerArgs.enable_cache_report,
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
-        )
-        parser.add_argument(
-            "--no-enable-cache-report",
-            dest="enable_cache_report",
-            action="store_false",
-            help="Omit cached-token counts from the OpenAI usage block.",
         )
         parser.add_argument(
             "--kv-events-config",
@@ -1547,7 +1413,8 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1580,13 +1447,20 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes. Derived from SLURM_STEP_NUM_NODES when unset.",
         )
         parser.add_argument(
-            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The node rank. Derived from SLURM_NODEID when unset.",
         )
 
         # Model override args
@@ -1629,23 +1503,14 @@ class ServerArgs:
             type=str,
             choices=["auto", "fla", "flashkda", "cutedsl_kda"],
             default=ServerArgs.kda_backend,
-            help="KDA (Kimi Delta Attention) prefill kernel policy: 'auto' "
-            "picks the fastest available kernel (cutedsl_kda > flashkda > fla); "
-            "'fla' forces the portable FLA scan; 'flashkda' the optional "
-            "FlashKDA library (source build, SM90+); 'cutedsl_kda' the "
+            help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
+            "this setting is ignored and compatible kernels are selected using "
+            "registry priority. On NVIDIA, 'auto' selects the fastest available "
+            "backend "
+            "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
+            "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
+            "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
             "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
-        )
-        parser.add_argument(
-            "--moe-activation-dtype",
-            type=str,
-            choices=["bf16", "mxfp8"],
-            default=ServerArgs.moe_activation_dtype,
-            help="MoE activation precision (Kimi-K3 fused SiTU MoE): 'bf16' "
-            "keeps bf16 activations (w4a16, default); 'mxfp8' block-quantizes "
-            "activations to fp8 (w4a8, mxfp8-act x mxfp4-weight). A run-wide "
-            "deployment choice, stable for the whole process; 'mxfp8' speeds up "
-            "large-batch prefill (~1.5x on the MoE) at a small decode cost and "
-            "requires the sidecar's w4a8 cubins. Weights stay mxfp4 either way.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
@@ -1808,7 +1673,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP", "DFLASH"],
+            choices=["EAGLE3", "MTP", "DFLASH", "DSPARK"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1884,6 +1749,14 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
+            "--disable-autotune",
+            "--disable-flashinfer-autotune",
+            action="store_true",
+            help="Skip the startup kernel-tuning pass; tunable kernels use each "
+            "library's heuristic tactics instead. Speeds up startup for "
+            "debugging at the cost of serving performance.",
+        )
+        parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
@@ -1897,11 +1770,6 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
-        )
-        parser.add_argument(
-            "--disable-custom-all-reduce",
-            action="store_true",
-            help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -2053,7 +1921,9 @@ class ServerArgs:
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
-            help="Specify tp size for dense part, default equals nprocs-per-node, if non dp_attn && combine_dense mode, this parameter will be overridden by attn_tp_size",
+            help="Specify tp size for dense part. Defaults to the attention "
+            "replica width (attn_tp_size x attn_cp_size): the full world without "
+            "DP attention, one replica with it.",
         )
         parser.add_argument(
             "--moe-tp-size",
@@ -2233,21 +2103,6 @@ class ServerArgs:
                 )
             args.attn_tp_size = tensor_parallel_size
 
-        # --enable-int8-mamba-checkpoint / --int8-mamba-ckpt-size are the old
-        # spelling from when int8 was the only reason for a second pool. They
-        # now select a dtype in a pool that is on by default.
-        if getattr(args, "enable_int8_mamba_checkpoint", False):
-            args.mamba_ckpt_dtype = "int8"
-            args.enable_mamba_ckpt_pool = True
-        int8_ckpt_size = getattr(args, "int8_mamba_ckpt_size", None)
-        if int8_ckpt_size is not None:
-            if getattr(args, "mamba_ckpt_size", None) is not None:
-                raise ValueError(
-                    "Cannot specify both --int8-mamba-ckpt-size and "
-                    "--mamba-ckpt-size; the first is the deprecated spelling."
-                )
-            args.mamba_ckpt_size = int8_ckpt_size
-
         # Only pass fields that argparse actually produced. Falling back to
         # ``None`` for missing attrs would silently clobber dataclass defaults
         # for non-CLI-exposed fields (e.g. ``enable_inline_detokenizer``).
@@ -2260,6 +2115,11 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
+
+    def zmq_handshake_endpoint(self) -> str:
+        """The frontend handshake endpoint dialed under ``--zmq-msgpack``,
+        composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
+        return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
 
     def get_weight_transfer_config(self):
         """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
@@ -2301,6 +2161,9 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
+    # The resolved rendezvous address after moving past busy local ports.
+    dist_init_addr: str
+
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
@@ -2331,6 +2194,12 @@ class PortArgs:
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+        elif server_args.dist_init_addr is None:
+            raise ValueError(
+                f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
+                "and could not be derived from the launcher environment. "
+                "Example: --dist-init-addr <head-node-ip>:20000"
+            )
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
         if len(dist_init_addr) != 2:
@@ -2341,12 +2210,18 @@ class PortArgs:
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
 
-        # Scan forward until we find a port cluster where all derived ports are free.
-        # This handles the case where a previous engine instance left ports in
-        # TIME_WAIT or its child processes haven't fully terminated yet.
-        # Note: the port at offset +1 (formerly detokenizer_port) is intentionally
-        # skipped so the rest of the port layout stays stable for any external
-        # tooling that indexed off the historical port cluster.
+        # Scan forward until we find a port cluster where all derived ports are
+        # free. This handles the case where a previous engine instance left
+        # ports in TIME_WAIT or its child processes haven't fully terminated
+        # yet. Note: the port at offset +1 (formerly detokenizer_port) is
+        # intentionally skipped so the rest of the port layout stays stable for
+        # any external tooling that indexed off the historical port cluster.
+        #
+        # The whole cluster is bound on node 0 alone, so scanning is only
+        # meaningful there: is_port_available binds the local wildcard, and a
+        # follower moving its own base would simply address ports the head
+        # never bound. Multi-node therefore takes the cluster as derived and
+        # reports a conflict instead of relocating it.
         while True:
             port_base = dist_init_port + 1
             rpc_port = port_base + 2
@@ -2357,17 +2232,26 @@ class PortArgs:
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
             rpc_ipc_port = scheduler_input_port + 1
-            if all(
-                is_port_available(p)
-                for p in [
-                    dist_init_port,
-                    port_base,
-                    rpc_port,
-                    metrics_ipc_port,
-                    scheduler_input_port,
-                    rpc_ipc_port,
-                ]
-            ):
+            cluster = [
+                dist_init_port,
+                port_base,
+                rpc_port,
+                metrics_ipc_port,
+                scheduler_input_port,
+                rpc_ipc_port,
+            ]
+            if server_args.mapping.nnodes > 1:
+                if server_args.node_rank == 0:
+                    busy = [p for p in cluster if not is_port_available(p)]
+                    if busy:
+                        raise ValueError(
+                            f"control-plane ports {busy} are already in use on the "
+                            "head node. Every node derives this cluster from "
+                            "--dist-init-addr, so it cannot be moved on one node "
+                            "alone; restart with a different --dist-init-addr port."
+                        )
+                break
+            if all(is_port_available(p) for p in cluster):
                 break
             dist_init_port += 10
 
@@ -2375,6 +2259,7 @@ class PortArgs:
             tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
             scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
             nccl_port=port,
+            dist_init_addr=f"{dist_init_host}:{dist_init_port}",
             rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
             metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
             tokenizer_worker_ipc_name=None,

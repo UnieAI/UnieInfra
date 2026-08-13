@@ -23,10 +23,10 @@
 #include <variant>
 
 #include "scheduler/operations/forward.h"
-#include "scheduler/operations/cache.h"
+#include "cache/tier/transfer.h"
 
 namespace tokenspeed {
 
-using Operation = std::variant<CacheOperation, ForwardOperation, FlatForwardOperation>;
+using Operation = std::variant<CacheOperation, ForwardBatch>;
 
 }  // namespace tokenspeed

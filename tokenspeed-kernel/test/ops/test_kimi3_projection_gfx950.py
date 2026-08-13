@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import tokenspeed_kernel
 import torch
@@ -12,16 +10,13 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     _use_gluon_mediumm,
 )
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
+from utils import is_cdna4
 
-
-def _is_gfx950() -> bool:
-    return "gfx950" in os.environ.get("PYTORCH_ROCM_ARCH", "") or (
-        torch.cuda.is_available() and "MI350" in torch.cuda.get_device_name()
+if not is_cdna4():
+    pytest.skip(
+        "AMD CDNA4 is required for Kimi K3 projection tests",
+        allow_module_level=True,
     )
-
-
-if not _is_gfx950():
-    pytest.skip("Kimi K3 projection tests require gfx950", allow_module_level=True)
 
 
 @pytest.mark.parametrize(
@@ -110,7 +105,7 @@ def test_kimi3_latent_projection_writes_out_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2])
+@pytest.mark.parametrize("num_tokens", [1, 2, 16])
 def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     num_tokens: int,
 ) -> None:
@@ -131,6 +126,38 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
             weight,
             prefix,
             shared_output,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures() -> None:
+    torch.manual_seed(37)
+    latent = torch.randn(1, 3584, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(3584, device="cuda", dtype=torch.bfloat16)
+    projection_weight = torch.randn(7168, 3584, device="cuda", dtype=torch.bfloat16)
+    prefix = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    shared = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    source = latent.float()
+    normalized = (
+        source
+        * torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + 1e-6)
+        * norm_weight.float()
+    ).to(latent.dtype)
+    projected = torch.nn.functional.linear(normalized, projection_weight)
+    expected = (projected.float() + prefix.float() + shared.float()).to(latent.dtype)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = tokenspeed_kernel.kimi3_latent_projection_add3(
+            latent,
+            projection_weight,
+            prefix,
+            shared,
+            norm_weight=norm_weight,
+            eps=1e-6,
         )
     graph.replay()
     torch.cuda.synchronize()

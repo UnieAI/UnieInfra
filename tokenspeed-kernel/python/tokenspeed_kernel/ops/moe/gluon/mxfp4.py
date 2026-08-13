@@ -31,21 +31,24 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
+# TP8/EP8 model measurements favor warp GEMV through M=16.
+_ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
+
 
 if platform.is_amd:
-    from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx1250
-    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         gluon_mxfp_dynamic_mxfp4_fused_moe,
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
-    from tokenspeed_kernel_amd.ops.moe.gluon_a16w4_situ_grouped import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (
         gluon_a16w4_situ_grouped_ep_gfx950,
     )
-    from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
-    from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx1250_preprocess import (
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused as fused_mxfp_gfx1250
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx1250_moe_weights,
     )
 
@@ -142,15 +145,16 @@ if platform.is_amd:
         num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
         expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
         use_route_direct_decode = (
-            0 < x.shape[0] <= 4
+            0 < x.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
             and x.is_contiguous()
             and x.shape[1] % 256 == 0
             and two_intermediate % 2 == 0
             and intermediate % 256 == 0
             and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
         )
+        output = getattr(w, "_situ_output_buffer", None)
         if use_route_direct_decode:
-            from tokenspeed_kernel_amd.ops.moe.gluon_a16w4_situ_decode import (
+            from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
                 gluon_a16w4_situ_warp_decode_ep_gfx950,
             )
 
@@ -173,6 +177,7 @@ if platform.is_amd:
                 w13_interleaved=(
                     getattr(w, "w13_input_layout", "concatenated") == "interleaved"
                 ),
+                routed_out=output,
             )
         return gluon_a16w4_situ_grouped_ep_gfx950(
             x,
@@ -185,6 +190,7 @@ if platform.is_amd:
             situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
             situ_linear_beta=getattr(w, "activation_situ_linear_beta", None),
             expert_start=expert_start,
+            out=output,
         )
 
     @register_kernel(

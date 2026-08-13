@@ -83,7 +83,7 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
-            q, latent_cache, gate = self._project_q_latent_gated(
+            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
                 hidden_states, ctx, comm_manager, block_scale
             )
         else:
@@ -91,7 +91,15 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
                 hidden_states, ctx, comm_manager, block_scale
             )
             gate = None
-        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
+            absorbed_query = None
+        attn_output = self._attn(
+            positions,
+            q,
+            latent_cache,
+            ctx,
+            out_cache_loc,
+            absorbed_query=absorbed_query,
+        )
         if gate is not None:
             if attn_output.shape[0] != gate.shape[0]:
                 gate = gate.index_select(0, ctx.gather_ids)
@@ -206,6 +214,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             residual,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            ctx=ctx,
         )
         return prefix.view(residual.shape)
 
@@ -355,6 +364,14 @@ class KimiK3NextNForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes:
+        everything under the NextN layer prefix.
+        """
+        return name.startswith(f"model.layers.{self.config.num_hidden_layers}.")
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         config = self.config
         nextn_prefix = f"model.layers.{config.num_hidden_layers}."
@@ -485,6 +502,13 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.language_model.forward(*args, **kwargs)
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader)."""
+        lm_prefix = "language_model."
+        if not name.startswith(lm_prefix):
+            return False
+        return self.language_model.checkpoint_weight_name_filter(name[len(lm_prefix) :])
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         lm_prefix = "language_model."

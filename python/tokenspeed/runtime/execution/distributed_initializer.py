@@ -21,7 +21,6 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -81,7 +80,6 @@ class DistributedConfig:
     max_num_tokens: int = 0
 
     # Feature flags
-    disable_custom_all_reduce: bool = False
     force_deterministic_rsag: bool = False
 
     # The full Mapping object for pg_manager initialization
@@ -111,7 +109,7 @@ class DistributedConfig:
             moe_ep_size=mapping.moe.ep_size,
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
-            dist_init_addr=server_args.dist_init_addr,
+            dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
                 if server_args.distributed_timeout_seconds is not None
@@ -121,7 +119,6 @@ class DistributedConfig:
             nprocs_per_node=mapping.nprocs_per_node,
             hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
-            disable_custom_all_reduce=server_args.disable_custom_all_reduce,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
             mapping=mapping,
         )
@@ -150,12 +147,10 @@ class DistributedInitializer:
         else:
             dist_init_method = f"tcp://127.0.0.1:{config.nccl_port}"
 
-        # Device-scoped NCCL init is only required and tested on AMD.
-        device_id = (
-            torch.device(config.device, config.gpu_id)
-            if current_platform().is_amd
-            else None
-        )
+        # Pass the device so PyTorch binds the process group to it (eager NCCL
+        # init) instead of inferring it later — this also mutes the c10d
+        # "barrier(): using the device under current context" warning.
+        device_id = torch.device(config.device, config.gpu_id)
 
         # Initialize distributed via the mapping-based process group manager
         pg_manager.init_distributed(
@@ -167,16 +162,19 @@ class DistributedInitializer:
         )
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
+        pg_manager.init_process_group(config.mapping.attn.dp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
 
-        # Register Lamport one-shot all-reduce workspaces for the TP groups.
-        # AutoBackend routes small SUM all-reduces (<= 2 MB payload, i.e. the
-        # per-step decode reductions) through them; larger payloads and every
-        # other op keep using NCCL. Without this the one-shot backend is
-        # never armed and raw all_reduce callers (e.g. models whose comm
-        # cannot fuse into a norm) pay ring latency per layer.
-        if not config.disable_custom_all_reduce and config.hidden_size > 0:
+        # Register the trtllm one-shot all-reduce workspaces for the TP
+        # groups. AutoBackend routes small SUM all-reduces (<= 2 MB payload,
+        # i.e. the per-step decode reductions) through them; larger payloads
+        # and every other op keep using NCCL. Without this the one-shot
+        # backend is never armed and raw all_reduce callers (e.g. models whose
+        # comm cannot fuse into a norm) pay ring latency per layer.
+        # Unconditional: --force-deterministic-rsag is the escape hatch, and
+        # it overrides at dispatch (auto.py) rather than at registration.
+        if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
             )

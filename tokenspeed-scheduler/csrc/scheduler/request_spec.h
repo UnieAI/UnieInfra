@@ -20,8 +20,8 @@
 
 #pragma once
 
-#include <span>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -30,31 +30,14 @@ namespace tokenspeed {
 struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
-    std::vector<std::string> rolling_hashes;
-    std::int32_t storage_hit_pages{0};
-    // Upper bound on tokens this request will generate.
-    //
-    // The scheduler had no way to ask how long a request would run, which is
-    // why the KV reservation for already-running requests
-    // (`num_pages_reserved_for_retracted_or_running`) was declared and never
-    // implemented -- there was nothing to compute it from. SGLang's
-    // `new_token_ratio` is exactly this quantity times a learned fraction.
-    //
-    // Zero means "unknown"; the reservation then falls back to a fixed horizon
-    // rather than assuming the request is about to finish.
     std::int32_t max_new_tokens{0};
 };
 
 struct PrefillInfo {
     std::span<const std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
-    std::int32_t already_scheduled_len;
-    std::int32_t extend_len;
-};
-
-struct StorageInfo {
-    std::vector<std::string> rolling_hashes;
-    std::int32_t hit_pages{0};
+    std::int32_t already_scheduled_len{0};
+    std::int32_t extend_len{0};
 };
 
 }  // namespace tokenspeed

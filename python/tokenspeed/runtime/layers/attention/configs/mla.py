@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -28,9 +28,30 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
+    resolve_speculative_num_tokens,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def resolve_mla_kv_cache_dtype(
+    server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+) -> torch.dtype:
+    """Resolve MLA cache precision without quantizing K3 DSpark context blindly.
+
+    The public K3 DSpark checkpoint has no FP8 KV scales and its reference vLLM
+    launch uses the default BF16 cache. TokenSpeed's K3 target currently requires
+    FP8 LCM storage, so the unified arena exposes a separate BF16 compute view
+    for the draft continuation fields. Other MLA drafts continue to honor the
+    global cache setting.
+    """
+    hf_config = getattr(model_config, "hf_config", None)
+    if (
+        is_draft
+        and server_args.speculative_algorithm == "DSPARK"
+        and getattr(hf_config, "model_type", None) == "k3_dspark"
+    ):
+        return torch.bfloat16
+    return resolve_dtype(server_args.kv_cache_dtype)
 
 
 @dataclass
@@ -41,6 +62,9 @@ class MLAConfig(BaseAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    layer_types: tuple[str, ...] = field(default=(), kw_only=True)
+    max_scheduled_tokens: int = field(default=0, kw_only=True)
+    pd_disaggregation_enabled: bool = field(default=False, kw_only=True)
 
     @classmethod
     def generate(
@@ -50,11 +74,22 @@ class MLAConfig(BaseAttnConfig):
         if server_args.speculative_algorithm is not None:
             kwargs.update(
                 speculative_num_steps=server_args.speculative_num_steps,
-                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+                speculative_num_draft_tokens=resolve_speculative_num_tokens(
+                    server_args, is_draft
+                ),
             )
+        hf_config = getattr(model_config, "hf_config", None)
+        layer_types = tuple(
+            getattr(hf_config, "paged_cache_layer_types", None)
+            or getattr(hf_config, "layer_types", None)
+            or ()
+        )
+        draft_block_decode = bool(
+            is_draft and server_args.speculative_algorithm in ("DFLASH", "DSPARK")
+        )
         return cls(
             device=server_args.device,
-            context_len=model_config.context_len,
+            context_len=model_config.context_len + server_args.spec_context_pad,
             backend_name=(
                 server_args.attention_backend
                 if not is_draft
@@ -65,19 +100,28 @@ class MLAConfig(BaseAttnConfig):
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             dtype=model_config.dtype,
-            kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
+            kv_cache_dtype=resolve_mla_kv_cache_dtype(
+                server_args, model_config, is_draft
+            ),
             page_size=server_args.block_size,
             max_graph_bs=server_args.max_cudagraph_capture_size,
             max_bs=server_args.max_num_seqs
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             is_draft=is_draft,
+            draft_block_decode=draft_block_decode,
             kv_lora_rank=model_config.kv_lora_rank,
             qk_nope_head_dim=model_config.qk_nope_head_dim,
             qk_rope_head_dim=model_config.qk_rope_head_dim,
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            layer_types=layer_types,
+            max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
+            pd_disaggregation_enabled=getattr(
+                server_args, "disaggregation_mode", "null"
+            )
+            != "null",
             **kwargs,
         )
 
@@ -93,28 +137,3 @@ class MLAConfig(BaseAttnConfig):
                 self.kv_lora_rank + self.qk_rope_head_dim
             ) * torch._utils._element_size(self.kv_cache_dtype)
         return cell_size
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-
-        return MLATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            model_dtype=self.dtype,
-            quant_method=self.kv_cache_quant_method,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-        )

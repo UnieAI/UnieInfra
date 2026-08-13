@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -33,38 +32,11 @@ from tokenspeed.runtime.execution.forward_batch_info import compute_position_tri
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
-# Must equal kMambaSnapshotMaxPerRequest in
-# tokenspeed-scheduler/csrc/fsm/forward_events.cpp -- the scheduler decides how
-# many snapshots to publish and this sizes the buffer that carries them.
-MAMBA_TRACK_MAX_PER_REQUEST = 6
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
 
 logger = get_colorful_logger(__name__)
-
-# Diagnostic for the multi-snapshot publish path: prints how many snapshot
-# depths the C++ scheduler actually published per request. The backend's
-# `use_multi` gate needs sum(counts) to EXCEED the number of rows carrying a
-# single track index, so a step where every count is 1 silently degrades to the
-# one-snapshot path and no amount of stride tuning changes anything.
-_TRACK_MULTI_DEBUG = bool(os.environ.get("TOKENSPEED_LOG_TRACK_MULTI"))
-_track_multi_seen = 0
-
-
-def _track_multi_debug(counts, indices, batch_size: int) -> None:
-    global _track_multi_seen
-    if _track_multi_seen >= 12:
-        return
-    _track_multi_seen += 1
-    logger.info(
-        "[TRACKMULTI] bs=%d counts=%s sum=%d indices=%s",
-        batch_size,
-        counts[:16],
-        sum(counts),
-        indices[:24],
-    )
 
 
 class InputBuffers:
@@ -83,7 +55,6 @@ class InputBuffers:
         dummy_kv_slot: int,
         state_write_padding_pool_index: int,
         device: str = "cuda",
-        has_mamba: bool = False,
     ):
         self.device = device
         self.page_size = page_size
@@ -92,7 +63,6 @@ class InputBuffers:
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
-        self.has_mamba = has_mamba
 
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
@@ -126,30 +96,6 @@ class InputBuffers:
             self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
-            if has_mamba:
-                self.mamba_pool_indices_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
-                self.mamba_cow_src_indices_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
-                self.mamba_branching_seqlens_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
-                self.mamba_track_pool_indices_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
-                # Ragged multi-snapshot destinations, flattened as
-                # (counts, indices): counts[i] slots for request i, then that
-                # many entries in indices, ascending by snapshot depth. One
-                # snapshot per request only ever serves an exact repeat; see
-                # unieinfra/xref/35-hybrid-prefix-reuse.md.
-                self.mamba_track_multi_counts_buf = torch.full(
-                    (max_bs,), 0, dtype=torch.int32
-                )
-                self.mamba_track_multi_indices_buf = torch.full(
-                    (max_bs * MAMBA_TRACK_MAX_PER_REQUEST,), -1, dtype=torch.int32
-                )
 
         # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
@@ -178,9 +124,11 @@ class InputBuffers:
         self,
         forward_op,
         runtime_states: RuntimeStates,
-        req_to_page: torch.Tensor,
         total_tokens: int,
+        page_table: torch.Tensor,
     ):
+        # out_cache_loc derives from the per-forward, batch-ordered full-history
+        # table (row i == batch position i) exported by the scheduler.
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
 
@@ -305,7 +253,7 @@ class InputBuffers:
                 req_pool_indices=req_pool_indices_device,
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
-                req_to_pages=req_to_page,
+                page_table=page_table,
                 page_size=self.page_size,
             )
             # Decode path's seq_lens / positions / out_cache_loc are done.
@@ -319,10 +267,9 @@ class InputBuffers:
             )
             compute_out_cache_loc(
                 out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-                req_pool_indices=req_pool_indices_device,
                 input_lengths=input_lengths_device,
                 cache_start=valid_cache_lengths,
-                req_to_pages=req_to_page,
+                page_table=page_table,
                 page_size=self.page_size,
             )
 
@@ -447,80 +394,6 @@ class InputBuffers:
                 self.state_write_padding_pool_index
             )
             self.seq_lens_buf[batch_size:].fill_(1)
-
-        if (
-            self.has_mamba
-            and hasattr(forward_op, "mamba_pool_indices")
-            and forward_op.mamba_pool_indices
-        ):
-            (
-                mamba_pool_indices_cpu,
-                mamba_cow_src_indices_cpu,
-                mamba_branching_seqlens_cpu,
-                mamba_track_pool_indices_cpu,
-            ) = self._bulk_pinned(
-                (batch_size, torch.int32),
-                (batch_size, torch.int32),
-                (batch_size, torch.int32),
-                (batch_size, torch.int32),
-            )
-            mamba_pool_indices_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_pool_indices, dtype=torch.int32)
-            )
-            mamba_cow_src_indices_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_cow_src_indices, dtype=torch.int32)
-            )
-            mamba_branching_seqlens_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_branching_seqlens, dtype=torch.int32)
-            )
-            mamba_track_pool_indices_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_track_pool_indices, dtype=torch.int32)
-            )
-
-            self.mamba_pool_indices_buf[:batch_size].copy_(
-                mamba_pool_indices_cpu, non_blocking=True
-            )
-            self.mamba_cow_src_indices_buf[:batch_size].copy_(
-                mamba_cow_src_indices_cpu, non_blocking=True
-            )
-            self.mamba_branching_seqlens_buf[:batch_size].copy_(
-                mamba_branching_seqlens_cpu, non_blocking=True
-            )
-            self.mamba_track_pool_indices_buf[:batch_size].copy_(
-                mamba_track_pool_indices_cpu, non_blocking=True
-            )
-
-            # Ragged; copied without the pinned staging because it is a handful
-            # of ints and its length varies per step.
-            multi_counts = list(
-                getattr(forward_op, "mamba_track_pool_counts_multi", ())
-            )
-            multi_indices = list(
-                getattr(forward_op, "mamba_track_pool_indices_multi", ())
-            )
-            if _TRACK_MULTI_DEBUG and any(c > 0 for c in multi_counts):
-                _track_multi_debug(multi_counts, multi_indices, batch_size)
-            if multi_counts:
-                n = min(len(multi_counts), batch_size)
-                self.mamba_track_multi_counts_buf[:n].copy_(
-                    torch.as_tensor(multi_counts[:n], dtype=torch.int32)
-                )
-                self.mamba_track_multi_counts_buf[n:].fill_(0)
-            else:
-                self.mamba_track_multi_counts_buf.fill_(0)
-            if multi_indices:
-                m = min(len(multi_indices), self.mamba_track_multi_indices_buf.numel())
-                self.mamba_track_multi_indices_buf[:m].copy_(
-                    torch.as_tensor(multi_indices[:m], dtype=torch.int32)
-                )
-                self.mamba_track_multi_indices_buf[m:].fill_(-1)
-            else:
-                self.mamba_track_multi_indices_buf.fill_(-1)
-            if batch_size < self.mamba_pool_indices_buf.shape[0]:
-                self.mamba_pool_indices_buf[batch_size:].fill_(-1)
-                self.mamba_cow_src_indices_buf[batch_size:].fill_(-1)
-                self.mamba_branching_seqlens_buf[batch_size:].fill_(-1)
-                self.mamba_track_pool_indices_buf[batch_size:].fill_(-1)
 
         return decode_input_ids
 

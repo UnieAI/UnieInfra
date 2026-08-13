@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <utility>
 #include <vector>
 
 #include "scheduler/outside_events/inc.h"
@@ -28,13 +29,12 @@ namespace tokenspeed {
 
 class ExecutionEvent {
 public:
-    template <typename EventType>
-    ExecutionEvent& With(EventType event) {
-        events_.emplace_back(event);
+    ExecutionEvent& With(Event event) {
+        events_.emplace_back(std::move(event));
         return *this;
     }
 
-    std::vector<Event> Events() const { return events_; }
+    const std::vector<Event>& Events() const { return events_; }
 
 private:
     std::vector<Event> events_;

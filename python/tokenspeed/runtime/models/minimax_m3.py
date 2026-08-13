@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -41,12 +42,14 @@ from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3Config,
     MiniMaxM3VisionConfig,
 )
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -72,6 +75,7 @@ from tokenspeed.runtime.layers.parameter import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
 from tokenspeed.runtime.models.base.comm_ops import FinalNormOp
@@ -701,8 +705,9 @@ class MiniMaxM3Attention(nn.Module):
             self.q_norm.gemma_weight,
             self.k_norm.gemma_weight,
             self.q_norm.variance_epsilon,
+            enable_pdl=pdl_enabled(),
         )
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, enable_pdl=pdl_enabled())
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -860,6 +865,13 @@ class MiniMaxM3Model(BaseTransformerModel):
     """MiniMax-M3 decoder-only text backbone."""
 
     layer_cls = MiniMaxM3DecoderLayer
+
+    def resolve_embed(self, config: MiniMaxM3VLTextConfig, prefix: str) -> nn.Module:
+        return VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
+        )
 
     def resolve_layers(
         self,
@@ -1590,7 +1602,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             prefix=add_prefix("patch_merge_mlp", prefix),
             bias=True,
         )
-        self.multimodal_embedder = MultimodalEmbedder()
+        self.multimodal_embedder = MultimodalEmbedder(encoder_mapping=mapping.vision)
         self.image_encoder = self.get_image_feature
         self.video_encoder = self.get_video_feature
 
@@ -1642,6 +1654,89 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
 
         return self._get_vision_feature(items, Modality.VIDEO)
 
+    def _make_vision_warmup_items(
+        self,
+        modality: Modality,
+        *,
+        temporal_patches: int,
+        grid_key: str,
+    ) -> list[MultimodalDataItem]:
+        """Build one input on MiniMax-M3's configured default image-token grid."""
+        vision_config = self.vl_config.vision_config
+        merge = int(vision_config.spatial_merge_size)
+        num_merged_tokens = int(self.vl_config.image_seq_length)
+        if merge <= 0 or num_merged_tokens <= 0:
+            raise ValueError(
+                "MiniMax-M3 image_seq_length and spatial_merge_size must be "
+                "positive, got "
+                f"image_seq_length={self.vl_config.image_seq_length}, "
+                f"spatial_merge_size={merge}"
+            )
+
+        # MiniMax-M3 accepts dynamic rectangular grids. Choose the closest
+        # factor pair so the configured default token count remains exact;
+        # the released 576-token config resolves to a 48x48 raw-patch grid.
+        merged_grid_h = math.isqrt(num_merged_tokens)
+        while num_merged_tokens % merged_grid_h:
+            merged_grid_h -= 1
+        merged_grid_w = num_merged_tokens // merged_grid_h
+        grid_h = merged_grid_h * merge
+        grid_w = merged_grid_w * merge
+        num_spatial_patches = grid_h * grid_w
+
+        flattened_patch_size = (
+            int(vision_config.num_channels)
+            * int(vision_config.temporal_patch_size)
+            * int(vision_config.patch_size) ** 2
+        )
+        grid = torch.tensor(
+            [[temporal_patches, grid_h, grid_w]],
+            dtype=torch.long,
+        )
+        feature = torch.zeros(
+            temporal_patches * num_spatial_patches,
+            flattened_patch_size,
+            dtype=self.vision_tower.dtype,
+        )
+        return [
+            MultimodalDataItem(
+                modality=modality,
+                feature=feature,
+                model_specific_data={grid_key: grid},
+            )
+        ]
+
+    def make_image_warmup_items(self) -> list[MultimodalDataItem]:
+        return self._make_vision_warmup_items(
+            Modality.IMAGE,
+            temporal_patches=1,
+            grid_key="image_grid_thw",
+        )
+
+    def make_video_warmup_items(self) -> list[MultimodalDataItem]:
+        return self._make_vision_warmup_items(
+            Modality.VIDEO,
+            # Use two temporal groups. Each group already contains
+            # vision_config.temporal_patch_size raw frames in the flattened
+            # patch width, so grid_t must not scale with that value.
+            temporal_patches=2,
+            grid_key="video_grid_thw",
+        )
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision_tower is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.make_image_warmup_items,
+            ),
+            Modality.VIDEO: EncoderSpec(
+                self.video_encoder,
+                make_warmup_items=self.make_video_warmup_items,
+            ),
+        }
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -1678,10 +1773,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             input_ids=input_ids,
             text_embedding=self.model.embed_tokens,
             ctx=multimodal_context,
-            encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder),
-                Modality.VIDEO: EncoderSpec(self.video_encoder),
-            },
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
             is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )

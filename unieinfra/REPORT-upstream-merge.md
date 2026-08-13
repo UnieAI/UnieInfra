@@ -67,39 +67,54 @@ RAG shape, C=128, GMU 0.80, 256 requests, all gate-passing with 0 failed:
 | merged, direct backend | 231.01 | 14590.9 | 75.9% |
 | + prefill alignment fix | 405.74 | 8115.6 | 79.7% |
 | + mixed batching | 500.71 | 7014.3 | 76.7% |
-| + paged-extend plan restored | **511.86** | 6979.4 | 77.6% |
+| + paged-extend plan restored | 511.86 | 6979.4 | 77.6% |
+| + flashinfer GDN, prefill graph off | **592.40** | 5840.5 | — |
 | default backend + stream ordering | 468.89 | 7505.7 | — |
 | | | | |
 | f162d993 nomix target | 754.0 | 3905.8 | 66.5% |
 | f162d993 mix target (needs a deleted flag) | 1086.8 | 2227.6 | 85.8% |
 
-231 -> 512 over the session, and the default configuration serves again. Still
-68% of the nomix target. The mix target was measured with
+231 -> 592 over the session, and the default configuration serves again. Still
+79% of the nomix target. The mix target was measured with
 `--mixed-prefill-decode-min-load 0`, which the merge deleted and upstream has no
 equivalent for, so it is not a configuration this tree can reproduce.
 
-### The one that nearly went in
+### 4. The prefill CUDA graph silently corrupts the flashinfer GDN kernel
 
-`TOKENSPEED_ENABLE_FI_GDN_SM120=1` measured **579.97 tok/s, +13.3%, mean TTFT
--14.4%, 256/256 successful, 0 failed** — and every completion was
-`"!!!!!!!!!!!!!!!!!!!!"`. Qwen3.5-27B runs 48 GDN layers so the kernel is most
-of prefill, the numbers were the best of the day, and the default had already
-been flipped on with a commit message calling it the session's biggest win.
+This one was wrong twice before it was right, and the sequence is the point.
 
-Nothing else caught it. Not the request-failure gate (0 failed), not the
-latency numbers, not reuse. The harness `.sample` file caught it, which is the
-whole reason `AGENTS.local.md` requires a text sample beside any throughput
-claim.
+`TOKENSPEED_ENABLE_FI_GDN_SM120=1` first measured **579.97 tok/s, +13.3%, 0
+failed** — with every completion `"!!!!!!!!!!!!!!!!!!!!"`. Nothing caught that
+except the harness `.sample` file: not the request-failure gate, not the
+latency numbers, not reuse. The default had already been flipped on and the
+commit written. I then concluded the kernel was numerically broken and kept it
+off for correctness, which was also wrong.
 
-The raw kernel still agrees with the Triton scan to 3.1e-4, so the defect is in
-the wrapper — decay space, q/k normalisation, initial-state layout. Default
-back off (a10d7dc0), now for correctness.
+Four arms settle it:
 
-I also had to retract the reasoning around it. The file's existing note said
-the integrated path measured 30-134% slower and kept the kernel off; I argued
-that note was stale because this session had fixed things it might have been
-blocked behind. That was motivated reasoning with an attractive number
-attached, and the note was simply right.
+| | tok/s | mean TTFT | output |
+|---|---|---|---|
+| triton, prefill graph | 511.86 | 6979 | normal |
+| triton, no graph | 472.02 | 7452 | normal |
+| flashinfer, prefill graph | 579.97 | 5975 | `!!!!!!` |
+| flashinfer, no graph | 574.94 | 6042 | normal |
+
+Same kernel, same build, one flag between coherent text and exclamation marks.
+It plans from host-visible batch data, so a capture bakes the dummy batch's
+plan and every replay runs it against the real one. A direct A/B on
+engine-shaped inputs — multi-sequence `cu_seqlens`, live non-zero
+`initial_state`, off-chunk lengths — agrees with the Triton path to 4.9e-4 on
+out and ~5e-3 on final_state. The numerics were never the problem.
+
+Net: the prefill graph is worth +8.4% on Triton, the kernel is worth +21.8%
+over Triton without it, and the combination measures **592.40 tok/s, mean TTFT
+5840 ms, mean TPOT 96.26 ms** with coherent output. The wrapper now raises
+under `torch.cuda.is_current_stream_capturing()` rather than letting a graph
+corrupt every reply (8eb78a11).
+
+Left open: the GDN mixer already carries `@break_point`, so it should be
+running eagerly under capture and this should not happen. Making that work
+would stack the graph's +8.4% on top of the kernel's +21.8%.
 
 ## What is still unexplained
 

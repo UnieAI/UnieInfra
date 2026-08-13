@@ -17,10 +17,20 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
+
+from tokenspeed.flat_kvcache_select import (
+    FLAT_KVCACHE_RUNTIME_ENV,
+    architectures_require_flat_kvcache,
+    model_path_requires_flat_kvcache,
+    select_flat_kvcache_ext,
+)
+
+logger = logging.getLogger(__name__)
 
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
@@ -74,14 +84,19 @@ def preflight_kimi_k3_flat_consumers(*model_configs: object | None) -> None:
         hf_config = getattr(model_config, "hf_config", None)
         architectures = getattr(hf_config, "architectures", None) or ()
         if any(arch in _KIMI_K3_ARCHITECTURES for arch in architectures):
-            if not scheduler_ext_flat_kvcache():
+            if not scheduler_ext_flat_kvcache_built():
                 raise RuntimeError(_KIMI_K3_FLATKV_REQUIRED_DIAGNOSTIC)
 
 
-def scheduler_ext_flat_kvcache() -> bool:
+def scheduler_ext_flat_kvcache_built() -> bool:
     """True iff the installed tokenspeed_scheduler ext was built with
     TOKENSPEED_FLAT_KVCACHE. A missing package or an older / radix-built
     ext reports False — the radix-safe default (never delivers flat tables).
+
+    This is a property of the .so, not of the model being served. Ask it when
+    the question is "can this ext deliver flat tables at all"; ask
+    ``scheduler_ext_flat_kvcache()`` when the question is "does THIS server
+    run the flat path".
     """
     try:
         # Local import: module must stay importable without the compiled ext.
@@ -89,6 +104,74 @@ def scheduler_ext_flat_kvcache() -> bool:
     except ImportError:
         return False
     return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
+
+
+def model_requires_flat_kvcache(*model_configs: object | None) -> bool:
+    """True iff any of these models cannot be served by the uniform KV pool.
+
+    Architecture-only and torch-free, so EventLoop can ask it in the same
+    breath as `preflight_kimi_k3_flat_consumers`. The vocabulary itself lives
+    in `tokenspeed.flat_kvcache_select`, which the CLI can import before the
+    engine exists -- see that module for why the decision has to be made that
+    early.
+    """
+    for model_config in model_configs:
+        if model_config is None:
+            continue
+        hf_config = getattr(model_config, "hf_config", None)
+        if architectures_require_flat_kvcache(
+            getattr(hf_config, "architectures", None)
+        ):
+            return True
+    return False
+
+
+def verify_flat_kvcache_ext_for_model(*model_configs: object | None) -> None:
+    """Fail loudly when the loaded extension is the wrong one for this model.
+
+    Defence in depth for `select_flat_kvcache_ext`: the CLI decides off
+    `config.json`, and this runs once the real ModelConfig exists. Getting it
+    wrong is not a graceful degradation in either direction -- a radix ext
+    under Gemma 4 refuses the first full-attention KV write, and a flat ext
+    under Qwen3.5 silently costs 39% of its throughput (prefix reuse 54.9% ->
+    0.0% on a RAG shape at concurrency 64) -- so say so at startup, where the
+    message can still name the fix.
+    """
+    required = model_requires_flat_kvcache(*model_configs)
+    loaded_flat = scheduler_ext_flat_kvcache_built()
+    if required == loaded_flat:
+        logger.info(
+            "tokenspeed_scheduler ext: %s (model requires flat=%s)",
+            "flat" if loaded_flat else "radix",
+            required,
+        )
+        return
+    if required:
+        raise RuntimeError(
+            "This model needs the flat KV path (heterogeneous KV geometry) "
+            "but the radix tokenspeed_scheduler extension is loaded. Set "
+            f"{FLAT_KVCACHE_RUNTIME_ENV}=1 before starting the server, or "
+            "install a flat-built extension."
+        )
+    logger.warning(
+        "The flat tokenspeed_scheduler extension is loaded for a model that "
+        "does not need it. On a hybrid model this costs prefix reuse (the "
+        "recurrent-state group only registers snapshots on page-aligned "
+        "chunk ends, and the admission probe takes the minimum hit across "
+        "groups). Unset %s to serve this model on the radix extension.",
+        FLAT_KVCACHE_RUNTIME_ENV,
+    )
+
+
+def scheduler_ext_flat_kvcache() -> bool:
+    """True iff THIS server runs the flat KV path.
+
+    Identical to `scheduler_ext_flat_kvcache_built` -- once the extension is
+    chosen per model, "how was the loaded .so compiled" and "does this server
+    run the flat path" are the same question again. Kept as a separate name
+    because every call site means the second one.
+    """
+    return scheduler_ext_flat_kvcache_built()
 
 
 # Paged-cache label vocabulary (NOT the HF checkpoint's serialized enum:
@@ -885,7 +968,13 @@ __all__ = [
     "PagedCacheGroupSpec",
     "Retention",
     "STATE_LAYER_TYPES",
+    "FLAT_KVCACHE_RUNTIME_ENV",
     "compute_max_logical_pages_for_capture",
+    "model_path_requires_flat_kvcache",
+    "model_requires_flat_kvcache",
+    "scheduler_ext_flat_kvcache_built",
+    "select_flat_kvcache_ext",
+    "verify_flat_kvcache_ext_for_model",
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",
     "hybrid_slab_group_size",

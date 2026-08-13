@@ -304,32 +304,21 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             return
         prefix_cpu = [int(x) for x in extend_prefix_lens_cpu.tolist()]
         seq_lens_cpu = [p + e for p, e in zip(prefix_cpu, metadata.extend_seq_lens_cpu)]
+        # Only the BATCH is installed -- which rows, which pages, how long each
+        # is. The geometry (head count, head dim, page size) and the scale,
+        # window and soft cap are per LAYER, and this backend has only pool-wide
+        # values for them: a heterogeneous-KV model runs several geometries
+        # through one forward (Gemma 4: 16 x 256 at page 16 on its sliding
+        # groups, 4 x 512 at page 32 on full_attention) and declares a scale of
+        # 1.0 rather than `head_dim ** -0.5`. The kernel plans each group's
+        # wrapper from what the layer actually hands it; passing guesses from
+        # here would only be something for it to disagree with.
         for page_table in tables:
             install_paged_extend_plan(
                 cu_seqlens_q=metadata.cu_extend_seq_lens,
                 cache_seqlens=metadata.seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 page_table=page_table,
-                num_qo_heads=self.num_q_heads_local,
-                num_kv_heads=self.num_kv_heads_local,
-                head_dim=self.head_dim,
-                page_size=self.page_size,
-                is_causal=True,
-                # Same expression the kernel uses for its default, so the two agree
-                # bit for bit rather than by luck. This plan is therefore only
-                # matchable by layers that take that default: the forward path
-                # passes `layer.scaling`, and a model declaring anything else
-                # (Gemma 4 declares 1.0) simply misses the match and plans per
-                # call. Correct either way -- the kernel attends at the scale it
-                # was handed, not the one the plan recorded -- but the sync this
-                # exists to remove comes back. Fixing it needs the plan to be
-                # per-cache-group, which is the same work as the per-group
-                # head_dim below.
-                softmax_scale=1.0 / math.sqrt(self.head_dim),
-                window_left=-1,
-                logit_cap=0.0,
-                q_dtype=self.qkv_dtype,
-                kv_dtype=self.kv_cache_dtype,
             )
 
     def init_forward_metadata(

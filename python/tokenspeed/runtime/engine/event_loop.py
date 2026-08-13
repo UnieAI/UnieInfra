@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import faulthandler
+import os
 import signal
 import threading
 import time
@@ -204,6 +205,36 @@ def validate_mixed_batch_backend(server_args, attn_backend) -> None:
         )
 
 
+def validate_fi_gdn_prefill_graph(server_args) -> None:
+    """Refuse the flashinfer GDN kernel together with the prefill CUDA graph.
+
+    The combination does not fail -- it answers every request with
+    ``"!!!!!!!!"`` while posting better throughput than the correct path.
+    Measured on Qwen3.5-27B, RAG at C=128: 579.97 tok/s and 0 failed requests,
+    every completion garbage; the same kernel with ``--disable-prefill-graph``
+    returns coherent text at 574.94.
+
+    The check belongs here rather than in the kernel. The GDN mixer carries
+    ``@break_point``, so the kernel runs as an EAGER break -- outside the
+    capture -- and ``torch.cuda.is_current_stream_capturing()`` is False inside
+    it. A guard written there looks right, never fires, and leaves the
+    corruption path open behind a false sense of safety. This one reads the
+    server flags, which is where the combination is actually decided.
+    """
+    if os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120") != "1":
+        return
+    if getattr(server_args, "disable_prefill_graph", False):
+        return
+    raise ValueError(
+        "TOKENSPEED_ENABLE_FI_GDN_SM120=1 requires --disable-prefill-graph. "
+        "The flashinfer GDN chunk-prefill kernel is correct and faster, but "
+        "under a prefill graph capture it silently produces garbage output "
+        "(every completion becomes a run of exclamation marks) while "
+        "reporting higher throughput than the Triton path. Add "
+        "--disable-prefill-graph, or unset TOKENSPEED_ENABLE_FI_GDN_SM120."
+    )
+
+
 class EventLoop:
     def __init__(
         self,
@@ -327,6 +358,7 @@ class EventLoop:
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         validate_mixed_batch_backend(server_args, attn_backend)
+        validate_fi_gdn_prefill_graph(server_args)
 
         self.model_executor = create_model_executor(
             server_args=server_args,

@@ -353,21 +353,6 @@ if is_available():
         The caller indexes directly with flashinfer-native offsets rather than
         rebuilding the FLA h tensor.
         """
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            # This kernel plans from host-visible batch data, so a capture bakes
-            # the DUMMY batch's plan and every replay runs it against the real
-            # one. The result is not an error -- it is a model that emits
-            # "!!!!!!!!" for every request while the timing numbers look better
-            # than the Triton path's, which is exactly how it nearly became the
-            # default. Fail loudly instead.
-            raise RuntimeError(
-                "flashinfer_gdn_chunk_prefill cannot be captured in a CUDA "
-                "graph: it plans from host data, so a replay would use the "
-                "capture batch's plan and silently produce garbage. Run with "
-                "--disable-prefill-graph, or leave "
-                "TOKENSPEED_ENABLE_FI_GDN_SM120 unset to use the Triton "
-                "chunked scan."
-            )
         batched = q.dim() == 4
         q3 = q.squeeze(0) if batched else q
         k3 = k.squeeze(0) if batched else k

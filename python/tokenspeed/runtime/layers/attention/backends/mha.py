@@ -38,7 +38,10 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    scrub_padding_tail,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.cache_groups import (
@@ -73,6 +76,30 @@ def _slice_extend_inputs(metadata, q, k, v):
     return slice_to_real_tokens(metadata.cu_extend_seq_lens_cpu[-1], q, k, v)
 
 
+def mixed_batch_supported(
+    spec_num_tokens: int, is_draft: bool, draft_block_decode: bool
+) -> bool:
+    """Whether an MHA backend with this spec configuration can serve MIXED.
+
+    The MIXED decode tail is served as exactly one query token per row (see
+    :meth:`MHAAttnBackend._forward_mixed`). That holds for the plain decode
+    plan, whose ``decode_input_tokens`` is 1, but not for a speculative build:
+    there each decode row is a ``spec_num_tokens``-wide verify window, and a
+    draft rank additionally re-uses the extend metadata as its own decode
+    metadata. Those combinations stay unsupported so the startup guard rejects
+    ``--enable-mixed-batch`` instead of a step failing mid-serve.
+
+    Args:
+        spec_num_tokens: Speculative draft tokens per step (1 when off).
+        is_draft: Whether this backend instance belongs to a draft rank.
+        draft_block_decode: Whether DFLASH block decode is active.
+
+    Returns:
+        ``True`` when MIXED batches are safe for this configuration.
+    """
+    return not (spec_num_tokens > 1 or is_draft or draft_block_decode)
+
+
 @dataclass(kw_only=True)
 class MHAExtendMetadata:
     # Device-side metadata:
@@ -99,6 +126,16 @@ class MHAExtendMetadata:
     # Per-group KV write locations (group_id -> [num_tokens] int32),
     # built with page_tables — same groups, same lifecycle.
     out_cache_locs: dict[str, torch.Tensor] | None = None
+    # MIXED split points. The batch is packed prefill-first, so the query rows
+    # divide at `mixed_prefill_tokens` and each segment is served by the kernel
+    # built for it -- see `_forward_mixed` for why that is worth doing.
+    # `mixed_prefill_tokens` is the query-token count of the prefill segment,
+    # `mixed_decode_rows` the number of one-token decode rows after it, and
+    # `mixed_total_tokens` their sum, which is the real row count before any
+    # prefill-graph padding. All zero on a non-mixed batch.
+    mixed_prefill_tokens: int = 0
+    mixed_decode_rows: int = 0
+    mixed_total_tokens: int = 0
 
 
 @dataclass(kw_only=True)
@@ -119,13 +156,10 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # stale-table guard. drop the flag.
     uses_cache_groups: bool = True
 
-    # `init_forward_metadata` asserts `not forward_mode.is_mixed()`, so the
-    # declaration has to say so -- inheriting the base class's True let
-    # `--enable-mixed-batch` start a server that then failed every request on
-    # that assert. The fork carried an implementation here (64e632d8) against
-    # the pre-restructure backend; it did not survive the upstream merge, and
-    # re-porting it is unwritten work rather than a flag flip.
-    supports_mixed_batch: bool = False
+    # This backend has a mixed path (`_forward_mixed`), but whether a given
+    # INSTANCE can use it depends on its speculative configuration, so
+    # `__init__` narrows this per instance via `mixed_batch_supported`.
+    supports_mixed_batch: bool = True
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -170,6 +204,17 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # (whole block in one decode forward), with uniform non-causal seq_lens.
         self.draft_block_decode = bool(config.draft_block_decode)
 
+        # MIXED support is per-instance, not per-class: the class-level default
+        # says only that this backend has a mixed path at all, while a
+        # speculative or draft configuration cannot use it. See
+        # `mixed_batch_supported`. The startup guard in
+        # `validate_mixed_batch_backend` reads this off the constructed
+        # backend, so a build that cannot mix refuses --enable-mixed-batch
+        # instead of asserting on the first mixed step.
+        self.supports_mixed_batch = mixed_batch_supported(
+            self.spec_num_tokens, self.is_draft, self.draft_block_decode
+        )
+
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
@@ -201,7 +246,17 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
-        assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
+        # `supports_mixed_batch` (narrowed per instance in __init__) gates the
+        # same condition at startup, so reaching here with an unsupported
+        # configuration is an engine bug rather than a user one.
+        is_mixed = forward_mode.is_mixed()
+        if is_mixed and not self.supports_mixed_batch:
+            raise AssertionError(
+                "this MHA backend instance cannot serve mixed prefill+decode "
+                "batches (speculative or draft configuration); the startup "
+                "guard should have refused --enable-mixed-batch (see "
+                "AttentionBackend.supports_mixed_batch)"
+            )
 
         seq_lens = seq_lens[:bs]
 
@@ -259,9 +314,22 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             assert extend_prefix_lens is not None
             assert extend_prefix_lens_cpu is not None
 
+            # A MIXED plan holds prefill rows [0, num_extends) followed by
+            # decode rows [num_extends, bs) -- the scheduler partitions prefill
+            # first -- and carries the extend vectors for the PREFILL rows only,
+            # because model_executor slices extend_*_buf[:num_extends]. Rather
+            # than synthesising a decode tail for those vectors and serving all
+            # bs rows through one varlen extend call, the extend metadata is
+            # built over the prefill rows alone and the decode tail gets its own
+            # decode metadata; the forward then dispatches each segment to the
+            # kernel built for it. See `_forward_mixed` for the measurement
+            # behind that split.
+            rows = num_extends if is_mixed else bs
+            extend_seq_lens_all = seq_lens[:rows]
+
             # Create cumulative sum of the sequence lengths for Q and KV.
-            extend_seq_lens = extend_seq_lens[:bs]
-            extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
+            extend_seq_lens = extend_seq_lens[:rows]
+            extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:rows].tolist()]
             cu_extend_seq_lens = torch.nn.functional.pad(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32),
                 (1, 0),
@@ -270,16 +338,16 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             for length in extend_seq_lens_cpu:
                 cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
             cu_seqlens_kv = torch.nn.functional.pad(
-                torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+                torch.cumsum(extend_seq_lens_all, dim=0, dtype=torch.int32),
                 (1, 0),
             )
-            extend_prefix_lens = extend_prefix_lens[:bs]
+            extend_prefix_lens = extend_prefix_lens[:rows]
             max_extend_seq_len = max(extend_seq_lens_cpu)
-            max_extend_prefix_len = int(extend_prefix_lens_cpu[:bs].max().item())
+            max_extend_prefix_len = int(extend_prefix_lens_cpu[:rows].max().item())
 
             self.forward_extend_metadata = MHAExtendMetadata(
-                page_table=page_table,
-                seq_lens=seq_lens,
+                page_table=None if page_table is None else page_table[:rows],
+                seq_lens=extend_seq_lens_all,
                 extend_seq_lens=extend_seq_lens,
                 cu_extend_seq_lens=cu_extend_seq_lens,
                 cu_seqlens_kv=cu_seqlens_kv,
@@ -288,9 +356,40 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
                 max_extend_seq_len=max_extend_seq_len,
                 max_extend_prefix_len=max_extend_prefix_len,
-                page_tables=group_page_tables,
+                page_tables=(
+                    None
+                    if group_page_tables is None
+                    else {gid: t[:rows] for gid, t in group_page_tables.items()}
+                ),
+                # The whole batch's write locations: the mixed forward writes KV
+                # for both segments in ONE call before either attention runs.
                 out_cache_locs=group_out_cache_locs,
+                mixed_prefill_tokens=(cu_extend_seq_lens_cpu[-1] if is_mixed else 0),
+                mixed_decode_rows=(bs - num_extends if is_mixed else 0),
+                mixed_total_tokens=(
+                    cu_extend_seq_lens_cpu[-1] + (bs - num_extends) if is_mixed else 0
+                ),
             )
+
+            if is_mixed:
+                # Decode tail: rows [num_extends, bs), one query token each.
+                self.forward_decode_metadata = MHADecodeMetadata(
+                    page_table=(
+                        None if page_table is None else page_table[num_extends:bs]
+                    ),
+                    seq_lens=seq_lens[num_extends:bs],
+                    page_tables=(
+                        None
+                        if group_page_tables is None
+                        else {
+                            gid: t[num_extends:bs]
+                            for gid, t in group_page_tables.items()
+                        }
+                    ),
+                    # KV for this segment is written by the mixed forward's
+                    # single whole-batch save, so the decode call needs no locs.
+                    out_cache_locs=None,
+                )
 
             # Drafter step 1+ decodes under an EXTEND/MIXED target; seq_lens
             # aliases the drafter's live buffer (pre-written by the wrapper).
@@ -590,6 +689,21 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         )
 
         extend_mode = plan.get("extend_mode", "prewrite")
+        if metadata.mixed_total_tokens > 0:
+            # Prefill chunks and decode rows in one batch; each half wants a
+            # different kernel, so it cannot go down either branch below.
+            return self._forward_mixed(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                save_kv_cache,
+                sinks,
+                extend_mode,
+            )
         if metadata.max_extend_prefix_len == 0 and extend_mode == "postwrite":
             return self._forward_prefill(
                 q,
@@ -614,6 +728,114 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 save_kv_cache,
                 sinks,
             )
+
+    def _forward_mixed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        metadata: MHAExtendMetadata,
+        save_kv_cache: bool,
+        sinks: torch.Tensor | None,
+        extend_mode: str,
+    ) -> torch.Tensor:
+        """Serve a MIXED batch: prefill rows and decode rows, one forward, two kernels.
+
+        The batch is packed prefill-first, so the query rows split cleanly at
+        ``mixed_prefill_tokens`` and each half goes to the kernel built for it --
+        the varlen extend/prefill kernel for the chunks, the decode kernel for
+        the one-token rows. Serving all of it through a single varlen extend call
+        also works and is numerically identical, but is far slower: that kernel
+        tiles queries at ``BLOCK_M`` (128 on this arch) and parallelises only
+        over (request, head, query-block), so a ``seqlen_q == 1`` row occupies a
+        whole tile and walks its entire KV with a single block, with no split-K.
+        Measured on the B64 shape (1 x 3072-token chunk + 63 decode rows over 3k
+        of cache, Qwen3-8B/TP1/sm_120/triton): the decode tail costs 3.74 ms
+        fused versus 1.12 ms on the decode kernel, making the layer 5.37 ms
+        instead of 2.91 ms -- +89 ms per step across 36 layers.
+
+        The KV write happens ONCE for the whole batch before either attention
+        call, which is what lets both halves read their own new tokens: the
+        prefill segment needs its chunk in cache for the paged extend path, and
+        every decode row needs the token it is about to attend over.
+
+        Args:
+            q: Packed queries ``[total_tokens, num_q_heads, head_dim]``; may
+                carry a padded tail under a prefill-graph replay.
+            k: Packed keys for the same rows.
+            v: Packed values for the same rows.
+            layer: The attention layer (page size, scales, cache group).
+            out_cache_loc: Whole-batch KV write locations.
+            token_to_kv_pool: The paged KV pool.
+            metadata: Extend metadata for the PREFILL segment, carrying the
+                ``mixed_*`` split points.
+            save_kv_cache: Whether this backend owns the KV write.
+            sinks: Optional attention sinks.
+            extend_mode: ``"prewrite"``/``"postwrite"`` from the kernel plan.
+
+        Returns:
+            ``[total_tokens, num_q_heads * v_head_dim]`` in the input row order;
+            a padded tail (graph replay) is returned zeroed.
+        """
+        npt = metadata.mixed_prefill_tokens
+        total = metadata.mixed_total_tokens
+
+        # Scrub before the write so a padded tail cannot reach the cache, then
+        # write both segments' KV in one call (see the docstring).
+        scrub_padding_tail(total, q, k, v)
+        if save_kv_cache:
+            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
+
+        # Prefill segment. A fresh chunk (no cached prefix) can still take the
+        # no-cache prefill kernel; anything with a prefix must read the pages.
+        if metadata.max_extend_prefix_len == 0 and extend_mode == "postwrite":
+            prefill_out = self._forward_prefill(
+                q[:npt],
+                k[:npt],
+                v[:npt],
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                False,
+                sinks,
+            )
+        else:
+            prefill_out = self._forward_extend(
+                q[:npt],
+                None,
+                None,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                metadata,
+                False,
+                sinks,
+            )
+
+        # Decode segment: one query token per row, over the pages written above.
+        decode_out = self._forward_decode(
+            q[npt:total],
+            None,
+            None,
+            layer,
+            out_cache_loc,
+            token_to_kv_pool,
+            self.forward_decode_metadata,
+            False,
+            sinks,
+        )
+
+        if q.shape[0] == total:
+            return torch.cat([prefill_out, decode_out])
+        # Padded prefill-graph replay: keep the caller's row count, zero the tail.
+        out = prefill_out.new_zeros(q.shape[0], prefill_out.shape[1])
+        out[:npt] = prefill_out
+        out[npt:total] = decode_out
+        return out
 
     def _forward_prefill(
         self,

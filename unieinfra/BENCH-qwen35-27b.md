@@ -5,6 +5,17 @@ both engines driven by the same client over HTTP, a cold server per arm.
 Build `f162d993` (branch `unieai`); see *Known defects* for the one file in it
 that is not committed.
 
+**This report describes `f162d993` and cannot be reproduced on current `unieai`.**
+The tree has since merged 184 upstream commits (`7471e09c`), which deleted the
+radix prefix-cache subsystem and, with the fork's scheduler config, the
+`--mixed-prefill-decode-min-load` flag that every `mix` row below depends on.
+Upstream's mixing is a plain boolean with no threshold, so the 1086.8 tok/s
+figure is not a target the current tree can be measured against — it is a
+different configuration, not a regression. The post-merge ladder is being
+rebuilt separately and stood at 511.86 tok/s on this arm at the time of writing,
+against the 754.0 `nomix` figure here. Read the numbers below as a record of
+what that build did, not as a bar the present one is failing to clear.
+
 ![concurrency ladder](assets/qwen35-27b-ladder.svg)
 
 ## The finding in one line

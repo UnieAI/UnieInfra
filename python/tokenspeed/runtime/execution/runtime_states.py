@@ -118,21 +118,16 @@ class RuntimeStates:
         ckpt_pool = getattr(self.mamba_pool, "ckpt_pool", None)
         if ckpt_pool is not None:
             # `src` indexes the checkpoint pool, `dst` the active one -- two
-            # index spaces, so this cannot be the fused same-tensor copy below.
-            # Rows with no cached source keep whatever they had; -1 would
-            # address the reserved slot 0 and seed the request with garbage.
-            valid = src_indices >= 0
-            if bool(valid.any()):
-                src_valid = src_indices[valid]
-                dst_valid = dst_indices[valid]
-                for layer in range(ckpt_pool.temporal.num_layers):
-                    ckpt_pool.load_layer_to_active(
-                        layer,
-                        self.mamba_pool.ssm_state[layer],
-                        self.mamba_pool.conv_state[layer],
-                        src_valid,
-                        dst_valid,
-                    )
+            # index spaces at two dtypes, so this cannot be the fused
+            # same-tensor copy below: it has to convert, and it must not treat
+            # `src == dst` as a self-copy. Rows with no cached source keep
+            # whatever they had.
+            ckpt_pool.load_to_active_indexed(
+                self.mamba_pool.conv_state,
+                self.mamba_pool.ssm_state,
+                src_indices,
+                dst_indices,
+            )
             return
 
         # page_size=0 disables page-boundary filtering
@@ -154,13 +149,36 @@ class RuntimeStates:
         cache_lengths: torch.Tensor,
         page_size: int,
         num_valid: int,
+        into_checkpoint: bool = True,
     ) -> None:
         """Copy current working Mamba states into checkpoint slots.
 
         src_indices/dst_indices are pre-filtered on CPU (only valid entries).
         The page_size condition is checked inside the Triton kernel.
+
+        Args:
+            into_checkpoint: ``dst_indices`` addresses the checkpoint pool.
+                False means both ends are working slots -- the retract path
+                moving an accepted draft row back -- which stays inside the
+                active tensors even when a separate checkpoint pool exists.
         """
         if self.mamba_pool is None or num_valid == 0:
+            return
+        ckpt_pool = (
+            getattr(self.mamba_pool, "ckpt_pool", None) if into_checkpoint else None
+        )
+        if ckpt_pool is not None:
+            # `dst` indexes the checkpoint pool, which has its own slot count
+            # and its own dtype. Writing it as if it were an active row would
+            # file a snapshot under a slot that describes something else.
+            ckpt_pool.store_from_active_indexed(
+                self.mamba_pool.conv_state,
+                self.mamba_pool.ssm_state,
+                src_indices,
+                dst_indices,
+                cache_lengths=cache_lengths,
+                page_size=page_size,
+            )
             return
         fused_mamba_state_copy(
             self.mamba_pool.conv_state,

@@ -515,9 +515,10 @@ class SimpleMambaPool:
 
         self.mamba_cache = (self.conv_state, self.ssm_state)
         self.layer_transfer_counter = None
-        # Set by the registry when --enable-int8-mamba-checkpoint is on. When it
-        # is None every snapshot stays in the tensors above, which is the
-        # arrangement where a cached state competes with a running one.
+        # Set by the registry unless --no-enable-mamba-ckpt-pool. When it is
+        # None every snapshot stays in the tensors above, which is both the
+        # arrangement where a cached state competes with a running one and the
+        # one where it is rounded to `ssm_dtype` on the way in.
         self.ckpt_pool = None
 
         self.current_input_indices = torch.full(
@@ -813,6 +814,21 @@ class MambaAttnBackend(AttentionBackend):
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
+
+    def _ckpt_h_dtype(self) -> torch.dtype | None:
+        """The dtype a harvested checkpoint should be produced at, or None.
+
+        None means "whatever the scan produces by default", which is the
+        activation dtype -- right when the snapshot lands back in the active
+        pool at ``ssm_dtype`` anyway. A separate checkpoint pool may be wider,
+        and then the harvest has to be wide too: the scan's fp32 accumulator is
+        rounded on its way into ``h``, and no store downstream can undo that.
+        """
+        ckpt_pool = getattr(self.pool, "ckpt_pool", None)
+        if ckpt_pool is None:
+            return None
+        dtype = getattr(ckpt_pool.temporal, "dtype", None)
+        return dtype if dtype is torch.float32 else None
 
     def set_kv_pool(self, kv_pool) -> None:
         """Bind the (layer-mapped) KV pool. Two structurally gated flat modes:
@@ -3009,6 +3025,10 @@ class MambaAttnBackend(AttentionBackend):
                     qk_l2norm=True,
                     output_final_state=True,
                     output_h=True,
+                    # Ask for checkpoints only as wide as the pool that will
+                    # hold them. Wider costs a byte per element of `h` and buys
+                    # nothing once the store rounds it back down.
+                    h_dtype=self._ckpt_h_dtype(),
                 )
                 core_attn_out = gdn_result.out
                 last_recurrent_state = gdn_result.final_state

@@ -50,7 +50,17 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     return_h: bool = False,
+    h_dtype: torch.dtype | None = None,
 ):
+    # `h` is an internal of the output computation when nobody asks for it, and
+    # a published prefix-cache checkpoint when someone does. In the second case
+    # the caller may ask for it wider than `k`: the scan carries its state in an
+    # fp32 accumulator, so a bf16 `h` rounds the state before any cache sees it
+    # -- 2.3e-3 relative, and a resumed prefill then disagrees with a cold one.
+    # Not the default, because it doubles `h`; `chunk_fwd_o` rounds back to the
+    # query dtype either way, so `o` does not move.
+    if not return_h:
+        h_dtype = None
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
@@ -73,6 +83,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        h_dtype=h_dtype,
     )
     o = chunk_fwd_o(
         q=q,
@@ -141,6 +152,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     output_h: bool = False,
+    h_dtype: torch.dtype | None = None,
 ):
     r"""
     Args:
@@ -252,6 +264,7 @@ def chunk_gated_delta_rule(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             return_h=True,
+            h_dtype=h_dtype,
         )
         o = o.to(q.dtype)
         if head_first:

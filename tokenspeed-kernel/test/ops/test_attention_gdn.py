@@ -351,6 +351,94 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
     assert result.final_state.shape == initial_state.shape
 
 
+@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+def test_gdn_chunk_prefill_h_dtype_widens_the_checkpoints(
+    device: str, solution: str, require
+):
+    """Checkpoints are published to a prefix cache and resumed from, so a caller
+    with somewhere wide to put them can ask for them wide. `final_state` is
+    float32 for the same reason."""
+    require("attention", "gdn_chunk_prefill", solution, torch.bfloat16, "q")
+
+    q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
+        device=device, dtype=torch.bfloat16
+    )
+    kwargs = dict(
+        scale=q.shape[-1] ** -0.5,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        qk_l2norm=True,
+        output_final_state=True,
+        output_h=True,
+        solution=solution,
+    )
+    wide = gdn_chunk_prefill(q, k, v, g, beta, h_dtype=torch.float32, **kwargs)
+    assert wide.h.dtype is torch.float32
+    assert wide.final_state.dtype is torch.float32
+
+    narrow = gdn_chunk_prefill(q, k, v, g, beta, **kwargs)
+    # flashinfer's checkpoints are float32 whatever is asked for; the triton
+    # scan defaults to the activation dtype, because widening `h` doubles it.
+    if narrow.h_layout is GdnCheckpointLayout.FLA:
+        assert narrow.h.dtype is torch.bfloat16
+        # Widening must not move the output: `chunk_fwd_o` rounds back.
+        torch.testing.assert_close(wide.out, narrow.out, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+def test_gdn_chunk_prefill_resume_from_h_matches_a_cold_run(
+    device: str, solution: str, require
+):
+    """A prefix hit resumes from a checkpoint out of `h`; a cold run carries the
+    same state in registers. The two must agree exactly, or the same prompt
+    returns different text depending on whether it hit the cache."""
+    require("attention", "gdn_chunk_prefill", solution, torch.bfloat16, "q")
+
+    torch.manual_seed(0)
+    hq = hv = 8
+    dk = dv = 128
+    chunk = 64
+    prefix, tail = 4 * chunk, 2 * chunk
+    total = prefix + tail
+    kw = dict(device=device, dtype=torch.bfloat16)
+    q = torch.randn(1, total, hq, dk, **kw) * 0.1
+    k = torch.randn(1, total, hv, dk, **kw) * 0.1
+    v = torch.randn(1, total, hv, dv, **kw) * 0.1
+    g = -torch.rand(1, total, hv, device=device, dtype=torch.float32) * 0.1
+    beta = torch.rand(1, total, hv, device=device, dtype=torch.float32)
+    zero = torch.zeros(1, hv, dv, dk, device=device, dtype=torch.float32)
+
+    def call(qs, ks, vs, gs, bs, state, output_h=False):
+        n = qs.shape[1]
+        return gdn_chunk_prefill(
+            qs,
+            ks,
+            vs,
+            gs,
+            bs,
+            scale=dk**-0.5,
+            initial_state=state,
+            cu_seqlens=torch.tensor([0, n], device=device, dtype=torch.int32),
+            output_final_state=True,
+            output_h=output_h,
+            h_dtype=torch.float32 if output_h else None,
+            solution=solution,
+        )
+
+    cold = call(q, k, v, g, beta, zero)
+    full = call(q, k, v, g, beta, zero, output_h=True)
+
+    if full.h_layout is GdnCheckpointLayout.FLA:
+        snapshot = full.h.squeeze(0)[prefix // chunk]
+    else:
+        snapshot = full.h[prefix // chunk]
+    snapshot = snapshot.unsqueeze(0).float().contiguous()
+
+    sl = slice(prefix, total)
+    resumed = call(q[:, sl], k[:, sl], v[:, sl], g[:, sl], beta[:, sl], snapshot)
+    torch.testing.assert_close(resumed.out, cold.out[:, sl], rtol=0, atol=0)
+
+
 # ===-----------------------------------------------------------------------===#
 # GDN decode / MTP (K-last, gdn_decode_step / gdn_decode_mtp)
 # ===-----------------------------------------------------------------------===#

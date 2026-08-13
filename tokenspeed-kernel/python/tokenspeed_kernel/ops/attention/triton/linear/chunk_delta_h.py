@@ -294,7 +294,19 @@ def chunk_gated_delta_rule_fwd_h(
     output_final_state: bool = False,
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    h_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunked scan producing per-chunk recurrent states.
+
+    Args:
+        h_dtype: Storage dtype for the per-chunk states ``h``. Defaults to
+            ``k.dtype``. Pass ``torch.float32`` when ``h`` is harvested as a
+            prefix-cache checkpoint: the scan carries its state in an fp32
+            accumulator and ``final_state`` is written out at that width, so a
+            narrower ``h`` is the one place a *resumed* prefill loses the bits
+            a cold one keeps. ``chunk_fwd_o`` rounds back to the query dtype,
+            so widening this does not change the output.
+    """
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -313,7 +325,7 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, K, V)
+    h = k.new_empty(B, NT, H, K, V, dtype=h_dtype if h_dtype is not None else k.dtype)
     final_state = (
         k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
     )

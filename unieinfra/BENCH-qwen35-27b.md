@@ -112,22 +112,32 @@ structure allows.
 
 ## Known defects, and what they cost this report
 
-**The reuse path is not yet correct.** A prefix hit resumes from a recurrent
-state stored in the bf16 state pool, while a cold prefill carries the same state
-in an fp32 accumulator across every chunk of its scan and writes it out only at
-the end. Round-tripping the state through bf16 changes it by 2.3e-03, which
-propagates to a 2.2e-03 difference in the layer's output and a 0.04–0.07
-difference in the first generated token's logprob — enough to flip the argmax at
-some prompt lengths, so the same prompt can return different text. Keeping the
-state in fp32 reproduces the cold answer exactly (0.000e+00). **Every TTFT figure
-above depends on this path**, so they are provisional until the snapshot is
-stored at higher precision than the working state.
+**A cached answer is not bit-identical to a cold one, and that is expected.**
+A prefix hit and a cold prefill differ in the first generated token's logprob by
+0.04-0.07 at some prompt lengths, enough to flip the argmax and return different
+text. This was initially diagnosed as a precision defect in the recurrent
+snapshot: the state pool is bf16 while a cold prefill carries its state in an
+fp32 accumulator, and round-tripping through bf16 moves the state by 2.3e-03 in
+an isolated kernel probe. That diagnosis is **wrong**, and the control that
+retires it is a dense model. Qwen3-0.6B has no recurrent layer to snapshot at
+all, and shows a perturbation of the same relative magnitude. Storing the
+snapshot in fp32 -- or running the entire recurrent path in fp32 -- changes the
+end-to-end numbers not at all, to six decimal places. What remains is what any
+prefix cache does: attention over restored KV, and a different token count per
+forward changing the reduction order inside the GEMMs. vLLM's cache carries the
+same property. The isolated probe measured a real mechanism that is not the
+cause of the observed effect.
 
-**The unique-prompt collapse at C=128 is unattributed.** A related symptom on
-another model — a P99 inter-token latency twenty times its own median at a
-saturated pool, with one preemption in an entire run — suggests the engine lacks
-a throughput-preserving preemption policy, but that has not been demonstrated
-here.
+**The unique-prompt collapse at C=128 is over-admission.** Demonstrated on
+gemma-4-31B, where the same symptom is louder: the KV pool holds about 30
+sequences and the engine accepts `--max-num-seqs 452`, so it admits far more work
+than can be resident and every request stalls together instead of a few being
+preempted. Lowering the limit to what the pool actually holds, with no code
+change, moved that model from 219.6 to 340.4 tok/s (+55%) and its P99 ITL from
+1905 to 155 ms — and took its median ITL below vLLM's. vLLM refuses to start in
+this situation and names the number to use; we accept it and stall at runtime.
+The same mechanism is the likely explanation here and the fix is a startup guard,
+not a kernel.
 
 **One dataset per shape, and one output length.** Every request emits exactly 64
 tokens under `--ignore-eos`, which weights the comparison toward

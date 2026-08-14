@@ -59,9 +59,7 @@ class TestArenaSaturationWarning(unittest.TestCase):
         self.probe = _Probe()
 
     def _feed(self, ratios, running=100):
-        with patch(
-            "tokenspeed.runtime.execution.model_executor.logger"
-        ) as mock_logger:
+        with patch("tokenspeed.runtime.execution.model_executor.logger") as mock_logger:
             for ratio in ratios:
                 self.probe._warn_if_arena_saturated(ratio, running)
             return mock_logger.warning.call_args_list

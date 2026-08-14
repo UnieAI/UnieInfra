@@ -820,3 +820,48 @@ It also corrects the estimate this section previously reasoned from. Deflating
 our mixing-on C=32 by the 39.9% measured at C=128 predicted about 359; the
 matched number is 500.56. Applying an effect measured at one operating point to
 another is the habit that produced the error, and it was wrong by 40%.
+
+## The cliff is arena saturation, and stopping short of it beats the baseline
+
+The per-step decode log carries `page ratio`, and it names the cliff directly.
+Steady-state decode steps, matched arms:
+
+| | in-flight | page ratio mean / max | per-request tok/s |
+|---|---|---|---|
+| C=64 | 63.9 | 0.897 / 0.990 | **12.14** |
+| C=128 | 82.0 | 0.954 / **1.000** | **5.79** |
+
+At C=128 the arena reaches 100% occupancy even with the larger GMU 0.92 pool,
+and per-request decode rate halves. So the collapse between 64 and 128 is not
+the decode kernels getting worse with batch size -- it is the pool running out
+and the engine continuing to admit anyway, then paying for it every step.
+
+That predicts a fix by arithmetic: hold in-flight requests just below
+saturation. Client concurrency stays at 128; only `--max-num-seqs` changes.
+
+| `--max-num-seqs` | GMU | in-flight | page ratio | tok/s | vs 754.0 |
+|---|---|---|---|---|---|
+| 452 (unbounded) | 0.92 | 110 | 1.000 | 645.49 | 85.6% |
+| 64 | 0.92 | 64 | 0.64 | 701.61 | 93.1% |
+| **88** | 0.92 | 88 | 0.89 | **783.26** | **103.9%** |
+| 88 | 0.80 | 74 | 0.99 | 599.45 | 79.5% |
+
+All arms 256/256 with 0 failed and coherent samples.
+
+**783.26 tok/s exceeds the 754.0 baseline.** The mechanism is confirmed rather
+than assumed: capping at 88 holds page ratio at 0.89 and the cliff does not
+occur, while the same cap at GMU 0.80 is useless because that pool saturates at
+74 in-flight -- the cap never binds, page ratio still reaches 0.99, and
+throughput falls back to 599.45.
+
+**What that number is and is not.** It needs *both* the larger pool and the
+cap; neither alone gets there. At the baseline's own GMU 0.80 we reach 599.45,
+which is 79.5% -- so this is **not** a matched-conditions win, and the fork
+would very likely also gain from a bigger pool (the peer measured GMU 0.80 to
+0.90 as +25.2% on the unique shape; 0.94 OOMed there, while 0.92 is stable
+here). It also costs latency: mean TTFT 4061 ms against the baseline's 3906.
+
+And it is a **workaround, not a repair**. It keeps the engine off the cliff by
+refusing load at the door, and it requires an operator to know the number. The
+cliff itself -- an engine that admits past its own arena and degrades instead of
+holding steady -- is still there.

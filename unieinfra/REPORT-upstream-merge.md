@@ -674,3 +674,43 @@ about 60% of the fork on both matched configurations**, and the earlier
 "79% of the nomix target" understated the gap by comparing across the mixing
 axis. The 1086.8 arm is reachable in principle now -- mixing engages by default
 -- so it is the right target, and it is 1.68x away.
+
+## Where the remaining gap lives: decode does not batch
+
+With the mixing axis matched and the memory lever taken, the gap is not
+admission and not prefill. Arithmetic on the matched arms, mixing off on both
+sides:
+
+| | peak in-flight | tok/s | per request |
+|---|---|---|---|
+| ours, GMU 0.92 | 103 | 461.25 | **4.48 tok/s** |
+| f162d993, GMU 0.80 | 80 | 754.0 | **9.43 tok/s** |
+
+**We hold more requests than the fork and produce roughly half the tokens
+each.** Prefill is not the problem -- mean TTFT is now 3679 ms against the
+baseline's 3906 -- and the layer-by-layer probe recorded earlier in this project
+has per-decode-token cost at parity with vLLM at concurrency 1 (36.4 vs 36.9
+ms). Parity at C=1 and half the rate at C≈100 is a scaling statement.
+
+Our own concurrency sweep, GMU 0.92, mixing on, 256 requests, 0 failed:
+
+| client concurrency | peak in-flight | tok/s | per request | mean TPOT |
+|---|---|---|---|---|
+| 32 | 32 (client-limited) | 502.11 | 15.69 | 54.5 ms |
+| 128 | 110 | 645.49 | 5.87 | 123.9 ms |
+
+**3.4x the in-flight requests buys 1.28x the throughput.** For a 27B decode
+step, which is bandwidth-bound on weights, adding requests to a batch should be
+nearly free and TPOT should stay close to flat; instead TPOT grows about
+linearly with batch size. Something in the decode step is O(batch) with a large
+constant.
+
+It is not a per-request loop in the hybrid backend's decode path --
+`forward_decode` (`hybrid_linear_attn.py:1278-1438`) contains no per-request
+iteration, no `.item()`, and no `.cpu()`. That was the first candidate and it is
+excluded.
+
+The next probe is host-versus-device: sampling GPU utilisation across a C=128
+arm separates "the scheduler and Python cannot feed the device" from "the
+device is genuinely doing this much work". Those two have completely different
+fixes, and no amount of reading distinguishes them.

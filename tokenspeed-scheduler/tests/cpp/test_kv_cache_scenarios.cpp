@@ -1094,6 +1094,12 @@ protected:
             MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
+        // Asserts the RETRACT-ONLY step: preemption fired only when the whole
+        // step produced no operation, so the forward batch was empty and the
+        // victim's pages came back at once. R3 (preempt_on_blocked_request)
+        // retracts while continuing to schedule, the way vLLM does, so that
+        // shape no longer holds. Kept for the old policy; R3 has its own suite.
+        cfg.preempt_on_blocked_request = false;
         return cfg;
     }
 };
@@ -1478,6 +1484,13 @@ protected:
         cfg.device_allocator.total_pages = 19;
         cfg.host_allocator.total_pages = 20;
         cfg.max_scheduled_tokens = 8;
+        // These cases are about the OPTIMISTIC admission design: let a request
+        // in on its first chunk and retract later if the pool runs out. R1
+        // (reserve_full_prefill_at_admission) replaces that policy, so it is
+        // switched off here and covered by ReserveFullPrefillSuite instead --
+        // "active" has a 16-token prompt against an 8-token step budget, and
+        // charging all 16 across both groups is more than this pool holds.
+        cfg.reserve_full_prefill_at_admission = false;
         for (auto& group : cfg.paged_cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
         }
@@ -1591,6 +1604,13 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         // 25 physical pages -> 24 usable: r1 charges 10, r2 8, r3 6 = the pool.
+        // These cases assert the RETRACT-ONLY step: preemption fired only when
+        // the whole step produced no operation, so the forward batch was empty
+        // and the victim's pages came back all at once. R3
+        // (preempt_on_blocked_request) retracts while continuing to schedule,
+        // the way vLLM does, so the old shape no longer holds. Kept here for
+        // the old policy; R3 is covered by PreemptOnBlockedRequestSuite.
+        cfg.preempt_on_blocked_request = false;
         cfg.device_allocator.total_pages = 25;
         cfg.host_allocator.total_pages = 26;
         for (auto& g : cfg.paged_cache_groups) {

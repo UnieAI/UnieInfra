@@ -58,6 +58,34 @@ struct SchedulerConfig {
     bool enable_l3_storage{false};
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+    // Charge the whole remaining prompt when a request is first admitted,
+    // instead of only this chunk plus one decode token. Ported from vLLM's
+    // `scheduler_reserve_full_isl` (config/scheduler.py, default True).
+    //
+    // Without it nothing converts the pool size into an admission limit, so
+    // `max_num_seqs` becomes the only gate and has to be guessed: measured on
+    // Qwen3.5-27B at 128 concurrent, 452 requests entered a pool that carries
+    // far fewer, and the resulting arena was full for the whole run with a
+    // median of ONE request able to decode -- every other resident request was
+    // waiting for a page. Throughput at a full batch matched vLLM (1036 vs
+    // 1036 tok/s); the run averaged 215 because the batch was almost never
+    // full. See unieinfra/xref/25-admission.md.
+    bool reserve_full_prefill_at_admission{true};
+    // Preempt when a single request is blocked for capacity, instead of only
+    // when the whole step produced no operation at all. Ported from vLLM,
+    // which preempts inside its running loop for the one request that cannot
+    // get blocks (v1/core/sched/scheduler.py).
+    //
+    // The existing trigger is `operations.empty() && admission_failed`, and a
+    // second guard refuses to retract while ANY request owes a forward result.
+    // Together they mean one request with room left in its tail page keeps the
+    // step non-empty and preemption never fires -- measured as a median of ONE
+    // decoding request with 128 outstanding and the arena pinned at 100%.
+    //
+    // Reserving the prompt at admission (above) is only half of vLLM's design:
+    // it charges the prompt, not the output, so its preemption path stays live
+    // and is a normal mechanism rather than a last resort.
+    bool preempt_on_blocked_request{true};
 
     Role role{Role::kFused};
     bool enable_pd_cache{false};

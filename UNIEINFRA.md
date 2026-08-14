@@ -4,6 +4,45 @@ UnieAI's inference stack. This repository **is** upstream
 [tokenspeed](https://github.com/lightseekorg/tokenspeed) plus a small amount of
 UnieAI-specific work kept strictly out of the upstream tree.
 
+## What UnieInfra optimises for
+
+Upstream builds an LLM inference engine for agentic workloads. **UnieInfra
+targets the agent itself**: a serving system whose unit of work is an agent
+turn — a fixed system prompt, a set of tool descriptions, and a conversation
+that grows — rather than an independent prompt.
+
+That is a different optimisation target, not a slogan, and it changes which
+number matters:
+
+- **The prefix is the workload.** A system prompt plus tool schemas is
+  identical across every request, sits at token 0, and never varies between
+  sessions. Retrieval-augmented traffic only shares part of its prompt and
+  changes it per query; an agent shares all of its preamble, always. Multi-turn
+  compounds it — turn N reuses the whole of turns 1..N-1.
+- **On a hybrid model that means recurrent state, not just KV.** Resuming a
+  prefix needs the recurrent snapshot at that depth, so a fixed preamble is
+  written once and read for the life of the deployment. This is the part
+  upstream's own benchmark shape does not exercise and vLLM does not implement
+  at all — it resolves `enable_prefix_caching=False` on Qwen3.5/3.6 hybrids and
+  says nothing.
+- **Goodput under a latency SLO, not peak throughput.** An agent turn that
+  misses its budget is worth nothing to the caller, so an arm that posts tokens
+  per second while breaching TTFT is not a result. See
+  `unieinfra/BENCH-qwen35-27b.md` for how that is scored here and for the case
+  where the two metrics disagree completely.
+
+Measured on Qwen3.5-27B, one RTX PRO 6000, shared-prefix traffic at concurrency
+128: 2.30x vLLM 0.26 on throughput with prefix reuse at 85.8% against its 40.2%.
+That advantage is a property of this shape. On prompts with no shared prefix the
+two engines are within 3% up to concurrency 64 — which is the honest statement
+of where the work pays and where it does not.
+
+The agent-shaped corpora in `bench-data/` (`bfcl_256.jsonl`,
+`structured_toolcall.jsonl`, `mtbench_multiturn.jsonl`) are the workloads this
+positioning implies and are **not yet benchmarked**; the report lists
+long-output and multi-turn shapes as unmeasured. Closing that is the next
+measurement, not a claim already banked.
+
 New file at the repository root by design: adding a file never conflicts on
 rebase, whereas editing upstream's `README.md` would conflict on every one.
 

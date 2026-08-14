@@ -865,3 +865,71 @@ And it is a **workaround, not a repair**. It keeps the engine off the cliff by
 refusing load at the door, and it requires an operator to know the number. The
 cliff itself -- an engine that admits past its own arena and degrades instead of
 holding steady -- is still there.
+
+## Unifying prefill and decode: already done at the scheduler, and one tax left
+
+The obvious next move after the cliff was to stop having two batch modes at all
+-- what vLLM v1 and TurboMind do, and what `xref/20-scheduler.md` §2.1 records
+as "this question does not exist" for them. Reading the merged tree first, as
+the process requires, changes the job.
+
+**The scheduler-level unification is already in this tree.** Priorities in
+`csrc/scheduler/operations/forward.cpp:544-551`:
+
+| request state | priority |
+|---|---|
+| in-flight prefill (`Prefilling`) | 3 |
+| new request (`Submitted`) | 4 |
+| decode (`Decoding` / `PrefillDone`) | **3 with mixing, 5 without** |
+
+With mixing on -- the default since `a2aa5385` -- decode ties with in-flight
+prefill and interleaves by request id, with new requests behind both. That is
+vLLM's "scan `running`, which holds decode and in-flight prefill chunks
+together, then scan `waiting`". The xref table describing separate priorities
+0/1/2 predates the merge: that file was rewritten from over a thousand lines to
+693, and its line references (`:1232`, `:1246`) no longer exist.
+
+What remains un-unified is only the *ability to turn it off*. At `:674`:
+
+```cpp
+if ((config_.role == Role::kD || !config_.enable_mixed_prefill_decode) && pushed_prefill) {
+    break;   // this step does no decode at all
+}
+```
+
+Non-mixed is not "prefill first", it is "prefill only", and it is what the
+461.25 tok/s arm was measuring. It is no longer the default, so this is a
+footgun rather than a live defect.
+
+**The real difference from vLLM is a tax, not a structure** (`:565-570`):
+
+```cpp
+state_prefill_reserve = enable_mixed_prefill_decode && HasMambaStateGroup() && has_local_prefill
+                        ? coordinator_.CacheBlockTokens() : 0;
+...
+if (token_budget < state_prefill_reserve + config_.decode_input_tokens) { continue; }  // skip this decode
+```
+
+Whenever mixing is on and the model has a recurrent state group, every step
+reserves a whole cache block out of the token budget, and decodes are skipped
+when the remaining budget cannot cover it. vLLM's unified path carries no such
+reservation. That fits the measured shape of mixing better than any structural
+story:
+
+| C | mixing on | mixing off | delta |
+|---|---|---|---|
+| 32 | 502.11 | 500.56 | **0%** |
+| 64 | 707.27 | 743.61 | **-4.9%** |
+| 128 | 645.49 | 461.25 | **+39.9%** |
+
+At low concurrency the budget is loose and there is little to interleave, so
+the tax and the benefit are both invisible. In the middle the tax can exceed
+the benefit. At high concurrency the benefit of not starving decode dominates
+everything. A feature that is worth -5% at one operating point and +40% at
+another is not one number, and quoting either alone is how this report got the
+"60% of baseline" headline wrong earlier.
+
+**So the bounded piece of work is the reserve, not the modes.** Whether
+`CacheBlockTokens()` per step is the right reservation -- rather than, say,
+reserving only when a recurrent prefill is actually admitted this step -- is
+measurable against the C=64 arm, where mixing currently loses.

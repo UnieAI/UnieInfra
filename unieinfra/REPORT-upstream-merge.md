@@ -248,3 +248,43 @@ would separate "less overhead per step" from "better kernel shape".
 - **The root filesystem being full reads as a compiler bug.**
   `error writing to /tmp/ccXXXX.s: No space left on device` — `/workspace` is a
   different device with room. Set `TMPDIR` under `/workspace` for builds.
+
+## The A/B that was built and not run
+
+Every number in this report is absolute. None is a same-harness differential
+against f162d993, so "78% of 754.0" compares across two builds, two
+architectures and several hours. The baseline's configuration cannot even be
+expressed on this tree: `--mixed-prefill-decode-min-load` was deleted by the
+merge and upstream has no equivalent, and the radix cache and fork admission it
+ran on are gone.
+
+The apparatus to settle it is built and verified:
+
+- `/workspace/roy/.f162` — worktree at f162d993, scheduler ext built
+  (md5 `fbbf22be77cd`).
+- `/workspace/roy/.f162venv` — a venv with `--system-site-packages` holding the
+  baseline `tokenspeed_scheduler`. Getting it to load took one trick worth
+  recording: the scikit-build editable `.pth` installs a meta-path finder that
+  pins the package to the HEAD source tree and the extension to dist-packages,
+  and **no PYTHONPATH can override it**. Shadowing that finder's module name
+  with an empty file inside the venv leaves normal `sys.path` resolution in
+  charge, and the venv's copy wins. Verified: both the package and the ext
+  resolve inside the venv.
+- `/workspace/roy/.cq_f162.sh` — `.cq_nomb_rag.sh` with `W` pointed at the
+  worktree, `W` threaded through to `.provenance.sh` so the label follows the
+  build, and the server launched from the venv's interpreter.
+
+Nothing in this touches the shared install, so it needs no coordination and has
+nothing to restore — unlike the earlier plan, which swapped the dist-packages
+`.so` and required an eight-minute window with the other session stood down.
+
+Run it as:
+
+    GPU=3 CONC=128 NREQ=256 ./.cq_f162.sh ours F162AB
+
+and check `head:` in the log reads `f162d993` before trusting the number.
+
+If it returns ~754 the gap is real and the remaining work is the GDN graph
+interaction plus whatever the ramp turns out to be. If it returns ~586 then
+754.0 was a property of the fork's architecture and is not a target this tree
+has missed.

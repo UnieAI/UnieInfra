@@ -1,7 +1,21 @@
 # Source this before building/running UnieInfra on sm_120 in the dev container.
 # See docs/guides/build-and-run.md section 4 for the rationale behind each shim.
 export FLASHINFER_DISABLE_VERSION_CHECK=1
-export CPATH=$(ls -d /usr/local/lib/python3.12/dist-packages/nvidia/*/include 2>/dev/null | tr '\n' ':')$CPATH
+# `nvidia/cuda_cccl` is excluded on purpose. Two CCCL copies are installed --
+# cu13 nests its own under `include/cccl/cuda/std`, which nvcc adds itself,
+# while cuda_cccl puts one at `include/cuda/std`, which only CPATH can reach.
+# With both visible a single translation unit takes `<cuda/std/utility>` from
+# nvcc's copy and `<cuda/std/version>` from CPATH's older one, so
+# `_LIBCUDACXX_HAS_SPACESHIP_OPERATOR` is undefined where it is used and every
+# DeepGEMM JIT compile fails with "missing binary operator before token" --
+# which reads like a source bug and is an include-path bug.
+export CPATH=$(ls -d /usr/local/lib/python3.12/dist-packages/nvidia/*/include 2>/dev/null | grep -v '/cuda_cccl/' | tr '\n' ':')$CPATH
+# The cu13 wheel ships nvcc 13.2 against CUDART 13.3 headers, and CCCL refuses
+# the pair outright ("CUDA compiler and CUDA toolkit headers are
+# incompatible"). The header names this flag for exactly that case -- a CTK
+# newer than the compiler ships. One minor version apart; revisit if the wheel
+# is ever fixed, and drop the flag rather than carrying it forever.
+export NVCC_PREPEND_FLAGS="-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK${NVCC_PREPEND_FLAGS:+ $NVCC_PREPEND_FLAGS}"
 # The nvidia pip wheels ship only sonames (libcudart.so.12, .so.13) and no
 # unversioned libcudart.so, so anything that JIT-compiles with `-lcudart` --
 # flashinfer's xqa decode kernel among them -- dies at link time with

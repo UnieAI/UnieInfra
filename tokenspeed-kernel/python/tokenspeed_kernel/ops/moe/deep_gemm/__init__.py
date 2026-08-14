@@ -18,6 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Two registrations under solution "deep_gemm", separated by the
+# supports_all_to_all_ep trait. contiguous_fp8 imports deepep_fp8's weight
+# preprocessor and routing helpers by name rather than duplicating them, so
+# the order these two lines appear in does not matter.
+import tokenspeed_kernel.ops.moe.deep_gemm.contiguous_fp8  # noqa: F401
 import tokenspeed_kernel.ops.moe.deep_gemm.deepep_fp8  # noqa: F401
 
 __all__ = []

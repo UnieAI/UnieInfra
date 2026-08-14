@@ -591,7 +591,43 @@ object itself* -- i.e. the prefill graph path replays without re-running
 capture batch. That is a different bug from a frozen argument binding, and it
 implies a different fix.
 
-**The experiment that decides it**, for whoever takes this: inside the GDN
+**Decided, by running it.** With `TOKENSPEED_FI_GDN_ALLOW_PREFILL_GRAPH=1`
+(a diagnostic escape hatch added for this, which logs an error and guarantees
+garbage output) and `TOKENSPEED_TRACE_GDN=1`, every GDN call in a `CONC=8`
+serving run reports the same thing:
+
+    call capturing=False q_rows=8192 cu_last=8192 cu_n=2 state_id=<varies> cu_id=138186089069488
+
+Three facts, and together they settle it:
+
+- `cu_n=2` with `cu_last=8192` is the *dummy capture batch* -- a single
+  sequence spanning the whole padded bucket. A real 8-way concurrent extend
+  batch cannot produce that shape on every call. So the kernel is being handed
+  the capture-time `cu_seqlens` at replay.
+- `cu_id` is byte-identical on every call while `state_id` changes on every
+  call. The recurrent state is rebound per forward; `query_start_loc` is not.
+  So it is the tensor binding, not a planner-side host plan cache.
+- `capturing=False` throughout, which is the eager break working as designed --
+  the predicate trap described above, seen directly.
+
+This is the peer session's hypothesis confirmed, and it lines up with a second
+reading of the graph itself: `prefill_graph.py` calls `init_forward_metadata`
+only on the capture path (`:620`), and `replay()` (`:671`) lands input embeds
+and replays without ever rebuilding it. The metadata object the eager break
+reads at replay is the one built for the dummy batch. Meanwhile
+`_replay_bucket`'s own docstring states the intended contract -- "the attention
+break reads the LIVE ambient ctx" -- so this is a violation of the design, not
+a limit of it.
+
+**The fix, for whoever takes it**, is to make the live batch's metadata reach
+the eager break at replay rather than the capture-time object. The captured
+segments are unaffected: their kernels are already baked into the graph and
+read the static buffers that `_land_in` refreshes. Acceptance is unchanged and
+free -- GDN enabled *without* `--disable-prefill-graph`, `.sample` must be
+coherent, and the degeneracy gate rejects the exclamation-mark failure
+automatically. The payoff is the graph's +8.4% stacked on the kernel's +21.8%.
+
+**The experiment that decided it**, for whoever takes this: inside the GDN
 mixer at replay, log `data_ptr()` and the contents of `query_start_loc`
 alongside the live metadata's. Fresh contents mean the argument binding is
 innocent and the fault is in the planner's own host-side plan cache; dummy-batch

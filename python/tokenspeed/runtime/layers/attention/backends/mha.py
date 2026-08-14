@@ -194,12 +194,29 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.is_mxfp8
         )
+        # The Triton kernels read the fp8 cache directly and convert it up to
+        # the query dtype, so they want the query left in the activation dtype:
+        # casting it down quantizes the query for no benefit, and because the
+        # output buffer is allocated `empty_like(q)` it also hands the attention
+        # output back in e4m3. The fa3/fa4 fp8 kernels do need an fp8 query --
+        # their signatures declare all three roles fp8 -- so the cast stays for
+        # them.
+        #
+        # Without this, --kv-cache-dtype fp8_e4m3 does not start at all:
+        # `triton_mha_extend_with_kvcache` declares fp16/bf16 query over fp8 KV
+        # (_Q_OVER_FP8_KV_SIGNATURES) and nothing declares fp8 query over fp8
+        # KV, so selection raises NoKernelFoundError.
+        self.cast_query_to_fp8 = self.kernel_solution != "triton"
         self.plan = partial(
             mha_plan,
             dtype=(
                 torch.float8_e4m3fn
                 if self.is_mxfp8
-                else (self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype)
+                else (
+                    self.kv_cache_dtype
+                    if self.is_fp8 and self.cast_query_to_fp8
+                    else self.qkv_dtype
+                )
             ),
             head_dim=self.head_dim,
             return_lse=False,
@@ -903,7 +920,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     ) -> torch.Tensor:
         q, k, v = _slice_extend_inputs(metadata, q, k, v)
         # TODO: use a custom kernel to do downcast
-        if self.is_fp8:
+        if self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
             k = k.to(self.kv_cache_dtype)
             v = v.to(self.kv_cache_dtype)
@@ -948,7 +965,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
@@ -996,7 +1013,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)

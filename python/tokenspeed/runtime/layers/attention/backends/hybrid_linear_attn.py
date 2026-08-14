@@ -1757,6 +1757,17 @@ class MambaAttnBackend(AttentionBackend):
                 output_final_state=True,
                 output_h=False,
             )
+            if _gdn_trace_enabled():
+                _o = gdn_result.out
+                _gdn_trace(
+                    "out",
+                    rows=int(_o.shape[-3]) if _o.dim() >= 3 else -1,
+                    absmean=float(_o.float().abs().mean().item()),
+                    nan=int(_o.float().isnan().any().item()),
+                    state_absmean=float(
+                        gdn_result.final_state.float().abs().mean().item()
+                    ),
+                )
             core_attn_out = gdn_result.out
             last_recurrent_state = gdn_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)

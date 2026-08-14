@@ -771,6 +771,29 @@ We are 30% *faster* than the fork at moderate batch and 39% slower at large --
 a 2.1x swing across the concurrency axis. That is the divergence branch, not a
 constant factor.
 
+**C=64 completes the curve, and it is a cliff rather than a slope.** Same
+matched conditions:
+
+| C | ours (mixing off, GMU 0.80) | f162d993 | ratio |
+|---|---|---|---|
+| 32 | 500.56 | 384.61 | **1.30x faster** |
+| 64 | **743.61** | 560.77 | **1.33x faster** |
+| 128 | 461.25 | 753.97 | 0.61x |
+
+We are ahead at 32 and ahead by the same margin at 64, then fall off between 64
+and 128 -- and not merely relative to the fork. **Our own throughput drops from
+743.61 to 461.25 when the client is allowed more concurrency**, a 38% loss from
+being handed more work. The fork's curve rises monotonically across the same
+span. Whatever this is, it engages between 64 and 128 rather than degrading
+gradually with batch size, which rules out the "decode gets steadily less
+efficient as the batch grows" picture the previous section reasoned toward.
+
+**This also reframes the headline of the whole report.** "60% of the baseline"
+is a C=128 statement that both this report and the peer session generalised to
+the engine. Matched at C=32 and C=64 the merged tree is about 1.3x *faster*
+than the fork. The honest summary is that the two engines cross between 64 and
+128, and below the crossover upstream's architecture is the better one.
+
 Two controls on the claim:
 
 - **Reuse cannot explain it, and cuts the wrong way.** The concern raised was

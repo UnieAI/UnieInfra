@@ -220,9 +220,25 @@ none is empty, while the free slots are spread thin across all of them.
 So the ceiling is **fragmentation of the shared arena**, not exhaustion of any
 pool. That is the structural cost of coupling KV and recurrent state into one
 allocation unit, and it is exactly what the fork's separate mamba pool could
-not suffer from. Freeing capacity requires evicting enough cached blocks that
-share a parent to empty it, which the current victim selection does not
-prioritise -- it evicts by age, not by how close a parent is to empty.
+not suffer from.
+
+**Correction.** An earlier revision of this section blamed victim ordering --
+"it evicts by age, not by how close a parent is to empty". That is wrong as a
+cause of rejections, and the code proves it. `AdmissionPlanner::Plan` has
+exactly one failure exit, `if (victim_candidates_.empty()) return false`, so a
+rejection means every evictable block was already evicted and the demand still
+did not fit. `fits()` is monotone under eviction -- emptying a parent trades
+`slots - 1` local free slots for one empty parent, which never lowers the
+number of admissible parents -- so no ordering can reach a fitting state that
+age order fails to reach. **Eviction order cannot change accept/reject at all;
+it only decides which reuse is sacrificed on the admissions that succeed.**
+
+What a rejection actually reports is that reclaimable capacity is genuinely
+exhausted: the blocks that remain are protected prefix hits or live state of
+the 72 in-flight requests. Free slots exist but sit in parents bound to a group
+that is not the one asking, and a parent only rebinds once every slot in it is
+free. That is a real fragmentation cost, but it is a *binding* cost, not an
+ordering one, and it is not addressable from the comparator.
 
 I called that a bounded piece of work -- make victim selection parent-aware --
 and then tried it. It is not bounded, and the reason is worth recording so the

@@ -205,45 +205,43 @@ def validate_mixed_batch_backend(server_args, attn_backend) -> None:
         )
 
 
-def validate_fi_gdn_prefill_graph(server_args) -> None:
-    """Refuse the flashinfer GDN kernel together with the prefill CUDA graph.
+def resolve_fi_gdn_prefill_graph(server_args) -> None:
+    """Turn the prefill graph off when the flashinfer GDN kernel is in use.
 
-    The combination does not fail -- it answers every request with
-    ``"!!!!!!!!"`` while posting better throughput than the correct path.
-    Measured on Qwen3.5-27B, RAG at C=128: 579.97 tok/s and 0 failed requests,
-    every completion garbage; the same kernel with ``--disable-prefill-graph``
-    returns coherent text at 574.94.
+    The two cannot coexist: under a prefill capture that kernel answers every
+    request with ``"!!!!!!!!"`` while reporting BETTER throughput than the
+    correct path. Measured on Qwen3.5-27B, RAG at C=128, 256 requests and 0
+    failed on all four arms:
 
-    The check belongs here rather than in the kernel. The GDN mixer carries
-    ``@break_point``, so the kernel runs as an EAGER break -- outside the
-    capture -- and ``torch.cuda.is_current_stream_capturing()`` is False inside
-    it. A guard written there looks right, never fires, and leaves the
-    corruption path open behind a false sense of safety. This one reads the
-    server flags, which is where the combination is actually decided.
+        triton,     prefill graph   511.86 tok/s   normal text
+        triton,     no graph        472.02 tok/s   normal text
+        flashinfer, prefill graph   579.97 tok/s   "!!!!!!!!"
+        flashinfer, no graph        574.94 tok/s   normal text
+
+    So the graph is worth +8.4% on Triton and this kernel is worth +21.8% over
+    Triton without it -- the combination that wins is the kernel with the graph
+    off, and it is the one an operator would never find by reading flag help.
+    Resolve it here instead of refusing it: the earlier version raised, which
+    was correct but left the best configuration behind two flags and an
+    environment variable.
+
+    Disabling the graph is the safe direction. The reverse -- keeping the graph
+    and dropping the kernel -- would be quieter but slower, and this failure
+    mode is one no gate catches: zero failed requests, every latency number
+    better, and every reply garbage.
     """
-    if os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120") != "1":
+    if os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120", "1") == "0":
         return
     if getattr(server_args, "disable_prefill_graph", False):
         return
-    if os.getenv("TOKENSPEED_UNSAFE_FI_GDN_GRAPH") == "1":
-        # Diagnostic escape hatch for whoever is chasing WHY the graph breaks
-        # this kernel -- the answer needs the broken configuration running with
-        # instrumentation. Named UNSAFE because it is: every completion under
-        # it is garbage.
-        logger.warning(
-            "TOKENSPEED_UNSAFE_FI_GDN_GRAPH=1: running the flashinfer GDN "
-            "kernel under a prefill graph on purpose. Output WILL be garbage. "
-            "This is for diagnosis only."
-        )
-        return
-    raise ValueError(
-        "TOKENSPEED_ENABLE_FI_GDN_SM120=1 requires --disable-prefill-graph. "
-        "The flashinfer GDN chunk-prefill kernel is correct and faster, but "
-        "under a prefill graph capture it silently produces garbage output "
-        "(every completion becomes a run of exclamation marks) while "
-        "reporting higher throughput than the Triton path. Add "
-        "--disable-prefill-graph, or unset TOKENSPEED_ENABLE_FI_GDN_SM120."
+    logger.warning(
+        "Disabling the prefill CUDA graph: the flashinfer GDN chunk-prefill "
+        "kernel is active and silently produces garbage under graph capture. "
+        "Net effect on Qwen3.5-27B RAG C=128 is +12.3%% against Triton with "
+        "the graph on. Set TOKENSPEED_ENABLE_FI_GDN_SM120=0 to keep the graph "
+        "and use the Triton chunked scan instead."
     )
+    server_args.disable_prefill_graph = True
 
 
 class EventLoop:
@@ -358,6 +356,11 @@ class EventLoop:
         per_rank_max_batch = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
         req_pool_padding_index = per_rank_max_batch + 1
 
+        # BEFORE ModelExecutorConfig is built: it reads disable_prefill_graph
+        # and freezes the bucket ladder, so flipping the flag afterwards prints
+        # a reassuring warning and changes nothing. That mistake shipped a
+        # default that served "!!!!!!!!" at 586 tok/s with 0 failed requests.
+        resolve_fi_gdn_prefill_graph(server_args)
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
@@ -369,7 +372,6 @@ class EventLoop:
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         validate_mixed_batch_backend(server_args, attn_backend)
-        validate_fi_gdn_prefill_graph(server_args)
 
         self.model_executor = create_model_executor(
             server_args=server_args,

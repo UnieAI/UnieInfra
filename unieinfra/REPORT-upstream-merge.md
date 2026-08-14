@@ -541,3 +541,52 @@ finders shadowed inside the venv, `tokenspeed`, `tokenspeed_kernel` and
 `tokenspeed_scheduler` all resolve to the worktree, confirmed from the engine
 log's own paths. What it cannot isolate is the installed gateway that spawns
 the engine.
+
+## Handover: the GDN prefill-graph corruption
+
+The FlashInfer GDN kernel is worth +21.8% but currently requires
+`--disable-prefill-graph`, which itself costs 8.4%; with the graph on, every
+completion degenerates to `!!!!!!`. If the two are made to compose they stack.
+This section records how far the diagnosis got, including one line of reasoning
+that reads plausible and is not supported.
+
+**Established.** `_record_break` (`breakable_cuda_graph.py:304`) binds tensor
+arguments once, at capture, and its docstring states the assumption: tensor
+args "alias persistent storage ... so they carry live values at replay". The
+GDN metadata builder violates that assumption -- every branch allocates a fresh
+`query_start_loc` per forward (`hybrid_linear_attn.py:811` `arange`, `:819`
+`arange`, `:842` `zeros`, `:857` `empty`), none of them writing into a
+persistent buffer, while the class does maintain `query_start_loc_list` (`:342`)
+and `cached_cuda_graph_decode_query_start_loc` (`:343`), so the machinery
+exists and this path bypasses it.
+
+**Ruled out.** That the prefill graph is not a breakable capture. It is:
+`prefill_graph.py:427` constructs `BreakableCapture` and captures `_run_inner`
+inside `with cap:`, so `is_breakable_capture_active()` is True throughout the
+GDN forward. Note that this does *not* conflict with
+`torch.cuda.is_current_stream_capturing()` reading False inside the break --
+those are different predicates, and running the fn off the capturing stream is
+exactly what a break does. Reading the second as evidence of "no break" is a
+trap; it cost one session an afternoon of the wrong hypothesis.
+
+**Not established, and it is the load-bearing step.** That the *bound tensor
+argument* is what goes stale. The GDN call at `:1747` sits in `forward_extend`
+(`:1438`), which is reached from `forward` (`:1938`) -- and `forward` is the
+function carrying `@break_point`. So the whole GDN forward, planner included,
+runs eagerly at replay, and `query_start_loc` is read from
+`self.forward_metadata` at replay time, which should make it fresh rather than
+stale. For the staleness story to hold, what must be stale is the *metadata
+object itself* -- i.e. the prefill graph path replays without re-running
+`init_forward_metadata`, leaving `self.forward_metadata` holding the dummy
+capture batch. That is a different bug from a frozen argument binding, and it
+implies a different fix.
+
+**The experiment that decides it**, for whoever takes this: inside the GDN
+mixer at replay, log `data_ptr()` and the contents of `query_start_loc`
+alongside the live metadata's. Fresh contents mean the argument binding is
+innocent and the fault is in the planner's own host-side plan cache; dummy-batch
+contents mean the metadata is not being rebuilt per replay. One arm decides
+which fix to write. Acceptance is free either way: run GDN enabled *without*
+`--disable-prefill-graph` and require the `.sample` to be coherent -- the
+degeneracy gate rejects the exclamation-mark failure automatically, which is
+the check that caught this being reported as a +13.3% win in the first place.

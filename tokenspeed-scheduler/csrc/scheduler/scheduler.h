@@ -136,7 +136,8 @@ private:
     void handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation);
     void publishCompletedPages(Request& request);
     void retractForCapacity(PlanBuildContext& context, const std::vector<Request*>& candidates,
-                            std::vector<WriteBackOperation>& write_back_operations);
+                            std::vector<WriteBackOperation>& write_back_operations,
+                            const std::unordered_set<std::string>& scheduled_this_step);
 
     std::optional<WriteBackOperation> beginRetraction(Request& request);
     std::size_t groupIndex(const std::string& group_id) const;

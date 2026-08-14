@@ -29,6 +29,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -263,6 +264,26 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             "promotion boundary must be page-aligned and inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
+
+    // Charge the whole remaining prompt before letting this request in, the
+    // way vLLM's `scheduler_reserve_full_isl` does. Admitting on one chunk
+    // makes `max_num_seqs` the only limit on residency, and a pool that cannot
+    // carry them then stalls every resident request instead of a few.
+    //
+    // Skipped while nothing else is resident, so a prompt larger than the pool
+    // still makes progress chunk by chunk rather than being refused forever.
+    if (config_.reserve_full_prefill_at_admission &&
+        req_pool_allocator_.AvailableSlots() < req_pool_allocator_.Size()) {
+        std::vector<BlockTable> full_tables(static_cast<std::size_t>(coordinator_.NumGroups()));
+        const std::vector<GroupDemand> full_demands = makeGroupDemands(
+            full_tables, GroupDemand{.num_tokens = unscheduled, .reserve_tokens = decode_input_tokens});
+        if (!coordinator_.CanAdmitAfterReleasing(match.probe, full_demands, {})) {
+            context.admission_failed = true;
+            context.capacity_blocker = request->Id();
+            return std::nullopt;
+        }
+    }
+
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
         tokens_this_round = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.CacheBlockTokens(),
@@ -448,18 +469,39 @@ std::optional<WriteBackOperation> Scheduler::beginRetraction(Request& request) {
 }
 
 void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<Request*>& candidates,
-                                   std::vector<WriteBackOperation>& write_back_operations) {
+                                   std::vector<WriteBackOperation>& write_back_operations,
+                                   const std::unordered_set<std::string>& scheduled_this_step) {
+    // The invariant is that a RETRACT VICTIM must not owe a forward result;
+    // requiring the whole map to be empty is a conservative stand-in for it,
+    // and it is what makes preemption unreachable once any op is scheduled.
+    // With per-request triggering the victim filter below enforces the real
+    // invariant instead. The other three conditions are unrelated to it and
+    // stay as they are.
+    const bool blanket_forward_guard = !config_.preempt_on_blocked_request && !pending_forward_results_.empty();
     if ((config_.role != Role::kFused && config_.role != Role::kD) || !context.admission_failed ||
-        !pending_forward_results_.empty() || !pd_transfer_pins_.empty() || context.waits_for_store_ack ||
+        blanket_forward_guard || !pd_transfer_pins_.empty() || context.waits_for_store_ack ||
         tier_transfers_.HasLoadBacksInFlight()) {
         return;
     }
+    // A victim must owe NO outstanding forward result, not merely none from
+    // this step. Filtering on `scheduled_this_step` crashed the scheduler with
+    // "FSM transition invalid: event=ExtendResultEvent; state=Retracted": at
+    // overlap depth 1 a request can owe a result issued a step earlier, and
+    // that result arrives after the retraction. The blanket check is therefore
+    // the correct implementation of the invariant, not a conservative one.
+    //
+    // The consequence is that per-request preemption cannot work here without
+    // a two-phase retract -- mark the victim, retract once its outstanding
+    // result lands. That is design work, not a looser predicate.
+    const auto owes_forward_result = [this](const Request* request) {
+        return pending_forward_results_.contains(request->Id());
+    };
 
     if (config_.role == Role::kD) {
         Request* victim = nullptr;
         std::optional<std::tuple<std::int32_t, std::int32_t, std::string>> victim_rank;
         for (Request* request : candidates) {
-            if (!request->Is<fsm::Decoding>()) {
+            if (!request->Is<fsm::Decoding>() || owes_forward_result(request)) {
                 continue;
             }
             auto rank = std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
@@ -469,8 +511,14 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
                 victim_rank = std::move(rank);
             }
         }
-        FatalCheck(victim != nullptr,
-                   "LCM admission failed without a retractable Decode request or asynchronous capacity release");
+        if (victim == nullptr) {
+            // Under per-request triggering every resident request may already
+            // owe a forward result this step. That is not a wedge -- the next
+            // step retries once those results land -- so it must not abort.
+            FatalCheck(config_.preempt_on_blocked_request,
+                       "LCM admission failed without a retractable Decode request or asynchronous capacity release");
+            return;
+        }
         recovery_barrier_ = context.capacity_blocker;
         if (!recovery_barrier_ || *recovery_barrier_ == victim->Id()) {
             const auto waiting = std::ranges::find_if(candidates, [victim](const Request* request) {
@@ -489,12 +537,15 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
 
     Request* request_to_retract = nullptr;
     for (Request* request : candidates) {
-        if ((request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) &&
+        if ((request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) && !owes_forward_result(request) &&
             (request_to_retract == nullptr || request->TokenSize() > request_to_retract->TokenSize())) {
             request_to_retract = request;
         }
     }
-    FatalCheck(request_to_retract != nullptr, "LCM admission failed without a retractable request");
+    if (request_to_retract == nullptr) {
+        FatalCheck(config_.preempt_on_blocked_request, "LCM admission failed without a retractable request");
+        return;
+    }
     if (config_.HasHostCache() && request_to_retract->Is<fsm::Decoding>()) {
         if (auto operation = beginRetraction(*request_to_retract)) {
             write_back_operations.push_back(std::move(*operation));
@@ -573,7 +624,16 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
     bool pushed_decode = false;
+    // Requests that received an operation in THIS step. The retract victim
+    // must not be one of them. `pending_forward_results_` is the wrong set to
+    // filter on: it holds every request still awaiting a result from ANY
+    // earlier step, and at overlap depth 1 that is nearly every resident
+    // request, so a filter built on it finds no eligible victim in steady
+    // state and preemption silently does nothing (51 retracts over a run that
+    // needed thousands).
+    std::unordered_set<std::string> scheduled_this_step;
     auto push_operation = [&](auto operation) {
+        scheduled_this_step.insert(operation.request_id);
         if (recovery_barrier_ && operation.request_id == *recovery_barrier_) {
             recovery_barrier_.reset();
         }
@@ -684,8 +744,11 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
     }
 
-    if (operations.empty() && context.admission_failed) {
-        retractForCapacity(context, candidates, write_back_operations);
+    // vLLM preempts for the ONE request that could not get blocks, inside its
+    // running loop. Waiting for the whole step to come up empty means a single
+    // request with room in its tail page suppresses preemption for everyone.
+    if (context.admission_failed && (operations.empty() || config_.preempt_on_blocked_request)) {
+        retractForCapacity(context, candidates, write_back_operations, scheduled_this_step);
     }
     return {std::move(operations), std::move(load_back_operations)};
 }

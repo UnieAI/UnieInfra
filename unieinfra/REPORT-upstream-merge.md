@@ -251,6 +251,40 @@ under this build's own resolved default of 0.88 for a single GPU
 (`server_args.py:485`). Every number in this report, the 596.63 included, was
 measured with that fraction pinned low.
 
+### The memory ladder, measured here
+
+Clean A/B on the merged tree, GPU 3, RAG shape, `CONC=128 NREQ=128`, all arms
+back to back in one sitting, 128/128 successful and 0 failed everywhere, output
+sampled and coherent:
+
+| `--gpu-memory-utilization` | parents | token capacity | peak in-flight | tok/s |
+|---|---|---|---|---|
+| 0.80 (harness default) | 247 | 379,392 | 73 | 534.68 |
+| 0.92 | 366 | 562,176 | 107 | 614.33 |
+| 0.95 | 396 | 608,256 | 116 | 622.15 |
+
+**+14.9% for one flag** at 0.92, and the in-flight column moves with the pool
+exactly as the fork's ladder predicted: parents +49% gave in-flight +49%
+(73 to 107). The peer's 0.36-in-flight-per-chunk relation was measured on the
+fork's separate mamba pool and reproduces here on upstream's shared LCM arena,
+across two allocators and six pool sizes -- which makes it a property of the
+engine's *admission*, not of either allocator. Nothing OOMed at 0.95; the fork
+OOMed at 0.94, so the merged tree tolerates a larger fraction than it did.
+
+Returns are flattening (0.92 to 0.95 buys 9 in-flight and 1.3%), and in-flight
+still has not saturated the client's 128, so pool size is not the only term.
+
+**A correction this forces on the rest of this report.** I have described
+596.63 tok/s as the figure "at pure defaults, no flags, no env". That is wrong.
+Every harness in `/workspace/roy/.cq*.sh` pins `--gpu-memory-utilization 0.80`
+(only `.cq90.sh` and `.cq_uniq90.sh` use 0.90), so every number here was taken
+with a non-default flag forced, on a pool about 10% smaller than this build's
+own resolved default of 0.88. The comparison against 754.0 is still fair --
+the peer's f162d993 baseline was captured through the same harness at the same
+0.80 -- but "at defaults" was never true of either side, and a real deployment
+that never touches the flag already gets a bigger pool than anything measured
+here.
+
 **Correction.** An earlier revision of this section blamed victim ordering --
 "it evicts by age, not by how close a parent is to empty". That is wrong as a
 cause of rejections, and the code proves it. `AdmissionPlanner::Plan` has

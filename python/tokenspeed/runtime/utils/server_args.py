@@ -1129,6 +1129,16 @@ class ServerArgs:
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
         )
         parser.add_argument(
+            "--disable-mixed-batch",
+            action="store_false",
+            dest="enable_mixed_batch",
+            help=(
+                "Force prefill and decode into separate iterations. The counterpart to "
+                "--enable-mixed-batch, which defaults on and is store_true, so without "
+                "this there is no way to turn mixing off or to measure what it is worth."
+            ),
+        )
+        parser.add_argument(
             "--block-size",
             metavar="BLOCK_SIZE",
             type=int,

@@ -47,6 +47,24 @@ clustered at 96-127. Fixed in ba69ea89 (+75.7% throughput, -44% TTFT).
 
 ### 3. The two L2 transfer streams race each other
 
+**Caveat found late, and then pinned down.** Ordering the streams fixes the
+SERVING path -- arms complete 256/256 where they previously lost 146 requests
+-- but a `kernel`-backend arm still logged 2 `illegal memory access` at
+teardown, after every request had completed and the gate had passed. Checking
+every completed arm separates it cleanly:
+
+| backend | arms | failed requests | illegal-mem |
+|---|---|---|---|
+| `direct` | 5 | 0 | **0** |
+| `kernel` | 1 | 0 | **2** |
+
+So the residual is specific to the mapped-host Triton transfer, not to the L2
+tier as such, and it is confined to shutdown -- serving is clean on both. The
+recommended configuration uses `--kvstore-io-backend direct`, which is clean
+across every arm measured. Whoever picks this up should treat the mapped-host
+path's shutdown as unexamined rather than the fix as incomplete for serving.
+
+
 `write_stream` and `load_stream` are never ordered against one another while
 both address the same device blocks and the same pinned Host buffer, so a block
 can be loaded into while its writeback is still reading it. Fixed in 26470983.

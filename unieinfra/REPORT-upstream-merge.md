@@ -224,9 +224,39 @@ not suffer from. Freeing capacity requires evicting enough cached blocks that
 share a parent to empty it, which the current victim selection does not
 prioritise -- it evicts by age, not by how close a parent is to empty.
 
-That is a concrete, bounded piece of work for whoever picks this up: make
-victim selection parent-aware, so evicting N blocks actually yields a free
-parent instead of thinning N different ones.
+I called that a bounded piece of work -- make victim selection parent-aware --
+and then tried it. It is not bounded, and the reason is worth recording so the
+next person does not spend the same afternoon.
+
+The obvious shape is to reorder `AdmissionPlanner::evictionKey`, which today is
+`(epoch, tier, position_rank, group_id, lcm_block_id, slot_index)`. Two
+orderings were built and run against the 402-test C++ suite:
+
+| ordering | result |
+|---|---|
+| parent occupancy ascending, ahead of age | 1 failure: `UsesLocalSlotAfterEvictingAnotherWholeParent` |
+| group by parent, parents ranked by oldest member | 8 failures, incl. `RestoresOlderSiblingWhenMiddleCandidateFreesRequiredParent`, `MixedGroupTieEvictsNonClosedBeforeFullHistory`, `OrdinarySwaKeepsLongerUnhitFrontier`, `ActualHitPromotesChunkBoundaryToNormalValue` |
+
+The first failure killed my justifying argument. I had reasoned that draining
+the least-occupied parent empties one for *fewer* evictions than age order
+needs, so it spends less reuse rather than more. The test shows the case where
+that is false: a parent that still has free slots, bound to the group that is
+asking, is already contributing usable capacity, so emptying it buys nothing
+and costs an eviction. Cheapest-to-empty is the wrong metric; the free slots
+have to be netted out first.
+
+The second is the real obstacle. Within one epoch the existing order encodes
+*which* boundary to reclaim, that a closed prefix is reclaimed from its suffix,
+and which SWA frontier survives -- and those decisions range across parents.
+Grouping victims by parent permutes all of them at once. Each of those eight
+tests is a deliberate policy someone wrote down, not an incidental assertion.
+
+So parent-awareness cannot be a reordering of this comparator. It would have to
+be a second pass: keep the existing order, and when the eviction loop has freed
+enough slots but still no whole parent, go back and consolidate. That is a
+design change in a subsystem whose invariants are denser than they look from
+the outside -- eight tests' worth denser than I assumed. Both attempts are
+reverted; the suite is green at 402/402.
 
 ### What the gap actually is: concurrency traded for reuse
 

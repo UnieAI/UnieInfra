@@ -600,3 +600,41 @@ which fix to write. Acceptance is free either way: run GDN enabled *without*
 `--disable-prefill-graph` and require the `.sample` to be coherent -- the
 degeneracy gate rejects the exclamation-mark failure automatically, which is
 the check that caught this being reported as a +13.3% win in the first place.
+
+## The comparison against 754.0 was mismatched, and the real figure is ~60%
+
+Every "% of baseline" in this report compared **our mixing-on number against the
+baseline's mixing-off number**. Once mixing could be switched off -- it could
+not be, until `1eb1d46f` added `--disable-mixed-batch` -- the mismatch was
+measurable, and it is large.
+
+RAG shape, `CONC=128 NREQ=256`, GMU 0.92, 256/256 successful and 0 failed on
+both arms:
+
+| | tok/s | mean TTFT | peak in-flight |
+|---|---|---|---|
+| mixing on (the default) | 645.49 | 3679 | 110 |
+| mixing off (`--disable-mixed-batch`) | 461.25 | 4379 | 103 |
+
+**Mixed batching is worth +39.9% here**, and it engages by upstream's own policy
+with no threshold knob. The f162d993 arms differ on exactly that axis: 754.0 was
+captured with `--enable-mixed-batch` at its default threshold, where mixing
+seldom fires, and 1086.8 with `--mixed-prefill-decode-min-load 0`, which forces
+it. So the matched pairs are:
+
+| pair | ours | f162d993 | ratio |
+|---|---|---|---|
+| mixing engaging | 645.49 | 1086.8 | **59.4%** |
+| mixing not engaging | 461.25 | 754.0 | **61.2%** |
+
+Both pairs land at roughly 60%, which is worse than the 79% this report has
+been carrying and much worse than the 85.6% the memory ladder briefly seemed to
+buy. The two independent pairs agreeing is a reason to trust the worse number,
+not to discount it.
+
+Restated honestly: the memory fraction is a real +10.4% on the matched shape
+and the merge's own fixes took the tree from 231 to 645, but **the tree is at
+about 60% of the fork on both matched configurations**, and the earlier
+"79% of the nomix target" understated the gap by comparing across the mixing
+axis. The 1086.8 arm is reachable in principle now -- mixing engages by default
+-- so it is the right target, and it is 1.68x away.

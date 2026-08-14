@@ -161,6 +161,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("reserve_full_prefill_at_admission",
                 &tokenspeed::SchedulerConfig::reserve_full_prefill_at_admission)
         .def_rw("preempt_on_blocked_request", &tokenspeed::SchedulerConfig::preempt_on_blocked_request)
+        .def_rw("reserve_generation_at_admission",
+                &tokenspeed::SchedulerConfig::reserve_generation_at_admission)
+        .def_rw("new_token_ratio_init", &tokenspeed::SchedulerConfig::new_token_ratio_init)
+        .def_rw("new_token_ratio_min_factor",
+                &tokenspeed::SchedulerConfig::new_token_ratio_min_factor)
+        .def_rw("new_token_ratio_decay_steps",
+                &tokenspeed::SchedulerConfig::new_token_ratio_decay_steps)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
 

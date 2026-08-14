@@ -274,9 +274,18 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     // still makes progress chunk by chunk rather than being refused forever.
     if (config_.reserve_full_prefill_at_admission &&
         req_pool_allocator_.AvailableSlots() < req_pool_allocator_.Size()) {
+        // prompt + max_new_tokens * ratio (SGLang). With the ratio at its
+        // floor this is close to vLLM's prompt-only reservation; at its init
+        // it is close to TRT-LLM's charge-to-completion.
+        std::int32_t generation_reserve = decode_input_tokens;
+        if (config_.reserve_generation_at_admission && request->MaxNewTokens() > 0) {
+            generation_reserve = std::max<std::int32_t>(
+                decode_input_tokens,
+                static_cast<std::int32_t>(request->MaxNewTokens() * new_token_ratio_));
+        }
         std::vector<BlockTable> full_tables(static_cast<std::size_t>(coordinator_.NumGroups()));
         const std::vector<GroupDemand> full_demands = makeGroupDemands(
-            full_tables, GroupDemand{.num_tokens = unscheduled, .reserve_tokens = decode_input_tokens});
+            full_tables, GroupDemand{.num_tokens = unscheduled, .reserve_tokens = generation_reserve});
         if (!coordinator_.CanAdmitAfterReleasing(match.probe, full_demands, {})) {
             context.admission_failed = true;
             context.capacity_blocker = request->Id();
@@ -496,6 +505,11 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
     const auto owes_forward_result = [this](const Request* request) {
         return pending_forward_results_.contains(request->Id());
     };
+    // Already marked victims are not candidates again, and are not counted as
+    // resident capacity that could be freed twice.
+    const auto already_marked = [this](const Request* request) {
+        return pending_retraction_.contains(request->Id());
+    };
 
     if (config_.role == Role::kD) {
         Request* victim = nullptr;
@@ -536,11 +550,34 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
     }
 
     Request* request_to_retract = nullptr;
+    Request* deferred_victim = nullptr;
     for (Request* request : candidates) {
-        if ((request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) && !owes_forward_result(request) &&
-            (request_to_retract == nullptr || request->TokenSize() > request_to_retract->TokenSize())) {
+        if (!(request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) || already_marked(request)) {
+            continue;
+        }
+        if (owes_forward_result(request)) {
+            // Cannot be torn down now, but can be marked: it stops receiving
+            // work immediately and is retracted once its result lands.
+            if (deferred_victim == nullptr || request->TokenSize() > deferred_victim->TokenSize()) {
+                deferred_victim = request;
+            }
+            continue;
+        }
+        if (request_to_retract == nullptr || request->TokenSize() > request_to_retract->TokenSize()) {
             request_to_retract = request;
         }
+    }
+    // A retract means the reservation was too optimistic; SGLang re-estimates
+    // upward from what the victims actually generated rather than resetting to
+    // a constant.
+    if (config_.reserve_generation_at_admission) {
+        new_token_ratio_ = std::min(1.0, new_token_ratio_ + (config_.new_token_ratio_init - new_token_ratio_) * 0.5);
+    }
+    if (request_to_retract == nullptr && deferred_victim != nullptr) {
+        pending_retraction_.insert(deferred_victim->Id());
+        spdlog::info("[Scheduler] retract: marked request {} ({} tokens); it owes a forward result",
+                     deferred_victim->Id(), deferred_victim->TokenSize());
+        return;
     }
     if (request_to_retract == nullptr) {
         FatalCheck(config_.preempt_on_blocked_request, "LCM admission failed without a retractable request");
@@ -562,6 +599,40 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
 std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Scheduler::buildForwardOperations(
     ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations) {
     PlanBuildContext context{plan};
+
+    // SGLang decays the ratio on every step that did not retract, so a run
+    // that is coping drifts toward admitting more.
+    if (config_.reserve_generation_at_admission) {
+        const double floor = config_.new_token_ratio_init * config_.new_token_ratio_min_factor;
+        const double step = config_.new_token_ratio_decay_steps > 0
+                                ? (config_.new_token_ratio_init - floor) / config_.new_token_ratio_decay_steps
+                                : 0.0;
+        new_token_ratio_ = std::max(floor, new_token_ratio_ - step);
+    }
+
+    // Phase two of a deferred retract: the debt has cleared, and this is a plan
+    // build, so a write-back operation has somewhere to go.
+    for (auto it = pending_retraction_.begin(); it != pending_retraction_.end();) {
+        Request* victim = findRequest(*it);
+        if (victim == nullptr || victim->Is<fsm::Finished>() || victim->Is<fsm::Retracted>()) {
+            it = pending_retraction_.erase(it);
+            continue;
+        }
+        if (pending_forward_results_.contains(*it)) {
+            ++it;  // still owes a result; try again next step
+            continue;
+        }
+        if (config_.HasHostCache() && victim->Is<fsm::Decoding>()) {
+            if (auto operation = beginRetraction(*victim)) {
+                write_back_operations.push_back(std::move(*operation));
+            }
+        } else {
+            victim->Apply(fsm::RetractEvent{&coordinator_});
+        }
+        spdlog::info("[Scheduler] retract: released marked request {} ({} tokens)", victim->Id(),
+                     victim->TokenSize());
+        it = pending_retraction_.erase(it);
+    }
     while (!recovery_queue_.empty()) {
         Request* request = findRequest(recovery_queue_.front());
         if (request != nullptr && !request->Is<fsm::Finished>()) {
@@ -661,6 +732,12 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
             break;
+        }
+        // A marked victim must stop growing immediately, or the pages the
+        // retraction is meant to free keep accumulating while it waits for its
+        // outstanding result to land.
+        if (pending_retraction_.contains(request->Id())) {
+            continue;
         }
 
         if (request->Is<fsm::Prefilling>() &&

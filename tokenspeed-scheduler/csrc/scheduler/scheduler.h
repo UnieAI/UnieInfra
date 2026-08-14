@@ -169,6 +169,17 @@ private:
     std::int32_t max_single_request_tokens_{0};
 
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
+    // Two-phase retract. A victim must not be torn down while it still owes a
+    // forward result -- the result lands afterwards and the FSM refuses it
+    // ("FSM transition invalid: event=ExtendResultEvent; state=Retracted").
+    // At overlap depth 1 nearly every resident request owes one, so requiring
+    // an unencumbered victim finds nobody and preemption never happens. These
+    // are marked instead: scheduling skips them, and the retraction runs at the
+    // start of the next plan, once the debt has cleared.
+    std::unordered_set<std::string> pending_retraction_;
+    // Current value of SGLang's new_token_ratio. Starts at the configured
+    // init, decays per plan toward the floor, and is raised on a retract.
+    double new_token_ratio_{1.0};
     std::unordered_set<std::string> pd_transfer_pins_;
     std::deque<std::string> recovery_queue_;
     std::optional<std::string> recovery_barrier_;

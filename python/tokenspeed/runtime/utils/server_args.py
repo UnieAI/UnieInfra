@@ -140,6 +140,23 @@ class ServerArgs:
     # at startup, so turning it on by default cannot reach a step it cannot
     # serve -- it fails with a message naming the flag instead.
     enable_mixed_batch: bool = True
+    # How much of a request's eventual footprint admission charges. The five
+    # engines surveyed in unieinfra/xref/25-admission.md give five different
+    # answers and none is a strict improvement on another; these are the four
+    # that are expressible here, measured on this engine (Qwen3.5-27B, one RTX
+    # PRO 6000, random 1024/1024 at C=128):
+    #
+    #   chunk               210.69 tok/s   this chunk + one decode token
+    #   prompt              168.55          whole prompt (vLLM)
+    #   generation-adaptive 360.95          + max_new * a learned ratio (SGLang)
+    #   generation-full     848.44          + max_new in full (TRT-LLM)
+    #
+    # generation-full also improves the agent shape (goodput 0.39 -> 0.41,
+    # median TTFT 2815 -> 1808 ms), because charging the output costs little
+    # when outputs are short against a 127k prompt and doubles the estimate
+    # when they are not. It is the default for that reason, not because it won
+    # one benchmark.
+    admission_reserve: str = "generation-full"
     # Kernel page size. Flat scheduler logical pages come from the LCM
     # runtime contract and must not overwrite this value.
     block_size: int = 64
@@ -1127,6 +1144,20 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+        )
+        parser.add_argument(
+            "--admission-reserve",
+            type=str,
+            choices=["chunk", "prompt", "generation-adaptive", "generation-full"],
+            default=ServerArgs.admission_reserve,
+            help=(
+                "How much of a request's eventual footprint admission charges. "
+                "chunk: this chunk only (admits most, tail latency undefended). "
+                "prompt: the whole prompt (vLLM). generation-adaptive: plus "
+                "max_new_tokens scaled by a self-tuning ratio (SGLang). "
+                "generation-full: plus max_new_tokens in full (TRT-LLM), which "
+                "makes preemption structurally unnecessary."
+            ),
         )
         parser.add_argument(
             "--disable-mixed-batch",

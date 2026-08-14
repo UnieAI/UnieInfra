@@ -3633,4 +3633,90 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
 
+// ---------------------------------------------------------------------------
+// Admission reserve policy. The four cells differ in how much of a request's
+// eventual footprint they charge, and the difference is only visible in HOW
+// MANY requests enter a pool that cannot hold them all -- which is why nothing
+// in this file caught it before. Measured end to end on Qwen3.5-27B, random
+// 1024/1024 at C=128: chunk 210.69 tok/s, prompt 168.55, generation-adaptive
+// 360.95, generation-full 848.44. See unieinfra/xref/25-admission.md.
+// ---------------------------------------------------------------------------
+class AdmissionReserveBase : public SchedulerTestSuite {
+protected:
+    SchedulerConfig BaseConfig() {
+        SchedulerConfig cfg{};
+        cfg.block_size = 4;
+        // 11 physical pages -> 10 usable. A 2-page prompt asking for 8 more
+        // tokens is 2 more pages, so three requests need 9 pages when only the
+        // prompt is charged and 12 when the generation is charged too. The
+        // pool sits deliberately between the two.
+        cfg.device_allocator.total_pages = 11;
+        cfg.host_allocator.total_pages = 12;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.paged_cache_groups = {
+            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+        };
+        return cfg;
+    }
+
+    // One request per step, because the reserve check reads resident slots and
+    // those are not allocated until an event is applied -- within a single plan
+    // build the count does not move, so a batch submitted at once is bounded by
+    // the pool rather than by the policy. Real traffic arrives across steps.
+    std::int32_t AdmittedOverSteps(int num_requests = 3) {
+        std::int32_t admitted = 0;
+        for (int i = 0; i < num_requests; ++i) {
+            Submit(MakeRequestSpec("r" + std::to_string(i), /*num_pages=*/2, /*start=*/1 + 100 * i,
+                                   /*max_new_tokens=*/32));
+            ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch != nullptr) {
+                for (const std::string& id : batch->request_ids) {
+                    if (id == "r" + std::to_string(i)) {
+                        ++admitted;
+                    }
+                }
+            }
+        }
+        return admitted;
+    }
+};
+
+class AdmissionChunkSuite : public AdmissionReserveBase {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = BaseConfig();
+        cfg.reserve_full_prefill_at_admission = false;
+        cfg.reserve_generation_at_admission = false;
+        return cfg;
+    }
+};
+
+class AdmissionGenerationFullSuite : public AdmissionReserveBase {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = BaseConfig();
+        cfg.reserve_full_prefill_at_admission = true;
+        cfg.reserve_generation_at_admission = true;
+        cfg.new_token_ratio_init = 1.0;
+        cfg.new_token_ratio_min_factor = 1.0;
+        return cfg;
+    }
+};
+
+TEST_F(AdmissionChunkSuite, ChargingOneChunkAdmitsAll) {
+    EXPECT_EQ(AdmittedOverSteps(), 3) << "charging one chunk ignores the generation entirely";
+}
+
+TEST_F(AdmissionGenerationFullSuite, ChargingGenerationBoundsResidency) {
+    // 2 prompt pages + 8 generation pages against 10 usable: the second
+    // request must wait rather than enter and stall on a full arena.
+    EXPECT_EQ(AdmittedOverSteps(), 1);
+}
+
 }  // namespace tokenspeed::test

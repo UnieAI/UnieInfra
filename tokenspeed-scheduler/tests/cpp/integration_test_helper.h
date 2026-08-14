@@ -67,11 +67,13 @@ protected:
 
     const SchedulerConfig& Config() const { return config_; }
     std::int32_t PageSize() const { return config_.block_size; }
-    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, std::int32_t start = 1) {
+    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, std::int32_t start = 1,
+                                std::int32_t max_new_tokens = 0) {
         auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
         return RequestSpec{
             .request_id = id,
             .tokens = tokens,
+            .max_new_tokens = max_new_tokens,
         };
     }
 

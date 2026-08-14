@@ -143,6 +143,48 @@ Whoever takes it needs instrumentation rather than reading: log what the kernel
 receives at capture versus at replay, behind a debug bypass of the startup
 guard. The payoff is the graph's +8.4% stacked on the kernel's +21.8%.
 
+## The largest lever found, measured, and NOT shipped
+
+Concurrency is the gap. On a clean arm at the new defaults the engine holds
+**69 in-flight against a client driving 128**, while f162d993 held 128. KV is
+not the constraint -- 2964 blocks free -- the recurrent state pool is: 247
+blocks per linear group, three groups, and roughly 3.5 blocks charged per
+request.
+
+`MambaStateManager` is built as `SwaManager(..., sliding_window=2, ...)`, and
+`CachedPagesBehindBoundary` computes `(window - 1 + block_tokens - 1) /
+block_tokens`, so 2 pins one page BEHIND every boundary and 1 pins none. Its
+own comment says "retain only the request's live state page", which is window
+1. A recurrent state summarises everything before it, so on the face of it the
+page behind carries nothing the state does not already hold.
+
+Changed to 1 and measured, RAG C=128, 256 requests, 0 failed:
+
+|  | window 2 | window 1 |
+|---|---|---|
+| throughput | 596.63 | **703.50** tok/s (+17.9%) |
+| mean TTFT | 5775.6 | 4805.9 ms |
+| mean TPOT | 97.14 | 85.30 ms |
+| prefix reuse | 77.0% | **80.6%** |
+| peak in-flight | 69 | 77 |
+| output | coherent | coherent |
+
+703.50 is 93% of the 754.0 reference, from 231 at the start.
+
+**It is reverted, because it breaks 8 scheduler tests.** The window is not only
+a capacity knob -- it changes state prefix MATCHING.
+`MambaStateKindTest.FactoryMapsStateKindToAlignSemantics` pins "state resumes
+off snapshot @2" with a specific hit-block count and block vector, and five
+`CoordinatorPromotionTest` cases plus two admission tests fail with it. One
+benchmark arm with correct output is not enough to overrule eight tests that
+encode the intended semantics.
+
+So the finding is: **+17.9% is available if recurrent-state retention can be
+reduced without changing match semantics**, and the eight named tests are the
+specification any such change has to satisfy. That is real work on the
+matching logic, not a constant to flip -- which is exactly why it is written
+down here rather than committed.
+
 ## What is still unexplained
 
 **It is not prefill scheduling, and that took two experiments to establish.**

@@ -204,10 +204,38 @@ fine anyway. The pattern is worth naming: on this engine, a change that frees
 cache capacity will always look like a throughput win, because throughput is
 what capacity buys -- the question to ask first is what stopped being stored.
 
-The concurrency ceiling is real (69 in-flight against a client driving 128, KV
-uncontended) but the recurrent state pool is not oversubscribed by a retention
-bug. It is simply the size the LCM arena gives it, and raising it means moving
-the packing ratio or the memory budget.
+### What the gap actually is: concurrency traded for reuse
+
+The ceiling is real -- 69 in-flight against a client driving 128, with KV
+uncontended -- and the arithmetic names the trade rather than a bug:
+
+|  | f162d993 | merged |
+|---|---|---|
+| recurrent state pool | 221 chunks, SEPARATE | 247 blocks, shared LCM arena |
+| charged per in-flight request | ~1.73 | ~3.58 |
+| concurrency reached | 128 | 69 |
+| prefix reuse | 66.5% | 77-80% |
+
+The pools are comparable. What differs is the per-request charge, and it is
+roughly double. Upstream's boundary-and-promotion machinery retains more state
+per request, which is exactly why prefix reuse is ten points HIGHER than the
+baseline's -- and exactly why concurrency is half.
+
+So the merged engine is not less efficient at the same operating point; it sits
+at a different one. It recomputes less and holds fewer requests. On a workload
+whose bottleneck is concurrency, that reads as a 21% throughput deficit; on one
+bottlenecked by prefill compute it would read as a win.
+
+Two consequences worth stating plainly:
+
+- **This is architectural, not a defect.** Upstream's shared arena couples KV
+  and recurrent-state capacity; the fork's separate mamba pool did not. Moving
+  the operating point means changing the packing ratio or the memory budget,
+  both of which cost something else.
+- **754.0 was measured at the other operating point**, on a build whose cache
+  and admission this tree no longer contains, and which will not start here
+  (see above). Treating it as a target this tree has missed by 21% assumes the
+  two are comparable, and nothing measured tonight supports that.
 
 ## What is still unexplained
 

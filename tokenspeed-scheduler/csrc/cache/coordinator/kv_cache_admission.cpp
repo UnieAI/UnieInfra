@@ -22,7 +22,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
+
+#include <spdlog/spdlog.h>
 #include <span>
 #include <tuple>
 #include <unordered_set>
@@ -291,6 +294,20 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
     AdmissionPlanner planner{groups, pool, demands, prefix, {}, victims};
     if (!planner.Plan()) {
+        // `TOKENSPEED_LOG_ADMISSION=1`: name the group that could not be
+        // satisfied. In-flight concurrency stalls well below the client's
+        // level while KV still has thousands of blocks free, and nothing in
+        // the log says which pool actually refuses -- the request simply is
+        // not scheduled.
+        static const bool trace = std::getenv("TOKENSPEED_LOG_ADMISSION") != nullptr;
+        if (trace) {
+            std::string per_group;
+            for (std::size_t i = 0; i < groups.size(); ++i) {
+                per_group += (i ? " " : "");
+                per_group += "g" + std::to_string(i) + "=" + std::to_string(demands[i].num_tokens) + "tok";
+            }
+            spdlog::info("[ADMIT-REJECT] empty_parents={} demands: {}", pool.NumEmptyLcmBlocks(), per_group);
+        }
         return std::nullopt;
     }
     return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims)};

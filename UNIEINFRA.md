@@ -21,10 +21,13 @@ number matters:
   compounds it — turn N reuses the whole of turns 1..N-1.
 - **On a hybrid model that means recurrent state, not just KV.** Resuming a
   prefix needs the recurrent snapshot at that depth, so a fixed preamble is
-  written once and read for the life of the deployment. This is the part
-  upstream's own benchmark shape does not exercise and vLLM does not implement
-  at all — it resolves `enable_prefix_caching=False` on Qwen3.5/3.6 hybrids and
-  says nothing.
+  written once and read for the life of the deployment. vLLM does have hybrid
+  prefix caching, but only its aligned form: on Qwen3.5/3.6 it falls back to
+  `--mamba-cache-mode=align` with a warning and keeps caching on, while the
+  `all` mode — full recurrent-state snapshotting — raises `NotImplementedError`
+  for `qwen3_5`, `qwen3_next` and `lfm2` and exists only for Mamba1/2
+  (`vllm/model_executor/models/qwen3_5.py:297`). The differentiator is
+  therefore "no full state snapshot on GDN", not "no hybrid prefix cache".
 - **Goodput under a latency SLO, not peak throughput.** An agent turn that
   misses its budget is worth nothing to the caller, so an arm that posts tokens
   per second while breaching TTFT is not a result. See

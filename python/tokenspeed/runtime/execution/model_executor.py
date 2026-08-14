@@ -550,6 +550,9 @@ class ModelExecutor:
         self.num_generated_tokens = 0
         self.num_decode_steps = 0
         self.last_decode_stats_tic = time.time()
+        # Arena-saturation warning state; see _warn_if_arena_saturated.
+        self._saturated_decode_steps = 0
+        self._warned_arena_saturated = False
 
         set_random_seed(48)
 
@@ -955,6 +958,60 @@ class ModelExecutor:
                     draft_rows.eq(target_draft_rows).tolist(),
                 )
 
+    # Warn once per process, after this many consecutive saturated decode
+    # STEPS. Counted in steps rather than in decode reports because
+    # decode_log_interval yields only single-digit reports across a whole
+    # benchmark run -- a streak counted in reports never accumulates, which is
+    # how the first version of this warning passed its unit tests and then
+    # failed to fire once on a run whose page ratio reached 1.00.
+    _ARENA_SATURATION_RATIO = 0.98
+    _ARENA_SATURATION_STEPS = 50
+
+    def _warn_if_arena_saturated(self, page_ratio: float, running_reqs: int) -> None:
+        """Say so when the KV arena is full, with the cap that would avoid it.
+
+        A full arena does not fail; it degrades, and it degrades steeply. On
+        Qwen3.5-27B RAG at 128 concurrent, the arena reaching 100% occupancy
+        halved per-request decode rate (12.14 -> 5.79 tok/s) and cost 38% of
+        total throughput against the same engine held just below saturation --
+        783.26 tok/s at ``--max-num-seqs 88`` (page ratio 0.89) against 645.49
+        unbounded (page ratio 1.000), same client concurrency, same pool.
+
+        Nothing in the existing output tells an operator this is happening:
+        requests still succeed, output is still correct, and only aggregate
+        throughput moves.
+
+        This deliberately does NOT compute a recommended cap. Two earlier
+        versions did and both were wrong: saturation is first reached during
+        ramp-up, when long prompts already fill the arena while only a handful
+        of requests have reached decode, so the batch size at that instant
+        suggested --max-num-seqs 26 on a run whose measured optimum was 88.
+        Tracking the largest batch carried while unsaturated does no better --
+        on this workload the arena fills before any decode batch has grown, so
+        that number is 1. The signal is real; a cap derived from it is not.
+        """
+        if self._warned_arena_saturated:
+            return
+        if page_ratio < self._ARENA_SATURATION_RATIO:
+            self._saturated_decode_steps = 0
+            return
+        self._saturated_decode_steps += 1
+        if self._saturated_decode_steps < self._ARENA_SATURATION_STEPS:
+            return
+        self._warned_arena_saturated = True
+        logger.warning(
+            "KV arena is saturated: active page ratio %.2f, sustained across "
+            "%d consecutive decode steps. Serving stays correct, but this "
+            "engine gives up throughput in this regime rather than plateauing "
+            "-- measured on Qwen3.5-27B RAG at 128 concurrent, 645-685 tok/s "
+            "saturated against 783 with the same pool held at ratio 0.89 by "
+            "--max-num-seqs 88. If throughput matters more than admitting "
+            "every request at once, try lowering --max-num-seqs or raising "
+            "--gpu-memory-utilization. This warning is emitted once.",
+            page_ratio,
+            self._ARENA_SATURATION_STEPS,
+        )
+
     def execute_forward_op_with_log(
         self,
         forward_op,
@@ -1012,6 +1069,16 @@ class ModelExecutor:
             multimodal_context=multimodal_context,
             capture_next_input_ids=capture_next_input_ids,
         )
+
+        if is_decode and self.config.global_rank == 0:
+            # Every decode step, not only the sampled ones: decode_log_interval
+            # yields single-digit reports over a whole benchmark run, so a
+            # streak counted in reports would never accumulate.
+            num_total_pages = self.config.num_total_pages
+            self._warn_if_arena_saturated(
+                num_active_pages / num_total_pages if num_total_pages > 0 else 0,
+                bs,
+            )
 
         if is_decode and (
             self.config.global_rank == 0

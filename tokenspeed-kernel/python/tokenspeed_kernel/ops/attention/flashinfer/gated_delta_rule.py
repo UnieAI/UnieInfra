@@ -228,7 +228,7 @@ def is_available() -> bool:
     # Default stays OFF because the win requires --disable-prefill-graph and
     # nothing here can enforce that; the wrapper raises under capture rather
     # than letting a graph silently corrupt every reply.
-    return os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120") == "1"
+    return os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120", "1") != "0"
 
 
 def _use_raw_kernel() -> bool:

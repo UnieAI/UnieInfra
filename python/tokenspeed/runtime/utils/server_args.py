@@ -134,7 +134,12 @@ class ServerArgs:
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
-    enable_mixed_batch: bool = False
+    # Default ON: worth +23.4% on Qwen3.5-27B, RAG at C=128 (500.71 against
+    # 405.74 tok/s on the same arm). Backends that cannot serve MIXED declare
+    # `supports_mixed_batch = False` and `validate_mixed_batch_backend` refuses
+    # at startup, so turning it on by default cannot reach a step it cannot
+    # serve -- it fails with a message naming the flag instead.
+    enable_mixed_batch: bool = True
     # Kernel page size. Flat scheduler logical pages come from the LCM
     # runtime contract and must not overwrite this value.
     block_size: int = 64
@@ -225,7 +230,12 @@ class ServerArgs:
     enable_kvstore: bool = False
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
-    kvstore_io_backend: str = "kernel"
+    # Default "direct": measured faster AND cleaner than the mapped-host
+    # Triton path. RAG at C=128, 586 against 543 tok/s, and the mapped-host
+    # backend is the only configuration that still logs an illegal memory
+    # access (at teardown) after the L2 stream-ordering fix -- five `direct`
+    # arms logged none.
+    kvstore_io_backend: str = "direct"
     kvstore_mem_layout: str = "layer_first"
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None

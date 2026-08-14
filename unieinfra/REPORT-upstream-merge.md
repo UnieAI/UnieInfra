@@ -758,12 +758,42 @@ fork's everywhere, or only diverges at large batch.
 | C=32 | 502.11 (mixing ON) | 384.61 | not comparable |
 | C=128 | 461.25 (mixing off) | 753.97 | 0.61x |
 
-Our C=32 arm has mixing on and the fork's ladder does not, so the one row that
-would decide it is not yet matched. Deflating by the 39.9% mixing is worth at
-C=128 gives roughly 359 against 384.61 -- near parity -- which would mean the
-curves coincide at moderate batch and diverge only at large, i.e. decode
-batching is the target. But that deflation is an estimate: the 39.9% was
-measured at C=128 and there is no reason it carries to C=32. The matched arm
-(C=32, `--disable-mixed-batch`, GMU 0.80) is the one that decides it, and a
-result near 359 rather than near 384 flips the answer to a flat per-step
-deficit instead.
+**Matched, and it decides against the flat hypothesis.** C=32,
+`--disable-mixed-batch`, GMU 0.80 -- the fork's own conditions -- measures
+**500.56 tok/s**, 256/256 with 0 failed, against the fork's 384.61:
+
+| | ours | f162d993 | ratio |
+|---|---|---|---|
+| C=32, mixing off, GMU 0.80 | **500.56** | 384.61 | **1.30x faster** |
+| C=128, mixing off | 461.25 | 753.97 | **0.61x** |
+
+We are 30% *faster* than the fork at moderate batch and 39% slower at large --
+a 2.1x swing across the concurrency axis. That is the divergence branch, not a
+constant factor.
+
+Two controls on the claim:
+
+- **Reuse cannot explain it, and cuts the wrong way.** The concern raised was
+  that the fork's C=32 row sits at 40.8% reuse, the lowest on its ladder, so
+  part of any advantage of ours might be cache rather than engine. But this
+  report's own comparison has upstream's cache reusing *better than the fork at
+  both ends* -- 48.7% against 40.8% at C=32, and 68.2% against 66.5% at C=128.
+  At C=128 we hold the reuse advantage and are still at 0.61x, so the cache is
+  subsidising the deficit rather than hiding it, and an 8-point reuse gap
+  cannot produce a 2.1x swing. (This arm's own reuse could not be read: the
+  engine-side `tokenspeed:prefix_cache_hits` counter is not on the port this
+  harness scrapes, so the figures above are the ones already in this report
+  rather than measurements from this run.)
+- **The pool favours us at C=128**, not the fork: our 461.25 was taken at GMU
+  0.92 against their 0.80, so we had the larger arena and more in-flight
+  headroom. The 0.61x is if anything flattered.
+
+A third fact fell out of the same arm: at C=32, mixing on and mixing off
+measure 502.11 and 500.56 -- indistinguishable. The +39.9% that mixing is worth
+is entirely a large-batch phenomenon, consistent with the batch axis being
+where this engine and the fork part company.
+
+It also corrects the estimate this section previously reasoned from. Deflating
+our mixing-on C=32 by the 39.9% measured at C=128 predicted about 359; the
+matched number is 500.56. Applying an effect measured at one operating point to
+another is the habit that produced the error, and it was wrong by 40%.

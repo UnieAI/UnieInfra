@@ -684,10 +684,17 @@ sides:
 | | peak in-flight | tok/s | per request |
 |---|---|---|---|
 | ours, GMU 0.92 | 103 | 461.25 | **4.48 tok/s** |
-| f162d993, GMU 0.80 | 80 | 754.0 | **9.43 tok/s** |
+| f162d993, GMU 0.80 | 128 | 753.97 | **5.89 tok/s** |
 
-**We hold more requests than the fork and produce roughly half the tokens
-each.** Prefill is not the problem -- mean TTFT is now 3679 ms against the
+**Corrected from the peer session.** An earlier revision of this table put the
+fork at 80 in-flight and 9.43 tok/s per request, and concluded we were 2.1x
+slower per request while holding *more* requests. That was a shape mislabel:
+80-94 in-flight is the fork's **unique-prompt** arm (chat corpus, no shared
+prefix), while on the RAG shape it saturated at 128 of 128. Matched, the
+per-request gap is **1.31x**, not 2.1x -- still real, half the size, and we
+hold fewer requests rather than more.
+
+Prefill is not the problem -- mean TTFT is now 3679 ms against the
 baseline's 3906 -- and the layer-by-layer probe recorded earlier in this project
 has per-decode-token cost at parity with vLLM at concurrency 1 (36.4 vs 36.9
 ms). Parity at C=1 and half the rate at C≈100 is a scaling statement.
@@ -714,3 +721,38 @@ The next probe is host-versus-device: sampling GPU utilisation across a C=128
 arm separates "the scheduler and Python cannot feed the device" from "the
 device is genuinely doing this much work". Those two have completely different
 fixes, and no amount of reading distinguishes them.
+
+### The fork's own curve, and the test that decides the branch
+
+The peer session's committed f162d993 ladder, RAG shape, mixing off, GMU 0.80:
+
+| C | tok/s | peak in-flight | per request | reuse |
+|---|---|---|---|---|
+| 1 | 26.64 | 1 | 26.64 | 72.1% |
+| 16 | 270.33 | 16 | 16.90 | 47.7% |
+| 32 | 384.61 | 32 | 12.02 | 40.8% |
+| 64 | 560.77 | 64 | 8.76 | 50.1% |
+| 128 | 753.97 | 128 | 5.89 | 66.5% |
+
+This kills a weaker version of the argument above. Per-request rate falling
+steeply with batch is what continuous batching does on *both* engines -- the
+fork drops 4.5x from C=1 to C=128 -- so "per-request rate collapses with
+concurrency" on its own distinguishes nothing.
+
+What does distinguish: whether our curve sits a constant factor below the
+fork's everywhere, or only diverges at large batch.
+
+| | ours | f162d993 | ratio |
+|---|---|---|---|
+| C=32 | 502.11 (mixing ON) | 384.61 | not comparable |
+| C=128 | 461.25 (mixing off) | 753.97 | 0.61x |
+
+Our C=32 arm has mixing on and the fork's ladder does not, so the one row that
+would decide it is not yet matched. Deflating by the 39.9% mixing is worth at
+C=128 gives roughly 359 against 384.61 -- near parity -- which would mean the
+curves coincide at moderate batch and diverge only at large, i.e. decode
+batching is the target. But that deflation is an estimate: the 39.9% was
+measured at C=128 and there is no reason it carries to C=32. The matched arm
+(C=32, `--disable-mixed-batch`, GMU 0.80) is the one that decides it, and a
+result near 359 rather than near 384 flips the answer to a flat per-step
+deficit instead.

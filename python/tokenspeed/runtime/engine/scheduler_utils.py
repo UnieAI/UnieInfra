@@ -210,6 +210,7 @@ def make_config(
     disable_prefix_cache: bool = False,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    admission_reserve: str = "generation-full",
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
@@ -240,6 +241,25 @@ def make_config(
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
+    # One policy name, translated to the two switches and the ratio the C++
+    # side reads. Keeping the translation here means the scheduler config stays
+    # a mechanism and the choice stays a documented, measured option.
+    if admission_reserve == "chunk":
+        cfg.reserve_full_prefill_at_admission = False
+        cfg.reserve_generation_at_admission = False
+    elif admission_reserve == "prompt":
+        cfg.reserve_full_prefill_at_admission = True
+        cfg.reserve_generation_at_admission = False
+    elif admission_reserve == "generation-adaptive":
+        cfg.reserve_full_prefill_at_admission = True
+        cfg.reserve_generation_at_admission = True
+        cfg.new_token_ratio_init = 0.7
+    elif admission_reserve == "generation-full":
+        cfg.reserve_full_prefill_at_admission = True
+        cfg.reserve_generation_at_admission = True
+        cfg.new_token_ratio_init = 1.0
+    else:
+        raise ValueError(f"unknown admission_reserve {admission_reserve!r}")
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg

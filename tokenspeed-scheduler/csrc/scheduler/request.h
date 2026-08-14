@@ -43,6 +43,8 @@ public:
 
     const std::string& Id() const { return id_; }
 
+    std::int32_t MaxNewTokens() const { return max_new_tokens_; }
+
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
@@ -127,6 +129,11 @@ private:
 
     std::string id_;
     TokenContainer token_container_;
+    // The caller's generation budget. Admission needs it to charge what a
+    // request will eventually occupy rather than only its prompt: SGLang's
+    // reservation is prompt + max_new_tokens * an adaptive ratio, and without
+    // this field the scheduler cannot express the second term.
+    std::int32_t max_new_tokens_{0};
     std::int32_t page_size_{};
     fsm::State state_;
 };

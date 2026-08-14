@@ -85,7 +85,23 @@ struct SchedulerConfig {
     // Reserving the prompt at admission (above) is only half of vLLM's design:
     // it charges the prompt, not the output, so its preemption path stays live
     // and is a normal mechanism rather than a last resort.
-    bool preempt_on_blocked_request{true};
+    bool preempt_on_blocked_request{false};
+    // Admission reserves `prompt + max_new_tokens * new_token_ratio`, ported
+    // from SGLang (srt/managers/schedule_policy.py, new_token_ratio_tracker).
+    // vLLM's reservation charges the prompt only, which is enough when a
+    // request's footprint is dominated by its prompt and not enough when it is
+    // not: on 1024-in/1024-out traffic the output doubles what admission
+    // believed it was charging, so 128 requests entered a pool sized for far
+    // fewer and every one of them stalled.
+    //
+    // The ratio is a feedback loop, not a constant -- it is the one admission
+    // among the five surveyed that learns its own conservativeness. It decays
+    // toward `min` on every step that does not retract, and is re-estimated
+    // upward from measured output whenever one does.
+    bool reserve_generation_at_admission{true};
+    double new_token_ratio_init{1.0};   // generation-full by default; see server_args.admission_reserve
+    double new_token_ratio_min_factor{1.0};  // 1.0 = no decay (TRT-LLM); 0.14 = SGLang
+    std::int32_t new_token_ratio_decay_steps{600};
 
     Role role{Role::kFused};
     bool enable_pd_cache{false};

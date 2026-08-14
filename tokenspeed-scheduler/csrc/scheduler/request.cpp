@@ -29,6 +29,7 @@ namespace tokenspeed {
 Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
     : id_{spec.request_id},
       token_container_{spec.tokens},
+      max_new_tokens_{spec.max_new_tokens},
       page_size_{page_size},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {}

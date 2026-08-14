@@ -268,11 +268,21 @@ exactly as the fork's ladder predicted: parents +49% gave in-flight +49%
 (73 to 107). The peer's 0.36-in-flight-per-chunk relation was measured on the
 fork's separate mamba pool and reproduces here on upstream's shared LCM arena,
 across two allocators and six pool sizes -- which makes it a property of the
-engine's *admission*, not of either allocator. Nothing OOMed at 0.95; the fork
-OOMed at 0.94, so the merged tree tolerates a larger fraction than it did.
+engine's *admission*, not of either allocator.
 
 Returns are flattening (0.92 to 0.95 buys 9 in-flight and 1.3%), and in-flight
 still has not saturated the client's 128, so pool size is not the only term.
+
+**0.95 is not a safe setting, and the 128-request ladder above cannot see it.**
+Re-run at `NREQ=256` -- the shape the 754.0 baseline was actually captured on --
+0.95 dies with `torch.OutOfMemoryError` mid-run, taking the engine process with
+it; the harness marked the result `.INVALID` and the client saw
+`tcp connect error`. The same fraction completed 128/128 cleanly minutes
+earlier. A longer run holds more concurrent decode state, so the peak arrives
+later than a 128-request wave ever reaches. This is the shape-dependence
+warning in `AGENTS.local.md` landing on my own arm: I had already written
+"nothing OOMed at 0.95" off the short run, and it was wrong within the hour.
+Treat every row of the ladder above as valid only at `NREQ=128`.
 
 **A correction this forces on the rest of this report.** I have described
 596.63 tok/s as the figure "at pure defaults, no flags, no env". That is wrong.

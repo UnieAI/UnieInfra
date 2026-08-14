@@ -234,6 +234,18 @@ def resolve_fi_gdn_prefill_graph(server_args) -> None:
         return
     if getattr(server_args, "disable_prefill_graph", False):
         return
+    if os.getenv("TOKENSPEED_FI_GDN_ALLOW_PREFILL_GRAPH") == "1":
+        # Diagnostic escape hatch for the combination this function exists to
+        # prevent. Every reply will be garbage; the point is to run the GDN
+        # trace (TOKENSPEED_LOG_GDN=1) under a real capture and compare what
+        # the kernel receives at capture against what it receives at replay.
+        # Never set this on anything whose output is read.
+        logger.error(
+            "TOKENSPEED_FI_GDN_ALLOW_PREFILL_GRAPH=1: keeping the prefill CUDA "
+            "graph with the flashinfer GDN kernel active. This configuration "
+            "is known to answer every request with garbage. Diagnostic use only."
+        )
+        return
     logger.warning(
         "Disabling the prefill CUDA graph: the flashinfer GDN chunk-prefill "
         "kernel is active and silently produces garbage under graph capture. "

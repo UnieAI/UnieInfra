@@ -128,12 +128,23 @@ if platform.is_nvidia:
         )
         x_scale = x_scale.to(torch.float32).contiguous()
         hidden_blocks = hidden_size // _FP8_BLOCK
-        if x_scale.shape != (hidden_blocks, x_fp8.shape[0]):
-            raise RuntimeError(
-                "unexpected hidden_states_scale shape "
-                f"{tuple(x_scale.shape)}; expected "
-                f"{(hidden_blocks, x_fp8.shape[0])}"
-            )
+        expected = (hidden_blocks, x_fp8.shape[0])
+        if x_scale.shape != expected:
+            # TRT-LLM's ``per_token_group_quant_8bit`` -- the path taken when
+            # scales are neither column-major nor TMA-aligned -- returns this
+            # same [K/128, M] group-major scale FLATTENED. The element order
+            # already matches what the kernel wants, so restore the 2D view
+            # instead of transposing. Reshaping the wrong layout would be
+            # silent: the GEMM would run and the model would emit plausible
+            # nonsense, so anything that is not an exact element-count match
+            # still raises.
+            if x_scale.numel() == expected[0] * expected[1]:
+                x_scale = x_scale.view(expected)
+            else:
+                raise RuntimeError(
+                    "unexpected hidden_states_scale shape "
+                    f"{tuple(x_scale.shape)}; expected {expected}"
+                )
 
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
         num_experts = getattr(w, "num_experts", local_experts)

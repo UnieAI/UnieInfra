@@ -194,6 +194,8 @@ class LogitsProcessor(nn.Module):
     _LOGITS_AG_MAX_TOKENS = 128
     _LOGITS_AG_STATE_UNINITIALIZED = object()
     _LOGITS_AG_STATES = {}
+    # Keys whose symmetric-memory rendezvous failed; see _init_all_gather_state.
+    _LOGITS_AG_UNAVAILABLE = set()
 
     _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
     _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
@@ -318,13 +320,40 @@ class LogitsProcessor(nn.Module):
             return None
 
         key = (self.tp_group, vocab_padded)
+        if key in self._LOGITS_AG_UNAVAILABLE:
+            return None
         if key not in self._LOGITS_AG_STATES:
-            self._LOGITS_AG_STATES[key] = create_state(
-                group=pg_manager.get_process_group("nccl", self.tp_group),
-                rank_in_group=self.tp_rank,
-                max_tokens=self._LOGITS_AG_MAX_TOKENS,
-                hidden_size=vocab_padded,
-            )
+            try:
+                self._LOGITS_AG_STATES[key] = create_state(
+                    group=pg_manager.get_process_group("nccl", self.tp_group),
+                    rank_in_group=self.tp_rank,
+                    max_tokens=self._LOGITS_AG_MAX_TOKENS,
+                    hidden_size=vocab_padded,
+                )
+            except Exception as exc:
+                # The RSAG kernel reduces through multimem instructions, so its
+                # buffer has to rendezvous as symmetric memory -- which needs
+                # NVLink/NVSwitch between the ranks. On a PCIe box the
+                # rendezvous fails with "CUDA driver error: invalid device
+                # ordinal", and because this runs during the first forward it
+                # took down startup for every tensor-parallel launch rather
+                # than degrading. The guards above cover platform, world size,
+                # node spanning and vocab alignment; none of them can see the
+                # interconnect, so the attempt is the test.
+                #
+                # Cached per key: without this every layer retries a rendezvous
+                # that cannot succeed.
+                self._LOGITS_AG_UNAVAILABLE.add(key)
+                logger.warning(
+                    "Triton RSAG all-gather unavailable for tp_group %s "
+                    "(vocab %d); falling back to the plain all-gather. This is "
+                    "expected without NVLink between the ranks. Cause: %s: %s",
+                    self.tp_group,
+                    vocab_padded,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
         return self._LOGITS_AG_STATES[key]
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):

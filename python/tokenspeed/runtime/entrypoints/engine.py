@@ -480,6 +480,59 @@ def _set_socket_interface(server_args: ServerArgs):
     logger.info(f"socket interface reaching {head}: {interface}")
 
 
+def _check_peer_access(server_args: ServerArgs):
+    """Refuse a multi-GPU launch whose devices cannot reach each other.
+
+    The collectives and the CUDA-graph capture both assume peer access. Without
+    it the launch dies deep inside capture with ``CUDART error: peer access is
+    not supported between these two devices`` -- after weights have loaded,
+    with no indication of which devices are at fault or which pairing would
+    work. On a PCIe box only devices behind the same switch are peers, so the
+    valid pairings are a property of the machine that the operator has to pick,
+    not something the engine can work around.
+
+    This follows the same habit as vLLM refusing ``max_num_seqs`` above the
+    recurrent-cache block count: fail at startup, and name the value to use.
+    """
+    world_size = getattr(getattr(server_args, "mapping", None), "world_size", None)
+    if not world_size or world_size < 2:
+        return
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        count = torch.cuda.device_count()
+        if count < 2:
+            return
+        blocked = [
+            (i, j)
+            for i in range(count)
+            for j in range(i + 1, count)
+            if not torch.cuda.can_device_access_peer(i, j)
+        ]
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        logger.debug("peer-access check skipped: %s", exc)
+        return
+    if not blocked:
+        return
+    peers = [
+        (i, j)
+        for i in range(count)
+        for j in range(i + 1, count)
+        if (i, j) not in blocked
+    ]
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "all")
+    raise ValueError(
+        f"CUDA_VISIBLE_DEVICES={visible} exposes {count} devices, but these "
+        f"pairs cannot peer-access each other: {blocked}. Multi-GPU serving "
+        f"needs peers throughout. Peer-capable pairs among the visible "
+        f"devices: {peers or 'none'} (indices are post-CUDA_VISIBLE_DEVICES; "
+        f"check `nvidia-smi topo -m` for the physical ones -- PIX pairs peer, "
+        f"NODE pairs do not)."
+    )
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -495,6 +548,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
 
     _set_socket_interface(server_args)
+
+    _check_peer_access(server_args)
 
     # Set prometheus env vars
     if server_args.enable_metrics:

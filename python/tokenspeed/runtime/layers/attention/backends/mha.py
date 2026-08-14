@@ -203,10 +203,18 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # them.
         #
         # Without this, --kv-cache-dtype fp8_e4m3 does not start at all:
-        # `triton_mha_extend_with_kvcache` declares fp16/bf16 query over fp8 KV
-        # (_Q_OVER_FP8_KV_SIGNATURES) and nothing declares fp8 query over fp8
-        # KV, so selection raises NoKernelFoundError.
-        self.cast_query_to_fp8 = self.kernel_solution != "triton"
+        # `triton_mha_extend_with_kvcache` and (since this change)
+        # `flashinfer_paged_mha_extend_with_kvcache` declare fp16/bf16 query
+        # over fp8 KV, and nothing declares fp8 query over fp8 KV, so selection
+        # raises NoKernelFoundError.
+        #
+        # Only fa3/fa4 want the cast: their fp8 signatures declare all three
+        # roles fp8. The flashinfer paged wrapper plans `q_data_type` and
+        # `kv_data_type` separately, so it takes the mixed pair like Triton
+        # does. Anything else (including the auto "mha" backend, which resolves
+        # to one of them at selection time) is better off leaving the query at
+        # activation precision.
+        self.cast_query_to_fp8 = self.kernel_solution in ("fa3", "fa4")
         self.plan = partial(
             mha_plan,
             dtype=(

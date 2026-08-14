@@ -930,6 +930,23 @@ def install_paged_extend_plan(
     )
 
 
+# The paged prefill wrapper plans `q_data_type` and `kv_data_type` separately
+# (see the plan calls below), so an fp8 cache read by a bf16 query is a
+# configuration it already supports -- it was simply never declared, and
+# selection cannot pick what a kernel does not claim. Without this, fp8 KV can
+# only run on the Triton solution, which has no paged extend, so the flag costs
+# more than the doubled capacity buys.
+_PAGED_Q_OVER_FP8_KV_SIGNATURES = frozenset(
+    format_signature(
+        q=dense_tensor_format(q_dtype),
+        k_cache=dense_tensor_format(kv_dtype),
+        v_cache=dense_tensor_format(kv_dtype),
+    )
+    for q_dtype in (torch.float16, torch.bfloat16)
+    for kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+)
+
+
 if _paged_prefill_available():
 
     @register_kernel(
@@ -945,7 +962,8 @@ if _paged_prefill_available():
             ("q", "k_cache", "v_cache"),
             "dense",
             {torch.float16, torch.bfloat16},
-        ),
+        )
+        | _PAGED_Q_OVER_FP8_KV_SIGNATURES,
         priority=Priority.PERFORMANT,
         traits={
             "is_causal": frozenset({False, True}),

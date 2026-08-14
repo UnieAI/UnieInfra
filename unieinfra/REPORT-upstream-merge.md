@@ -717,10 +717,21 @@ It is not a per-request loop in the hybrid backend's decode path --
 iteration, no `.item()`, and no `.cpu()`. That was the first candidate and it is
 excluded.
 
-The next probe is host-versus-device: sampling GPU utilisation across a C=128
-arm separates "the scheduler and Python cannot feed the device" from "the
-device is genuinely doing this much work". Those two have completely different
-fixes, and no amount of reading distinguishes them.
+**Host-versus-device, measured: not host-starved.** Sampling GPU 3 once a
+second across a C=128 arm, over the serving window (41 samples with the device
+non-idle): median 99%, mean 77.2%, 68.3% of samples at or above 90%. A
+scheduler that could not feed the device would show the opposite.
+
+The instrument has a limit worth stating rather than glossing:
+`utilization.gpu` reports the fraction of time at least one kernel was
+resident, so a stream of small inefficient kernels reads 100% exactly like a
+saturated one. This rules out gross host starvation. It does **not** establish
+that the decode step's device work is efficient, and it cannot -- that needs
+per-kernel timing, not a sampler.
+
+Also worth recording for anyone reading deltas off this report: two runs of the
+identical configuration (C=128, GMU 0.92, mixing on) measured 645.49 and 684.72
+tok/s, a 6.1% spread. Nothing smaller than that should be read as an effect.
 
 ### The fork's own curve, and the test that decides the branch
 

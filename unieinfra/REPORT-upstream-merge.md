@@ -284,7 +284,33 @@ Run it as:
 
 and check `head:` in the log reads `f162d993` before trusting the number.
 
-If it returns ~754 the gap is real and the remaining work is the GDN graph
-interaction plus whatever the ramp turns out to be. If it returns ~586 then
-754.0 was a property of the fork's architecture and is not a target this tree
-has missed.
+### It was run, and it cannot start
+
+The A/B was executed. f162d993 does not come up on today's environment, and the
+reason is not the merge or the permissions:
+
+    AttributeError: 'ServerArgs' object has no attribute
+    'enable_int8_mamba_checkpoint'
+
+`f162d993/python/.../attention/registry.py:618` reads that attribute
+unguarded, while f162d993's own `ServerArgs` never declares it -- zero dataclass
+fields, and the only other reference is a defensive
+`getattr(args, "enable_int8_mamba_checkpoint", False)` in the arg-normalisation
+path. So the attribute existed on the args object only because the CLI and
+gateway of that era put it there. Today's installed `smg_grpc_servicer` lives
+in the system dist-packages, has moved since, and does not.
+
+**So 754.0 is not re-measurable on this machine as it stands.** Reproducing it
+needs the era-matching gateway reverted alongside the worktree, which is a
+system-package change rather than anything inside this repository.
+
+That does not make 754.0 wrong -- it was measured, and the ladder is committed.
+It makes it **unverifiable from here**, which is the honest status of the
+denominator in "78% of 754.0". Any future plan that budgets against a 22% gap
+should first establish that the gap is measurable, because right now it is not.
+
+The isolation itself works and is worth keeping: with the three editable
+finders shadowed inside the venv, `tokenspeed`, `tokenspeed_kernel` and
+`tokenspeed_scheduler` all resolve to the worktree, confirmed from the engine
+log's own paths. What it cannot isolate is the installed gateway that spawns
+the engine.

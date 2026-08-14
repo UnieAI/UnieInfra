@@ -933,3 +933,37 @@ another is not one number, and quoting either alone is how this report got the
 `CacheBlockTokens()` per step is the right reservation -- rather than, say,
 reserving only when a recurrent prefill is actually admitted this step -- is
 measurable against the C=64 arm, where mixing currently loses.
+
+### Correction: saturation costs ~15%, it is not the cliff
+
+Writing the warning above forced a measurement that corrects the section
+before it. Running with the arena at active page ratio 1.00 measures 645-685
+tok/s across repeats, against 783 with the same pool held at 0.89. That is
+about 15% given up, not a collapse. The 743.61 -> 461.25 fall recorded earlier
+belongs to the **non-mixed** scheduling path -- the `break` at
+`forward.cpp:674` that skips every decode in any step that pushed a prefill --
+and not to saturation. Both effects are real and they were being conflated.
+
+### Three wrong versions of one warning, all of which passed their tests
+
+Worth recording because the failure mode was identical each time and unit tests
+could not see any of them:
+
+1. **Silent.** The streak was counted in decode *reports*. `decode_log_interval`
+   yields four of those across a whole benchmark run, so three consecutive
+   never accumulated. Fixed by evaluating every decode step, outside the
+   sampling gate.
+2. **Wrong number.** A cap derived from the batch size at the moment saturation
+   is noticed recommended `--max-num-seqs 26` on a run whose measured optimum
+   was 88 -- because saturation is first reached during ramp-up, when long
+   prompts already fill the arena while only a handful of requests have reached
+   decode. That advice would have cost an operator most of their throughput.
+3. **No number.** Tracking the largest batch carried while *unsaturated* is no
+   better: on this workload the arena fills before any decode batch grows, so
+   the answer is 1.
+
+The common error was assuming the signal contained a derivable sustainable
+concurrency. It does not. The final version reports the regime, cites the
+measured cost, names the two knobs, and computes nothing -- with a test
+asserting that no running-request count appears in the message, so the next
+attempt to add one fails loudly rather than shipping.

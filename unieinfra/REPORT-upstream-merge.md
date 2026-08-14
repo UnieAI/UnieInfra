@@ -204,6 +204,30 @@ fine anyway. The pattern is worth naming: on this engine, a change that frees
 cache capacity will always look like a throughput win, because throughput is
 what capacity buys -- the question to ask first is what stopped being stored.
 
+### The ceiling is arena fragmentation, measured
+
+`TOKENSPEED_LOG_ADMISSION=1` names the refusal. On a RAG C=128 arm the
+scheduler rejected admission 6392 times, and **6391 of them report
+`empty_parents=0`**: the shared LCM arena had no fully-empty parent block left.
+
+KV had thousands of individual slots free at the same time. Both are true
+because a parent is allocatable only when ALL of its slots are free -- on this
+model one parent carries 12 full-attention blocks plus one block for each of
+three linear-attention groups. Cached blocks from a high-reuse workload land
+scattered across parents, so nearly every parent holds something and almost
+none is empty, while the free slots are spread thin across all of them.
+
+So the ceiling is **fragmentation of the shared arena**, not exhaustion of any
+pool. That is the structural cost of coupling KV and recurrent state into one
+allocation unit, and it is exactly what the fork's separate mamba pool could
+not suffer from. Freeing capacity requires evicting enough cached blocks that
+share a parent to empty it, which the current victim selection does not
+prioritise -- it evicts by age, not by how close a parent is to empty.
+
+That is a concrete, bounded piece of work for whoever picks this up: make
+victim selection parent-aware, so evicting N blocks actually yields a free
+parent instead of thinning N different ones.
+
 ### What the gap actually is: concurrency traded for reuse
 
 The ceiling is real -- 69 in-flight against a client driving 128, with KV

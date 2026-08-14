@@ -219,8 +219,37 @@ none is empty, while the free slots are spread thin across all of them.
 
 So the ceiling is **fragmentation of the shared arena**, not exhaustion of any
 pool. That is the structural cost of coupling KV and recurrent state into one
-allocation unit, and it is exactly what the fork's separate mamba pool could
-not suffer from.
+allocation unit.
+
+**Correction, from the peer session's committed f162d993 data.** I wrote that
+this "is exactly what the fork's separate mamba pool could not suffer from".
+That is wrong. The fork hit the same ceiling, in its own allocator, and the
+ladder is committed:
+
+| f162d993 pool | in-flight, client driving 128 |
+|---|---|
+| 165 chunks (`--mamba-full-memory-ratio 1.0`) | 74 |
+| 221 chunks (GMU 0.80, the baseline) | 80 |
+| 221 chunks, prefix cache off | 93 |
+| 264 chunks (`--mamba-full-memory-ratio 4.0`) | 94 |
+| 306 chunks (GMU 0.90) | 128, saturated |
+
+A near-constant 0.36 in-flight requests per chunk across five pool sizes. So
+the 72 measured here is the same ceiling wearing new clothes, not a regression
+the merge introduced, and the shared arena is not what causes it. The merged
+arena is in fact the larger of the two -- 377,856 token capacity in one pool
+against the fork's 132,432 KV tokens plus 221 mamba chunks.
+
+The one lever that ever moved it was giving the pool more memory: on the fork,
+GMU 0.80 to 0.90 took the pool 221 to 306 chunks, saturated in-flight at 128,
+and lifted throughput 314.8 to 394.2 tok/s (+25.2%). GMU 0.94 OOMed, so 0.90
+was that card's ceiling.
+
+That matters here because **the benchmark harness hardcodes
+`--gpu-memory-utilization 0.80` for both engines** (`.cq_nomb_rag.sh:61`), well
+under this build's own resolved default of 0.88 for a single GPU
+(`server_args.py:485`). Every number in this report, the 596.63 included, was
+measured with that fraction pinned low.
 
 **Correction.** An earlier revision of this section blamed victim ordering --
 "it evicts by age, not by how close a parent is to empty". That is wrong as a

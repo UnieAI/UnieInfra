@@ -179,11 +179,35 @@ off snapshot @2" with a specific hit-block count and block vector, and five
 benchmark arm with correct output is not enough to overrule eight tests that
 encode the intended semantics.
 
-So the finding is: **+17.9% is available if recurrent-state retention can be
-reduced without changing match semantics**, and the eight named tests are the
-specification any such change has to satisfy. That is real work on the
-matching logic, not a constant to flip -- which is exactly why it is written
-down here rather than committed.
+### And then the +17.9% turned out to be a correctness break
+
+The obvious refinement was to split the window in two: keep 2 for matching
+(which is what the promotion tests pin) and use 1 only for release. That took
+the failures from 8 down to 1, and the survivor named the mistake --
+`MambaStateKindTest.StateGroupRetentionKeepsOnlyLastPage`, with 4 pages and
+`num_computed=16`:
+
+    window 2:  skipped = 16 - 2 + 1 = 15  ->  15/4 = 3 pages freed, page 3 KEPT
+    window 1:  skipped = 16 - 1 + 1 = 16  ->  16/4 = 4 pages freed, page 3 GONE
+
+The test's own comment says it: *"skipped = n-1: only the live state page"*.
+Window 2 already retains exactly the live page. The page I thought was surplus
+IS the request's live recurrent state, and window 1 frees it.
+
+So the 703.50 tok/s came from throwing away live state. Requests kept serving,
+the output sample read as coherent English, and prefix reuse went UP to 80.6%
+-- none of which was evidence of anything. **Reverted in full; 402/402 pass.**
+
+That is the fourth time in this session that a large, clean-looking gain came
+out of a broken configuration, and the second where the generated text looked
+fine anyway. The pattern is worth naming: on this engine, a change that frees
+cache capacity will always look like a throughput win, because throughput is
+what capacity buys -- the question to ask first is what stopped being stored.
+
+The concurrency ceiling is real (69 in-flight against a client driving 128, KV
+uncontended) but the recurrent state pool is not oversubscribed by a retention
+bug. It is simply the size the LCM arena gives it, and raising it means moving
+the packing ratio or the memory budget.
 
 ## What is still unexplained
 

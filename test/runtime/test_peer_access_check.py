@@ -31,6 +31,7 @@ before the load, and to say which pairs are usable.
 import types
 
 import pytest
+
 from tokenspeed.runtime.entrypoints.engine import _check_peer_access
 
 

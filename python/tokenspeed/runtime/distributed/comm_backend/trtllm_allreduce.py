@@ -28,6 +28,8 @@ The workspace is created once per group via ``configure_group`` and
 reused for every subsequent ``all_reduce`` on that group.
 """
 
+import os
+
 import torch
 from tokenspeed_kernel.ops.communication.trtllm import (
     AllReduceFusionPattern,
@@ -37,9 +39,12 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.utils import get_colorful_logger
 
 # Public: dispatch layers (AutoBackend, comm_ops) key size-based routing on
 # the one-shot admission window; tensors past it always take an NCCL path.
+logger = get_colorful_logger(__name__)
+
 MAX_ONESHOT_BYTES = 2 * 1024 * 1024
 _MAX_ONESHOT_BYTES = MAX_ONESHOT_BYTES
 
@@ -74,6 +79,27 @@ class TrtllmAllReduceBackend(CommBackend):
         """Create IPC workspace for *group*.  Returns True on success."""
         if group in self._resources:
             return True
+
+        if os.environ.get("TOKENSPEED_DISABLE_TRTLLM_AR", "") not in ("", "0"):
+            # Returning False routes the group through NCCL, which is what the
+            # "nothing usable" branch below already does.
+            #
+            # This exists because the failure it works around is not
+            # detectable here. On sm_120 over PCIe the Lamport workspace is
+            # created without complaint on both ranks -- the log even prints
+            # "lamportInitialize start" twice -- and the fault only arrives in
+            # the first forward, as "CUDA error: an illegal memory access was
+            # encountered" from inside the kernel, after weights have loaded.
+            # Nothing at configure time reports a problem, so there is no
+            # capability query to gate on yet; until the fault is understood
+            # this is the switch that gets a tensor-parallel launch running.
+            # vLLM carries the same escape hatch as --disable-custom-all-reduce.
+            logger.warning(
+                "TOKENSPEED_DISABLE_TRTLLM_AR set: routing group %s through "
+                "NCCL instead of the TRT-LLM all-reduce.",
+                group,
+            )
+            return False
 
         if not self._load_comm():
             return False

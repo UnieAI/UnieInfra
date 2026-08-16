@@ -56,9 +56,19 @@ import triton.language as tl
 # swept -- it is set at the decode batch sizes this path was measured on.
 DECODE_MAX_PAIRS = 64
 
-_SPLIT_K = 8
-_BLOCK_N = 64
-_BLOCK_K = 64
+# Swept under CUDA-graph capture with rotating expert sets. Both conditions
+# matter: eager, 59 us of launch overhead sits on top of a 25 us kernel and
+# hides any tile difference; with a fixed expert set the 50 MB working set
+# stays inside the 128 MB L2 and every configuration reports above HBM peak.
+#
+# Three sweeps -- tiles, warps/stages, and narrow-N shapes -- all land between
+# 46 and 48 us (59-61% of peak), so the parameter space is flat and this is the
+# end of what it buys. The winner splits K not at all: the advantage over the
+# grouped GEMM comes from the matvec structure, not from the split, which is
+# why SPLIT_K sits at 1 despite the file's name.
+_SPLIT_K = 1
+_BLOCK_N = 8
+_BLOCK_K = 256
 _BLOCK_RED = 128
 
 
@@ -116,8 +126,14 @@ def _mv_splitk(
 def _reduce_silu(
     part_ptr,
     out_ptr,
-    PAIRS: tl.constexpr,
+    # Runtime, not constexpr: PAIRS is tokens x top_k, so a decode step with a
+    # different number of resident requests would otherwise trigger a fresh
+    # Triton compile. A microbenchmark at one fixed token count never sees
+    # that; the engine changes it every step, and the recompiles cost more than
+    # the kernel saves -- measured 3.2x slower end to end before this line.
+    PAIRS,
     N2: tl.constexpr,
+    GATE_FIRST: tl.constexpr,
     SPLIT_K: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -130,13 +146,19 @@ def _reduce_silu(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     half: tl.constexpr = N2 // 2
+    # GATE_FIRST distinguishes the checkpoint layout (gate in the low half)
+    # from the copy the CUTLASS weight preprocessor leaves behind, which swaps
+    # the two halves in place. Reading the wrong one computes silu(up)*gate --
+    # a plausible-looking tensor with no error anywhere.
+    gate_off: tl.constexpr = 0 if GATE_FIRST else half
+    up_off: tl.constexpr = half if GATE_FIRST else 0
     offs = pid_n * BLOCK + tl.arange(0, BLOCK)
     g = tl.zeros((BLOCK,), dtype=tl.float32)
     u = tl.zeros((BLOCK,), dtype=tl.float32)
     for k in range(SPLIT_K):
         base = k * (PAIRS * N2) + pid_m * N2
-        g += tl.load(part_ptr + base + offs)
-        u += tl.load(part_ptr + base + half + offs)
+        g += tl.load(part_ptr + base + gate_off + offs)
+        u += tl.load(part_ptr + base + up_off + offs)
     tl.store(out_ptr + pid_m * half + offs, (g * tl.sigmoid(g) * u).to(tl.bfloat16))
 
 
@@ -148,7 +170,7 @@ def _reduce_weighted(
     N: tl.constexpr,
     TOPK: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    PAIRS: tl.constexpr,
+    PAIRS,
     BLOCK: tl.constexpr,
 ):
     """Sum the split-K partials AND the token's top-k experts, weighted."""
@@ -187,7 +209,7 @@ def _partials(x, w, ids, *, x_per_pair, topk, pairs):
     return part
 
 
-def decode_moe_body(x, w, topk_weights, topk_ids):
+def decode_moe_body(x, w, topk_weights, topk_ids, *, gate_first=True):
     """bf16 MoE for decode-shaped batches.
 
     Args:
@@ -197,6 +219,10 @@ def decode_moe_body(x, w, topk_weights, topk_ids):
             needs none of the transposed copies the ragged matmul wants.
         topk_weights: Router weights ``[tokens, top_k]``.
         topk_ids: Expert ids ``[tokens, top_k]``.
+        gate_first: True when ``w13_weight`` holds ``[gate | up]`` in that
+            order, which is the checkpoint layout. Pass False for weights the
+            CUTLASS preprocessor has already swapped in place, so this path can
+            share them instead of needing a second copy.
 
     Returns:
         ``[tokens, hidden]`` in the input dtype.
@@ -205,6 +231,30 @@ def decode_moe_body(x, w, topk_weights, topk_ids):
     topk = topk_ids.shape[1]
     pairs = tokens * topk
     inter_dim = w.w2_weight.shape[2]
+
+    # The reduction kernels index their partials with an unmasked
+    # `pid * BLOCK + arange(BLOCK)`, and the partials buffer is uninitialised.
+    # On a shape the blocks do not divide, they read whatever was in that
+    # memory: the result is wrong *and* different on every call, which reads as
+    # a flaky test rather than a bad kernel. Refuse instead -- the caller can
+    # fall back to the grouped GEMM, which has no such requirement.
+    if inter_dim % _BLOCK_RED or hidden % _BLOCK_RED:
+        raise ValueError(
+            f"split-decode MoE needs intermediate ({inter_dim}) and hidden "
+            f"({hidden}) to be multiples of {_BLOCK_RED}"
+        )
+    if hidden % _SPLIT_K or inter_dim % _SPLIT_K:
+        raise ValueError(
+            f"split-decode MoE needs intermediate ({inter_dim}) and hidden "
+            f"({hidden}) to be multiples of SPLIT_K={_SPLIT_K}; a remainder is "
+            "silently dropped from the reduction"
+        )
+    if w.w13_weight.shape[1] % _BLOCK_N or w.w2_weight.shape[1] % _BLOCK_N:
+        raise ValueError(
+            f"split-decode MoE needs both output widths "
+            f"({w.w13_weight.shape[1]}, {w.w2_weight.shape[1]}) to be multiples "
+            f"of {_BLOCK_N}"
+        )
 
     ids = topk_ids.reshape(-1).to(torch.int32).contiguous()
     gate = topk_weights.reshape(-1).to(torch.float32).contiguous()
@@ -218,6 +268,7 @@ def decode_moe_body(x, w, topk_weights, topk_ids):
         inter,
         PAIRS=pairs,
         N2=w.w13_weight.shape[1],
+        GATE_FIRST=gate_first,
         SPLIT_K=_SPLIT_K,
         BLOCK=_BLOCK_RED,
         num_warps=4,
@@ -239,3 +290,23 @@ def decode_moe_body(x, w, topk_weights, topk_ids):
         num_warps=4,
     )
     return out.to(x.dtype)
+
+
+# Tokens up to which the split reduction wins. Measured on one RTX PRO 6000 at
+# Qwen3.6-35B-A3B's shape (hidden 2048, 256 experts, top-8, intermediate 512),
+# against the FlashInfer CUTLASS path both engines otherwise use:
+#
+#   tokens    1     2     4     8    16    32    64   128
+#   speedup 1.48  1.57  1.38  1.22  1.10  1.05  1.00  0.96
+#
+# The repository's bar is +10%, which this clears through 16 and not past it;
+# beyond the crossover the grouped GEMM has enough M to tile and wins back.
+_MAX_DECODE_TOKENS = 16
+
+
+# Deliberately NOT registered as a `moe.apply` solution. Registering it made the
+# registry pick it for every shape, prefill included, where it is far slower
+# than the grouped GEMM: end to end on 35B agent C=16 that was 49.9 tok/s
+# against 160.1, and the shape gate below never got a chance to run because
+# selection had already happened. The only way in is the delegation inside
+# flashinfer/cutlass_unquant.py, which checks _MAX_DECODE_TOKENS first.

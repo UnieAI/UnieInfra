@@ -60,9 +60,7 @@ def test_counts_are_padded_per_expert_and_leave_idle_experts_empty():
     """
     num_experts = 8
     # tokens 0..2 all route to experts 0 and 1; nothing routes to 2..7
-    topk_ids = torch.tensor(
-        [[0, 1], [0, 1], [0, 1]], dtype=torch.int64, device="cuda"
-    )
+    topk_ids = torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int64, device="cuda")
     counts = contiguous_fp8._aligned_expert_counts(topk_ids, num_experts)
 
     assert len(counts) == num_experts

@@ -62,16 +62,24 @@ class Weights(torch.nn.Module):
         )
         self.w13_weight_scale_inv = torch.nn.Parameter(
             torch.rand(
-                EXPERTS, 2 * INTER_PP // BLOCK, HIDDEN // BLOCK,
-                dtype=torch.float32, device="cuda",
-            ) + 0.1,
+                EXPERTS,
+                2 * INTER_PP // BLOCK,
+                HIDDEN // BLOCK,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            + 0.1,
             requires_grad=False,
         )
         self.w2_weight_scale_inv = torch.nn.Parameter(
             torch.rand(
-                EXPERTS, HIDDEN // BLOCK, INTER_PP // BLOCK,
-                dtype=torch.float32, device="cuda",
-            ) + 0.1,
+                EXPERTS,
+                HIDDEN // BLOCK,
+                INTER_PP // BLOCK,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            + 0.1,
             requires_grad=False,
         )
         self.ep_size, self.ep_rank, self.tp_size, self.tp_rank = 1, 0, 1, 0
@@ -81,6 +89,7 @@ def probe(name, module_path, fn_name, tokens):
     """Run one solution at `tokens` rows and report what it does."""
     try:
         import importlib
+
         mod = importlib.import_module(module_path)
         fn = getattr(mod, fn_name)
     except Exception as exc:
@@ -101,8 +110,10 @@ def probe(name, module_path, fn_name, tokens):
         out = fn({}, x, w, logits, topk_weights=tw, topk_ids=ti.to(torch.int32))
         torch.cuda.synchronize()
         finite = torch.isfinite(out).all().item()
-        print(f"{name:22} M={tokens:<4} OK  out={tuple(out.shape)} "
-              f"dtype={out.dtype} finite={finite} absmax={out.abs().max().item():.4f}")
+        print(
+            f"{name:22} M={tokens:<4} OK  out={tuple(out.shape)} "
+            f"dtype={out.dtype} finite={finite} absmax={out.abs().max().item():.4f}"
+        )
         return True
     except Exception as exc:
         first = " | ".join(str(exc).strip().splitlines())[:400]
@@ -115,18 +126,32 @@ def probe(name, module_path, fn_name, tokens):
 
 
 CASES = [
-    ("flashinfer_cutlass", "tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8",
-     "flashinfer_cutlass_fp8_moe_apply"),
-    ("flashinfer_trtllm", "tokenspeed_kernel.ops.moe.flashinfer.trtllm_fp8",
-     "flashinfer_trtllm_fp8_moe_apply"),
-    ("deep_gemm_deepep", "tokenspeed_kernel.ops.moe.deep_gemm.deepep_fp8",
-     "deep_gemm_deepep_fp8_moe_apply"),
-    ("deep_gemm_contiguous", "tokenspeed_kernel.ops.moe.deep_gemm.contiguous_fp8",
-     "deep_gemm_contiguous_fp8_moe_apply"),
+    (
+        "flashinfer_cutlass",
+        "tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8",
+        "flashinfer_cutlass_fp8_moe_apply",
+    ),
+    (
+        "flashinfer_trtllm",
+        "tokenspeed_kernel.ops.moe.flashinfer.trtllm_fp8",
+        "flashinfer_trtllm_fp8_moe_apply",
+    ),
+    (
+        "deep_gemm_deepep",
+        "tokenspeed_kernel.ops.moe.deep_gemm.deepep_fp8",
+        "deep_gemm_deepep_fp8_moe_apply",
+    ),
+    (
+        "deep_gemm_contiguous",
+        "tokenspeed_kernel.ops.moe.deep_gemm.contiguous_fp8",
+        "deep_gemm_contiguous_fp8_moe_apply",
+    ),
 ]
 
-print(f"shape: experts={EXPERTS} top_k={TOP_K} hidden={HIDDEN} "
-      f"inter_per_partition={INTER_PP} (fused w13 N={2 * INTER_PP})")
+print(
+    f"shape: experts={EXPERTS} top_k={TOP_K} hidden={HIDDEN} "
+    f"inter_per_partition={INTER_PP} (fused w13 N={2 * INTER_PP})"
+)
 print(f"torch {torch.__version__}  device {torch.cuda.get_device_name(0)}\n")
 for name, path, fn in CASES:
     for m in (1, 8, 128):

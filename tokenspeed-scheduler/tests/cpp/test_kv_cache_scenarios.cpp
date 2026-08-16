@@ -1799,6 +1799,20 @@ protected:
             MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
         };
+        // Head-of-line exists to stop a second request consuming the capacity
+        // an incomplete prefill still needs. That is only a risk while
+        // admission charges one chunk at a time, so the suite pins the policy
+        // it is written against rather than inheriting whichever is default.
+        cfg.reserve_full_prefill_at_admission = false;
+        return cfg;
+    }
+};
+
+class PromotionBoundaryPackedPrefillSuite : public PromotionBoundaryHeadOfLineSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = PromotionBoundaryHeadOfLineSuite::MakeConfig();
+        cfg.reserve_full_prefill_at_admission = true;
         return cfg;
     }
 };
@@ -1829,6 +1843,39 @@ TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
     ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
     EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6})
         << "the full-history hit promotes token 6 before the remaining prompt";
+}
+
+TEST_F(PromotionBoundaryPackedPrefillSuite, StartsSecondIncompletePrefillWhenAdmissionReservesWholePrompt) {
+    // The mirror of the test above. Once admission has charged each request
+    // its whole prompt, a second incomplete prefill cannot strand the first,
+    // so holding the line only serialises the queue: a prompt longer than the
+    // token budget takes ceil(prompt / budget) steps and every other request
+    // waits for all of them. Measured on Qwen3.6-35B-A3B with 43k-token
+    // prompts and an 8192 budget, that left 1.8 requests resident against
+    // vLLM's 12, and TTFT p50 18.1 s against 3.4 s.
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    PlanOnce();
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 0u);
+
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    RequestSpec second = MakeRequestSpec("second", /*num_pages=*/6, /*start=*/2001);
+    Submit({first, second});
+    ASSERT_EQ(scheduler_->WaitingSize(), 2u);
+
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"first", "second"}))
+        << "both prompts are reserved in full, so both may progress in one step";
 }
 
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {

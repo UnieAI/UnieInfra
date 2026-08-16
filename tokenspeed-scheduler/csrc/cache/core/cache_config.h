@@ -46,6 +46,9 @@ struct PagedCacheGroupConfig {
     std::int32_t total_pages{};
     // Number of this group's CacheBlocks packed into one physical LCM block.
     std::int32_t cache_blocks_per_lcm_block{1};
+    // Blocks between recurrent-state checkpoints; 1 backs every page. Only a
+    // state group reads it. See KvCacheSpec::checkpoint_stride_blocks.
+    std::int32_t checkpoint_stride_blocks{1};
     Retention retention{Retention::FullHistory};
     std::optional<std::int32_t> sliding_window_tokens{};
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};

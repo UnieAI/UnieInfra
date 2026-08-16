@@ -78,6 +78,12 @@ struct KvCacheSpec {
     // Tokens represented by one CacheBlock in this group. Zero keeps the
     // legacy meaning: use the coordinator-wide logical granularity P.
     std::int32_t cache_block_tokens{0};
+    // Blocks between recurrent-state checkpoints. 1 backs every page, which is
+    // what a hybrid has always done and what makes a long prompt reserve one
+    // LCM parent per page; larger strides null the pages in between, so a
+    // prefix match resumes from the nearest earlier snapshot. Windowed groups
+    // only.
+    std::int32_t checkpoint_stride_blocks{1};
 };
 
 // Per-group input for one admission. page_hashes is the request's cumulative

@@ -78,7 +78,7 @@ public:
         _assert(page_id <= std::numeric_limits<std::int32_t>::max(), "kernel page id exceeds int32 range");
         return static_cast<std::int32_t>(page_id);
     }
-    std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
+    virtual std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
         for (const CacheBlockRef& block_ref : table.Blocks()) {
@@ -140,7 +140,12 @@ public:
         table.blocks_ = std::move(hit.blocks);
     }
 
-    bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens = 0) {
+    // Virtual so a group that keeps only periodic checkpoints can leave the
+    // blocks between them null instead of allocating every page; see
+    // SwaManager. The table length still tracks the sequence either way, which
+    // is what keeps logical block indices aligned with the page hashes.
+    virtual bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens,
+                         std::int32_t reserve_tokens = 0) {
         _assert(num_tokens >= 0 && reserve_tokens >= 0, "token demand and reserve must be non-negative");
         const std::int32_t num_pages = BlocksNeededFor(table, num_tokens + reserve_tokens);
         if (num_pages == 0) {
@@ -160,16 +165,26 @@ public:
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
                              std::vector<BlockTransfer>& load_pairs) {
         _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
-        const std::int32_t num_pages = static_cast<std::int32_t>(std::ranges::count_if(
-            host_block_refs, [](const CacheBlockRef& block_ref) { return static_cast<bool>(block_ref); }));
+        // A sparse group backs only checkpoint positions, and admission
+        // reserved exactly that many; materialising every host hit here would
+        // ask the pool for blocks nobody charged for, which is what the check
+        // below then reports as a plan that no longer fits.
+        const std::int32_t first_index = static_cast<std::int32_t>(table.blocks_.size());
+        std::int32_t num_pages = 0;
+        for (std::size_t i = 0; i < host_block_refs.size(); ++i) {
+            if (host_block_refs[i] && IsBackedIndex(first_index + static_cast<std::int32_t>(i))) {
+                ++num_pages;
+            }
+        }
         table.blocks_.reserve(table.blocks_.size() + host_block_refs.size());
         std::vector<CacheBlockRef> destination_refs =
             pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages);
         FatalCheck(static_cast<std::int32_t>(destination_refs.size()) == num_pages,
                    "admission plan no longer fits the block pool");
         auto destination_it = destination_refs.begin();
-        for (CacheBlockRef& host_block_ref : host_block_refs) {
-            if (!host_block_ref) {
+        for (std::size_t i = 0; i < host_block_refs.size(); ++i) {
+            CacheBlockRef& host_block_ref = host_block_refs[i];
+            if (!host_block_ref || !IsBackedIndex(first_index + static_cast<std::int32_t>(i))) {
                 table.blocks_.emplace_back();
                 continue;
             }
@@ -191,6 +206,53 @@ public:
         }
         const std::int32_t over = num_tokens - table.available_tokens_;
         return (over + cache_block_tokens_ - 1) / cache_block_tokens_;
+    }
+
+    // What admission should charge for this demand. Defaults to the real
+    // block count; groups that reclaim as they advance override it so a new
+    // request is not charged for capacity it will never hold at once.
+    // `prepended` is how many logical pages Admit() will splice in ahead of
+    // this demand (the host extension). A sparse group's checkpoint positions
+    // are counted from the table's length, so an estimate that ignores the
+    // splice lands on different positions than the acquisition does -- right
+    // most of the time, fatally low occasionally.
+    // What Acquire will really take, as opposed to how many positions the
+    // sequence spans. base_index is where this group's own pages will land:
+    // Admit() claims the device match and splices the host extension in first,
+    // and a sparse group's checkpoints fall on different positions depending on
+    // where it starts. Getting that offset wrong is not a lost page, it is the
+    // Admit-time FatalCheck.
+    // Whether every position in this group's table holds a block. False only
+    // for a group keeping periodic checkpoints.
+    virtual bool BacksEveryPage() const { return true; }
+
+    virtual std::int32_t AdmissionBlocksNeededFor(const BlockTable& table, std::int32_t num_tokens,
+                                                 std::int32_t base_index) const {
+        const std::int32_t pages = BlocksNeededFor(table, num_tokens);
+        if (pages == 0 || BacksEveryPage()) {
+            return pages;  // nothing to walk
+        }
+        std::int32_t backed = 0;
+        for (std::int32_t i = 0; i < pages; ++i) {
+            // The last page is the tail the request writes into, so it is
+            // backed wherever it falls.
+            if (IsBackedIndex(base_index + i) || i == pages - 1) {
+                ++backed;
+            }
+        }
+        return backed;
+    }
+
+    // Positions the host extension occupies are hits.size(); how many of them
+    // AppendHostExtension will actually back is this.
+    std::int32_t BackedHostExtensionPages(std::int32_t base_index, std::span<const std::uint8_t> hits) const {
+        std::int32_t backed = 0;
+        for (std::size_t i = 0; i < hits.size(); ++i) {
+            if (hits[i] != 0 && IsBackedIndex(base_index + static_cast<std::int32_t>(i))) {
+                ++backed;
+            }
+        }
+        return backed;
     }
 
     std::int32_t BlocksNeededFor(const BlockTable& table, const GroupDemand& demand) const {
@@ -429,6 +491,40 @@ public:
     }
 
 protected:
+    // Append `num_pages` logical slots, filling only the positions a subclass
+    // asked for and leaving the rest null. Token accounting matches
+    // appendBlocks: the table advances by the full page extent, because the
+    // sequence occupies those positions whether or not a block backs them.
+    void AppendSparse(BlockTable& table, std::int32_t num_tokens, std::int32_t num_pages,
+                      std::int32_t first_index, std::vector<CacheBlockRef> block_refs) {
+        auto next = block_refs.begin();
+        for (std::int32_t i = 0; i < num_pages; ++i) {
+            const bool last = i == num_pages - 1;
+            if (next != block_refs.end() && (IsBackedIndex(first_index + i) || last)) {
+                table.blocks_.push_back(std::move(*next));
+                ++next;
+            } else {
+                table.blocks_.emplace_back();
+            }
+        }
+        _assert(next == block_refs.end(), "sparse append left blocks unplaced");
+        table.available_tokens_ += num_pages * cache_block_tokens_ - num_tokens;
+    }
+
+    // Which logical positions a sparse group backs with a real block. The base
+    // backs every one; see SwaManager for the checkpoint-strided answer.
+    virtual bool IsBackedIndex(std::int32_t /*logical_index*/) const { return true; }
+
+public:
+    // Of `pages` consecutive logical pages, how many hold a real block. The
+    // single-request token ceiling is derived from this, so a group that backs
+    // one page in N raises that ceiling by N -- without it the ceiling is
+    // computed as though every page were backed and a long prompt is refused
+    // for capacity it would never have used.
+    virtual std::int64_t BackedPagesFor(std::int64_t pages) const { return pages; }
+
+protected:
+
     bool ContainsCachedBlock(const CacheBlockRef& block_ref) const {
         if (!block_ref) {
             return false;

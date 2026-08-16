@@ -183,7 +183,10 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
         } else {
             child_pages = local_prefill_peak();
         }
-        required_parents += ceilDiv(child_pages, manager.CacheBlocksPerLcmBlock());
+        // A sparse group only materialises its checkpoints, so the pages it
+        // charges against the arena are a fraction of the logical span.
+        required_parents +=
+            ceilDiv(manager.BackedPagesFor(child_pages), manager.CacheBlocksPerLcmBlock());
     }
     return required_parents;
 }

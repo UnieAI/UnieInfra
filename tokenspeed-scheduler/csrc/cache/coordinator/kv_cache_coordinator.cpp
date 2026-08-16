@@ -698,6 +698,8 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int3
             case AttnKind::kMambaState:
                 manager = std::make_unique<MambaStateManager>(group_cache_block_tokens, spec.cache_blocks_per_lcm_block,
                                                               group_id);
+                static_cast<MambaStateManager&>(*manager).SetCheckpointStrideBlocks(
+                    spec.checkpoint_stride_blocks);
                 break;
             case AttnKind::kSlidingWindow:
                 manager = std::make_unique<SwaManager>(group_cache_block_tokens, spec.cache_blocks_per_lcm_block,

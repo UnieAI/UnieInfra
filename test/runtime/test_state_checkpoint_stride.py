@@ -56,19 +56,25 @@ def test_charge_is_bounded_however_long_the_context():
         )
         pages = -(-max_model_len // BLOCK_TOKENS)
         checkpoints = -(-pages // stride)
-        assert checkpoints <= _MAX_STATE_CHECKPOINTS, (
-            f"max_model_len={max_model_len} charges {checkpoints} snapshots"
-        )
+        assert (
+            checkpoints <= _MAX_STATE_CHECKPOINTS
+        ), f"max_model_len={max_model_len} charges {checkpoints} snapshots"
 
 
 def test_an_explicit_stride_still_wins():
     """The derivation is a default, not a policy the operator cannot escape."""
-    assert _state_checkpoint_stride_blocks(
-        _args(state_checkpoint_stride_blocks=4), BLOCK_TOKENS
-    ) == 4
-    assert _state_checkpoint_stride_blocks(
-        _args(state_checkpoint_stride_blocks=1), BLOCK_TOKENS
-    ) == 1
+    assert (
+        _state_checkpoint_stride_blocks(
+            _args(state_checkpoint_stride_blocks=4), BLOCK_TOKENS
+        )
+        == 4
+    )
+    assert (
+        _state_checkpoint_stride_blocks(
+            _args(state_checkpoint_stride_blocks=1), BLOCK_TOKENS
+        )
+        == 1
+    )
 
 
 def test_an_unknown_context_length_snapshots_every_block():
@@ -79,6 +85,4 @@ def test_an_unknown_context_length_snapshots_every_block():
     against, and one-per-block is the conservative end.
     """
     assert _state_checkpoint_stride_blocks(_args(max_model_len=0), BLOCK_TOKENS) == 1
-    assert (
-        _state_checkpoint_stride_blocks(types.SimpleNamespace(), BLOCK_TOKENS) == 1
-    )
+    assert _state_checkpoint_stride_blocks(types.SimpleNamespace(), BLOCK_TOKENS) == 1

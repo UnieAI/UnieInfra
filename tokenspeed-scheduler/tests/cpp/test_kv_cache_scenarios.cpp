@@ -1498,6 +1498,34 @@ protected:
     }
 };
 
+TEST_F(PrefillHeadOfLineSuite, HoldingTheLineStopsAdmissionNotDecoding) {
+    // An incomplete prefill holds the line so a newly submitted request cannot
+    // take the capacity it still needs. That is a rule about ADMISSION, and it
+    // used to be enforced by ending the whole step: every request sorted after
+    // the prefill lost its slot too, including resident decodes that were not
+    // competing for anything. On the 35B agent shape 98.6% of steps then used
+    // under 1024 of an 8192-token budget and carried 3.5 decodes.
+    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 18);
+
+    Submit(MakeRequestSpec("holder", /*num_pages=*/2));
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"holder"});
+    SendForwardDone("holder", {42});
+
+    // "active" is 4 pages against an 8-token step budget, so its first chunk
+    // leaves it incomplete and holding the line, with room to spare.
+    Submit(MakeRequestSpec("active", /*num_pages=*/4, /*start=*/101));
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"active"});
+    SendForwardDone("active", {43});
+
+    Submit(MakeRequestSpec("queued", /*num_pages=*/1, /*start=*/201));
+    const std::vector<std::string> ids = FindForwardBatch(PlanOnce())->request_ids;
+
+    EXPECT_EQ(std::ranges::count(ids, "queued"), 0) << "the line still holds against a new request";
+    EXPECT_GT(std::ranges::count(ids, "holder"), 0)
+        << "a resident decode has no claim on what the prefill needs, so it keeps its slot";
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "only the unadmitted request is waiting";
+}
+
 TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), 18);
 

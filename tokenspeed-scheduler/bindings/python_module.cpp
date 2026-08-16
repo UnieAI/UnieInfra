@@ -112,12 +112,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t entry_stride_tokens, std::int32_t total_pages,
                tokenspeed::PagedCacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family,
-               std::int32_t cache_blocks_per_lcm_block, tokenspeed::PagedCacheTransferPolicy transfer_policy) {
+               std::int32_t cache_blocks_per_lcm_block, tokenspeed::PagedCacheTransferPolicy transfer_policy,
+               std::int32_t checkpoint_stride_blocks) {
                 new (self) tokenspeed::PagedCacheGroupConfig{std::move(group_id),
                                                              rows_per_page,
                                                              entry_stride_tokens,
                                                              total_pages,
                                                              cache_blocks_per_lcm_block,
+                                                             checkpoint_stride_blocks,
                                                              retention,
                                                              sliding_window_tokens,
                                                              family,
@@ -127,12 +129,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt,
             nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History, nb::arg("cache_blocks_per_lcm_block") = 1,
-            nb::arg("transfer_policy") = tokenspeed::PagedCacheTransferPolicy::Unspecified)
+            nb::arg("transfer_policy") = tokenspeed::PagedCacheTransferPolicy::Unspecified,
+            nb::arg("checkpoint_stride_blocks") = 1)
         .def_rw("group_id", &tokenspeed::PagedCacheGroupConfig::group_id)
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
         .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::PagedCacheGroupConfig::cache_blocks_per_lcm_block)
+        .def_rw("checkpoint_stride_blocks", &tokenspeed::PagedCacheGroupConfig::checkpoint_stride_blocks)
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)

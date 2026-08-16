@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 import re
 from collections import defaultdict
 from collections.abc import Mapping
@@ -32,6 +34,9 @@ from itertools import pairwise
 # Planner/runtime limits, not model layout inputs.
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -501,6 +506,16 @@ def solve_cache_layout(
         )
 
     ordered_group_ids = tuple(sorted(raw_by_group))
+    # One line, once per plan: the per-group block footprint that decides how
+    # many cache blocks share an LCM parent. A group with the largest footprint
+    # packs 1:1 and then spends a whole parent per 128-token block, which is
+    # what bounds admission on long prompts -- and it is invisible from the
+    # token capacity the profile reports.
+    if os.environ.get("TOKENSPEED_LOG_CACHE_PACKING"):
+        logger.info(
+            "cache packing inputs: %s",
+            {g: raw_by_group[g] for g in ordered_group_ids},
+        )
     has_explicit_packing = cache_blocks_per_lcm_block is not None
     if has_explicit_packing:
         unknown = set(cache_blocks_per_lcm_block) - set(ordered_group_ids)

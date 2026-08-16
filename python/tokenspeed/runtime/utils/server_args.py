@@ -237,6 +237,12 @@ class ServerArgs:
     enable_eplb: bool = False
 
     # MoE backend
+    # Tokens covered by one recurrent-state checkpoint. 1 means a snapshot in
+    # every cache block, which is what makes a hybrid's state groups reserve an
+    # LCM parent per block and caps admitted concurrency near one on long
+    # prompts. Raising it divides that demand and costs recompute from the
+    # nearest earlier checkpoint on a partial prefix hit.
+    state_entry_stride_tokens: int = 1
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
     all2all_backend: str = "none"
@@ -1459,6 +1465,18 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--state-entry-stride-tokens",
+            type=int,
+            default=ServerArgs.state_entry_stride_tokens,
+            help=(
+                "Tokens per recurrent-state checkpoint on hybrid models "
+                "(1 = one snapshot per cache block, today's behaviour). "
+                "Higher values cut how much cache arena a long prompt "
+                "reserves, at the cost of resuming a prefix match from the "
+                "nearest earlier checkpoint."
+            ),
         )
         parser.add_argument(
             "--moe-backend",

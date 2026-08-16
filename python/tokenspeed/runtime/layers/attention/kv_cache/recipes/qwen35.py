@@ -214,6 +214,10 @@ def prepare_qwen35_cache(
         sliding_window_tokens=None,
         page_size=logical_block_tokens,
         pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
+        # A GDN snapshot is 20.5 MB against a 40 MB LCM parent here, so at the
+        # default of one snapshot per cache block the state groups, not the
+        # KV, decide how many requests fit.
+        state_entry_stride_tokens=getattr(server_args, "state_entry_stride_tokens", 1),
     )
     return build_hybrid_cache_setup(
         family="qwen_gdn",

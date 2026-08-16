@@ -84,9 +84,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_contiguous is not None:
     _FP8_BLOCK = 128
     _UE8M0_PACKED_RECIPE = (1, 1, _FP8_BLOCK)
 
-    def _aligned_expert_counts(
-        topk_ids: torch.Tensor, num_experts: int
-    ) -> list[int]:
+    def _aligned_expert_counts(topk_ids: torch.Tensor, num_experts: int) -> list[int]:
         """Rows each expert block needs, padded to the grouped-GEMM tile.
 
         DeepEP returns these from dispatch; without it they come from a

@@ -36,6 +36,11 @@ platform = current_platform()
 if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
 
+    try:
+        from tokenspeed_kernel.ops.moe.triton import bf16_decode as _split_decode
+    except Exception:  # pragma: no cover - candidate is optional
+        _split_decode = None
+
     def flashinfer_cutlass_unquant_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
         first_half = w.w13_weight.data[:, :half_w, :].clone()
@@ -90,6 +95,29 @@ if platform.is_nvidia:
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
+
+        # Decode-shaped batches go to the split reduction instead. At one token
+        # this layer is bandwidth-bound -- ~42 MFLOP against ~50 MB of weights
+        # -- and a grouped GEMM has no M to tile, so it reaches 46% of HBM peak
+        # against the matvec path's 60% (captured, rotating expert sets:
+        # 60.8 us vs 46.7 us). The advantage decays with batch and the two are
+        # level by 64 tokens, so the handover is bounded by a measured
+        # crossover rather than left to the caller.
+        #
+        # gate_first=False because this path's weight preprocessor has already
+        # swapped the two halves of w13 in place; the split kernel reads them
+        # in that order rather than forcing a second copy of the weights.
+        if _split_decode is not None and x.shape[0] <= _split_decode._MAX_DECODE_TOKENS:
+            try:
+                return _split_decode.decode_moe_body(
+                    x, w, topk_weights, topk_ids, gate_first=False
+                )
+            except ValueError:
+                # Shapes the split kernel refuses (its reduction blocks must
+                # divide hidden and intermediate) fall through to the GEMM,
+                # which carries no such requirement.
+                pass
+
         return cutlass_fused_moe(
             input=x,
             token_selected_experts=topk_ids.to(torch.int),

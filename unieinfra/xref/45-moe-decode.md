@@ -382,6 +382,78 @@ TurboMind 有一個五家獨有的硬限制值得記下：`src/turbomind/kernels
   **只有 CUDA graph 捕捉路徑才併行，eager 路徑是序列的**。這一格與 vLLM（無條件、
   以 token 數為門檻）不同，值得記進 §3。
 
+### 2.8b 已入帳、自動生效，但端到端沒有變化（2026-08-16）
+
+§2.8 的候選現在有 `register_kernel`、十個測試、與一個實測的交接門檻。三件事在
+量測過程中被推翻，都記在這裡，因為每一件都會讓下一個人重犯：
+
+**一、「split-K」不是勝出的原因。** 三輪掃描（tile、warps/stages、窄 N 形狀）之後
+最快的組態是 **`_SPLIT_K = 1`**——K 完全不切。贏過 grouped GEMM 的是 matvec 的結構
+本身，不是切 K。檔名留著是歷史，調參數的人不要去動 SPLIT_K 找空間。
+
+**二、eager 下掃參數量不到東西。** 一次空的 Triton 啟動在這台機器是 14.8 us，這支
+kernel 有四次啟動＝59 us 的固定成本壓在 25 us 的 kernel 上。tile 之間 10% 的差異
+完全被蓋住。**必須在 CUDA graph 捕捉下掃**——引擎的 decode 本來就是這樣跑的。
+
+**三、固定路由會讓工作集常駐 L2。** T=1 只碰 8 個專家＝50.3 MB，而這張卡有 128 MB
+L2；用同一組專家重複量，graph replay 報出 2175 GB/s＝**121% of HBM peak**。
+量測必須讓每次迭代路由到不同專家（32 組 × 8 = 256，覆蓋整個 1.61 GB）。
+
+修正上述三點之後的數字（Qwen3.6-35B-A3B 形狀，hidden 2048 / 256 experts /
+top-8 / intermediate 512，T=1，輪替專家組）：
+
+| | eager | CUDA graph（引擎實際跑法） |
+|---|---|---|
+| FlashInfer CUTLASS（vLLM 也是這條） | 141.3 us / 356 GB/s / 20% peak | 60.8 us / 827 GB/s / 46% peak |
+| **本 kernel** | **85.8 us / 587 GB/s / 33%** | **46.7 us / 1078 GB/s / 60%** |
+| 倍數 | **1.65x** | **1.30x** |
+
+roofline 是 28.1 us（50.3 MB ÷ 1792 GB/s）。**參數空間已經榨乾**——三輪掃描的前六名
+都落在 46–48 us。演算法層面算過三條路，融合歸約省 0.4%、persistent kernel 省 ~1%、
+存取形狀已掃遍，因為 50.3 MB 的權重讀取不可壓縮（算術強度 0.8 FLOP/byte）。
+
+**真正的槓桿是批次大小**：同一支 kernel 在 T=64 達到 88% of peak，因為同一份權重
+分攤給 64 個 token。**MoE 的效率本質是批次問題，而批次被准入卡在 1–2**
+（見 `46-fp8-moe-reachability.md` §6）。兩條線在這裡合流。
+
+**端到端量測：沒有變化，而且路上錯了兩次。**
+
+| 35B agent C=16 | 基準 | 含此改動 |
+|---|---|---|
+| tok/s | 160.08 | 159.64 |
+| goodput/s | 0.27 | 0.27 |
+| 首字 p50 | 14,947 ms | 16,241 ms |
+
+kernel 的 1.30x 沒有兌現，原因就是上面那段批次分析：35B 在 C=16 時每步只有 1–2 個
+請求在解碼，MoE 的 decode 呼叫佔整體時間極小，瓶頸壓倒性在 prefill 與准入排隊
+（首字 16 秒對門檻 10 秒）。**這個 kernel 要等批次變大才會兌現。**
+
+路上兩個錯，第一個是設計層級的：
+
+1. **把它註冊成競爭 solution，registry 就在所有形狀選了它**——包括 8192 token 的
+   prefill，端到端掉到 **49.9 tok/s**（基準 160.1）。形狀門檻完全沒機會執行，因為
+   **選擇在 plan 建立時發生一次**，不是每次呼叫。正確做法是**不註冊**，只透過
+   `cutlass_unquant` 內部那條有 token 門檻的轉交進入。`test_is_not_registered_as_a_solution`
+   釘住這一點。
+2. **診斷錯方向**：先懷疑 `PAIRS: tl.constexpr` 造成每步 JIT 重編譯（那確實是缺陷，
+   token 數當編譯期常數會讓每個不同的常駐請求數觸發一次完整編譯，已改成執行期
+   參數），但修完數字一模一樣。真正的病因是第 1 點。分辨方法很簡單：把門檻設 0
+   關掉轉交再量一次——數字不動就代表病因不在轉交。
+
+**自動選擇，不需要旗標。** `flashinfer_cutlass_unquant_moe_apply` 在
+`tokens <= _MAX_DECODE_TOKENS`（16，實測交叉點：1.48/1.57/1.38/1.22/1.10/1.05/1.00/
+0.96 對應 1/2/4/8/16/32/64/128 tokens）時轉交，並以 `gate_first=False` 讀
+CUTLASS preprocessor 已經互換過的 w13 兩半——**兩條路徑共用一份權重**。形狀不支援
+時明確拋錯並退回 GEMM。
+
+**順手修掉一個會靜默損壞的缺陷。** `_reduce_silu` 的載入沒有遮罩，而 partials 是
+`torch.empty` 的未初始化記憶體：任何 intermediate 或 hidden 不是 `_BLOCK_RED`(128)
+倍數的模型都會讀進垃圾，**而且每次不同**。35B 的 512 剛好整除所以躲過了。現在
+`decode_moe_body` 會在進 kernel 前拒絕這些形狀。這個缺陷是**測試抓到的、不是量測
+抓到的**——第一版測試用 hidden=256/inter=64，立刻就不可重現。
+
+---
+
 ### 2.8 本 repo 的 split-K 候選（**未入帳**：讀取時仍是未追蹤檔）
 
 `ops/moe/triton/bf16_decode.py` 在本文寫作期間出現在工作樹上，**尚未進任何 commit**。

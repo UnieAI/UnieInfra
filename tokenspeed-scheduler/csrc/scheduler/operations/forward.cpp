@@ -513,18 +513,29 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
         tier_transfers_.HasLoadBacksInFlight()) {
         return;
     }
-    // A victim must owe NO outstanding forward result, not merely none from
-    // this step. Filtering on `scheduled_this_step` crashed the scheduler with
-    // "FSM transition invalid: event=ExtendResultEvent; state=Retracted": at
-    // overlap depth 1 a request can owe a result issued a step earlier, and
-    // that result arrives after the retraction. The blanket check is therefore
-    // the correct implementation of the invariant, not a conservative one.
+    // A victim must owe NO outstanding forward result before it is torn down:
+    // filtering on `scheduled_this_step` instead crashed the scheduler with
+    // "FSM transition invalid: event=ExtendResultEvent; state=Retracted",
+    // because at overlap depth 1 a request can owe a result issued a step
+    // earlier and that result arrives after the retraction.
     //
-    // The consequence is that per-request preemption cannot work here without
-    // a two-phase retract -- mark the victim, retract once its outstanding
-    // result lands. That is design work, not a looser predicate.
-    const auto owes_forward_result = [this](const Request* request) {
-        return pending_forward_results_.contains(request->Id());
+    // Requiring the whole map to be empty before even looking used to stand in
+    // for that. It is far stronger than the invariant needs, and once the step
+    // stopped ending itself on a blocked prefill it was never satisfied: some
+    // request has been scheduled in essentially every step, so retraction
+    // stopped running at all and capacity was never reclaimed. The two-phase
+    // path below is the real implementation -- mark the victim now, tear it
+    // down when its result lands -- so the per-request filter is enough.
+    // Both halves are needed. `pending_forward_results_` alone misses a
+    // request whose operation was pushed in THIS step but whose counter has
+    // not been raised yet, and retracting one of those tore it down before its
+    // result arrived: "FSM transition invalid: event=ExtendResultEvent;
+    // state=Submitted". `scheduled_this_step` alone misses a request that owes
+    // a result issued a step earlier, which is the other half of the same
+    // crash. Either condition sends the request down the deferred path
+    // instead, which is where both cases are safe.
+    const auto owes_forward_result = [this, &scheduled_this_step](const Request* request) {
+        return pending_forward_results_.contains(request->Id()) || scheduled_this_step.contains(request->Id());
     };
     // Already marked victims are not candidates again, and are not counted as
     // resident capacity that could be freed twice.
@@ -550,8 +561,10 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
             // Under per-request triggering every resident request may already
             // owe a forward result this step. That is not a wedge -- the next
             // step retries once those results land -- so it must not abort.
-            FatalCheck(config_.preempt_on_blocked_request,
-                       "LCM admission failed without a retractable Decode request or asynchronous capacity release");
+            // It used to abort anyway, because the FatalCheck here was
+            // predicated on a config flag rather than on the situation being
+            // unrecoverable.
+            spdlog::debug("[Scheduler] retract: no eligible Decode victim; admitting nothing this step");
             return;
         }
         recovery_barrier_ = context.capacity_blocker;
@@ -601,7 +614,14 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
         return;
     }
     if (request_to_retract == nullptr) {
-        FatalCheck(config_.preempt_on_blocked_request, "LCM admission failed without a retractable request");
+        // Every resident request is either scheduled this step or owes a
+        // forward result, so there is nothing to free right now. That is a
+        // step which admits nobody, not an engine that cannot continue: the
+        // next step sees a different set. Crashing here took down the 35B
+        // agent-127k cell, where a single prompt legitimately needs more arena
+        // than one step can free.
+        spdlog::debug("[Scheduler] retract: no eligible victim; admitting nothing this step");
+        return;
         return;
     }
     if (config_.HasHostCache() && request_to_retract->Is<fsm::Decoding>()) {
@@ -714,6 +734,11 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     std::vector<ForwardOperation> operations;
     std::vector<LoadBackOperation> load_back_operations;
     std::int32_t token_budget = config_.max_scheduled_tokens;
+    // Capacity ran out, or an incomplete prefill is holding the line. Either
+    // way nothing NEW may be admitted -- but the requests already resident can
+    // still decode, and ending the whole step instead is what left 8192 tokens
+    // of budget carrying 3.5 decodes.
+    bool admissions_closed = false;
     bool pushed_prefill = false;
     bool pushed_decode = false;
     // Requests that received an operation in THIS step. The retract victim
@@ -835,11 +860,24 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                     // resident against vLLM's 12, TTFT p50 18.1 s against
                     // 3.4 s, while our TPOT was 4.4x better because almost
                     // nothing was sharing the decode.
+                    //
+                    // Holding the line is about admission, so it closes
+                    // admission. Ending the step was a much bigger hammer: the
+                    // decodes sorted after this request lost their slot too,
+                    // and they were not competing for the capacity it needs.
                     if (!config_.reserve_full_prefill_at_admission) {
-                        break;
+                        admissions_closed = true;
                     }
                 }
             } else if (context.admission_failed) {
+                // Still ends the step, because retraction is triggered on one
+                // that came up empty. Letting the decodes through instead
+                // needs the retract path reworked first: the victim filter,
+                // the trigger, and an `outside_event_handler` that erases the
+                // whole pending-result counter where it should decrement.
+                // Half of that lands a crash -- "FSM transition invalid:
+                // event=ExtendResultEvent; state=Submitted" -- so it is
+                // deliberately not half-landed here.
                 break;
             }
             continue;
@@ -862,6 +900,10 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
 
         if (request->Is<fsm::Submitted>()) {
+            if (admissions_closed) {
+                ++rej_firstchunk;
+                continue;
+            }
             if (config_.role == Role::kD && pushed_decode) {
                 trace_stop = "D-role: decode already pushed (first chunk)";
                 break;
@@ -881,8 +923,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                     // prompt. Reserving the whole prompt at admission removes
                     // the stranding risk it guards against.
                     if (!config_.reserve_full_prefill_at_admission) {
-                        trace_stop = "head-of-line: first chunk holds the line";
-                        break;
+                        admissions_closed = true;
                     }
                 }
             } else {
@@ -937,7 +978,10 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
     // vLLM preempts for the ONE request that could not get blocks, inside its
     // running loop. Waiting for the whole step to come up empty means a single
-    // request with room in its tail page suppresses preemption for everyone.
+    // request with room in its tail page suppresses preemption for everyone --
+    // and once a blocked prefill stopped ending the step, the step was never
+    // empty again, so this condition suppressed it always. Admission failing
+    // is the trigger; whether anything else got scheduled is unrelated to it.
     if (context.admission_failed && (operations.empty() || config_.preempt_on_blocked_request)) {
         retractForCapacity(context, candidates, write_back_operations, scheduled_this_step);
     }

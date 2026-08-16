@@ -127,12 +127,11 @@ TEST(SwaCheckpointStrideTest, AdmissionEstimateMatchesWhatAcquireTakes) {
     // it acquires, so a plan that counted checkpoints from index 0 charged for
     // a different set of pages than the one Acquire went on to allocate. When
     // the estimate came out low the difference surfaced as "admission plan no
-    // longer fits the block pool" and took the engine down mid-run; when it was
-    // padded to a safe upper bound instead, admission over-charged and
-    // concurrency on 35B agent C=16 fell from 15-16 running requests to 1-2.
+    // longer fits the block pool" and took the engine down mid-run.
     //
-    // Sweeping the offset is the point: only some of these are off by anything,
-    // and which ones depends on where the stride boundary lands.
+    // Equality, not a bound in either direction: an acquisition that reaches
+    // past its charge takes blocks a later group in the same Admit was already
+    // charged for, which reproduces the same fatal check from the other side.
     for (std::int32_t prepended = 0; prepended < 8; ++prepended) {
         for (std::int32_t tokens = 4; tokens <= 40; tokens += 4) {
             BlockPool pool(64);
@@ -141,9 +140,6 @@ TEST(SwaCheckpointStrideTest, AdmissionEstimateMatchesWhatAcquireTakes) {
 
             BlockTable table;
             const std::int32_t estimate = manager.AdmissionBlocksNeededFor(table, tokens, prepended);
-
-            // Stand in for the prepends by acquiring that many pages first,
-            // then measure only what the second Acquire adds.
             if (prepended > 0) {
                 ASSERT_TRUE(manager.Acquire(pool, table, prepended * kBlockTokens));
                 ASSERT_EQ(table.Blocks().size(), static_cast<std::size_t>(prepended));
@@ -152,6 +148,7 @@ TEST(SwaCheckpointStrideTest, AdmissionEstimateMatchesWhatAcquireTakes) {
             ASSERT_TRUE(manager.Acquire(pool, table, tokens));
             EXPECT_EQ(BackedBlocks(table) - before, estimate)
                 << "prepended=" << prepended << " tokens=" << tokens;
+            EXPECT_TRUE(table.Blocks().back()) << "the tail this chunk writes into cannot be a hole";
         }
     }
 }

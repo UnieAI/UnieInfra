@@ -497,10 +497,22 @@ protected:
     // sequence occupies those positions whether or not a block backs them.
     void AppendSparse(BlockTable& table, std::int32_t num_tokens, std::int32_t num_pages,
                       std::int32_t first_index, std::vector<CacheBlockRef> block_refs) {
+        // The tail is the page this chunk writes into, so it is backed before
+        // any checkpoint. Filling in index order instead would spend a short
+        // acquisition on resume points and leave the forward pass without the
+        // page it is about to write -- a short acquisition has to cost reuse
+        // depth, never correctness.
+        _assert(num_pages == 0 || !block_refs.empty(), "sparse append needs a block for the tail");
+        CacheBlockRef tail;
+        if (!block_refs.empty()) {
+            tail = std::move(block_refs.back());
+            block_refs.pop_back();
+        }
         auto next = block_refs.begin();
         for (std::int32_t i = 0; i < num_pages; ++i) {
-            const bool last = i == num_pages - 1;
-            if (next != block_refs.end() && (IsBackedIndex(first_index + i) || last)) {
+            if (i == num_pages - 1) {
+                table.blocks_.push_back(std::move(tail));
+            } else if (next != block_refs.end() && IsBackedIndex(first_index + i)) {
                 table.blocks_.push_back(std::move(*next));
                 ++next;
             } else {

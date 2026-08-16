@@ -20,11 +20,14 @@
 
 """Helper functions for constructing scheduler specs and events."""
 
+import logging
 import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -300,6 +303,10 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             cache_blocks_per_lcm_block=int(
                 getattr(spec, "cache_blocks_per_lcm_block", 1)
             ),
+            # State groups only. 1 keeps a snapshot in every page, which is
+            # what a hybrid has always done; the scheduler nulls the pages
+            # between checkpoints at higher strides.
+            checkpoint_stride_blocks=int(getattr(spec, "checkpoint_stride_blocks", 1)),
         )
         transfer_policy = getattr(spec, "transfer_policy", None)
         if transfer_policy is not None:
@@ -312,6 +319,14 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             kwargs["transfer_policy"] = mapped_policy
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
+        if os.environ.get("TOKENSPEED_LOG_CACHE_PACKING"):
+            logger.info(
+                "paged cache group %s: ckpt_stride=%s rows=%s entry_stride=%s",
+                spec.group_id,
+                kwargs.get("checkpoint_stride_blocks"),
+                kwargs.get("rows_per_page"),
+                kwargs.get("entry_stride_tokens"),
+            )
         out.append(PagedCacheGroupConfig(**kwargs))
     return out
 

@@ -38,6 +38,9 @@ class PagedCacheGroupSpec:
     cache_blocks_per_lcm_block: int = 1
     # None preserves standalone/non-PD behavior; PD plans set this explicitly.
     transfer_policy: TransferPolicy | None = None
+    # Blocks between recurrent-state checkpoints; state groups only. 1 backs
+    # every page, which is the historical behaviour.
+    checkpoint_stride_blocks: int = 1
 
     @property
     def cache_block_tokens(self) -> int:
@@ -479,6 +482,7 @@ def group_specs_from_layer_types(
     page_size: int,
     page_sizes: Mapping[str, int] | None = None,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
+    state_entry_stride_tokens: int = 1,
 ) -> list[PagedCacheGroupSpec]:
     """Derive paged-cache group specs from per-layer attention types.
 
@@ -502,6 +506,16 @@ def group_specs_from_layer_types(
         page_sizes: Per-group page sizes keyed by group id (heterogeneous
             block sizes); values must be positive multiples of page_size.
             Groups not listed use page_size.
+        state_entry_stride_tokens: How many tokens one recurrent-state entry
+            covers. State groups snapshot the whole recurrent state per cache
+            block, so this is the checkpoint interval, and it sets how much
+            arena a long prompt reserves: on Qwen3.6-35B-A3B each snapshot is
+            20.5 MB against a 40 MB LCM parent, so with the default of 1 a
+            6,656-token chunk wants 52 parents in each of three state groups
+            and admission caps concurrency near one. Raising it divides that
+            demand, at the cost of resuming a prefix match from the nearest
+            earlier snapshot. Only applies to state-family groups; history
+            groups always use 1.
         cache_blocks_per_lcm_block: Per-group physical packing. Omitted groups
             use one CacheBlock per physical parent.
 
@@ -549,12 +563,19 @@ def group_specs_from_layer_types(
         seen[gid] = (retention, window, family)
         ps = sizes.pop(gid, None) or page_size
         group_packing = packing.pop(gid, 1)
+        # The scheduler requires a group's block tokens to divide its own, so
+        # a coarser recurrent grain cannot come from entry_stride_tokens; it
+        # comes from backing only every Nth page instead. See
+        # unieinfra/xref/46 6.1.
         specs.append(
             PagedCacheGroupSpec(
                 group_id=gid,
                 retention=retention,
                 rows_per_page=ps,
                 entry_stride_tokens=1,
+                checkpoint_stride_blocks=(
+                    state_entry_stride_tokens if family == "state" else 1
+                ),
                 sliding_window_tokens=window,
                 family=family,
                 cache_blocks_per_lcm_block=group_packing,
@@ -598,6 +619,7 @@ def build_paged_cache_group_specs(
     page_size: int,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     pd_disaggregation_enabled: bool = False,
+    state_entry_stride_tokens: int = 1,
 ) -> tuple[PagedCacheGroupSpec, ...]:
     """Build the scheduler group specs one cache recipe publishes.
 
@@ -635,6 +657,7 @@ def build_paged_cache_group_specs(
         sliding_window_tokens=sliding_window_tokens,
         page_size=page_size,
         cache_blocks_per_lcm_block=cache_blocks_per_lcm_block,
+        state_entry_stride_tokens=state_entry_stride_tokens,
     )
     if pd_disaggregation_enabled:
         specs = apply_pd_transfer_policies(specs)

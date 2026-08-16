@@ -98,6 +98,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
                 .cache_block_tokens = cache_block_tokens,
+                .checkpoint_stride_blocks = group.checkpoint_stride_blocks,
             });
             continue;
         }

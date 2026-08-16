@@ -244,6 +244,12 @@ protected:
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.max_batch_size = 3;
         cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        // What this suite asserts is that admission does not pre-charge the
+        // capacity a future retraction would need -- one request per plan is
+        // how that shows up, and it only holds while head-of-line does. Pin
+        // the chunk-at-a-time policy so the subject stays retraction rather
+        // than becoming a second copy of the packing test.
+        cfg.reserve_full_prefill_at_admission = false;
         return cfg;
     }
 };

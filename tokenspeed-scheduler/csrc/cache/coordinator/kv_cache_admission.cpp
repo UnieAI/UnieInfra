@@ -21,6 +21,7 @@
 #include "cache/coordinator/kv_cache_coordinator.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -69,6 +70,41 @@ public:
         collectCandidates();
         while (!fits()) {
             if (victim_candidates_.empty()) {
+                // fits() sums a per-group ceiling against only the fully empty
+                // parents, so a request needing one block in each of many
+                // groups can be refused while bound parents still hold free
+                // slots. Record both sides once per refusal to tell that apart
+                // from a genuine shortage.
+                static const bool trace =
+                    std::fopen("/workspace/roy/.plan_trace.on", "r") != nullptr;
+                if (trace) {
+                    static std::FILE* f = std::fopen("/workspace/roy/.fits_trace.txt", "a");
+                    if (f != nullptr) {
+                        std::int64_t need = 0, free_slots = 0, blocks = 0;
+                        for (std::size_t i = 0; i < groups_.size(); ++i) {
+                            const std::int64_t remaining =
+                                std::max<std::int64_t>(blocks_needed_[i] - local_free_slots_[i], 0);
+                            const std::int64_t slots = groups_[i].Manager().CacheBlocksPerLcmBlock();
+                            need += (remaining + slots - 1) / slots;
+                            free_slots += local_free_slots_[i];
+                            blocks += blocks_needed_[i];
+                        }
+                        std::fprintf(f,
+                                     "refuse groups=%zu blocks_needed=%lld free_slots=%lld "
+                                     "parents_needed=%lld empty_parents=%d |",
+                                     groups_.size(), static_cast<long long>(blocks),
+                                     static_cast<long long>(free_slots),
+                                     static_cast<long long>(need), empty_parent_count_);
+                        for (std::size_t i = 0; i < groups_.size(); ++i) {
+                            std::fprintf(f, " g%zu(need=%lld free=%lld slots=%d)", i,
+                                         static_cast<long long>(blocks_needed_[i]),
+                                         static_cast<long long>(local_free_slots_[i]),
+                                         groups_[i].Manager().CacheBlocksPerLcmBlock());
+                        }
+                        std::fprintf(f, "\n");
+                        std::fflush(f);
+                    }
+                }
                 return false;
             }
             std::ranges::pop_heap(victim_candidates_, evictedAfter);
@@ -133,11 +169,28 @@ private:
             const GroupDemand& demand = demands_[i];
             _assert(demand.table != nullptr, "group demand requires a block table");
             const KvCacheManager& manager = groups_[i].Manager();
-            const std::int32_t device_blocks = manager.BlocksNeededFor(*demand.table, demand);
-            const std::int32_t host_blocks =
-                prefix_.host.per_group.empty()
-                    ? 0
-                    : static_cast<std::int32_t>(std::ranges::count(prefix_.host.per_group[i].hits, std::uint8_t{1}));
+            // The admission view, which a sparse group narrows to the blocks
+            // it will actually back. Acquire allocates exactly this many, so
+            // the two stay consistent and the Admit-time FatalCheck holds.
+            // Admit() runs ClaimHitBlocks then AppendHostExtension before it
+            // acquires, so this group's own pages begin that far along the
+            // table. Both tiers contribute positions, not just backed pages:
+            // a hole still occupies a slot and still shifts the checkpoints.
+            const std::span<const std::uint8_t> device_hits =
+                prefix_.device.num_common_tokens > 0 && !prefix_.device.per_group.empty()
+                    ? std::span<const std::uint8_t>(prefix_.device.per_group[i].hits)
+                    : std::span<const std::uint8_t>{};
+            const std::span<const std::uint8_t> host_hits =
+                prefix_.host.per_group.empty() ? std::span<const std::uint8_t>{}
+                                               : std::span<const std::uint8_t>(prefix_.host.per_group[i].hits);
+            const std::int32_t host_base =
+                static_cast<std::int32_t>(demand.table->Blocks().size() + device_hits.size());
+            const std::int32_t host_blocks = manager.BackedHostExtensionPages(host_base, host_hits);
+            const std::int32_t device_blocks =
+                demand.materialized_suffix_start < 0
+                    ? manager.AdmissionBlocksNeededFor(*demand.table, demand.num_tokens + demand.reserve_tokens,
+                                                       host_base + static_cast<std::int32_t>(host_hits.size()))
+                    : manager.BlocksNeededFor(*demand.table, demand);
             blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks;
         }
 

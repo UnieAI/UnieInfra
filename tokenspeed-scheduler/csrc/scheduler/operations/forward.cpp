@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <optional>
 #include <ranges>
@@ -287,6 +289,25 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         const std::vector<GroupDemand> full_demands = makeGroupDemands(
             full_tables, GroupDemand{.num_tokens = unscheduled, .reserve_tokens = generation_reserve});
         if (!coordinator_.CanAdmitAfterReleasing(match.probe, full_demands, {})) {
+            // Record what was asked against what was free. The step counters
+            // establish that every new request is turned away here; they
+            // cannot say whether the shortfall is the prompt, the generation
+            // reserve, or an arena more fragmented than its token total
+            // suggests -- and those three have different fixes.
+            static const bool admit_trace =
+                std::fopen("/workspace/roy/.plan_trace.on", "r") != nullptr;
+            if (admit_trace) {
+                static std::FILE* admit_file = std::fopen("/workspace/roy/.admit_trace.txt", "a");
+                if (admit_file != nullptr) {
+                    std::fprintf(admit_file,
+                                 "refused req=%s unscheduled=%d gen_reserve=%d matched=%d "
+                                 "free_lcm=%d\n",
+                                 request->Id().c_str(), unscheduled, generation_reserve,
+                                 match.probe.device.num_common_tokens,
+                                 coordinator_.NumAvailableLcmBlocks());
+                    std::fflush(admit_file);
+                }
+            }
             context.admission_failed = true;
             context.capacity_blocker = request->Id();
             return std::nullopt;
@@ -703,6 +724,31 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     // state and preemption silently does nothing (51 retracts over a run that
     // needed thousands).
     std::unordered_set<std::string> scheduled_this_step;
+    // Why a step admitted what it did. Two very different defects look
+    // identical from the outside -- a step that ran out of token budget and a
+    // step that had budget left but never offered it to the next request --
+    // and the running-request histogram cannot tell them apart. Off unless
+    // TOKENSPEED_LOG_PLAN_TRACE is set; one line per plan build when it is.
+    // Triggered by the existence of a file, not an environment variable, and
+    // written straight to disk rather than through spdlog. Both indirections
+    // were forced: the engine runs the scheduler in a spawned process that
+    // neither forwards this variable nor surfaces its spdlog sink in the
+    // harness log, so an env-gated spdlog trace stays silent and reads exactly
+    // like code that never ran.
+    static const char* plan_trace_path = "/workspace/roy/.plan_trace.txt";
+    static const bool plan_trace = std::fopen("/workspace/roy/.plan_trace.on", "r") != nullptr;
+    const std::int32_t trace_budget_start = token_budget;
+    const std::size_t trace_candidates = candidates.size();
+    const char* trace_stop = "candidates exhausted";
+    std::int32_t trace_prefill_ops = 0, trace_decode_ops = 0, trace_prefill_tokens = 0;
+    std::int32_t trace_skip_retract = 0, trace_skip_reserve = 0, trace_no_event = 0;
+    std::int32_t trace_first_chunk_tokens = -1;
+    // Which state each candidate arrived in, and which call turned it away.
+    // "candidates exhausted with nothing scheduled" is the common outcome and
+    // it names no culprit; these do.
+    std::int32_t st_submitted = 0, st_prefilling = 0, st_decode = 0, st_other = 0;
+    std::int32_t rej_prefill = 0, rej_firstchunk = 0, rej_decode = 0, rej_unmatched = 0;
+
     auto push_operation = [&](auto operation) {
         scheduled_this_step.insert(operation.request_id);
         if (recovery_barrier_ && operation.request_id == *recovery_barrier_) {
@@ -718,6 +764,13 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(operation)>, DecodeOperation>) {
             pushed_decode = true;
+            ++trace_decode_ops;
+        } else {
+            ++trace_prefill_ops;
+            trace_prefill_tokens += operation.input_length;
+            if (trace_first_chunk_tokens < 0) {
+                trace_first_chunk_tokens = operation.input_length;
+            }
         }
         operations.push_back(std::move(operation));
     };
@@ -731,21 +784,25 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
+            trace_stop = token_budget <= 0 ? "token budget exhausted" : "max_batch_size reached";
             break;
         }
         // A marked victim must stop growing immediately, or the pages the
         // retraction is meant to free keep accumulating while it waits for its
         // outstanding result to land.
         if (pending_retraction_.contains(request->Id())) {
+            ++trace_skip_retract;
             continue;
         }
 
         if (request->Is<fsm::Prefilling>() &&
             (config_.role != Role::kD || request->PrefillSource() == fsm::PrefillSource::kLocal)) {
             if (config_.role == Role::kD && pushed_decode) {
+                trace_stop = "D-role: decode already pushed";
                 break;
             }
             const std::int32_t reserve = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+            ++st_prefilling;
             if (auto event = schedulePrefill(context, request, token_budget, reserve)) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event)));
                 // P-side pages stay pinned until the PD transfer completes.
@@ -757,6 +814,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 trackPendingForwardResult(request);
                 if (config_.role == Role::kD) {
                     // Decode-side recovery prefill runs in its own batch.
+                    trace_stop = "D-role: recovery prefill is its own batch";
                     break;
                 }
                 if (request->Is<fsm::Prefilling>()) {
@@ -764,7 +822,22 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                     // remaining prompt. Keep one incomplete prefill as the
                     // head of line so another request cannot strand it by
                     // consuming the capacity it needs to finish.
-                    break;
+                    //
+                    // That premise no longer holds when admission reserves the
+                    // whole prompt: the capacity this request needs to finish
+                    // is already charged to it, so nothing another request
+                    // admits can strand it, and holding the line costs far
+                    // more than it protects. A prompt longer than the token
+                    // budget takes ceil(prompt / budget) steps, and while it
+                    // holds the line every other request waits for all of
+                    // them -- on the 35B agent shape (43k-token prompts, 8192
+                    // budget, 16 concurrent) that measured 1.8 requests
+                    // resident against vLLM's 12, TTFT p50 18.1 s against
+                    // 3.4 s, while our TPOT was 4.4x better because almost
+                    // nothing was sharing the decode.
+                    if (!config_.reserve_full_prefill_at_admission) {
+                        break;
+                    }
                 }
             } else if (context.admission_failed) {
                 break;
@@ -790,10 +863,12 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
         if (request->Is<fsm::Submitted>()) {
             if (config_.role == Role::kD && pushed_decode) {
+                trace_stop = "D-role: decode already pushed (first chunk)";
                 break;
             }
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
+            ++st_submitted;
             if (auto event = schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens)) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
                 if (config_.enable_pd_cache) {
@@ -801,23 +876,62 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 }
                 trackPendingForwardResult(request);
                 if (request->Is<fsm::Prefilling>()) {
-                    break;
+                    // Same head-of-line rule as the continuation branch above,
+                    // for a request whose first chunk did not finish its
+                    // prompt. Reserving the whole prompt at admission removes
+                    // the stranding risk it guards against.
+                    if (!config_.reserve_full_prefill_at_admission) {
+                        trace_stop = "head-of-line: first chunk holds the line";
+                        break;
+                    }
                 }
+            } else {
+                ++rej_firstchunk;
             }
             continue;
         }
 
         if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
             if ((config_.role == Role::kD || !config_.enable_mixed_prefill_decode) && pushed_prefill) {
+                trace_stop = "mixed prefill+decode disabled and a prefill is already in the step";
                 break;
             }
             if (token_budget < state_prefill_reserve + config_.decode_input_tokens) {
+                ++trace_skip_reserve;
                 continue;
             }
+            ++st_decode;
             if (auto event = scheduleDecode(context, request)) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event)));
                 trackPendingForwardResult(request);
+            } else {
+                ++rej_decode;
             }
+            continue;
+        }
+
+        // Matched none of the branches above: neither prefill nor decode was
+        // even attempted for this candidate.
+        ++st_other;
+        ++rej_unmatched;
+    }
+
+    if (plan_trace) {
+        static std::FILE* trace_file = std::fopen(plan_trace_path, "a");
+        if (trace_file != nullptr) {
+            std::fprintf(trace_file,
+                         "budget %d->%d used=%d candidates=%zu prefill_ops=%d first_chunk=%d "
+                         "decode_ops=%d waiting=%zu skipped(retract=%d reserve=%d) "
+                         "state(sub=%d pre=%d dec=%d other=%d) "
+                         "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d) stop=\"%s\"\n",
+                         trace_budget_start, token_budget, trace_budget_start - token_budget,
+                         trace_candidates, trace_prefill_ops, trace_first_chunk_tokens,
+                         trace_decode_ops,
+                         trace_candidates - static_cast<std::size_t>(trace_prefill_ops + trace_decode_ops),
+                         trace_skip_retract, trace_skip_reserve,
+                         st_submitted, st_prefilling, st_decode, st_other,
+                         rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, trace_stop);
+            std::fflush(trace_file);
         }
     }
 

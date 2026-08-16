@@ -463,3 +463,36 @@ prompt（vLLM）/ prompt + max_new × 回饋係數（SGLang）/ prompt + max_new
 - **建議**：**先做 R1，量 A1，再決定。** 若 R1 之後 P99 已經收斂到 vLLM 水準，R5 只會
   換來更低的併發；若 P99 仍有長尾（表示問題出在生成長度而非 prompt 長度），再走 R5，
   或走 SGLang 的係數版本。這一格是四家真正意見不合的地方，不要在量測之前選邊。
+
+
+---
+
+## 7. 為什麼「每步都填滿批次」目前做不到（實測，2026-08-16）
+
+R3（搶佔改成單一請求觸發）在本引擎上**還不能落地**，而擋住它的不是搶佔本身，是撤回
+之後的優先級。三個相互耦合的位置：
+
+| # | 位置 | 現況 | 後果 |
+|---|---|---|---|
+| 1 | `forward.cpp` Prefilling 分支，`admission_failed` 時 `break` | 一個請求配不到頁就終止整步 | 排在它後面、**不跟它搶容量**的常駐 decode 也丟掉槽位 |
+| 2 | `retractForCapacity` 觸發條件 `operations.empty()` | 只有整步空掉才撤回 | 修掉 #1 之後步永遠不空，撤回**再也不會發生** |
+| 3 | `blanket_forward_guard` | 只要**任何**請求欠著 forward result 就整個 return | 比兩階段撤回路徑（`deferred_victim`）更早擋掉，而那條路正是為此存在 |
+
+三個一起改之後，撤回會**連鎖**：三請求容量案例把三個全撤光、`DecodingSize()` 歸零。
+根因是 `priority()`（`forward.cpp:670`）給 `recovery_queue_` 隊首的請求 **2**，而常駐的
+Prefilling 與 Decoding 都是 **3** —— 被撤回的請求下一步就搶回自己剛釋出的頁，把下一個
+請求擠爆，如此遞推。加上「只為 `capacity_blocker` 撤回」與「同時只允許一個撤回在飛」
+兩道節流都擋不住，因為每完成一次撤回就會再觸發一次。
+
+vLLM 沒有這個問題：被搶佔的請求回到 waiting，**不會**插隊到 running 之前
+（`v1/core/sched/scheduler.py:442` 的迴圈先跑完 `self.running`）。所以下一步要做的是
+優先級順序，不是這三個分支。
+
+**已量到的代價**：`k2trace` 那次跑（35B agent 26k、C=16、64 req）2,337 個有效步裡
+95.1% 只用掉 8192 預算中的 <2048，99.9% 停在 `candidates exhausted`。但拒絕時
+`free_lcm` 中位數是 3 —— arena 是真的滿了，所以填滿批次要先有容量，
+`fp8 KV`（2x 容量）比排程更可能是下一格。
+
+**已落地的部分**：head-of-line 只關閉准入而不終止整步（`176c8344`），以及兩處
+「找不到可撤回請求」從 `FatalCheck` 改成跳過 —— 後者解鎖了 35B agent-127k 的五格，
+它們先前全部無產出。

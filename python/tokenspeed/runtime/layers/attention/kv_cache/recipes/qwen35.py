@@ -9,6 +9,55 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     merge_continuation_layers,
 )
 
+# Most recurrent-state checkpoints a single request may be charged for,
+# whatever its prompt length -- the same budget vLLM's `MambaSpec` gives a
+# request at its default `mamba_cache_mode="none"`.
+#
+# 4 was measured first, on the theory that a few extra resume points were worth
+# a little arena. They were not: at 4 the 35B agent shape scored 0.91 req/s of
+# goodput against 1.05 at 1, and prefix reuse was *lower* (59.8% against
+# 61.9%), which is what says the reuse is coming from the KV groups rather than
+# from these snapshots. Chunk tails are still backed unconditionally, so a
+# request keeps one resume point per prefill chunk regardless of this number.
+_MAX_STATE_CHECKPOINTS = 2
+
+
+def _state_checkpoint_stride_blocks(server_args, logical_block_tokens: int) -> int:
+    """Blocks between recurrent-state checkpoints, derived when unset.
+
+    A recurrent group snapshots its whole state into a cache block, so at one
+    snapshot per block a request's state charge grows with its prompt, and
+    admission refuses on that charge rather than on the KV. vLLM does not have
+    the problem by construction: `MambaSpec.max_memory_usage_bytes` charges
+    `page_size_bytes * 1` at its default `mamba_cache_mode="none"`, and only
+    its opt-in `"all"` mode charges `cdiv(max_model_len, block_size)` pages the
+    way one-per-block does here. SGLang arrives at the same place differently,
+    sizing `MambaPool` in per-request slots and clamping `max_num_reqs` to it.
+
+    So the default derives a stride that bounds the charge instead of letting
+    the prompt set it. Measured on Qwen3.6-35B-A3B, agent 26k, 16 concurrent,
+    against one snapshot per block: 169.7 -> 290.5 tok/s, goodput 0.30 -> 1.05
+    req/s, TTFT p50 15.2 s -> 3.3 s, prefix reuse 63.6% -> 61.9%. The
+    checkpoints one-per-block was charging for bought 1.7 points of reuse for
+    1.7x the throughput.
+
+    Args:
+        server_args: Parsed server arguments. A positive
+            `state_checkpoint_stride_blocks` overrides the derivation.
+        logical_block_tokens: Tokens per cache block.
+
+    Returns:
+        Blocks between checkpoints, at least 1.
+    """
+    override = getattr(server_args, "state_checkpoint_stride_blocks", 0)
+    if override and override > 0:
+        return int(override)
+    max_model_len = int(getattr(server_args, "max_model_len", 0) or 0)
+    if max_model_len <= 0:
+        return 1
+    pages = -(-max_model_len // max(logical_block_tokens, 1))
+    return max(1, -(-pages // _MAX_STATE_CHECKPOINTS))
+
 
 def qwen_gdn_max_padding_fraction(*, layer_types, num_draft_layers: int) -> float:
     """Allow the structural K/V planes added by a Qwen MTP draft.
@@ -214,10 +263,13 @@ def prepare_qwen35_cache(
         sliding_window_tokens=None,
         page_size=logical_block_tokens,
         pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
-        # A GDN snapshot is 20.5 MB against a 40 MB LCM parent here, so at the
-        # default of one snapshot per cache block the state groups, not the
-        # KV, decide how many requests fit.
-        state_entry_stride_tokens=getattr(server_args, "state_entry_stride_tokens", 1),
+        # A GDN snapshot is 20.5 MB against a 40 MB LCM parent here, so at one
+        # snapshot per cache block the state groups, not the KV, decide how
+        # many requests fit -- and the charge grows with the prompt, which is
+        # what admission then refuses on.
+        state_entry_stride_tokens=_state_checkpoint_stride_blocks(
+            server_args, logical_block_tokens
+        ),
     )
     return build_hybrid_cache_setup(
         family="qwen_gdn",

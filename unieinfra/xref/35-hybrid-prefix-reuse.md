@@ -407,3 +407,121 @@ per-request 的 K 讓長短 prompt 都拿到 K 個，分不開這兩者。**在�
 RAG c=64/128 的 LOSS 因此不是 checkpoint 密度能解的。下一格要看的是容量本身
 （`fp8 KV` 有 2x），或 vLLM 在這個形狀上到底快在哪 —— 我們 1,089 tok/s 對它 1,647，
 而兩邊 TTFT p50 都在 1 秒級，差距不在准入。
+
+## 9. vLLM 側的同一題：命中率是被容量吃掉的，不是被粒度（原始碼 + 既有日誌，2026-08-17）
+
+在 `github.com/unieai/vllm` 分支 `roy/mamba-checkpoint-reuse` 上把 §8 的想法移植過去
+（新旗標 `--mamba-align-retained-states`，讓 align 模式在 stride 邊界上不釋放狀態
+block），實測只有 +2.8%。這一節是「為什麼只有 +2.8%」的歸因，全部不需要 GPU：
+只讀原始碼和已經跑完的日誌。
+
+### 9.1 目標模型的頁大小是算得出來的
+
+Qwen3.6-35B-A3B(`config.json`)：40 層、`full_attention_interval 4` →
+**10 層 full attention + 30 層 GDN**。
+
+| | 每層每 block 的位元組 |
+|---|---|
+| full attention | `1056 tokens × 2(K,V) × 2 kv heads × 256 head_dim × 2 B` = **2,162,688** |
+| GDN | ssm `32×128×128 × 4 B(fp32)` = 2,097,152 + conv `8192×4 × 2 B` = 65,536 = **2,162,688** |
+
+兩者精確相等，這就是引擎日誌那兩行的來源：
+
+    Setting attention block size to 1056 tokens to ensure that attention page
+    size is >= mamba page size.
+    Padding mamba page size by 0.76% to ensure that mamba page size and
+    attention page size are exactly equal.
+
+vLLM 是**把 attention 的 block 撐大到 mamba 頁**，不是把 mamba 頁縮小。1056 tokens
+的 attention block 因此是被 GDN 狀態尺寸決定的，不是自由參數。
+
+### 9.2 群組結構：attention 和 mamba 共用一個可互換的池
+
+用手算的 spec 直接跑 vLLM 自己的 `get_kv_cache_groups` /
+`get_kv_cache_config_from_groups`（純 Python，無 GPU，探針見附註）：
+
+    4 groups, sizes [10, 10, 10, 10]
+      FullAttentionSpec  10 layers
+      MambaSpec          10 layers   ×3
+
+10 個 tensor，每個由 4 層共享（每 group 一層）；block id 全域唯一，所以同一個 id
+不會同時被兩個 group 佔用。**這就是我們的 LCM arena：一個池，attention 和 mamba
+可互換。** 原本以為這是我們相對 vLLM 的結構優勢，不是——vLLM 已經是這樣了，這條
+移植路線是空的。
+
+### 9.3 `max_memory_usage_bytes` 只是諮詢用的
+
+    num_blocks = 380      # retained=0
+    num_blocks = 380      # retained=4
+
+`retained` 完全不改變池子大小。追 `max_memory_usage_bytes` 的所有呼叫端：啟動可行
+性檢查、`_estimate_max_model_len_from_groups`、以及日誌那行 `Maximum concurrency`。
+**沒有一個是執行期的閘門**——`max_admission_blocks_per_request` 只掛在
+`SlidingWindowSpec` 和 `ChunkedLocalAttentionSpec` 上，mamba 和 full attention 都
+沒有。
+
+所以「retained=4 砍掉 18.5% 容量」是錯的推論，我一度這樣寫。它只砍掉**回報的**併發
+數（7.18x → 5.85x），而 5.85x 正是日誌裡印的值——這反過來獨立證實了那次跑的旗標
+確實生效。
+
+即便如此這仍是記帳錯誤，已修：retained 快照是**共享前綴快取**，共用同一段前綴的請
+求資源命中的是同一批 block，而且隨時可被淘汰；按每請求私有計費會低估併發，並可能
+拒絕一個其實跑得動的啟動組態。請求私有的只有「當前 + 前一個」狀態 block。
+
+### 9.4 真正的成本是 pinning，真正的限制是容量
+
+修掉記帳後，`--mamba-align-retained-states` 的執行期效果只剩一個：讓
+`remove_skipped_blocks` 不要釋放 stride 邊界上的 block。被釘住的 block 保證在，代
+價是池子變小；被釋放的 block 進 free queue 後**仍然是 hashed、仍然可命中**，直到被
+淘汰。所以這筆交易是「保證命中 vs 池子大小」。
+
+C=16 時 16 請求 × 4 = 64 個 block 被釘死，佔 380 的 **17%**。而池子本來就在飽和：
+
+| 時間 | KV 使用率 | 命中率(累計) |
+|---|---|---|
+| 11:23:44 | 24.5% | **93.9%** |
+| 11:23:54 | 70.7% | 70.2% |
+| 11:24:14 | 92.3% | 51.2% |
+| 11:24:34 | 99.2% | 38.5% |
+| 11:24:44 | 96.0% | **35.1%** |
+
+`CachingMetrics` 的窗口是 `max_recent_requests`（預設 1000），這次只有 64 個請求，
+**窗口從未滑動**，所以上表是累計值——末段的邊際命中率遠低於 35.1%。
+
+**命中率是被容量吃掉的。** 26k 提示需要 25 個 attention block + ~6 個 mamba
+block-slot ≈ 31 個 id；380/31 = 12.2 併發，C=16 就已經超訂。在這個體制下，任何
+「重新分配池子」的改動都會打平——和 §8 在我們自己引擎上得到的結論完全一致，兩邊
+獨立撞到同一面牆。
+
+### 9.5 每 step 每請求只有一個真實 block
+
+順帶確認一個原本以為是瓶頸的東西不是。align 模式的 `allocate_new_blocks` 會把
+`[prev_block_len, num_skipped_blocks)` 一次填成 `_null_block`，而且上游自己寫了
+
+    assert num_new_blocks <= 1
+
+所以快照粒度 = **每個 scheduler step 每個請求處理的 token 數**，不是 `block_size`。
+高併發下每步每請求的 chunk 很小，粒度自然很細——粒度不是限制。
+
+`find_longest_cache_hit` 的對齊過濾 `(i+1)*block_size % alignment_tokens != 0` 也不
+會再砍一刀：`alignment_tokens = scheduler_block_size`，而 hybrid 上它等於
+`block_size`，該分支直接短路。
+
+### 9.6 剩下的槓桿
+
+診斷指向容量，而 vLLM 的結構本身沒有可撿的東西（9.2）。唯一能動的是**縮小每請求
+的位元組**，而最大的一項是 GDN 的 ssm 狀態：`mamba_ssm_dtype: float32`，
+`32×128×128×4 B` = 2 MiB/層，佔了整個 mamba 頁的 97%。改成 bf16 後頁縮到
+1,114,112 B，attention block 隨之降到 544 tokens，同樣記憶體下 block 數
+380 → ~737，**約 1.9x 容量**。
+
+這正是 SGLang 的 `--enable-int8-mamba-checkpoint` 在做的事：**量化存下來的
+checkpoint，活躍狀態維持高精度**。我們自己則因為它和 hierarchical cache 會把 int8
+checkpoint slot 當 bf16 active slot 讀而拒絕這個組合（見 `AGENTS.md` 的設計習慣一
+節）。vLLM 沒有這個東西。
+
+這是量化，落在「先不做任何量化」的範圍內，需要先確認才動。
+
+> 附註：探針 `kv_split_probe.py` 手工建 `FullAttentionSpec` / `MambaSpec` 再跑
+> vLLM 自己的群組與配置函式，不需要 GPU 也不需要權重。它先斷言兩邊頁大小相等，
+> 這一點和引擎日誌對得上，才有資格談後面的數字。

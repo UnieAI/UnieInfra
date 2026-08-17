@@ -88,19 +88,25 @@ def main():
                 g.kv_cache_spec.max_memory_usage_bytes(cfg),
                 g.kv_cache_spec.page_size_bytes,
             )
-            print(f"  {kind:<20} {len(g.layer_names):>3} layers  "
-                  f"max_mem {pages:>4} pages/request")
+            print(
+                f"  {kind:<20} {len(g.layer_names):>3} layers  "
+                f"max_mem {pages:>4} pages/request"
+            )
 
         per_req = ku._max_memory_usage_bytes_from_groups(cfg, groups)
-        print(f"  per max-length request: {per_req / 1024**3:.3f} GiB"
-              f"  -> concurrency {AVAILABLE / per_req:.2f}x")
+        print(
+            f"  per max-length request: {per_req / 1024**3:.3f} GiB"
+            f"  -> concurrency {AVAILABLE / per_req:.2f}x"
+        )
 
         kvc = ku.get_kv_cache_config_from_groups(cfg, groups, AVAILABLE)
         print(f"  num_blocks = {kvc.num_blocks}")
         total = 0
         for t in kvc.kv_cache_tensors:
             total += t.size
-        print(f"  tensors: {len(kvc.kv_cache_tensors)}, total {total / 1024**3:.3f} GiB")
+        print(
+            f"  tensors: {len(kvc.kv_cache_tensors)}, total {total / 1024**3:.3f} GiB"
+        )
         by_kind = {}
         for t in kvc.kv_cache_tensors:
             name = t.shared_by[0]

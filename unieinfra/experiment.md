@@ -1,6 +1,29 @@
 # Experiment
 # Unieinfra 的格子重測於 2026-08-17，commit 176c8344 之後（准入不再替 checkpoint 收費、
 # head-of-line 只關閉准入、找不到可撤回請求改為跳過）。vllm 的格子未重測。
+#
+# !! agent 127k 那 20 列的語料有結構問題，引用前必讀 !!
+# agent_real_full.jsonl 只有 32 列而 NREQ=64，vllm bench 的 maybe_oversample_requests
+# 會用 random.choice 複製列補齊（兩邊日誌都印 "Oversampled requests to reach 64 total
+# samples"）。而且那 32 列**全體共享 106,016 字元的前綴**，是 prompt 中位數的 47%。
+# 這一格獎勵的重用是語料結構造出來的，不是一般工作負載。
+#
+# 同格 NREQ=32（不觸發複製）的對照，2026-08-17：
+#   我們 321.7 tok/s / goodput 1.26 ；vLLM 241.2 tok/s / goodput 0.94  ->  1.34x
+# 矩陣裡 NREQ=64 那五列記的是 5.84x，差別幾乎全部來自 vLLM 在複製後的格子上崩掉
+# （它的 goodput 0.94 -> 0.25，我們的 1.26 -> 1.46）。兩個讀數各自對它自己的操作點
+# 成立，比較也一直是配對的（同 seed、同請求串、兩邊都被複製），所以那五列照原樣有效
+# —— 但 **5.84x 不可以當成一般工作負載的數字引用**，要連同上面的 1.34x 一起講。
+#
+# 另外 --num-warmups 送的是 input_requests[0] 重複 N 次（vllm/benchmarks/serve.py:823
+# 與 :891），不是從語料抽樣。對這份語料，那一條的前綴正是共享的 47%，所以連 NREQ=32
+# 都不是冷快取；真正的冷對照需要 --num-warmups 0 或在暖機後 /reset_prefix_cache。
+#
+# agent short 與 RAG 兩份語料的全體共同前綴都是 0，不受這個問題影響。
+#
+# 之前 WIN 12 / PARITY 12 / LOSS 11 / 未測 85
+# 現在 WIN 20 / PARITY 17 / LOSS  3 / 未測 80
+# 剩下三格 LOSS 都是 35B 高併發：RAG c=64/128 與 General c=64。
 [x] vllm c=1, agent 127k , qwen3-27b  -- 4.8/min, 22 tok/s, TTFT p50 479 ms, 合格 100%
 [x] vllm c=16, agent 127k , qwen3-27b  -- 18.6/min, 100 tok/s, TTFT p50 2831 ms, 合格 79%
 [x] vllm c=32, agent 127k , qwen3-27b  -- 8.4/min, 114 tok/s, TTFT p50 2396 ms, 合格 31%

@@ -80,7 +80,9 @@ def _reference(x, w, topk_weights, topk_ids):
     for token in range(x.shape[0]):
         for slot in range(TOP_K):
             expert = int(topk_ids[token, slot])
-            hidden = x[token].to(torch.float32) @ w.w13_weight[expert].to(torch.float32).T
+            hidden = (
+                x[token].to(torch.float32) @ w.w13_weight[expert].to(torch.float32).T
+            )
             gate, up = hidden[:INTER], hidden[INTER:]
             act = torch.nn.functional.silu(gate) * up
             out[token] += float(topk_weights[token, slot]) * (
@@ -148,7 +150,7 @@ def test_is_not_registered_as_a_solution():
 @pytest.mark.parametrize(
     "hidden,inter",
     [
-        (512, 64),   # intermediate below the reduction block
+        (512, 64),  # intermediate below the reduction block
         (320, 128),  # hidden not a multiple of the reduction block
     ],
 )
@@ -170,11 +172,15 @@ def test_refuses_shapes_it_would_corrupt(hidden, inter):
             super().__init__()
             self.top_k = TOP_K
             self.w13_weight = torch.nn.Parameter(
-                torch.zeros(EXPERTS, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda"),
+                torch.zeros(
+                    EXPERTS, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda"
+                ),
                 requires_grad=False,
             )
             self.w2_weight = torch.nn.Parameter(
-                torch.zeros(EXPERTS, hidden, inter, dtype=torch.bfloat16, device="cuda"),
+                torch.zeros(
+                    EXPERTS, hidden, inter, dtype=torch.bfloat16, device="cuda"
+                ),
                 requires_grad=False,
             )
 

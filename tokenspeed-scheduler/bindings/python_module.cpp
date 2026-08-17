@@ -252,6 +252,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
+        .def_ro("mamba_track_pool_indices", &tokenspeed::ForwardBatch::mamba_checkpoint_dst_indices)
         .def("is_local_prefill", &tokenspeed::ForwardBatch::IsLocalPrefill)
         .def_prop_ro(
             "block_tables",

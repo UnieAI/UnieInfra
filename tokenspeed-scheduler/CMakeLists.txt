@@ -109,6 +109,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_swa_checkpoint_stride.cpp
         tests/cpp/test_checkpoint_slot_allocator.cpp
+        tests/cpp/test_forward_checkpoint_channel.cpp
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_manager.cpp
         tests/cpp/test_swa_manager.cpp

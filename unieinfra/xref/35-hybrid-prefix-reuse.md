@@ -373,3 +373,37 @@ Marconi 明講**當時沒有任何既有系統支援 hybrid 的 prefix caching**
 - **上面所有量測數字的時間戳是 2026-07-25 前後，而本分支此後有 41 個 commit**，
   其中包含 scheduler 優先權重排（`d1018671`，commit message 自陳未量測）。
   引用本文件任何 ms 數之前先重跑。
+
+
+---
+
+## 8. checkpoint 密度在高併發下是「重用 vs 常駐」，不是純粹的重用（實測，2026-08-17）
+
+出貨的間距是從 `max_model_len` 推導的固定值（`_MAX_STATE_CHECKPOINTS = 2`，
+`qwen35.py`）。它在 RAG c=64/128 上讓 goodput 從 0.75x 掉到 0.66x，重用從 75.5%
+掉到 69.5%，所以看起來像是「短 prompt 拿不到 checkpoint」的 bug ——
+MML=16384 → 間距 64 blocks，而 RAG 的 prompt 只有約 32 頁，落在一個間距之內。
+
+**把間距改成從請求自己的長度推導（固定 K 個快照）之後，RAG 更差。** 實測：
+
+| RAG c=64 | per-request K=2 | 固定間距（出貨值） |
+|---|---|---|
+| goodput | **2.49** req/s | 4.26 / 4.37 |
+| P99 TTFT | **8,955 ms** | 4,681 / 4,525（SLO 5,000） |
+| TPOT p50 | 30.1 ms | 39.0 ms |
+| reuse | 71.0% | 69.5% |
+
+重用確實升了 1.5 個百分點，TPOT 也更好，但 **P99 TTFT 幾乎翻倍**，跨過 SLO 的請求
+變多，goodput 掉 42%。原因是 charge：固定間距給一個 32 頁的 RAG 請求 **1** 個
+backed page（只有 chunk 尾），per-request K=2 給它 **2** 個。RAG 在 c=64 是
+arena-bound 的，多那一個 checkpoint 換到的重用補不回常駐數。
+
+**結構上的結論**：固定間距按「prompt 相對於 `max_model_len` 的長度」分配 checkpoint
+—— 短 prompt 少、長 prompt 多 —— 而 arena 壓力正好隨「併發 × 短 prompt」上升。
+per-request 的 K 讓長短 prompt 都拿到 K 個，分不開這兩者。**在這一題上固定間距是對的
+抽象，per-request 不是。** agent 26k c=16 兩者持平（1.00 vs 0.99），所以這個改動是
+純粹的退步，已還原。
+
+RAG c=64/128 的 LOSS 因此不是 checkpoint 密度能解的。下一格要看的是容量本身
+（`fp8 KV` 有 2x），或 vLLM 在這個形狀上到底快在哪 —— 我們 1,089 tok/s 對它 1,647，
+而兩邊 TTFT p50 都在 1 秒級，差距不在准入。

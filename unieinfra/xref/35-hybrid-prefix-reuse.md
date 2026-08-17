@@ -525,3 +525,91 @@ checkpoint slot 當 bf16 active slot 讀而拒絕這個組合（見 `AGENTS.md` 
 > 附註：探針 `kv_split_probe.py` 手工建 `FullAttentionSpec` / `MambaSpec` 再跑
 > vLLM 自己的群組與配置函式，不需要 GPU 也不需要權重。它先斷言兩邊頁大小相等，
 > 這一點和引擎日誌對得上，才有資格談後面的數字。
+
+## 10. 一個 parent 只能放一個 checkpoint，而 16 是 2 的冪的巧合（原始碼，2026-08-17）
+
+§8 量到「每請求第二個 backed page」在 RAG c=64 上要 42% 的 goodput
+（4.26 → 2.49 req/s）。這一節是那個代價的機制，以及它是不是必然。
+
+### 10.1 parent 是可互換單位，不是共享容器
+
+引擎自己印的：
+
+    parent_bytes=41943040, P=128, parents=222, token_capacity=454656, layers=40,
+    groups={'full_attention': 16, 'linear_attention_0': 1,
+            'linear_attention_1': 1, 'linear_attention_2': 1}
+
+`qwen_gdn_cache_fields` 把 plane 命名成 `unit.{unit}.a` / `unit.{unit}.b`，而
+`unit` 是**每群組各自的計數器**，所以不同群組共用同一組 plane id；
+`solve_cache_layout` 對 plane 取 `max` over groups。**因此一個 parent 同時只服務
+一個群組**，`usable_pages = num_lcm_blocks × cache_blocks_per_lcm_block` 是「所有
+parent 都給這個群組時」的上限，不是同時可得的量。
+
+### 10.2 那 48.8% 的浪費是什麼，以及它不是可回收的
+
+| plane | attention 放什麼 | state 放什麼 | 大小 |
+|---|---|---|---|
+| `unit.j.a` ×10 | K：16 頁 × 131,072 | ssm **2,097,152** | 2,097,152 |
+| `unit.j.b` ×10 | V：16 頁 × 131,072 | conv **49,152** | 2,097,152 |
+
+合計 41,943,040 = parent，逐位元吻合；state raw = 10×2,097,152 + 10×49,152 =
+21,463,040，同樣吻合。K/ssm 那半邊是**精確相等**的設計（16 個 attention 頁 ≡ 1 個
+ssm）；浪費全在 `.b`：**conv 只有 49,152 B 卻佔著一個 V 尺寸的 plane，使用率 2.34%。**
+
+**但把 conv 搬到自己的 plane 是輸的。** 那些位元組不是全域浪費，它們只在該 parent
+拿去放 state 時閒置，而 parent 拿去放 attention 時就需要它們——這是可互換性的代價。
+搬走只是多一個 attention 付錢卻用不到的 plane。用「每位元組買到幾個 block」來比：
+
+| 方案 | parent | attn/parent | state/parent | attn 每位元組 | state 每位元組 |
+|---|---|---|---|---|---|
+| 出貨 | 41,943,040 | 16 | 1 | 3.8147e-7 | 2.3842e-8 |
+| conv 獨立 plane | 84,869,120 | 32 | 2 | 3.7705e-7（−1.2%） | 2.3566e-8（−1.2%） |
+| **parent = 17 個 attn block** | **44,564,480** | **17** | **2** | **3.8147e-7（持平）** | **4.4880e-8（+88%）** |
+
+真正的槓桿是 **16 是 2 的冪的巧合**：
+
+    44,564,480 / 17 = 2,621,440   ← 與現行 attention stride 逐位元相同，零 padding
+    44,564,480 /  2 = 22,282,240  ≥ 21,463,040，state padding 3.8%
+
+**attention 每位元組一點不虧，state 容量 +88%。**
+
+### 10.3 但 packing=2 只在同一群組有 ≥2 個 checkpoint 時才有用
+
+parent 綁群組，而 state 有 **3 個**群組。一個請求在每組各放 1 個 block，就得佔 3 個
+parent，每個只用一半——packing 提高完全幫不上。
+
+| 每組 checkpoint 數 | 出貨（packing 1） | packing 2 |
+|---|---|---|
+| K=1 | 3 parents | 3 parents |
+| **K=2** | **6 parents** | **3 parents** |
+
+**所以 packing=2 的效果精確地是「讓第二個 checkpoint 免費」**，而 §8 量到的正是
+K=2：多出來的 3 個 parent 就是那 42% goodput 的去向。§8 的失敗實驗因此是這個改動的
+現成對照組。
+
+### 10.4 卡在一個 ABI，而且它寫在程式裡
+
+    # hybrid_mha.py:109
+    if ssm.stride(0) != int(np.prod(ssm.shape[1:])):
+        raise ValueError("... the GDN decode ABI requires contiguous state page rows")
+
+一個 parent 放兩個 state block，等於 ssm 的 page stride 不再等於 payload，所以 ssm
+必須從 `exact_page_stride=True` 改成 `False`（planner 用來標「kernel 吃 tensor 的
+runtime stride」）。`conv` 早就是 `False`，所以機制存在；`fla_kda_recurrent.py` 也
+早就在傳 `stride_state_page=h_pool.stride(0)`——但那是 KDA 不是 GDN，而 GDN 的
+FlashInfer 後端大概跟不上。
+
+`base.py:202` 的欄位 view 本來就是 `as_strided(page_stride_bytes // element_size)`，
+所以**框架層不需要改**，要改的只有宣告自己走隱含 stride 的那些 kernel。
+
+### 10.5 四家怎麼做（調查，2026-08-17）
+
+| 引擎 | conv / ssm 配置 |
+|---|---|
+| SGLang | 兩個獨立 tensor，`(num_layers, size+1) + shape`，按 slot 索引 |
+| TRT-LLM | 兩個獨立 `torch.zeros`；`intermediate_*_states` 是 MTP 用的，不是前綴 checkpoint |
+| lmdeploy | `conv_state` 與 `recurrent_state` 分開載入 |
+| vLLM | 同一頁但 `page_size = conv + ssm`，沒有 V 尺寸的 plane 逼它變大 |
+
+**四家一致：沒有任何一家把 conv 的 page stride 綁在 attention 的 V 上。** 這個耦合
+是 LCM arena 獨有的，也是這一節整個問題的來源。

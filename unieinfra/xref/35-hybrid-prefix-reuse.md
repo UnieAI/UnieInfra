@@ -613,3 +613,45 @@ FlashInfer 後端大概跟不上。
 
 **四家一致：沒有任何一家把 conv 的 page stride 綁在 attention 的 V 上。** 這個耦合
 是 LCM arena 獨有的，也是這一節整個問題的來源。
+
+### 10.6 實測：每一次准入拒絕都由 state 群組造成（2026-08-17）
+
+`AdmissionPlanner::Plan()` 在 `/workspace/roy/.plan_trace.on` 存在時，會把每次拒絕
+的每群組需求寫進 `.fits_trace.txt`。這個儀表**已經編譯在出貨的 .so 裡**，不需要重建。
+
+Qwen3.5-27B、RAG c=64、n=64、MML=16384、GPU 0
+（`parent_bytes=100663296, parents=366, groups={'full_attention': 12,
+'linear_attention_0/1/2': 1}`）。
+
+**82 次拒絕，82 次完全相同：**
+
+    parents_needed=3  empty_parents=1
+    g0(need=1 free=0 slots=1)   linear_attention_0
+    g1(need=1 free=0 slots=1)   linear_attention_1
+    g2(need=1 free=0 slots=1)   linear_attention_2
+    g3(need=1 free=7 slots=12)  full_attention
+
+扣掉 `free` 之後每群組實際要求的 parent 數：state 三組各 **1**，attention **0**，
+82/82 皆然。**注意力從來不是拒絕的原因。**
+
+而且原因是結構性的而非壓力性的：**`slots=1` 讓 state parent 從綁定的那一刻起
+`free` 恆為 0**，所以 state 永遠無法重用已綁定的 parent，每一個 state block 都必須
+要一塊**全空**的 parent。一個總共只要 4 個 block 的請求，在 7 個 attention slot 空
+著的情況下被拒絕，而 `empty_parents=1` —— 每一次都差兩塊。
+
+**這修正了 §10.3 的框架。** 共用是**跨請求**的，不是請求內的：parent 綁的是群組
+（`block_pool.h:94` 的 `BoundGroup` 回傳單一 optional group，所以三個 state 群組
+永遠不可能共用一個 parent 的不同 slot），而同一群組的兩個 block 來自兩個不同請求。
+
+| | packing 1（出貨） | packing 2 |
+|---|---|---|
+| 單一請求孤立來看 | 3 parents | **3**（不變） |
+| 64 請求 × 3 群組 × 1 block | **192 parents，每一個都必須是空的** | **96** |
+
+所以 packing=2 **在 K=1 就已經是純贏**，不必等到多 checkpoint 才划算：它把「需要全空
+parent」變成「可以擠進已綁定的 parent」，直接打在這 82 次拒絕上。
+
+> **同一次跑的端到端數字已作廢。** 另一個 session 的 gemma arm 從 21:14:11 起在
+> GPU 1 上跑，我的 benchmark 視窗落在其中。不同卡，但同一個容器與主機 CPU。trace
+> 不受影響——它是 allocator 對 GPU 0 arena 的自有記帳，且 82 筆逐筆相同而非平均值。
+> 乾淨窗口的 35B 覆核另記。

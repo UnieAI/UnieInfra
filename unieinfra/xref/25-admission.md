@@ -537,3 +537,52 @@ goodput 只在一個期限上報一個數字，會蓋掉曲線的形狀。35B ag
 **所以曲線前段不是准入政策能解的。** 要有快車道，得讓熱前綴留在 device 而不是掉到
 主機層，也就是 device 容量本身 —— `fp8 KV` 在 sm_120 上已證實可用（2x 容量），
 那是下一格。
+
+
+---
+
+## 9. 移植 vLLM 的就地搶佔：做了，更差，而且 vLLM 在那一格根本不搶佔（2026-08-17）
+
+§2.2 說我們是孤例 —— 搶佔的觸發是「整步空掉」，而飽和 pool 上那永遠不會發生。
+RAG c=64 實測證實了後果：56,141 個 decode 候選裡有 **6,988 個被拒**（12.4%），
+**搶佔零次**，每步平均只有 36.7 個請求拿到 decode，而常駐是 53–64。
+
+於是照 vLLM 的形狀移植：`scheduleDecode` 因容量失敗時就地挑一個 victim
+（不欠 forward result、且不是本步已排到的 —— 我們的 op 是邊排邊提交 FSM 與 block，
+沒有 vLLM `scheduler.py:548` 那種把已排請求撤出批次的回滾能力，所以 victim 只能取
+候選順序中還在我們後面的那一段），撤回後重試一次，並加上 vLLM 的
+`if not preempted_reqs`（本步搶佔過就不再准入）。
+
+機制有動 —— 日誌可見 `preempt: released request b (7 tokens) so a could decode` ——
+**結果更差**：
+
+| RAG c=64 | 就地搶佔 | 現行 |
+|---|---|---|
+| tok/s | **656.6** | 1089 / 1117 |
+| goodput req/s | **2.56** | 4.26 / 4.37 |
+| 時長 | **24.95 s** | 15.0 s |
+| 搶佔次數 | 52 | 0 |
+
+**然後看 vLLM 在同一格的日誌：`Running: 64 reqs, Waiting: 0 reqs`。它一次都沒搶佔。**
+它把 64 個全部同時跑完，9.9 秒結束。所以「移植搶佔」從一開始就是錯的槓桿 ——
+vLLM 快不是因為它搶佔得好，是因為**它根本不需要**。
+
+### 真正的差別是每請求的 parent 佔用
+
+| | bytes/block | 每 parent 放得下 | 每請求 |
+|---|---|---|---|
+| `full_attention` | 2,621,440 | 16 | 4k prompt → 2 parents |
+| `linear_attention_0/1/2` | 21,463,040（fp32） | **1**（浪費 49%） | **3 parents**（三個群組各一） |
+
+parent 是 41,943,040 bytes，而一個狀態快照是 20.47 MB —— **差一點點就放得下兩個**，
+所以每個 parent 只放一個、將近一半空著。一個 4k 的 RAG 請求因此吃掉約 5 個 parent，
+64 個請求要 320 個，而池子只有 224。vLLM 的 mamba 是單一群組、`"align"` 模式兩頁，
+所以它裝得下。
+
+`mamba_ssm_dtype` 目前是 `float32`。SGLang 的 `Int8CheckpointStore`
+（`srt/mem_cache/mamba_checkpoint_pool.py:186`）把 SSM 狀態存成 int8，scale 是
+per-(layer, slot, head, k-channel)、縮減軸取 `d_v`，對齊 `diag(alpha)` 的 per-k-channel 衰減。
+換算過來是 **5.12 MB/block、每 parent 7 個**，也就是狀態群組的 parent 佔用降到 1/7。
+
+**這是下一格，而且它跟今天失敗的四個走的是不同的軸** —— 前四個都在既有容量上重新分配
+（checkpoint 密度、host 層、前綴長度、搶佔），這一個是把每請求的佔用直接砍掉。

@@ -157,13 +157,6 @@ class ServerArgs:
     # when they are not. It is the default for that reason, not because it won
     # one benchmark.
     admission_reserve: str = "generation-full"
-    # Cap on requests left mid-prefill at the end of a step; 0 is unlimited,
-    # which is what the scheduler did before this knob existed. Admission was
-    # bounded only by the token budget and max_batch_size, so a step could
-    # admit 11 new sequences into 8,192 tokens against ~1,149-token prompts --
-    # none finishing, 21 still queued. Left at 0 pending the sweep that sets a
-    # measured default; see unieinfra/gemma-notes.md.
-    max_partial_prefills: int = 0
     # Kernel page size. Flat scheduler logical pages come from the LCM
     # runtime contract and must not overwrite this value.
     block_size: int = 64
@@ -1157,19 +1150,6 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
-        )
-        parser.add_argument(
-            "--max-partial-prefills",
-            type=int,
-            default=ServerArgs.max_partial_prefills,
-            help=(
-                "Maximum requests left with an unfinished prefill at the end of "
-                "a scheduler step (0 = unlimited). Bounds fragmentation of the "
-                "per-step token budget, not concurrency: a request whose "
-                "prefill completes in the step does not count. vLLM exposes "
-                "this as --max-num-partial-prefills, though its V1 scheduler "
-                "never reads it."
-            ),
         )
         parser.add_argument(
             "--admission-reserve",

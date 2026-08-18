@@ -223,6 +223,7 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         mlp_only_layers=[],
         layer_types=None,
+        output_gate_type="silu",
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -262,6 +263,23 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
+
+        # Qwen3.8 ships `output_gate_type`; Qwen3.5 does not. The GDN output
+        # gate is hardcoded to silu here (`layernorm_gated`: norm(x) * silu(z)),
+        # and swish IS silu -- vLLM folds the two the same way
+        # (`qwen_gdn_linear_attn.py`). So accepting those two costs nothing and
+        # changes nothing. Anything else would run silu regardless and produce
+        # plausible-but-wrong output that no latency number can see, which is
+        # the failure worth refusing at startup rather than serving.
+        if output_gate_type not in ("silu", "swish"):
+            raise ValueError(
+                f"unsupported output_gate_type={output_gate_type!r}; this "
+                "runtime applies silu unconditionally in the GDN output gate, "
+                "so it would silently compute the wrong activation. Implement "
+                "it in tokenspeed/runtime/layers/attention/linear/"
+                "layernorm_gated.py before loading this checkpoint."
+            )
+        self.output_gate_type = output_gate_type
 
     @property
     def layers_block_type(self):

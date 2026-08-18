@@ -115,6 +115,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_forward_batch.cpp
+        tests/cpp/test_partial_prefill_cap.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_kv_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp

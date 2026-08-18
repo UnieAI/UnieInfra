@@ -118,3 +118,50 @@ prompt 加完整 max_new_tokens），但 64 × 1,150 ≈ 73k 在 173,376 的池�
    檢查 server，並排除容器裡數百個 `[tokenspeed::sch] <defunct>` 殭屍。
 3. **`pgrep | head -1` 只殺第一個匹配**：我啟動過兩次的 runner 活了一個下來，在我把機器交給
    別人的那一刻自己開跑。停止背景 runner 後必須**重新列一次確認為 0**。
+
+## Decode 的 roofline：頭手還剩多少
+
+權重 62.5 GB。分母用**實測唯讀**頻寬，不是 copy、也不是規格：
+
+```
+read-only : 1523.3 GB/s   <- decode 讀權重的真分母
+copy(r+w) : 1460.6 GB/s   <- .roofline.py 報的（重現了先前的 1461.8）
+datasheet : 1792.0 GB/s   <- 實測唯讀只達到它的 85%
+```
+
+唯讀只比 copy 高 **4.3%**，所以先前用 copy 當分母得到的結論碰巧成立。而規格 1792 會讓每一格
+的達成率偏低 15%——**它是一個沒有 kernel 達得到的數字**。每步下限 62.5/1523.3 = **41.0 ms**。
+
+### 達成率必須用引擎報的純 decode，不是 benchmark 的端到端
+
+```
+Decode batch. #running-req: 32, page ratio: 0.65, gen throughput: 546.49
+Decode batch. #running-req: 32, page ratio: 0.68, gen throughput: 519.26
+Decode batch. #running-req: 32, page ratio: 0.71, gen throughput: 514.62
+```
+
+| 來源 | tok/s | 對 780 的達成 | 可得 |
+|---|---|---|---|
+| benchmark 端到端 | 437.8 | 58.4% | 1.71x |
+| **引擎純 decode** | **514–546** | **66–70%** | **~1.45x** |
+
+端到端的數字含 prefill 步與暖機/收尾，把它當 decode 效率會**高估缺口**。先驗過批次是滿的
+（44 個排程取樣裡 31 個 `#running-req: 32`），所以缺口本身是真的。
+
+各併發（用引擎純 decode 校正過的比例外推）：c=1 已在約 88%，**c=32 是操作點且只有 66–70%**。
+**低併發沒有空間，空間在操作點的 decode。**
+
+### decode 吞吐隨上下文衰減
+
+上面三行是同一次跑、批次固定 32：吞吐 546 → 514，`page ratio` 0.65 → 0.71。每步要重讀的 KV
+隨已產生的 token 累積變大，所以**「每步固定讀一次權重」的模型在關鍵處是錯的**——下限是常數，
+每步總量不是。
+
+推論：**同一併發、不同 OSL 的兩格量的不是同一件事**。OSL 長的那格會看起來比較差，原因與引擎
+無關。任何單一的 tok/s 都只是衰減曲線上的一個取樣點。
+
+### 待辦：那 17.6 ms 的歸屬
+
+批次 32、546 tok/s → 每步 58.6 ms，下限 41.0 ms，缺口 **17.6 ms**。KV 流量估約 4.5 ms，
+**剩約 13 ms 未歸屬**。torch profiler 走不通（這個 build 沒註冊 `/start_profile` 路由，
+`VLLM_TORCH_PROFILER_DIR` 有設也沒有），下一個儀器是 `LOG_MM_TIMING`。

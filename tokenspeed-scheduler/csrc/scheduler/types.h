@@ -70,27 +70,6 @@ struct SchedulerConfig {
     // waiting for a page. Throughput at a full batch matched vLLM (1036 vs
     // 1036 tok/s); the run averaged 215 because the batch was almost never
     // full. See unieinfra/xref/25-admission.md.
-    // Cap on requests left with an INCOMPLETE prefill at the end of a step.
-    // A request whose prefill finishes this step does not count, so this
-    // bounds fragmentation of the token budget, not concurrency.
-    //
-    // Measured on gemma-4-31B / RAG: with no cap the scheduler admitted 11 new
-    // sequences into one 8,192-token step -- ~745 tokens each against ~1,149
-    // token prompts, so none of them finished and 21 more sat queued behind
-    // them. vLLM on the same shape at c=64 held TTFT p99 at 3,435 ms and
-    // 640 tok/s; we managed 6,925 ms p50 and 481 tok/s.
-    //
-    // This is vLLM's max_num_partial_prefills, which their V1 scheduler
-    // plumbs but never reads -- their actual throttle is memory-based
-    // (`scheduler_reserve_full_isl`), and ours does not bind because the pool
-    // is large enough that capacity is never the limit on this shape.
-    //
-    // 0 means unlimited, which is the behaviour before this field existed.
-    // A cap of 1 is NOT the safe default: the comment in buildForwardOperations
-    // records that holding a single incomplete prefill as head of line cost
-    // TTFT p50 18.1 s against vLLM's 3.4 s on the 35B agent shape, where a
-    // 43k-token prompt occupies the line for six consecutive steps.
-    std::int32_t max_partial_prefills{0};
     bool reserve_full_prefill_at_admission{true};
     // Preempt when a single request is blocked for capacity, instead of only
     // when the whole step produced no operation at all. Ported from vLLM,

@@ -807,6 +807,13 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
     };
 
+    // Requests that will end this step with an unfinished prefill. Candidates
+    // are sorted so every continuation (Prefilling, priority 3) is scheduled
+    // before any new admission (Submitted, priority 4), so this count is
+    // complete by the time it gates one.
+    std::int32_t partial_prefills = 0;
+    std::int32_t rej_partial_cap = 0;
+
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
             trace_stop = token_budget <= 0 ? "token budget exhausted" : "max_batch_size reached";
@@ -843,6 +850,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                     break;
                 }
                 if (request->Is<fsm::Prefilling>()) {
+                    ++partial_prefills;
                     // Admission reserves only this chunk, not the request's
                     // remaining prompt. Keep one incomplete prefill as the
                     // head of line so another request cannot strand it by
@@ -904,6 +912,17 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 ++rej_firstchunk;
                 continue;
             }
+            // Stop admitting once enough requests already owe an unfinished
+            // prefill. Without this the only limits are the token budget and
+            // max_batch_size, so a step admits as many as fit and gives each a
+            // fraction of the budget: measured 11 new sequences sharing 8,192
+            // tokens against ~1,149-token prompts, none finishing, 21 queued.
+            // Unlike closing admissions entirely, a cap of N still lets short
+            // prompts through while a long one is mid-flight.
+            if (config_.max_partial_prefills > 0 && partial_prefills >= config_.max_partial_prefills) {
+                ++rej_partial_cap;
+                continue;
+            }
             if (config_.role == Role::kD && pushed_decode) {
                 trace_stop = "D-role: decode already pushed (first chunk)";
                 break;
@@ -918,6 +937,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 }
                 trackPendingForwardResult(request);
                 if (request->Is<fsm::Prefilling>()) {
+                    ++partial_prefills;
                     // Same head-of-line rule as the continuation branch above,
                     // for a request whose first chunk did not finish its
                     // prompt. Reserving the whole prompt at admission removes
@@ -964,14 +984,16 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                          "budget %d->%d used=%d candidates=%zu prefill_ops=%d first_chunk=%d "
                          "decode_ops=%d waiting=%zu skipped(retract=%d reserve=%d) "
                          "state(sub=%d pre=%d dec=%d other=%d) "
-                         "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d) stop=\"%s\"\n",
+                         "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d partial_cap=%d) "
+                         "partial=%d stop=\"%s\"\n",
                          trace_budget_start, token_budget, trace_budget_start - token_budget,
                          trace_candidates, trace_prefill_ops, trace_first_chunk_tokens,
                          trace_decode_ops,
                          trace_candidates - static_cast<std::size_t>(trace_prefill_ops + trace_decode_ops),
                          trace_skip_retract, trace_skip_reserve,
                          st_submitted, st_prefilling, st_decode, st_other,
-                         rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, trace_stop);
+                         rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, rej_partial_cap,
+                         partial_prefills, trace_stop);
             std::fflush(trace_file);
         }
     }

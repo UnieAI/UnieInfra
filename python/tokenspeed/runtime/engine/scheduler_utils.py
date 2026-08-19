@@ -215,6 +215,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     admission_reserve: str = "generation-full",
     prefix_replay_tokens: int = 0,
+    max_cold_prefills: int = 0,
 ) -> SchedulerConfig:
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -263,6 +264,12 @@ def make_config(
         cfg.new_token_ratio_init = 1.0
     else:
         raise ValueError(f"unknown admission_reserve {admission_reserve!r}")
+    if not 0 <= max_cold_prefills <= (1 << 31) - 1:
+        raise ValueError(
+            "max_cold_prefills must fit a non-negative int32; "
+            f"got {max_cold_prefills}."
+        )
+    cfg.max_cold_prefills = max_cold_prefills
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg

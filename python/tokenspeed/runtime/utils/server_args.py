@@ -157,6 +157,12 @@ class ServerArgs:
     # when they are not. It is the default for that reason, not because it won
     # one benchmark.
     admission_reserve: str = "generation-full"
+    # Cap on requests admitted in one step whose prefix matched nothing in the
+    # cache; 0 is unlimited. Requests admitted together all probe the cache
+    # before any of them writes to it, so on a shared-prefix corpus the first
+    # step prefills the same prefix once per request. Measured cold vs warm
+    # TTFT p50 on gemma-4-31B / RAG c=64: 4,022 ms against 1,837 ms.
+    max_cold_prefills: int = 0
     # Kernel page size. Flat scheduler logical pages come from the LCM
     # runtime contract and must not overwrite this value.
     block_size: int = 64
@@ -1150,6 +1156,17 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+        )
+        parser.add_argument(
+            "--max-cold-prefills",
+            type=int,
+            default=ServerArgs.max_cold_prefills,
+            help=(
+                "Maximum requests admitted in one scheduler step whose prefix "
+                "missed the cache entirely (0 = unlimited). Lets the first one "
+                "publish its prefix before the rest probe, instead of every "
+                "request in the step prefilling the same prefix independently."
+            ),
         )
         parser.add_argument(
             "--admission-reserve",

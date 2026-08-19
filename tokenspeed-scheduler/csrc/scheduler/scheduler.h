@@ -110,7 +110,8 @@ private:
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(PlanBuildContext& context,
                                                                                  Request* request,
                                                                                  std::int32_t remaining,
-                                                                                 std::int32_t decode_input_tokens);
+                                                                                 std::int32_t decode_input_tokens,
+                                                                                 std::int32_t* out_hit_tokens = nullptr);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(PlanBuildContext& context, Request* request,
                                                              std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event);

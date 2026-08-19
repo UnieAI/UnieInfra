@@ -252,13 +252,17 @@ bool Scheduler::admitWithKvEventTracking(PlanBuildContext& context, Request& req
 }
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
-    PlanBuildContext& context, Request* request, std::int32_t remaining, std::int32_t decode_input_tokens) {
+    PlanBuildContext& context, Request* request, std::int32_t remaining, std::int32_t decode_input_tokens,
+    std::int32_t* out_hit_tokens) {
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return std::nullopt;
     }
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    if (out_hit_tokens != nullptr) {
+        *out_hit_tokens = hit_tokens;
+    }
     const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
     _assert(promotion_boundary_tokens == 0 ||
                 (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
@@ -807,6 +811,12 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
     };
 
+    // Admissions this step whose prefix matched nothing in the cache. They are
+    // the ones that duplicate each other's prefill work, because they all probe
+    // before any of them publishes.
+    std::int32_t cold_prefills = 0;
+    std::int32_t rej_cold_cap = 0;
+
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
             trace_stop = token_budget <= 0 ? "token budget exhausted" : "max_batch_size reached";
@@ -908,10 +918,19 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 trace_stop = "D-role: decode already pushed (first chunk)";
                 break;
             }
+            if (config_.max_cold_prefills > 0 && cold_prefills >= config_.max_cold_prefills) {
+                ++rej_cold_cap;
+                continue;
+            }
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
             ++st_submitted;
-            if (auto event = schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens)) {
+            std::int32_t hit_tokens = 0;
+            if (auto event =
+                    schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens, &hit_tokens)) {
+                if (hit_tokens == 0) {
+                    ++cold_prefills;
+                }
                 push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
@@ -964,14 +983,16 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                          "budget %d->%d used=%d candidates=%zu prefill_ops=%d first_chunk=%d "
                          "decode_ops=%d waiting=%zu skipped(retract=%d reserve=%d) "
                          "state(sub=%d pre=%d dec=%d other=%d) "
-                         "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d) stop=\"%s\"\n",
+                         "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d cold_cap=%d) cold=%d "
+                         "stop=\"%s\"\n",
                          trace_budget_start, token_budget, trace_budget_start - token_budget,
                          trace_candidates, trace_prefill_ops, trace_first_chunk_tokens,
                          trace_decode_ops,
                          trace_candidates - static_cast<std::size_t>(trace_prefill_ops + trace_decode_ops),
                          trace_skip_retract, trace_skip_reserve,
                          st_submitted, st_prefilling, st_decode, st_other,
-                         rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, trace_stop);
+                         rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, rej_cold_cap,
+                         cold_prefills, trace_stop);
             std::fflush(trace_file);
         }
     }

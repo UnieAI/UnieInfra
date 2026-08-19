@@ -511,6 +511,7 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             admission_reserve=server_args.admission_reserve,
+            max_cold_prefills=server_args.max_cold_prefills,
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(

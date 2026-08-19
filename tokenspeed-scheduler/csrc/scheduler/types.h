@@ -70,6 +70,22 @@ struct SchedulerConfig {
     // waiting for a page. Throughput at a full batch matched vLLM (1036 vs
     // 1036 tok/s); the run averaged 215 because the batch was almost never
     // full. See unieinfra/xref/25-admission.md.
+    // Cap on requests admitted in one step whose prefix matched NOTHING in the
+    // cache. Zero means unlimited, which is the behaviour before this field.
+    //
+    // Measured on gemma-4-31B / RAG at c=64: the first step of a measured run
+    // admits ten requests and the whole step reports 1,088 cached tokens --
+    // about one request's worth -- because all ten probe the cache in the same
+    // step, before any of them has written to it. They then prefill the same
+    // ~1,000-token shared prefix ten times over. The cache fills in as the run
+    // proceeds (1,088 -> 6,784 -> 17,664 cached across successive steps), so
+    // the redundancy is confined to the cold start, but that start is what TTFT
+    // measures: p50 4,022 ms on a cold cache against 1,837 ms on a warm one.
+    //
+    // Admitting one cold request per step lets it publish its prefix before the
+    // rest probe. It costs a step of latency when prompts share nothing, which
+    // is why it is off by default and set from measurement.
+    std::int32_t max_cold_prefills{0};
     bool reserve_full_prefill_at_admission{true};
     // Preempt when a single request is blocked for capacity, instead of only
     // when the whole step produced no operation at all. Ported from vLLM,

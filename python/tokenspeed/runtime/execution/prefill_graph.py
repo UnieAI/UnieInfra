@@ -286,21 +286,45 @@ class PrefillGraph:
         self.dp_size = config.data_parallel_size
 
         self.capture_buckets = get_prefill_token_buckets(config)
-        self.disable = (
-            config.enforce_eager
-            or config.disable_prefill_graph
-            or not self.capture_buckets
-            or self.inner_model is None
-            or self._embed_tokens is None
-            or model_runner is None
-            or not model_runner.is_generation
+        # Ordered so the first hit is the most specific reason, and named so a
+        # disabled graph says why. An operator who passes
+        # --prefill-graph-max-tokens and gets eager prefill anyway has no way
+        # to tell which condition bit; that silence cost a measurement cycle
+        # (a "prefill graphs don't help" reading taken from a run where they
+        # never captured -- xref 15-encoder-embedding.md §6.6).
+        disable_reasons = [
+            ("enforce_eager", config.enforce_eager),
+            ("disable_prefill_graph", config.disable_prefill_graph),
+            # Only a root cause: get_prefill_token_buckets returns empty when
+            # disable_prefill_graph is set, so reporting it next to that flag
+            # would name a consequence as if it were a reason.
+            (
+                "no capture buckets (prefill_graph_max_tokens <= 0)",
+                not self.capture_buckets and not config.disable_prefill_graph,
+            ),
+            ("model_runner is None", model_runner is None),
+            ("model exposes no inner .model", self.inner_model is None),
+            ("inner model exposes no embed_tokens", self._embed_tokens is None),
+            (
+                "model is not a generation model",
+                model_runner is not None and not model_runner.is_generation,
+            ),
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
             # prefill eager while text-only peers replay desyncs the EP
             # collectives. Until the DP metadata gather carries a multimodal
             # flag, keep the graph off for multimodal models under DP.
-            or (config.data_parallel_size > 1 and model_runner.is_multimodal)
-        )
+            (
+                "multimodal model under DP",
+                model_runner is not None
+                and config.data_parallel_size > 1
+                and model_runner.is_multimodal,
+            ),
+        ]
+        hit = [name for name, failed in disable_reasons if failed]
+        self.disable = bool(hit)
+        if self.disable and config.global_rank == 0:
+            logger.info("prefill breakable graph disabled: %s", ", ".join(hit))
 
         self._ctx: ForwardContext | None = None
         self._pool = None

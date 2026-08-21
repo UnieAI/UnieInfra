@@ -205,7 +205,26 @@ def validate_mixed_batch_backend(server_args, attn_backend) -> None:
         )
 
 
-def resolve_fi_gdn_prefill_graph(server_args) -> None:
+def _uses_gdn_linear_attention(model_config) -> bool:
+    """Does this checkpoint have linear-attention (GDN) layers at all?
+
+    Hybrid models declare them in ``layer_types`` on the text config
+    (``configs/qwen3_5_text_base_config.py:297``); a dense or MoE model either
+    has no such field or lists only attention layers. Read from the config
+    rather than from the attention-backend name: the backend is chosen later
+    and per layer, while what decides whether the GDN chunk-prefill kernel can
+    run at all is whether such a layer exists.
+    """
+    text_config = getattr(model_config, "hf_text_config", None)
+    if text_config is None:
+        return True  # unknown shape: keep the conservative behaviour
+    layer_types = getattr(text_config, "layer_types", None)
+    if not layer_types:
+        return False
+    return any("linear" in str(label) for label in layer_types)
+
+
+def resolve_fi_gdn_prefill_graph(server_args, model_config=None) -> None:
     """Turn the prefill graph off when the flashinfer GDN kernel is in use.
 
     The two cannot coexist: under a prefill capture that kernel answers every
@@ -233,6 +252,14 @@ def resolve_fi_gdn_prefill_graph(server_args) -> None:
     if os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120", "1") == "0":
         return
     if getattr(server_args, "disable_prefill_graph", False):
+        return
+    if model_config is not None and not _uses_gdn_linear_attention(model_config):
+        # The kernel this function protects against only runs on models with
+        # linear-attention layers. Disabling the prefill graph for a dense or
+        # MoE model turns off a capture that has nothing to do with GDN, and
+        # that is not free: on Qwen3-0.6B a single short request costs 17.3 ms
+        # with the graph off against 8.98 ms with it on. The guard used to
+        # fire for every model, which is how that 8 ms hid.
         return
     if os.getenv("TOKENSPEED_FI_GDN_ALLOW_PREFILL_GRAPH") == "1":
         # Diagnostic escape hatch for the combination this function exists to
@@ -372,7 +399,7 @@ class EventLoop:
         # and freezes the bucket ladder, so flipping the flag afterwards prints
         # a reassuring warning and changes nothing. That mistake shipped a
         # default that served "!!!!!!!!" at 586 tok/s with 0 failed requests.
-        resolve_fi_gdn_prefill_graph(server_args)
+        resolve_fi_gdn_prefill_graph(server_args, self.model_config)
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,

@@ -527,6 +527,29 @@ class BertTransformer(nn.Module):
     embedding_cls: type[nn.Module] = BertEmbedding
     layer_cls: type[nn.Module] = BertLayer
 
+    # Refused, and measured before refusing: on bge-small the breakable
+    # prefill graph is worth 6.69 -> 3.29 ms (2.03x), so this is a real
+    # prize, not a shrug.
+    #
+    # It cannot be taken as the graph stands. This stack reads its batch
+    # layout from ``ctx.gather_ids`` *inside* the region that gets captured,
+    # and the graph captures against ``make_dummy_batch``'s context, which it
+    # drops (``self._ctx = None``) once capture finishes. Nothing refreshes
+    # that tensor's contents per replay, so every replay would attend with
+    # the dummy batch's sequence boundaries. Verified, not assumed: with the
+    # graph engaged, parity fell to 0.295 (bge) and 0.683 (e5) -- a
+    # well-formed embedding computed over the wrong rows.
+    #
+    # A pooling *decoder* is unaffected because its reduction runs in
+    # ``replay()``'s eager tail against the caller's real context; only a
+    # model that needs the layout during the forward hits this.
+    #
+    # Lifting it means giving the prefill graph a per-replay batch-layout
+    # buffer (positions_buf already refreshes; cu_seqlens could be derived
+    # from it with fixed shapes), which is a change to machinery every model
+    # shares and wants its own verification.
+    supports_prefill_graph: bool = False
+
     def __init__(
         self,
         config: PretrainedConfig,

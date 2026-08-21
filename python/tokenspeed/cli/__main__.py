@@ -46,8 +46,65 @@ def _select_scheduler_ext(raw_argv: list[str]) -> None:
         select_flat_kvcache_ext_for_model_path(model)
 
 
+# Routes the in-repo control server and the smg gateway can answer today.
+# Keyed by the runtime a checkpoint resolves to; an empty tuple means the
+# engine will start and then have nothing to answer with.
+_RUNTIME_ROUTES: dict[str, tuple[str, ...]] = {
+    "generate": ("/v1/completions", "/v1/chat/completions", "/v1/responses"),
+    "embed": (),
+    "rerank": (),
+    "asr": (),
+    "diffusion": (),
+}
+
+_RUNTIME_MISSING: dict[str, str] = {
+    "embed": "/v1/embeddings",
+    "rerank": "/v1/rerank",
+    "asr": "/v1/audio/transcriptions",
+}
+
+
+def _announce_runtime(raw_argv: list[str]) -> None:
+    """Say which runtime this checkpoint resolved to, and what can reach it.
+
+    Printed rather than inferred silently: ``ts serve <model>`` is meant to be
+    the whole command for every model this engine runs, and the operator
+    should be able to see that the engine agreed with them about what the
+    checkpoint is. A wrong answer here is otherwise quiet -- an embedding
+    checkpoint served generatively builds an lm_head no weight fills.
+    """
+    from tokenspeed.runtime_select import describe_runtime, resolve_serving_runtime
+
+    model = next((arg for arg in raw_argv if arg and not arg.startswith("-")), None)
+    if model is None:
+        return
+    runtime = resolve_serving_runtime(model)
+    print(f"[ts serve] runtime: {runtime} -- {describe_runtime(runtime)}")
+
+    if runtime == "diffusion":
+        raise SystemExit(
+            "[ts serve] this is a diffusers pipeline (model_index.json), and "
+            "the diffusion runtime is not built yet.\n"
+            "           Survey and plan: unieinfra/xref/16-diffusion.md"
+        )
+
+    missing = _RUNTIME_MISSING.get(runtime)
+    if missing:
+        # Start anyway: the engine path is real and reachable in-process via
+        # Engine.encode(...), and refusing would block the people using it.
+        # But say plainly that HTTP cannot reach it, because "the server
+        # started" would otherwise read as "the model is being served".
+        print(
+            f"[ts serve] warning: no {missing} route exists yet, so this "
+            f"model is not reachable over HTTP.\n"
+            f"           The engine path is verified and usable in-process "
+            f"(Engine.encode). See unieinfra/REPORT-encoder-serving.md §5."
+        )
+
+
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     _select_scheduler_ext(raw_argv)
+    _announce_runtime(raw_argv)
 
     from tokenspeed.cli.serve_smg import run_smg_from_args
 

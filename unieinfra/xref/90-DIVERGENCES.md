@@ -47,6 +47,21 @@
 | P3 | prefill 專用 breakable graph | 與 SGLang 同級，vLLM 只有 piecewise，TRT-LLM 只有 decode graph | `30-prefill.md` §3 |
 | P4 | C++ scheduler 的 TP 決定性有明文保證 | 排序以 `Id()` 平手，理由寫在註解裡 | `20-scheduler.md` §2.6 |
 
+### 1.1 encoder / embedding（`15-encoder-embedding.md`，四方對照，TurboMind 缺席）
+
+| # | 分歧點 | 階段 | 誰跟誰同一邊 | 本引擎 | 預期成本方向 | 來源 |
+|---|---|---|---|---|---|---|
+| D23 | encoder-only 模型的 KV pool | cache | TRT-LLM 完全不建 manager、vLLM 用 0 個 group；SGLang 照樣配滿整池只是不寫不讀 | **缺席**（沒有 embedding 能力） | **大**（能力缺口） | `15-encoder-embedding.md` §3.2 |
+| D24 | cross-attention KV 放哪 | cache | vLLM / TRT-LLM 各給獨立 spec 或獨立 pool；SGLang 用 layer_id 位移折進主池 | **缺席**（無 cross-attention） | **大**（能力缺口） | `15-encoder-embedding.md` §3.3 |
+| D25 | 「不要 decode」怎麼表達 | scheduler | 三家三種：vLLM `max_tokens=1`、SGLang 在 `run_batch` 分岔、TRT-LLM 換 `EarlyStopSampler` | 缺席 | 小（結構選擇） | `15-encoder-embedding.md` §3.4 |
+| D26 | embedding 流量的專屬批次 | API | 只有 TRT-LLM 有 HTTP 層 dynamic batcher（5ms hold window） | 缺席 | 中（待量，見 §2） | `15-encoder-embedding.md` §3.5 |
+| D27 | 能力宣告 vs 現場改寫旗標 | config | vLLM 用可查詢的 `attn_type` 推導能力；SGLang 在 `server_args` 後處理直接改寫使用者旗標 | — | 小（可維護性） | `15-encoder-embedding.md` §3.1 |
+
+**已有的一半**：非因果 encoder attention 我們已經有了
+（`runtime/layers/attention/mm_encoder_attention.py`，四個 backend、全部 `causal=False`），
+且已在服務 ASR（`runtime/models/qwen3_asr.py`，但是 decoder-only + audio prefix，沒有 cross-attention）。
+缺的是 pooling／輸出契約、無 KV 請求型別、cross-attention 的 cache family。
+
 ---
 
 ## 2. 下一輪量測範圍

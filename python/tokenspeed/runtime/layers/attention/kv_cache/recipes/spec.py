@@ -294,7 +294,8 @@ def _retention_for_label(label: str) -> Retention | None:
     Args:
         label: A layer_type label — one of the exact vocabulary in
             ``_LAYER_TYPE_RETENTION``, or a sliding sub-group label
-            ``sliding_attention_<k>`` (k a decimal index).
+            or a numbered sub-group label ``<known label>_<k>`` (k a
+            decimal index), as produced by ``split_groups_to_equal_depth``.
 
     Returns:
         The label's retention, or None for labels outside the vocabulary.
@@ -302,11 +303,21 @@ def _retention_for_label(label: str) -> Retention | None:
     retention = _LAYER_TYPE_RETENTION.get(label)
     if retention is not None:
         return retention
-    if (
-        label.startswith(_SLIDING_SUBGROUP_PREFIX)
-        and label[len(_SLIDING_SUBGROUP_PREFIX) :].isdigit()
-    ):
-        return "sliding_window"
+    # A numbered sub-group label, `<known label>_<k>`. `split_groups_to_equal_depth`
+    # appends the suffix to WHICHEVER label is deepest, not to sliding ones only:
+    # `f"{label}_{rank % num_groups}"`. Accepting the suffix on sliding labels
+    # alone was true while gemma was the only split model, and became false the
+    # moment mha.py started splitting any stack that labels its layers -- a
+    # Qwen3.5-27B stack is 48 linear of 64, so it splits into
+    # `linear_attention_0..2` and every one of them was rejected:
+    #
+    #   ValueError: unknown layer_type 'linear_attention_0' at layer 0
+    #
+    # which fails at engine startup, on the model that had nothing to do with
+    # the change. Resolve the base label instead of matching one prefix.
+    base, sep, index = label.rpartition("_")
+    if sep and index.isdigit():
+        return _LAYER_TYPE_RETENTION.get(base)
     return None
 
 

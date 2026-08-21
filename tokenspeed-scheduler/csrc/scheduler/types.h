@@ -47,6 +47,44 @@ struct SchedulerConfig {
     // does not continuously stream ordinary Device cache entries to Host.
     bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
 
+    // How the per-step token budget is divided among the requests that are
+    // mid-prefill. Ported from TRT-LLM's `ContextChunkingPolicy`
+    // (cpp/tensorrt_llm/batch_manager/microBatchScheduler.cpp:126 for the
+    // kEQUAL_PROGRESS specialisation); it is the only one of the five surveyed
+    // engines that makes this a choice rather than a side effect.
+    //
+    //   kFirstComeFirstServed  what we have always done: `schedulePrefill`
+    //     takes min(remaining, unscheduled), so the first continuation in
+    //     priority order consumes the whole step and the next request is
+    //     offered whatever is left, usually nothing.
+    //
+    //   kEqualProgress  round-robin: every mid-prefill request is offered one
+    //     `context_chunk_unit` per pass, repeatedly, until the budget is spent
+    //     or nobody can take more. Same total budget, same makespan; what
+    //     changes is WHICH requests finish early.
+    //
+    // Which is better is a function of how unequal the prefill work is, and
+    // that is what this exists to measure rather than assume. With equal work
+    // FCFS strictly dominates on mean completion time -- 16 identical prompts
+    // at one step each finish at steps 1..16 under FCFS and ALL at step 16
+    // under equal progress. With unequal work the long prompts under FCFS wait
+    // behind everything and miss the deadline: measured on
+    // agent-26k/Qwen3.6-35B-A3B c=16, where prompt lengths span 23x, our TTFT
+    // correlates +0.575 with a request's own length while vLLM's is flat
+    // (-0.026), and the four requests that miss the 10 s bound are literally
+    // the four longest prompts in the corpus.
+    //
+    // NOT the same knob as `--chunked-prefill-size`. That sets
+    // `max_scheduled_tokens`, the whole step; shrinking it makes the step
+    // smaller, not shared, and measured 8192 -> 1024 on that cell cost 74% of
+    // throughput while the length correlation barely moved (+0.456 -> +0.409).
+    enum class ContextChunkPolicy { kFirstComeFirstServed, kEqualProgress };
+    ContextChunkPolicy context_chunk_policy{ContextChunkPolicy::kFirstComeFirstServed};
+    // Granularity of one round-robin pass. 0 means "one cache block", which
+    // keeps every offer page-aligned -- an unaligned chunk is refused outright
+    // by AlignPrefillChunk on hybrid models.
+    std::int32_t context_chunk_unit{0};
+
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
@@ -70,6 +108,22 @@ struct SchedulerConfig {
     // waiting for a page. Throughput at a full batch matched vLLM (1036 vs
     // 1036 tok/s); the run averaged 215 because the batch was almost never
     // full. See unieinfra/xref/25-admission.md.
+    // Cap on requests admitted in one step whose prefix matched NOTHING in the
+    // cache. Zero means unlimited, which is the behaviour before this field.
+    //
+    // Measured on gemma-4-31B / RAG at c=64: the first step of a measured run
+    // admits ten requests and the whole step reports 1,088 cached tokens --
+    // about one request's worth -- because all ten probe the cache in the same
+    // step, before any of them has written to it. They then prefill the same
+    // ~1,000-token shared prefix ten times over. The cache fills in as the run
+    // proceeds (1,088 -> 6,784 -> 17,664 cached across successive steps), so
+    // the redundancy is confined to the cold start, but that start is what TTFT
+    // measures: p50 4,022 ms on a cold cache against 1,837 ms on a warm one.
+    //
+    // Admitting one cold request per step lets it publish its prefix before the
+    // rest probe. It costs a step of latency when prompts share nothing, which
+    // is why it is off by default and set from measurement.
+    std::int32_t max_cold_prefills{0};
     bool reserve_full_prefill_at_admission{true};
     // Preempt when a single request is blocked for capacity, instead of only
     // when the whole step produced no operation at all. Ported from vLLM,

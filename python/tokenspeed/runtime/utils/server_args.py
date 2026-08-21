@@ -156,6 +156,17 @@ class ServerArgs:
     # when outputs are short against a 127k prompt and doubles the estimate
     # when they are not. It is the default for that reason, not because it won
     # one benchmark.
+    # How the per-step prefill budget is divided among requests that are
+    # mid-prefill. "fcfs" (default) is the historical behaviour: the first
+    # continuation in priority order takes min(remaining, unscheduled) and the
+    # rest are offered what is left. "equal-progress" is TRT-LLM's
+    # kEQUAL_PROGRESS -- round-robin one unit at a time. Same step budget, same
+    # makespan; it changes which requests finish early. Better or worse depends
+    # on how unequal the prefill work is, which is the point of having both.
+    context_chunk_policy: str = "fcfs"
+    # Granularity of one round-robin pass; 0 = one cache block (page-aligned,
+    # which hybrid models require).
+    context_chunk_unit: int = 0
     admission_reserve: str = "generation-full"
     # Kernel page size. Flat scheduler logical pages come from the LCM
     # runtime contract and must not overwrite this value.
@@ -1150,6 +1161,33 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+        )
+        parser.add_argument(
+            "--context-chunk-policy",
+            type=str,
+            choices=["fcfs", "equal-progress"],
+            default=ServerArgs.context_chunk_policy,
+            help=(
+                "How the per-step prefill budget is split among requests that "
+                "are mid-prefill. fcfs: the first continuation takes what it "
+                "can and the rest get the remainder (historical behaviour). "
+                "equal-progress: round-robin one unit at a time, ported from "
+                "TRT-LLM's kEQUAL_PROGRESS. Same budget and makespan; it "
+                "changes which requests finish early. FCFS wins when prefill "
+                "work is equal; equal-progress protects the long prompts when "
+                "it is not."
+            ),
+        )
+        parser.add_argument(
+            "--context-chunk-unit",
+            type=int,
+            default=ServerArgs.context_chunk_unit,
+            help=(
+                "Tokens granted per request per round-robin pass under "
+                "--context-chunk-policy equal-progress. 0 = one cache block, "
+                "which keeps every offer page-aligned; hybrid models refuse "
+                "unaligned chunks."
+            ),
         )
         parser.add_argument(
             "--admission-reserve",

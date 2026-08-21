@@ -46,6 +46,7 @@
 #include "scheduler/page_hasher.h"
 #include "scheduler/request.h"
 #include "utils.h"
+#include <unordered_map>
 
 namespace tokenspeed {
 
@@ -252,13 +253,45 @@ bool Scheduler::admitWithKvEventTracking(PlanBuildContext& context, Request& req
 }
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
-    PlanBuildContext& context, Request* request, std::int32_t remaining, std::int32_t decode_input_tokens) {
+    PlanBuildContext& context, Request* request, std::int32_t remaining, std::int32_t decode_input_tokens,
+    std::int32_t* out_hit_tokens) {
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return std::nullopt;
     }
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    // Every admission, refused or not, with BOTH boundaries. `common` is what
+    // the coordinator will actually serve -- a std::min across cache groups --
+    // and `closed` is the coverage the prefix-closed groups alone supported
+    // before a window or state group shortened it. Refusals already print
+    // `common`; the pair is what distinguishes an empty cache from a veto.
+    //
+    // On a six-group model (gemma: 1 full-attention + 5 sliding) a hit pattern
+    // of all-or-nothing at full size is the signature of a veto: an empty
+    // cache gives graded partial matches. `closed>0, common=0` says the
+    // sliding groups discarded the full-attention group's match;
+    // `closed=0, common=0` says there was nothing to discard. Different
+    // findings, and the pair separates them in one line.
+    // Requested by roy-ad for the gemma sliding-window reuse investigation.
+    {
+        static const bool match_trace =
+            std::fopen("/workspace/roy/.plan_trace.on", "r") != nullptr;
+        if (match_trace) {
+            static std::FILE* match_file = std::fopen("/workspace/roy/.admit_trace.txt", "a");
+            if (match_file != nullptr) {
+                std::fprintf(match_file, "match req=%s common=%d closed=%d unscheduled=%d\n",
+                             request->Id().c_str(), hit_tokens,
+                             std::max(match.probe.device.prefix_closed_tokens,
+                                      match.probe.host.prefix_closed_tokens),
+                             request->PrefillSize() - hit_tokens);
+                std::fflush(match_file);
+            }
+        }
+    }
+    if (out_hit_tokens != nullptr) {
+        *out_hit_tokens = hit_tokens;
+    }
     const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
     _assert(promotion_boundary_tokens == 0 ||
                 (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
@@ -773,6 +806,13 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     // it names no culprit; these do.
     std::int32_t st_submitted = 0, st_prefilling = 0, st_decode = 0, st_other = 0;
     std::int32_t rej_prefill = 0, rej_firstchunk = 0, rej_decode = 0, rej_unmatched = 0;
+    // roy-ad's facd44a3: admissions this step whose prefix matched nothing.
+    // They duplicate each other's prefill work, because they all probe before
+    // any of them publishes. Carried here so ONE installed extension serves
+    // both branches -- a .so that two branches write to is a shared mutable
+    // global, and it broke both of us today, once in each direction.
+    std::int32_t cold_prefills = 0;
+    std::int32_t rej_cold_cap = 0;
 
     auto push_operation = [&](auto operation) {
         scheduled_this_step.insert(operation.request_id);
@@ -807,6 +847,98 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
     };
 
+    // --- equal-progress chunking -------------------------------------------
+    // Ported from TRT-LLM `setCtxRequestsChunkSize<kEQUAL_PROGRESS>`
+    // (microBatchScheduler.cpp:126): offer every mid-prefill request one unit
+    // per pass, repeatedly, until the budget is spent or no request can take
+    // another unit. The result is a per-request cap for THIS step; the step's
+    // total budget is unchanged, so this reorders completions without changing
+    // makespan.
+    //
+    // Deliberately not TRT-LLM's reuse discount: their loop charges only the
+    // non-cached portion, which is a second independent change. One variable
+    // at a time -- charging by cached bytes is a separate experiment.
+    std::unordered_map<std::string, std::int32_t> equal_progress_cap;
+    if (config_.context_chunk_policy == SchedulerConfig::ContextChunkPolicy::kEqualProgress) {
+        const std::int32_t unit =
+            config_.context_chunk_unit > 0 ? config_.context_chunk_unit : coordinator_.CacheBlockTokens();
+        std::vector<Request*> mid_prefill;
+        for (Request* request : candidates) {
+            if (pending_retraction_.contains(request->Id())) {
+                continue;
+            }
+            const bool local_prefill =
+                request->Is<fsm::Prefilling>() &&
+                (config_.role != Role::kD || request->PrefillSource() == fsm::PrefillSource::kLocal);
+            if (local_prefill || (config_.role != Role::kD && request->Is<fsm::Submitted>())) {
+                mid_prefill.push_back(request);
+                equal_progress_cap.emplace(request->Id(), 0);
+            }
+        }
+        // A single prefill in flight has nobody to share with, and capping it
+        // at one unit would be strictly worse than FCFS for no benefit.
+        if (mid_prefill.size() > 1 && unit > 0) {
+            std::int32_t spent = 0;
+            bool progressed = true;
+            while (spent < token_budget && progressed) {
+                progressed = false;
+                for (Request* request : mid_prefill) {
+                    std::int32_t& cap = equal_progress_cap[request->Id()];
+                    // `UnscheduledPrefillSize()` returns -1 for a Submitted
+                    // request -- it has no prefill window yet. Feeding that to
+                    // the round-robin made `cap >= want` true on the first
+                    // pass for every request, so nobody was ever granted a
+                    // unit, every cap stayed 0, and the step scheduled NOTHING.
+                    // The unit test caught it as 0 prefill ops; on a card it
+                    // would have been a stalled engine reported as a policy
+                    // that "made throughput worse".
+                    const std::int32_t want = request->Is<fsm::Submitted>()
+                                                  ? request->PrefillSize()
+                                                  : request->UnscheduledPrefillSize();
+                    if (want <= 0) {
+                        continue;
+                    }
+                    if (cap >= want) {
+                        continue;  // this request already has its whole prompt
+                    }
+                    // Grants must stay page-aligned. Hybrid models refuse an
+                    // unaligned chunk, and clamping by the leftover budget
+                    // (`token_budget - spent`) can produce a partial page --
+                    // which then propagates into the block geometry the
+                    // executor maps. That is the difference between a chunk
+                    // the scheduler declines and one it hands downstream in a
+                    // shape nothing expects: measured as SIGBUS inside
+                    // next_execution_plan() after several healthy shared steps.
+                    //
+                    // A partial grant is legitimate in exactly one case: it
+                    // completes the request's remaining prompt, which is the
+                    // prompt's own tail and already the last chunk.
+                    const std::int32_t remaining_want = want - cap;
+                    const std::int32_t budget_left = token_budget - spent;
+                    std::int32_t grant = std::min(unit, remaining_want);
+                    if (grant > budget_left) {
+                        // Only whole units may come out of the leftover budget.
+                        grant = (budget_left / unit) * unit;
+                    }
+                    if (grant > 0 && grant < unit && grant != remaining_want) {
+                        grant = 0;  // partial page that is not a prompt tail
+                    }
+                    if (grant <= 0) {
+                        continue;
+                    }
+                    cap += grant;
+                    spent += grant;
+                    progressed = true;
+                    if (spent >= token_budget) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            equal_progress_cap.clear();  // fall back to FCFS for this step
+        }
+    }
+
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
             trace_stop = token_budget <= 0 ? "token budget exhausted" : "max_batch_size reached";
@@ -828,7 +960,34 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             }
             const std::int32_t reserve = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             ++st_prefilling;
-            if (auto event = schedulePrefill(context, request, token_budget, reserve)) {
+            // Under equal progress a request may take only its share of this
+            // step. An empty map means the policy is off, or it declined to
+            // engage because fewer than two requests were mid-prefill.
+            std::int32_t offer = token_budget;
+            if (const auto it = equal_progress_cap.find(request->Id()); it != equal_progress_cap.end()) {
+                offer = std::min(offer, it->second);
+            }
+            if (offer <= 0) {
+                ++trace_no_event;
+                continue;
+            }
+            // Forward progress is not optional. A capped offer can be smaller
+            // than one aligned chunk -- AlignPrefillChunk refuses an unaligned
+            // chunk on hybrid models and returns nullopt -- and if every
+            // request in the step is capped that way, the step schedules
+            // nothing, forever. Measured as a live hang: 16 sequences sharing
+            // the step correctly, then 20 minutes of zero GPU utilisation with
+            // the pool still held.
+            //
+            // So: if the capped offer yields no event AND this step has
+            // scheduled nothing at all, fall back to the uncapped budget for
+            // this one request. Equal progress is a policy about fairness
+            // among requests that CAN run; it must never be the reason none do.
+            auto event = schedulePrefill(context, request, offer, reserve);
+            if (!event && offer < token_budget && operations.empty()) {
+                event = schedulePrefill(context, request, token_budget, reserve);
+            }
+            if (event) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event)));
                 // P-side pages stay pinned until the PD transfer completes.
                 // D-side local recovery has no corresponding PD ACK; its
@@ -909,9 +1068,45 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 break;
             }
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
-            const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
+            std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
+            // The FIRST chunk is where a long prompt starts monopolising, so
+            // equal progress has to apply here and not only to continuations.
+            // A unit test caught this: with the longest request exceeding the
+            // step budget -- the regime the policy exists for -- every request
+            // is still Submitted on the first plan, so patching only the
+            // continuation path left the policy inert exactly where it matters.
+            //
+            // Not applied to the recovery path above: a retracted request is
+            // pinned through recovery on purpose, because two of them can
+            // otherwise evict each other forever. Sharing its step would
+            // reintroduce that.
+            if (const auto it = equal_progress_cap.find(request->Id());
+                it != equal_progress_cap.end() && config_.role != Role::kD) {
+                prefill_budget = std::min(prefill_budget, it->second);
+            }
+            if (prefill_budget <= 0) {
+                ++trace_no_event;
+                continue;
+            }
+            if (config_.max_cold_prefills > 0 && cold_prefills >= config_.max_cold_prefills) {
+                ++rej_cold_cap;
+                continue;
+            }
             ++st_submitted;
-            if (auto event = schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens)) {
+            const std::int32_t uncapped_budget =
+                config_.role == Role::kD ? request->PrefillSize() : token_budget;
+            std::int32_t hit_tokens = 0;
+            auto event =
+                schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens, &hit_tokens);
+            if (!event && prefill_budget < uncapped_budget && operations.empty()) {
+                // Same forward-progress guarantee as the continuation path.
+                event = schedulePrefillFirstChunk(context, request, uncapped_budget, decode_input_tokens,
+                                                  &hit_tokens);
+            }
+            if (event) {
+                if (hit_tokens == 0) {
+                    ++cold_prefills;
+                }
                 push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());

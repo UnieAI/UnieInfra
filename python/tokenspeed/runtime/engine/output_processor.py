@@ -127,7 +127,11 @@ class OutputProcessor:
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.engine.server_args.weight_version,
             }
-            logprobs_info = state.logprobs_info if not state.obj.stream else {}
+            # ``EmbeddingReqInput`` has no ``stream`` field -- a pooled vector
+            # is one value, never a stream of them (the same getattr is
+            # already used where the collector is fed, further down).
+            streaming = bool(getattr(state.obj, "stream", False))
+            logprobs_info = state.logprobs_info if not streaming else {}
 
             obj = state.obj
             sp = getattr(obj, "sampling_params", None) or {}

@@ -63,6 +63,7 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
@@ -196,7 +197,15 @@ class RequestHandler:
         """Dispatch control requests and return new generate request specs and states."""
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
         for recv_req in recv_reqs:
-            if isinstance(recv_req, TokenizedGenerateReqInput):
+            if isinstance(recv_req, TokenizedEmbeddingReqInput):
+                req_spec, req_state, bootstrap_info = self.handle_embedding_request(
+                    recv_req
+                )
+
+                new_req_specs.append(req_spec)
+                req_states.append(req_state)
+                bootstrap_infos.append(bootstrap_info)
+            elif isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
                     recv_req
                 )
@@ -261,6 +270,32 @@ class RequestHandler:
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
+
+    def handle_embedding_request(
+        self,
+        recv_req: TokenizedEmbeddingReqInput,
+    ):
+        """Admit a pooling request: one prefill, one vector, then finished.
+
+        Deliberately not routed through ``handle_generate_request``. That path
+        reads PD bootstrap fields and session params an embedding request does
+        not carry, and resolves a ``max_new_tokens`` budget it does not have.
+        A pooling request is admitted with a zero-token generation budget, so
+        the C++ scheduler reserves no decode slot for it.
+        """
+        req_spec = make_spec(rid=recv_req.rid, tokens=recv_req.input_ids)
+        req_state = RequestState.from_recv_req(
+            recv_req,
+            tokenizer=self.tokenizer,
+            eos_token_ids=self.hf_eos_token_id,
+        )
+        if getattr(recv_req, "validation_error", None):
+            req_state.finished_reason = FINISH_ABORT(
+                f"Invalid request: {recv_req.validation_error}"
+            )
+        req_state.sampling_params.max_new_tokens = 0
+        req_spec.max_new_tokens = 0
+        return req_spec, req_state, BootstrapInfo(None, None, None)
 
     def handle_generate_request(
         self,

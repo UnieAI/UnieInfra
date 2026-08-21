@@ -233,7 +233,11 @@ class CudaGraphWrapper:
         self.use_v4_mtp_paged_metadata = config.use_v4_mtp_paged_metadata
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
-        self.disable = config.enforce_eager
+        # A pooling forward returns embeddings, not the (tokens, lengths,
+        # logprobs) tuple this wrapper captures, and it is always an extend so
+        # `_can_use_graph`'s decode check already excludes it. Disabling it
+        # outright makes that structural, not incidental.
+        self.disable = config.enforce_eager or config.is_embedding
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         init_backend_cuda_graph_state(

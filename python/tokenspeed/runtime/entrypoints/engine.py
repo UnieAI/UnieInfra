@@ -63,6 +63,7 @@ from tokenspeed.runtime.engine.data_parallel_controller import (
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
+    EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -203,6 +204,21 @@ class Engine(EngineBase):
             return self.llm.generate_stream(obj)
         else:
             return self.llm.generate(obj)
+
+    def encode(
+        self,
+        prompt: list[str] | str | None = None,
+        input_ids: list[list[int]] | list[int] | None = None,
+    ) -> dict | list[dict]:
+        """Embed one prompt or a batch; returns ``{"embedding": [...], ...}``.
+
+        The pooling counterpart of :meth:`generate`, and the only entry point
+        for an embedding server -- ``generate`` is refused on one, and
+        ``encode`` is refused on a generative one, because a server is one or
+        the other (no engine in the xref survey serves both at once).
+        """
+        obj = EmbeddingReqInput(text=prompt, input_ids=input_ids)
+        return self.llm.generate(obj)
 
     async def async_generate(
         self,

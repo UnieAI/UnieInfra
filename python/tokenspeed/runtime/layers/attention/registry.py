@@ -970,16 +970,43 @@ def create_attn_components(
             for group in spec.memory_plan.groups
         },
     )
-    # The parent count, not token_capacity, is what bounds admission: a request
-    # binds a parent in EVERY group, so concurrency is num_lcm_blocks divided by
-    # the group count -- and a group whose binding leaves most of its parent
-    # unused pays that whole parent anyway. Neither number is visible above.
+    # token_capacity does not bound admission. The gate is fits() in
+    # csrc/cache/coordinator/kv_cache_admission.cpp:
+    #
+    #   parents_needed = SUM_g ceil(max(blocks_needed[g] - free_slots[g], 0)
+    #                               / slots[g])
+    #   admit iff parents_needed <= empty_parent_count_
+    #
+    # where free_slots[g] counts slots in parents ALREADY BOUND to g, and
+    # empty_parent_count_ counts parents bound to no group at all. So the
+    # quantities that decide admission are the per-group `slots` and how many
+    # parents are wholly unbound -- neither derivable from token_capacity, and
+    # neither previously logged.
+    #
+    # A group with slots=1 is the pathological case: a bound parent of that
+    # group is always full, so it can never contribute a free slot and every
+    # block needs a wholly-empty parent. Both recurrent-state groups here and
+    # gemma's sliding groups are slots=1.
+    #
+    # Reported below is the floor for a MINIMAL request -- one block in each
+    # group -- because ceil(1/slots)=1 for every group regardless of slots.
+    # Real demand is higher whenever a group needs more than one block, which
+    # for full attention scales with prompt length, so this is an upper bound
+    # on concurrency and not a prediction of it.
+    slots = {
+        group.group_id: int(group.cache_blocks_per_lcm_block)
+        for group in spec.memory_plan.groups
+    }
+    unshareable = sorted(gid for gid, n in slots.items() if n == 1)
     logger.info(
-        "Cache binding: groups=%d, parents_per_request=%d, admission_bound=%d, "
+        "Cache admission: parents=%d, slots=%s, unshareable(slots=1)=%s, "
+        "minimal-request parents=%d, concurrency ceiling<=%d, "
         "binding_utilization=%s",
-        len(spec.memory_plan.groups),
-        len(spec.memory_plan.groups),
-        spec.memory_plan.num_lcm_blocks // max(1, len(spec.memory_plan.groups)),
+        spec.memory_plan.num_lcm_blocks,
+        slots,
+        unshareable or "none",
+        len(slots),
+        spec.memory_plan.num_lcm_blocks // max(1, len(slots)),
         {
             gid: round(entry["binding_utilization"], 4)
             for gid, entry in spec.memory_plan.capacity_report().items()

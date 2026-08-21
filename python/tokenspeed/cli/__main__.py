@@ -46,12 +46,10 @@ def _select_scheduler_ext(raw_argv: list[str]) -> None:
         select_flat_kvcache_ext_for_model_path(model)
 
 
-# Runtimes whose route does not exist anywhere yet. embed and rerank are
-# absent because ts serve now launches entrypoints/pooling_http for them
-# rather than a gateway that cannot answer.
-_RUNTIME_MISSING: dict[str, str] = {
-    "asr": "/v1/audio/transcriptions",
-}
+# Runtimes whose route does not exist anywhere yet. Empty: generate goes to
+# the gateway, embed and rerank to entrypoints/pooling_http, asr to
+# entrypoints/asr_http, and diffusion is refused before it gets here.
+_RUNTIME_MISSING: dict[str, str] = {}
 
 
 def _announce_runtime(raw_argv: list[str]) -> None:
@@ -79,7 +77,7 @@ def _announce_runtime(raw_argv: list[str]) -> None:
         )
 
     missing = _RUNTIME_MISSING.get(runtime)
-    if missing:
+    if missing:  # pragma: no cover - nothing lands here today
         # asr only: /v1/audio/transcriptions has no server yet. Start anyway
         # -- the engine path is real and reachable in-process -- but say so,
         # because "the server started" would otherwise read as "the model is
@@ -93,6 +91,34 @@ def _announce_runtime(raw_argv: list[str]) -> None:
     return runtime
 
 
+def _split_host_port(raw_argv: list[str]) -> tuple[list[str], str, int]:
+    """Engine args plus the gateway-side --host/--port this server binds."""
+    from tokenspeed.cli._argsplit import split_argv
+
+    split = split_argv(raw_argv)
+    host, port = "127.0.0.1", 8000
+    gateway = list(split.gateway)
+    if "--host" in gateway:
+        host = gateway[gateway.index("--host") + 1]
+    if "--port" in gateway:
+        port = int(gateway[gateway.index("--port") + 1])
+    return split.engine, host, port
+
+
+def _serve_asr(raw_argv: list[str]) -> None:
+    """``ts serve`` for Whisper: audio in, transcript out.
+
+    Its own server rather than the gateway for the same reason pooling has
+    one -- the proto's only generative RPC is text in, text out, and Whisper
+    needs log-mel features to ride alongside the prompt.
+    """
+    from tokenspeed.runtime.entrypoints.asr_http import serve
+
+    engine_args, host, port = _split_host_port(raw_argv)
+    print(f"[ts serve] asr server on http://{host}:{port}")
+    serve(engine_args, host=host, port=port)
+
+
 def _serve_pooling(raw_argv: list[str]) -> None:
     """``ts serve`` for an embedding or reranking checkpoint.
 
@@ -101,30 +127,24 @@ def _serve_pooling(raw_argv: list[str]) -> None:
     starts something that cannot answer; ``entrypoints/pooling_http`` owns
     its engine and serves /v1/embeddings and /v1/rerank directly.
     """
-    from tokenspeed.cli._argsplit import split_argv
     from tokenspeed.runtime.entrypoints.pooling_http import serve
 
-    split = split_argv(raw_argv)
-    host, port = "127.0.0.1", 8000
-    gateway = list(split.gateway)
-    for flag, setter in (("--host", "host"), ("--port", "port")):
-        if flag in gateway:
-            value = gateway[gateway.index(flag) + 1]
-            if setter == "host":
-                host = value
-            else:
-                port = int(value)
+    engine_args, host, port = _split_host_port(raw_argv)
     print(f"[ts serve] pooling server on http://{host}:{port}")
-    serve(split.engine, host=host, port=port)
+    serve(engine_args, host=host, port=port)
 
 
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     _select_scheduler_ext(raw_argv)
     runtime = _announce_runtime(raw_argv)
 
-    if runtime in ("embed", "rerank") and not getattr(args, "headless", False):
-        _serve_pooling(raw_argv)
-        return
+    if not getattr(args, "headless", False):
+        if runtime in ("embed", "rerank"):
+            _serve_pooling(raw_argv)
+            return
+        if runtime == "asr":
+            _serve_asr(raw_argv)
+            return
 
     from tokenspeed.cli.serve_smg import run_smg_from_args
 

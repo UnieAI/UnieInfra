@@ -457,7 +457,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if isinstance(obj, EmbeddingReqInput):
+            if isinstance(obj, EmbeddingReqInput) and (
+                self.server_args.embedding_batch_tokenize
+            ):
                 # Tokenize the whole list before sending any of it. Sending as
                 # we tokenize means every ``await`` hands control back to the
                 # event loop, the scheduler picks up whatever has arrived, and

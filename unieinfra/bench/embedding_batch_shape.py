@@ -44,6 +44,12 @@ def main() -> None:
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument(
+        "--no-batch-tokenize",
+        action="store_true",
+        help="Turn the optimization off. The cliff should come back -- that "
+        "is what says the switch and the attribution are both real.",
+    )
+    parser.add_argument(
         "--max-ratio",
         type=float,
         default=1.15,
@@ -58,6 +64,7 @@ def main() -> None:
 
     token_ids = AutoTokenizer.from_pretrained(args.model)(args.text).input_ids
     print(f"prompt tokens: {len(token_ids)}")
+    print(f"batch_tokenize: {not args.no_batch_tokenize}")
 
     engine = Engine(
         model=args.model,
@@ -65,6 +72,7 @@ def main() -> None:
         max_model_len=2048,
         gpu_memory_utilization=0.60,
         max_num_seqs=args.max_num_seqs,
+        embedding_batch_tokenize=not args.no_batch_tokenize,
         disable_kvstore=True,
         attention_backend="triton",
     )

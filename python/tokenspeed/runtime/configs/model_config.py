@@ -555,6 +555,9 @@ class ModelConfig:
             # is constructed from the HF config alone, so the pool bound has
             # to travel on it. `+ 1` mirrors the scheduler's own padding slot.
             self.hf_config.cross_attn_slots = int(server_args.max_num_seqs) + 1
+            self.hf_config.cross_attn_path = str(
+                getattr(server_args, "cross_attn_path", "auto")
+            )
 
         if self.pooling_config is not None:
             # Deferred to here, not to where pooling_config is resolved: the

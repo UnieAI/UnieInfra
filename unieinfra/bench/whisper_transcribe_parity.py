@@ -78,7 +78,12 @@ def reference(snapshot: str, processor, feats, max_new_tokens: int) -> str:
 
 
 def ours(
-    snapshot: str, processor, feats, max_new_tokens: int, max_num_seqs: int
+    snapshot: str,
+    processor,
+    feats,
+    max_new_tokens: int,
+    max_num_seqs: int,
+    cross_attn_path: str,
 ) -> str:
     from tokenspeed.runtime.engine.io_struct import GenerateReqInput
     from tokenspeed.runtime.entrypoints.engine import Engine
@@ -94,6 +99,7 @@ def ours(
         max_model_len=448,
         gpu_memory_utilization=0.25,
         max_num_seqs=max_num_seqs,
+        cross_attn_path=cross_attn_path,
         disable_kvstore=True,
         attention_backend="triton",
     )
@@ -126,6 +132,13 @@ def main() -> None:
         help="Cross-attention picks its read path by batch occupancy "
         "(bs*2 >= slots). Set this to 1 so a single request exercises the "
         "padded path; leave it larger to exercise the gather path.",
+    )
+    parser.add_argument(
+        "--cross-attn-path",
+        choices=["auto", "padded", "gather"],
+        default="auto",
+        help="Force one cross-attention read path so both can be verified "
+        "on the same build; 'auto' picks by occupancy.",
     )
     args = parser.parse_args()
 

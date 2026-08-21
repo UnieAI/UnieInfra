@@ -20,6 +20,10 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_LAYER_TYPES,
+)
+
 
 def split_groups_to_equal_depth(layer_types: Sequence[str]) -> tuple[str, ...]:
     """Relabel so every cache group holds the same number of layers.
@@ -61,6 +65,22 @@ def split_groups_to_equal_depth(layer_types: Sequence[str]) -> tuple[str, ...]:
         return tuple(layer_types)
     shallow = min(counts.values())
     deep_label, deep = max(counts.items(), key=lambda kv: kv[1])
+    if deep_label in STATE_LAYER_TYPES:
+        # Dead rows are a PAGED-KV problem: the argument above counts slab rows
+        # that a history group reserves and does not use. A state group holds
+        # one recurrent state per SEQUENCE, not per token, so it has no slab
+        # rows to waste and splitting it buys nothing.
+        #
+        # It also breaks three separate consumers, all of which match the label
+        # exactly: `spec.py` resolves family via `layer_types[i] in
+        # STATE_LAYER_TYPES`, and `registry.py` / `hybrid_kda.py` do the same
+        # to route a layer to the state backend. Qwen3.5-27B (48 linear + 16
+        # full) split into `linear_attention_0..2`, every one of them resolved
+        # to family "history", and the engine died at startup with
+        # "MambaAttnBackend requires at least one state-family cache group" --
+        # on a model that has nothing to do with the gemma layout this
+        # function exists for.
+        return tuple(layer_types)
     num_groups = -(-deep // shallow)  # ceil
     if num_groups <= 1:
         return tuple(layer_types)

@@ -319,9 +319,33 @@ Qwen3-0.6B   5-token prompt,  1 token out    17.3 ms
 - **延遲**（單請求）：這是主成本。Whisper 一段 23-token 轉譯共 46 ms，其中 23 ms 是它；
   embedding 單一短請求 19.3 ms，其中約 16 ms 是它。
 
-**尚未定位。** 已排除：模型計算、prompt 長度、client 橋接。未排除：ZMQ 來回、
-scheduler 每輪的地板、admission 要等幾輪、overlap 排程延後一步。要再往下必須在引擎內部
-埋量測點，那會動到共用路徑。
+**用既有開關二分**（Qwen3-0.6B、5-token prompt、1 token out、p50）：
+
+```
+baseline               17.50 ms
+overlap off            16.84 ms   -0.66
+stream_interval=8      17.58 ms   +0.08
+inline detok off       17.40 ms   -0.10
+prefix cache off       17.26 ms   -0.24
+prefill graph 512      17.33 ms   -0.35
+enforce_eager          30.43 ms   +12.93   <- 唯一大幅移動的
+```
+
+**一個被推翻的假設**：既然 `enforce_eager` 貴 12.9 ms、而 prefill 在這棵樹預設是 eager
+（prefill graph 是 opt-in），我原本推論那 16 ms 是 eager prefill 的 kernel launch 開銷。
+**開了 prefill graph 只省 0.35 ms，假設不成立。**
+
+`enforce_eager` 同時關掉 decode graph，所以它動到的是**每輪迴圈的成本**，不是某一次
+forward。最符合全部數據的模型是：
+
+    延遲 ~= (請求要活過的 scheduler 輪數) x (每輪成本)
+
+這同時解釋了為什麼地板跟著層數走（每輪成本）而不跟 prompt 長度走，以及為什麼並發時會被
+攤掉（多個請求共用同一批輪次）。
+
+**仍未定位到是哪幾輪。** 已排除：模型計算、prompt 長度、client 橋接、串流間隔、
+detokenizer、前綴快取、eager prefill。要再往下必須在事件迴圈裡埋量測點——那會動到共用
+路徑，尚未進行。
 
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 

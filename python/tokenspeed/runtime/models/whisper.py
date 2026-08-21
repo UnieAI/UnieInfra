@@ -56,7 +56,7 @@ which is exactly the "q from the decoder, kv from the encoder" shape.
 
 from __future__ import annotations
 
-import math
+import dataclasses
 from collections.abc import Iterable
 from typing import Any
 
@@ -257,17 +257,15 @@ class CrossAttentionCache:
     request, so none of the arena's machinery applies to it (see the module
     docstring, and §3.3 of the xref).
 
-    Layout is ``[slot, layer, encoder_len, kv_heads, head_dim]`` so one
-    ``index_select`` per forward gathers *every* layer's KV for the batch --
-    the gather is unavoidable on sm_120, where no flash-attn path reads KV by
-    page or index (measured; see ``15-encoder-embedding.md`` §6.1), so the
-    thing to minimise is the number of gathers, not their existence.
+    Layout is ``[layer, slot, encoder_len, kv_heads, head_dim]`` -- layer
+    first so that ``k[layer]`` is contiguous and reshaping it to the packed
+    ``[slot * encoder_len, heads, dim]`` that flash-attn wants is a view, not
+    a copy. With slot first, that reshape silently materialises the whole
+    buffer on every layer of every step.
 
-    Slots are indexed by ``req_pool_index``, which the scheduler already
-    bounds at ``per_rank_max_batch + 1`` (``event_loop.py:369``). The buffer
-    grows to fit the largest index seen rather than taking that bound as a
-    constructor argument: the model is built from the HF config alone and
-    does not see the scheduler's sizing.
+    Slots are indexed by ``req_pool_index``, which the scheduler bounds at
+    ``per_rank_max_batch + 1`` (``event_loop.py:369``); ModelConfig stamps
+    that bound on the HF config as ``cross_attn_slots``.
     """
 
     def __init__(
@@ -283,7 +281,9 @@ class CrossAttentionCache:
         self.num_slots = num_slots
         self.num_layers = num_layers
         self.encoder_len = encoder_len
-        shape = (num_slots, num_layers, encoder_len, kv_heads, head_dim)
+        self.kv_heads = kv_heads
+        self.head_dim = head_dim
+        shape = (num_layers, num_slots, encoder_len, kv_heads, head_dim)
         # Allocated once, up front. Growing it lazily would mean reading
         # ``slots.max()`` on the read path, and that is a device-to-host sync
         # on every decode step -- illegal under CUDA graph capture and a
@@ -314,21 +314,52 @@ class CrossAttentionCache:
                 "window is fixed, so a different length means the feature "
                 "extractor did not pad or trim to it."
             )
-        self.k[slot, layer_id].copy_(k)
-        self.v[slot, layer_id].copy_(v)
+        self.k[layer_id, slot].copy_(k)
+        self.v[layer_id, slot].copy_(v)
+
+    def whole_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Every slot's K/V for one layer, packed, as a view.
+
+        The decode fast path: rather than gathering the batch's slots into a
+        contiguous block, attend over all of them and let the query scatter
+        pick out the rows that matter. Nothing is copied, and the shape is
+        constant, which is also what lets a CUDA graph capture it.
+
+        Two measurements, and the difference between them is the point.
+        Isolating the kernels (gather + attention only) says:
+
+            large-v3-turbo  bs=16  1.864 ms -> 0.247 ms   7.55x
+
+        Measuring the whole cross-attention block -- layer norm, the query
+        and output projections, the scatter -- says:
+
+            large-v3-turbo  bs=1   0.671 ms -> 0.766 ms   0.88x
+                            bs=8   0.746 ms -> 0.774 ms   0.96x
+                            bs=16  1.348 ms -> 0.755 ms   1.79x
+            large-v3        bs=1   5.006 ms -> 5.777 ms   0.87x
+                            bs=8   5.905 ms -> 5.951 ms   0.99x
+                            bs=16 10.920 ms -> 5.936 ms   1.84x
+
+        The block number is the one that matters. At small batch the block is
+        launch-bound (an empty kernel launch costs 7.7-13.9 us on this box),
+        so removing a bandwidth cost buys nothing there, and attending over
+        every slot to serve one request costs ~13%. The gather grows with
+        batch size and this does not, which is where the win comes from --
+        and why the caller picks between the two by occupancy rather than
+        taking this unconditionally.
+        """
+        flat = (self.num_slots * self.encoder_len, self.kv_heads, self.head_dim)
+        return self.k[layer_id].view(flat), self.v[layer_id].view(flat)
 
     def gather(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Batch-ordered, contiguous K/V for every layer: [bs, layers, ...].
+        """The batch's slots only, as ``[layers, bs, ...]``.
 
-        No validation here, deliberately. That a request reaching decode has
-        been prefilled is a scheduler invariant (``prefill_finished`` gates
-        the output path), and re-deriving it here would cost a host sync per
-        step to read the slot ids. An unwritten slot reads as the zeros it
-        was allocated with, which is also what the engine's warmup and
-        autotune batches want -- they carry no audio at all.
+        Used on steps that carry a prefill. Those are not CUDA-graph captured
+        and happen once per request, so the copy is affordable there; it is
+        the per-decode-step copy that :meth:`whole_buffer` exists to avoid.
         """
         index = slots.to(device=self.k.device, dtype=torch.long)
-        return self.k.index_select(0, index), self.v.index_select(0, index)
+        return self.k.index_select(1, index), self.v.index_select(1, index)
 
 
 class WhisperDecoderSelfAttention(nn.Module):
@@ -487,9 +518,13 @@ class WhisperCrossAttention(nn.Module):
             v.view(-1, self.num_heads, self.head_dim),
         )
 
-    def forward(
+    def project_query(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        q, _ = self.q_proj(hidden_states)
+        return q.view(-1, self.num_heads, self.head_dim)
+
+    def attend(
         self,
-        hidden_states: torch.Tensor,
+        q: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
@@ -501,9 +536,7 @@ class WhisperCrossAttention(nn.Module):
             cross_attn_varlen,
         )
 
-        q, _ = self.q_proj(hidden_states)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        attended = cross_attn_varlen(
+        return cross_attn_varlen(
             q,
             key,
             value,
@@ -513,8 +546,35 @@ class WhisperCrossAttention(nn.Module):
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scaling,
         )
+
+    def project_out(self, attended: torch.Tensor) -> torch.Tensor:
         output, _ = self.out_proj(attended.reshape(-1, self.num_heads * self.head_dim))
         return output
+
+
+@dataclasses.dataclass
+class CrossAttentionPlan:
+    """Everything the decoder layers need to run cross-attention this step.
+
+    Built once per forward rather than per layer: the cumulative-length
+    tensors and the query scatter buffer are identical across layers, and
+    rebuilding them 4 (or 32) times a step is pure launch overhead.
+
+    ``padded`` selects the decode fast path -- attend over every slot with
+    the queries scattered by pool index -- against the gather path used on
+    steps that carry a prefill. See ``CrossAttentionCache.whole_buffer``.
+    """
+
+    cache: "CrossAttentionCache"
+    padded: bool
+    slots: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    encoder_len: int
+    max_seqlen_q: int = 1
+    query_buffer: torch.Tensor | None = None
+    key: torch.Tensor | None = None
+    value: torch.Tensor | None = None
 
 
 class WhisperDecoderLayer(nn.Module):
@@ -528,6 +588,7 @@ class WhisperDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         embed_dim = config.d_model
+        self.layer_id = layer_id
         self.self_attn = WhisperDecoderSelfAttention(
             config,
             mapping,
@@ -573,12 +634,7 @@ class WhisperDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        cross_key: torch.Tensor,
-        cross_value: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
+        cross: "CrossAttentionPlan",
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -587,16 +643,39 @@ class WhisperDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
-        hidden_states = self.encoder_attn(
-            hidden_states,
-            cross_key,
-            cross_value,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-        )
-        hidden_states = residual + hidden_states
+        query = self.encoder_attn.project_query(hidden_states)
+        if cross.padded:
+            # Padded path: q row j is slot j, so the batch's queries are
+            # scattered by pool index into a full-width buffer, attended over
+            # the whole KV buffer, then read back out by the same index.
+            # Both touch only ``bs`` rows -- tens of KB against the hundreds
+            # of MB the gather it replaces would move.
+            # Not zeroed per layer: rows outside the batch keep whatever a
+            # previous step left, their outputs are discarded, and a zero_()
+            # here is one more kernel launch per layer on a path that is
+            # launch-bound at small batch. The buffer is zeroed once at
+            # allocation so the first steps read zeros, not garbage.
+            cross.query_buffer.index_copy_(0, cross.slots, query)
+            attended = self.encoder_attn.attend(
+                cross.query_buffer,
+                *cross.cache.whole_buffer(self.layer_id),
+                cu_seqlens_q=cross.cu_seqlens_q,
+                cu_seqlens_k=cross.cu_seqlens_k,
+                max_seqlen_q=1,
+                max_seqlen_k=cross.encoder_len,
+            )
+            attended = attended.index_select(0, cross.slots)
+        else:
+            attended = self.encoder_attn.attend(
+                query,
+                cross.key[self.layer_id].reshape(-1, *cross.key.shape[3:]),
+                cross.value[self.layer_id].reshape(-1, *cross.value.shape[3:]),
+                cu_seqlens_q=cross.cu_seqlens_q,
+                cu_seqlens_k=cross.cu_seqlens_k,
+                max_seqlen_q=cross.max_seqlen_q,
+                max_seqlen_k=cross.encoder_len,
+            )
+        hidden_states = residual + self.encoder_attn.project_out(attended)
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -644,26 +723,11 @@ class WhisperDecoder(nn.Module):
         positions: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        cross_key: torch.Tensor,
-        cross_value: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
+        cross: CrossAttentionPlan,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids) + self.embed_positions(positions)
-        for layer_id, layer in enumerate(self.layers):
-            hidden_states = layer(
-                hidden_states,
-                ctx,
-                out_cache_loc,
-                cross_key[:, layer_id].reshape(-1, *cross_key.shape[3:]),
-                cross_value[:, layer_id].reshape(-1, *cross_value.shape[3:]),
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-            )
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, ctx, out_cache_loc, cross)
         return self.layer_norm(hidden_states)
 
 
@@ -719,6 +783,9 @@ class WhisperForConditionalGeneration(nn.Module):
             prefix=add_prefix("proj_out", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
+        self._pad_cu_seqlens_q: torch.Tensor | None = None
+        self._pad_cu_seqlens_k: torch.Tensor | None = None
+        self._pad_query_buffer: torch.Tensor | None = None
         self.cross_cache = CrossAttentionCache(
             # Bounded by the request pool, which the scheduler sizes at
             # per_rank_max_batch + 1 (event_loop.py:369). ModelConfig stamps
@@ -862,6 +929,102 @@ class WhisperForConditionalGeneration(nn.Module):
         self.proj_out.weight = self.decoder.embed_tokens.weight
         return loaded
 
+    def _cross_attention_plan(
+        self,
+        ctx: ForwardContext,
+        req_pool_indices: torch.Tensor,
+        device: torch.device,
+    ) -> CrossAttentionPlan:
+        """Choose how this step reads the cross-attention KV.
+
+        A pure decode step takes the padded path: attend over every slot with
+        the queries scattered by pool index. A step carrying a prefill takes
+        the gather path, because its query segments have different lengths
+        per request and the padded layout assumes one row per slot.
+        """
+        encoder_len = self.config.max_source_positions
+        bs = int(req_pool_indices.shape[0])
+        slots = req_pool_indices.to(device=device, dtype=torch.long)
+
+        # Occupancy decides, not the mode alone. The padded path always reads
+        # every slot's KV, so it wins once the batch fills a good fraction of
+        # the pool and loses when it does not. Measured on large-v3-turbo,
+        # 17 slots, whole cross-attention block per decode step:
+        #
+        #     bs= 1  gather 0.671 ms  padded 0.766 ms  0.88x
+        #     bs= 8  gather 0.746 ms  padded 0.774 ms  0.96x
+        #     bs=16  gather 1.348 ms  padded 0.755 ms  1.79x
+        #
+        # large-v3 (32 decoder layers) tracks it: 0.87x / 0.99x / 1.84x.
+        # Parity sits at about half occupancy, which is where this switches.
+        # The branch depends only on bs and a constant, and the decode graph
+        # captures one graph per batch-size bucket, so it is stable within
+        # any captured graph.
+        if ctx.num_extends == 0 and bs * 2 >= self.cross_cache.num_slots:
+            self._ensure_padded_buffers(device)
+            return CrossAttentionPlan(
+                cache=self.cross_cache,
+                padded=True,
+                slots=slots,
+                cu_seqlens_q=self._pad_cu_seqlens_q,
+                cu_seqlens_k=self._pad_cu_seqlens_k,
+                encoder_len=encoder_len,
+                query_buffer=self._pad_query_buffer,
+            )
+
+        key, value = self.cross_cache.gather(req_pool_indices)
+        query_lengths = _query_lengths(ctx, bs, device)
+        cu_seqlens_q = torch.cat(
+            [
+                torch.zeros(1, device=device, dtype=torch.int32),
+                torch.cumsum(query_lengths, dim=0, dtype=torch.int32),
+            ]
+        )
+        cu_seqlens_k = torch.arange(
+            0, (bs + 1) * encoder_len, encoder_len, device=device, dtype=torch.int32
+        )
+        return CrossAttentionPlan(
+            cache=self.cross_cache,
+            padded=False,
+            slots=slots,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            encoder_len=encoder_len,
+            # A python int, never ``.max().item()``: reading a device tensor
+            # here is a host sync, and outright illegal while a CUDA graph is
+            # capturing. flash-attn uses max_seqlen_q only to size its
+            # schedule, so an upper bound is as good as the exact value.
+            max_seqlen_q=int(ctx.input_num_tokens),
+            key=key,
+            value=value,
+        )
+
+    def _ensure_padded_buffers(self, device: torch.device) -> None:
+        """Constant tensors for the padded path, built once.
+
+        Every slot contributes exactly one query row and one ``encoder_len``
+        key segment, so both cumulative-length tensors are fixed for the life
+        of the server -- and being fixed is what lets a CUDA graph capture
+        this path.
+        """
+        if getattr(self, "_pad_cu_seqlens_q", None) is not None:
+            return
+        slots = self.cross_cache.num_slots
+        encoder_len = self.cross_cache.encoder_len
+        self._pad_cu_seqlens_q = torch.arange(
+            slots + 1, device=device, dtype=torch.int32
+        )
+        self._pad_cu_seqlens_k = torch.arange(
+            0, (slots + 1) * encoder_len, encoder_len, device=device, dtype=torch.int32
+        )
+        self._pad_query_buffer = torch.zeros(
+            slots,
+            self.cross_cache.kv_heads,
+            self.cross_cache.head_dim,
+            device=device,
+            dtype=self.cross_cache.k.dtype,
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -890,48 +1053,12 @@ class WhisperForConditionalGeneration(nn.Module):
             if features is not None:
                 self.encode_audio(features, slots)
 
-        cross_key, cross_value = self.cross_cache.gather(req_pool_indices)
-        encoder_len = self.config.max_source_positions
-        bs = int(req_pool_indices.shape[0])
-        device = input_ids.device
-
-        # One query segment per request. In decode every segment is a single
-        # token; in extend the segment is that request's prefill span, which
-        # the executor already lays out contiguously.
-        query_lengths = _query_lengths(ctx, bs, device)
-        cu_seqlens_q = torch.cat(
-            [
-                torch.zeros(1, device=device, dtype=torch.int32),
-                torch.cumsum(query_lengths, dim=0, dtype=torch.int32),
-            ]
-        )
-        cu_seqlens_k = torch.arange(
-            0,
-            (bs + 1) * encoder_len,
-            encoder_len,
-            device=device,
-            dtype=torch.int32,
-        )
-
         hidden_states = self.decoder(
             input_ids,
             positions,
             ctx,
             out_cache_loc,
-            cross_key,
-            cross_value,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            # A python int, never ``.max().item()``: reading a device tensor
-            # here is a host sync on every step and is outright illegal while
-            # a CUDA graph is capturing. flash-attn uses max_seqlen_q to size
-            # its schedule, so an upper bound is as good as the exact value --
-            # one row per request on a decode, and the whole token count on an
-            # extend.
-            max_seqlen_q=(
-                1 if ctx.forward_mode.is_decode_or_idle() else int(ctx.input_num_tokens)
-            ),
-            max_seqlen_k=encoder_len,
+            self._cross_attention_plan(ctx, req_pool_indices, input_ids.device),
         )
         return self.logits_processor(
             input_ids,

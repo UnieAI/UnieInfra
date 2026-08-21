@@ -210,6 +210,41 @@ ours       ' Mr. Quilter is the apostle of the middle classes, and we are glad t
    `query_lengths.max().item()`，那是每個 decode step 一次 host 同步，捕捉時直接違法。
    flash-attn 只拿它排程，給上界即可。
 
+## 6.3　cross-attention 讀取路徑的優化（2026-08-21）
+
+§6.1 記的是「sm_120 沒有按索引讀 KV 的 kernel，所以要複製」。實測之後，正確的結論是
+**根本不需要那份複製**：gather 存在只是為了讓該批次的 KV 連續，但一個 decode step 的
+cross-attention 成本由「讀多少 KV」決定，不是由「每個請求那一列 query」決定。所以改成對
+**整個 slot buffer** 做 attention，把批次的 query 按 pool index 散射進全寬 buffer——
+零複製、零額外記憶體、形狀固定（因此 CUDA graph 捕捉得了）。
+
+量了兩個層級，而**兩者的差距本身就是重點**：
+
+| 量測範圍 | large-v3-turbo bs=16 |
+|---|---|
+| 只看 kernel（gather + attention） | 1.864 → 0.247 ms，**7.55x** |
+| 整個 cross-attention block（含 layer norm、q/out 投影、散射） | 1.348 → 0.755 ms，**1.79x** |
+
+**該引用的是 block 的數字。** kernel-only 的 7.55x 沒有撐過周圍那些投影：小批次時整個
+block 是 launch-bound（此機空 kernel launch 7.7–13.9 µs），拿掉頻寬成本在那裡買不到東西。
+這正是 memory 裡 `eager-microbench-overstates-captured-ops` 的形狀。
+
+完整曲線（block 層級）：
+
+```
+large-v3-turbo  bs=1   0.671 → 0.766 ms  0.88x    large-v3  bs=1   5.006 → 5.777 ms  0.87x
+                bs=8   0.746 → 0.774 ms  0.96x              bs=8   5.905 → 5.951 ms  0.99x
+                bs=16  1.348 → 0.755 ms  1.79x              bs=16 10.920 → 5.936 ms  1.84x
+```
+
+padded 路徑的時間**與 bs 無關**（~0.755 ms），gather 則隨 bs 成長——成長的那一段就是複製。
+低佔用率時 padded 反而慢約 13%，因為要為一個請求掃過所有 slot。所以**兩條路徑都留著、
+依批次佔用率選**（`bs*2 >= slots`，平手點約在半滿）。這是操作點的取捨而非排名，
+同 memory 的 `tokenspeed-wins-only-at-high-concurrency`。
+
+兩條路徑都做過端到端轉譯驗證（`--max-num-seqs 1` 走 padded、較大值走 gather），
+輸出都與 HF 逐字相同。重跑：`unieinfra/bench/whisper_cross_attn_paths.py`。
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder
@@ -239,7 +274,8 @@ ours       ' Mr. Quilter is the apostle of the middle classes, and we are glad t
   （`runtime/layers/attention/kv_cache/recipes/spec.py:36`）。cross KV 是第三種 family：
   寫一次、不成長、不參與前綴比對。vLLM 與 TRT-LLM 都投給「獨立池」，SGLang 投給「折進主池」；
   我們的 arena 是 LCM 共用 parent，折進主池會讓 cross 與 history 搶同一批 parent，
-  傾向跟 vLLM/TRT-LLM 同邊——但這一步會動到 C++ 側，屬於本箱共用資產，先量 §6.3 再做。
+  所以站 vLLM/TRT-LLM 那邊。**已完成**（§6.2、§6.3），而且結果比原本預想的省：實作成
+  arena 外的一塊 per-slot buffer，第三種 family 根本不需要，C++ 側一行未動。
 - **Q4（pooling 與輸出契約）**：我們的 API 層目前沒有 `/v1/embeddings`、沒有
   `/v1/audio/transcriptions`（`runtime/entrypoints/control_server.py` 的路由清單），
   runtime 內也沒有任何 pooler（唯一的 "pooling" 命中是 `runtime/configs/qwen3_config.py:72` 講 GQA

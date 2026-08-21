@@ -305,6 +305,19 @@ def _derive_num_attention_layers(
 ) -> int:
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
+    if "WhisperForConditionalGeneration" in architectures:
+        # Whisper reports num_hidden_layers == encoder_layers, but the encoder
+        # keeps no KV at all (it runs through the pool-free
+        # ``mm_encoder_attention`` path) and the decoder's cross-attention KV
+        # lives outside the arena in its own buffer. What the paged pool has
+        # to size for is the decoder's *self*-attention, and nothing else.
+        #
+        # SGLang sizes the same pool at ``encoder_layers + 2 * decoder_layers``
+        # (`srt/configs/model_config.py:1014`) because its encoder blocks
+        # register as ordinary attention layers and its cross KV is folded
+        # into the same pool. On large-v3-turbo that is 40 layer slots of
+        # which 32 are never indexed; here it is 4.
+        return int(getattr(hf_config, "decoder_layers", num_hidden_layers))
     if is_deepseek_v4_nextn(hf_config):
         num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
@@ -1019,6 +1032,10 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "KimiK3ForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        # Audio in, tokens out: the request carries its audio the same way a
+        # multimodal request carries an image, even though Whisper is an
+        # encoder-decoder rather than an audio-prefix model.
+        "WhisperForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -1033,6 +1050,7 @@ def is_image_gen_model(model_architectures: list[str]):
 
 def is_audio_model(model_architectures: list[str] | None):
     audio_architectures = {
+        "WhisperForConditionalGeneration",
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",

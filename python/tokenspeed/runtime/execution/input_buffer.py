@@ -39,6 +39,12 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
+# Bit 30 of a token id, where a cross-encoder's segment rides. Defined here
+# and in models/bert.py from the same constant; the two must agree, and a
+# unit test pins them together.
+_PACKED_TOKEN_TYPE_MASK = 1 << 30
+
+
 class InputBuffers:
     """
     ForwardContext tensor data source, read-only after fill. Holds only
@@ -358,7 +364,23 @@ class InputBuffers:
         # handled separately below because valid content-derived MM pads are
         # out-of-vocab until Eagle/MTP restores their modality token.
         vocab_size = runtime_states.vocab_size
-        self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
+        if getattr(runtime_states, "packed_token_type_ids", False):
+            # A cross-encoder's ids carry the pair's segment in bit 30, so the
+            # clamp has to bound the token underneath and put the bit back --
+            # clamping the whole value erases both, and the model then reads
+            # `vocab_size - 1` where the document should be. That failure is
+            # silent: it still scores, just against the wrong text.
+            #
+            # Same shape as the exemption three lines below for
+            # shifted_prefill_ids_buf, whose multimodal pads are also
+            # intentionally out of vocabulary.
+            ids = self.input_ids_buf[:total_tokens]
+            high = ids & _PACKED_TOKEN_TYPE_MASK
+            ids &= ~_PACKED_TOKEN_TYPE_MASK
+            ids.clamp_(0, vocab_size - 1)
+            ids |= high
+        else:
+            self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
         # Do not clamp shifted_prefill_ids_buf here. Content-derived MM pad IDs
         # intentionally exceed the vocabulary and retain a modality tag until
         # Eagle/MTP replaces them with model-specific in-vocab tokens. The draft

@@ -129,6 +129,21 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     return cap
 
 
+def _packs_token_type_ids(model_config) -> bool:
+    """True when this model's ids carry a segment in their high bits.
+
+    Only cross-encoders do: a reranker scores a pair, and BERT distinguishes
+    the halves with segment ids that ride packed in the token id (see
+    ``models/bert.py`` ``encode_token_type_ids``). Deriving it from the
+    architecture rather than exposing a flag keeps an operator from turning
+    it on for a generative model, where an id with bit 30 set is not a
+    segment -- it is a corrupt id, and the clamp that would have caught it is
+    the thing this disables.
+    """
+    architectures = getattr(model_config.hf_config, "architectures", None) or []
+    return any(str(a).endswith("ForSequenceClassification") for a in architectures)
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -174,6 +189,12 @@ class ModelExecutorConfig:
     is_embedding: bool = False
     # Whether a pooling model may use the breakable prefill graph.
     pooling_prefill_graph: bool = True
+    # Whether this model's input ids may carry a packed high bit. A
+    # cross-encoder's segment id rides in bit 30 of the token id rather than
+    # in a second per-token tensor, and the defensive vocab clamp in
+    # ``InputBuffers.fill_input_buffers`` would otherwise erase it -- along
+    # with the token underneath.
+    packed_token_type_ids: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -274,6 +295,7 @@ class ModelExecutorConfig:
             pooling_prefill_graph=bool(
                 getattr(server_args, "pooling_prefill_graph", True)
             ),
+            packed_token_type_ids=_packs_token_type_ids(model_config),
             logical_page_size=logical_page_size,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
@@ -420,6 +442,7 @@ class ModelExecutor:
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
+            packed_token_type_ids=config.packed_token_type_ids,
         )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(

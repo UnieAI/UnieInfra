@@ -205,6 +205,12 @@ class BertEmbedding(nn.Module):
             if getattr(config, "type_vocab_size", 0) > 0
             else None
         )
+        # One row means one segment: the checkpoint has no second embedding
+        # to look up, and its tokenizer may still hand back segment ids of 1
+        # for a pair (gte-multilingual-reranker does). Reading them indexes
+        # past the table -- a device-side assert, and only once a pair
+        # reaches it.
+        self.has_segments = getattr(config, "type_vocab_size", 0) > 1
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
@@ -217,9 +223,15 @@ class BertEmbedding(nn.Module):
         # the graph runs the word gather outside the capture and hands the
         # result back. Everything after it reads ``positions``, so it stays
         # inside.
+        # Unmask unconditionally: a caller may pack a segment bit at a model
+        # with no second segment, and the word gather still has to see the
+        # real id underneath.
+        input_ids, packed_types = decode_token_type_ids(input_ids)
         token_type_ids = None
-        if self.token_type_embeddings is not None:
-            input_ids, token_type_ids = decode_token_type_ids(input_ids)
+        if self.has_segments:
+            token_type_ids = packed_types
+        elif self.token_type_embeddings is not None:
+            token_type_ids = torch.zeros_like(packed_types)
         embeddings = (
             self.word_embeddings(input_ids) if word_embeds is None else word_embeds
         )
@@ -265,6 +277,7 @@ class NewEmbedding(nn.Module):
             if getattr(config, "type_vocab_size", 0) > 0
             else None
         )
+        self.has_segments = getattr(config, "type_vocab_size", 0) > 1
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
@@ -273,9 +286,12 @@ class NewEmbedding(nn.Module):
         positions: torch.Tensor,
         word_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        input_ids, packed_types = decode_token_type_ids(input_ids)
         token_type_ids = None
-        if self.token_type_embeddings is not None:
-            input_ids, token_type_ids = decode_token_type_ids(input_ids)
+        if self.has_segments:
+            token_type_ids = packed_types
+        elif self.token_type_embeddings is not None:
+            token_type_ids = torch.zeros_like(packed_types)
         embeddings = (
             self.word_embeddings(input_ids) if word_embeds is None else word_embeds
         )

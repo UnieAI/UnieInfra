@@ -35,9 +35,14 @@ class RuntimeStates:
         vocab_size: int,
         output_length: int,
         device: str = "cuda",
+        packed_token_type_ids: bool = False,
     ):
         self.device = device
         self.vocab_size = vocab_size
+        # See InputBuffers.fill_input_buffers: a cross-encoder's segment id
+        # rides in bit 30 of the token id, so the vocab clamp has to leave
+        # that bit alone.
+        self.packed_token_type_ids = packed_token_type_ids
 
         self.valid_cache_lengths = torch.zeros(
             req_pool_size + 1, dtype=torch.int32, device=device

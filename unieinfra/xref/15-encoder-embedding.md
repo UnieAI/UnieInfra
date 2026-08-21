@@ -245,6 +245,34 @@ padded 路徑的時間**與 bs 無關**（~0.755 ms），gather 則隨 bs 成長
 兩條路徑都做過端到端轉譯驗證（`--max-num-seqs 1` 走 padded、較大值走 gather），
 輸出都與 HF 逐字相同。重跑：`unieinfra/bench/whisper_cross_attn_paths.py`。
 
+## 6.4　embedding：列表請求被拆進兩個 prefill step（2026-08-21）
+
+§3.5 記的分歧點是「只有 TRT-LLM 為 embedding 流量另做批次」。在自己身上量之後，
+發現我們有一個更基本的問題，而且它在單一請求的延遲數字裡完全看不見。
+
+前端對列表型請求是**逐條 tokenize 後立刻送出**（`async_llm.py:_handle_batch_request`）。
+每個 `await` 都讓出事件迴圈，scheduler 撿走已到達的請求就開跑，於是一個列表請求被拆進
+兩個 prefill step。對 embedding 而言那是純損失——呼叫端本來就要等最後一條。
+
+**用預先 tokenize 的輸入當對照組**（`input_ids=` 不可能被 tokenize 拆開），機制立刻現形：
+
+```
+n     文字       input_ids   ratio          修正後文字   ratio
+ 4   20.7 ms      20.4 ms    1.01x            20.7 ms    1.01x
+ 6   38.4 ms      20.7 ms    1.85x  ← 斷崖    21.3 ms    1.01x
+ 8   39.1 ms      21.1 ms    1.85x            21.8 ms    1.03x
+16   41.1 ms      23.1 ms    1.78x            23.7 ms    1.01x
+32   44.8 ms      30.8 ms    1.45x            31.6 ms    1.03x
+```
+
+修正是整批 tokenize 完再一起送（SGLang 對 embedding 模型強制的
+`enable_tokenizer_batch_encode` 就是這件事）。修正後文字路徑在每個 n 都與對照組
+一致（1.01–1.03x），**表示被修掉的是機制而不只是症狀**。最高 1.80x。
+
+**不套用到生成請求**：那裡先送第一條能降低它的 TTFT，串流呼叫端在其餘到達前就能用。
+
+回歸探針：`unieinfra/bench/embedding_batch_shape.py`（門檻 1.15x，超過即失敗）。
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder

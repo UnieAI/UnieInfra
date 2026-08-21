@@ -88,8 +88,11 @@ input_validation → text_encoding → image_encoding → latent_preparation
 （311k 行）。這棵樹既有的 embedding / ASR / paged KV / continuous batching 幾乎都用不上——
 一個 diffusion 請求沒有 KV cache、沒有自迴歸 decode、沒有 token 輸出。
 
-**唯一能直接重用的是 text encoder。** Qwen2.5-VL 與 Qwen3-VL 已經在 registry 裡
-（`qwen3_vision.py`、`qwen3_omni.py`、`qwen3_5.py`），FLUX 的 T5/CLIP 沒有。
+**最接近能重用的是 text encoder，但今天還不能直接用。** registry 裡有
+`qwen3_vision.py`（ViT tower）與 `qwen3_omni.py`（MoE 的
+`Qwen3OmniMoeForConditionalGeneration`），**沒有** dense 的
+`Qwen3VLForConditionalGeneration`——而 MiniMax-H3 的 text encoder 正是後者。
+FLUX 的 T5/CLIP 也沒有。（初稿寫成「已經在 registry 裡」，2026-08-21 查證後更正。）
 
 **已決定的做法**（2026-08-21，operator 選擇）：
 
@@ -111,3 +114,8 @@ MiniMax-H3 的 audio VAE 與 t2va/fl2va 雙任務留到骨架穩定之後。
 
 **尚未確認**：FLUX.1-dev 的 repo 是 gated（抓 config 回 401），要嘛用 FLUX.1-schnell，
 要嘛提供 HF token。容器內目前**沒有 diffusers**。
+
+**MiniMax-H3 的展開設計見 `unieinfra/DESIGN-minimax-h3.md`。** 兩件在那裡查證出來、
+會改變本節判斷的事：H3 的 repo **未 gated**，而且 `diffusers` **0.40.0 正式版**已經
+內含 `MiniMaxH3Transformer3DModel` / `AutoencoderKLMiniMaxH3`——所以「先包 diffusers」
+這條路可以釘在發行版號上，而 H3 少了 FLUX 那道 gated 的關卡。

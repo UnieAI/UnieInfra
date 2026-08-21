@@ -84,6 +84,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
         .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes);
 
+    nb::enum_<tokenspeed::SchedulerConfig::ContextChunkPolicy>(m, "ContextChunkPolicy")
+        .value("kFirstComeFirstServed", tokenspeed::SchedulerConfig::ContextChunkPolicy::kFirstComeFirstServed)
+        .value("kEqualProgress", tokenspeed::SchedulerConfig::ContextChunkPolicy::kEqualProgress);
+
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 
     nb::enum_<tokenspeed::Role>(scheduler_config, "Role")
@@ -145,6 +149,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     scheduler_config.def(nb::init<>())
         .def_rw("block_size", &tokenspeed::SchedulerConfig::block_size)
+        .def_rw("context_chunk_policy", &tokenspeed::SchedulerConfig::context_chunk_policy)
+        .def_rw("context_chunk_unit", &tokenspeed::SchedulerConfig::context_chunk_unit)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
@@ -162,6 +168,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
+        .def_rw("max_cold_prefills", &tokenspeed::SchedulerConfig::max_cold_prefills)
         .def_rw("reserve_full_prefill_at_admission",
                 &tokenspeed::SchedulerConfig::reserve_full_prefill_at_admission)
         .def_rw("preempt_on_blocked_request", &tokenspeed::SchedulerConfig::preempt_on_blocked_request)

@@ -214,6 +214,8 @@ def make_config(
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
     admission_reserve: str = "generation-full",
+    context_chunk_policy: str = "fcfs",
+    context_chunk_unit: int = 0,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
@@ -223,6 +225,28 @@ def make_config(
         )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
+    # How the step budget is split among mid-prefill requests. See
+    # SchedulerConfig::ContextChunkPolicy -- "fcfs" is what we have always
+    # done; "equal-progress" is TRT-LLM's kEQUAL_PROGRESS ported 1:1.
+    from tokenspeed_scheduler import ContextChunkPolicy as _Policy
+
+    if _Policy is None:
+        # Extension predates the policy. Refuse loudly if it was asked for, and
+        # stay silent otherwise -- a request for equal-progress that silently
+        # ran FCFS would produce exactly the clean null result the experiment
+        # might legitimately return.
+        if context_chunk_policy != "fcfs":
+            raise RuntimeError(
+                "--context-chunk-policy=%s needs a scheduler extension that "
+                "exports ContextChunkPolicy; the installed one does not"
+                % context_chunk_policy
+            )
+    else:
+        cfg.context_chunk_policy = {
+            "fcfs": _Policy.kFirstComeFirstServed,
+            "equal-progress": _Policy.kEqualProgress,
+        }[context_chunk_policy]
+        cfg.context_chunk_unit = context_chunk_unit
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.block_size = page_size

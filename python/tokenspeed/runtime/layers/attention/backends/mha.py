@@ -32,6 +32,7 @@ from tokenspeed_kernel import (
     mha_plan,
     mha_prefill,
 )
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed_kernel.ops.attention.flashinfer import (
     clear_paged_extend_plan,
     install_paged_extend_plan,
@@ -68,6 +69,9 @@ _KERNEL_SOLUTION_BY_BACKEND = {
     "triton": "triton",
     "flashinfer": "flashinfer",
 }
+
+
+logger = get_colorful_logger(__name__)
 
 
 def _slice_extend_inputs(metadata, q, k, v):
@@ -766,6 +770,38 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         )
 
         extend_mode = plan.get("extend_mode", "prewrite")
+        if layer.skip_kv_cache:
+            # An embedding server's prefill computes its attention from the
+            # k/v passed in and nothing ever reads the pages back, so the
+            # write is pure bandwidth -- but only on the no-prefix postwrite
+            # prefill. Every other branch reads pages, and skipping the write
+            # there would attend over uninitialised memory and return a
+            # well-formed wrong answer, which nothing downstream could catch.
+            #
+            # postwrite is chosen by the kernel plan only when a
+            # PERFORMANT-priority prefill kernel matches the dtype and traits
+            # (tokenspeed_kernel/ops/attention/__init__.py:3276). On bf16 +
+            # triton here it resolves to prewrite, so the saving is currently
+            # unreachable. Fall back rather than fail: an optimization that
+            # cannot apply should leave the server running, and say why once
+            # rather than silently doing nothing.
+            if (
+                metadata.mixed_total_tokens == 0
+                and metadata.max_extend_prefix_len == 0
+                and extend_mode == "postwrite"
+            ):
+                save_kv_cache = False
+            elif not getattr(self, "_skip_kv_cache_warned", False):
+                self._skip_kv_cache_warned = True
+                logger.warning(
+                    "embedding_skip_kv_write is on but this forward reads the "
+                    "pages, so the KV write is kept: extend_mode=%r "
+                    "mixed_total_tokens=%d max_extend_prefix_len=%d. The "
+                    "saving needs a postwrite prefill kernel for this dtype.",
+                    extend_mode,
+                    metadata.mixed_total_tokens,
+                    metadata.max_extend_prefix_len,
+                )
         if metadata.mixed_total_tokens > 0:
             # Prefill chunks and decode rows in one batch; each half wants a
             # different kernel, so it cannot go down either branch below.

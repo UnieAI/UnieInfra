@@ -92,7 +92,24 @@ class BaseCausalLM(nn.Module):
                 # ever fills.
                 self.lm_head = None
                 self.logits_processor = None
+        if self.pooler is not None and getattr(config, "embedding_skip_kv_write", True):
+            self._skip_kv_cache_writes()
         self.post_init()
+
+    def _skip_kv_cache_writes(self) -> None:
+        """Tell every attention layer not to write KV.
+
+        A pooling request is one prefill and then done -- nothing ever reads
+        the pages back, so the write is bandwidth spent on data with no
+        reader. Set here rather than threaded through each model's attention
+        call: every model would otherwise need the same argument passed down
+        for a decision that belongs to the server's mode.
+        """
+        from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+        for module in self.modules():
+            if isinstance(module, PagedAttention):
+                module.skip_kv_cache = True
 
     def resolve_pooler(self, config: PretrainedConfig) -> Pooler | None:
         pooling_config = getattr(config, "pooling_config", None)

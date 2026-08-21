@@ -457,13 +457,46 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            # Send all requests
-            for i in range(batch_size):
-                tmp_obj = obj[i]
-                tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                generators.append(self._wait_one_response(tmp_obj))
-                rids.append(tmp_obj.rid)
+            if isinstance(obj, EmbeddingReqInput):
+                # Tokenize the whole list before sending any of it. Sending as
+                # we tokenize means every ``await`` hands control back to the
+                # event loop, the scheduler picks up whatever has arrived, and
+                # a list request gets split across prefill steps -- which for
+                # an embedding request is pure loss, because the caller cannot
+                # use item 0 until item N is done either way.
+                #
+                # Measured on Qwen3-Embedding-8B (8-token prompts, p50):
+                #
+                #     n     as text   pre-tokenized
+                #      4    20.7 ms        20.4 ms   (one step, no split)
+                #      6    38.4 ms        20.7 ms   1.85x
+                #      8    39.1 ms        21.1 ms   1.85x
+                #     16    41.1 ms        23.1 ms   1.78x
+                #     32    44.8 ms        30.8 ms   1.45x
+                #
+                # The cliff at 5-6 is one extra scheduler step: below it the
+                # whole list lands in one prefill, above it the tail waits for
+                # the next. SGLang forces the same thing for embedding models
+                # (`enable_tokenizer_batch_encode`); see
+                # unieinfra/xref/15-encoder-embedding.md §3.5.
+                #
+                # Deliberately not applied to generation: there, submitting
+                # the first prompt early lowers its TTFT, and a streaming
+                # caller can use it before the rest arrive.
+                objs = [obj[i] for i in range(batch_size)]
+                tokenized_objs = await self.input_processor.tokenize_batch(objs)
+                for tmp_obj, tokenized_obj in zip(objs, tokenized_objs):
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj))
+                    rids.append(tmp_obj.rid)
+            else:
+                # Send all requests
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj))
+                    rids.append(tmp_obj.rid)
         else:
             # Batched parallel sampling still follows a conservative path and
             # can be slower than duplicating requests explicitly.

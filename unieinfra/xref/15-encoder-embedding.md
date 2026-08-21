@@ -455,6 +455,130 @@ capture stream 必須用 `getattr`。那個 wrapper 只有在自己 capture 時�
 
 
 
+## 6.7　encoder-only 架構落地：BERT / RoBERTa-XLM-R / GTE-v1.5（2026-08-21）
+
+先前這台上每一個 pooling 模型都是「decoder 外掛 pooler」（Qwen3-Embedding）：因果 attention、
+分頁 KV pool、LAST reduction。BERT 家族是另一種形狀——雙向 attention、完全沒有 KV、
+一次 forward 就結束。
+
+**「BERT / GTE / BGE」是三個架構，不是同一個架構的三個 checkpoint：**
+
+| HF `architectures` | 代表 checkpoint | 位置編碼 | MLP |
+|---|---|---|---|
+| `BertModel` | `bert-base`、`BAAI/bge-*-en-v1.5`、`thenlper/gte-*` | learned absolute | 2 層 post-LN |
+| `XLMRobertaModel` / `RobertaModel` | `intfloat/multilingual-e5-*`、`BAAI/bge-m3` | absolute，起點是 `pad_token_id + 1` | 同上 |
+| `NewModel` | `Alibaba-NLP/gte-*-en-v1.5` | **RoPE + NTK scaling** | **gated（GeGLU）** |
+
+RoBERTa 那個位移就是兩家 forward 的全部差異，也是為什麼那些 config 的
+`max_position_embeddings` 是 514 而不是 512。
+
+### 第三個架構裡兩個「照 config 寫就會錯」的地方
+
+1. **`hidden_act` 是 `"gelu"`，但 checkpoint 出的是 `mlp.up_gate_proj`——MLP 其實是 GeGLU。**
+   vLLM 在 config 層改寫這個欄位（`model_executor/models/config.py:391
+   config.hidden_act = "geglu"`）；checkpoint 自己的 reference 實作
+   （`Alibaba-NLP/new-impl` `modeling.py` `NewGatedMLP`）殊途同歸，它只把
+   `ACT2FN[hidden_act]` 套在 gate 那一半。照字面讀 config 會得到一個非 gated 的 MLP，
+   而且**對著一半的權重載入得乾乾淨淨**。
+   注意 checkpoint 的排列是 `[up; gate]`，與本樹 fused `gate_up` 的慣例相反。
+2. **`rope_scaling {"type": "ntk", "factor": 2.0}` 縮放的是 base 頻率**，所以它改變
+   *每一個* 位置，不是只改訓練窗口之外的位置。短 prompt 的測試抓不到漏掉它。
+   本樹的 `get_rope` 沒有 `"ntk"` 這個 scaling type，加一個會動到每個 decoder 共用的
+   rotary 層，所以 cache 放在模型檔內（`NTKScalingRotaryCache`）。
+
+   實際的縮放是兩步，而且**不是條件式的**：reference 建了兩次 cache，第一次用
+   `max_position_embeddings`（守門是嚴格 `>`，不觸發），第二次用
+   `max_position_embeddings * factor`（觸發）。第二次的結果才是服務時用的：
+
+       base' = base * factor        inv_freq = 1 / base'^(2i/d)
+       inv_freq /= factor^(2/d)
+
+### attention 不需要新工作
+
+§7 Q1 早就記過：非因果 encoder pass 在本樹已解決。三個架構都走
+`mm_encoder_attention` 的 varlen backend——Whisper encoder 用的同一條 pool-free 路徑。
+GTE 的 RoPE 也不需要新東西，`MultimodalEncoderAttention` 本來就收
+`rotary_pos_emb_cos` / `rotary_pos_emb_sin`。
+
+### 批次佈局取自 `gather_ids`，不取自 attention backend
+
+encoder-only 模型沒有任何 attention 層在驅動那個 backend，而 `ctx.gather_ids` 已經是
+`BaseCausalLM.pool` 拿來 reduce 的那個 tensor，所以 attention 與 pooling **不可能**
+對「某個請求的 row 在哪裡」有不同看法。`gather_ids` 在 extend forward 上就是
+`cumsum(extend_lens) - 1`，所以 `cat([0, gather_ids + 1])` 直接**就是** cu_seqlens。
+
+`max_seqlen` 給的是上界（`input_num_tokens`）而不是精確值：精確值要 `.item()`，
+那是一次 device sync，在捕捉中的 CUDA graph 裡非法（Whisper decoder 撞過同一條）。
+varlen kernel 只拿它決定 grid 大小、再用 per-request 長度遮罩，所以高估只是空 block，
+不會算到錯的 row。
+
+### 對 HuggingFace 的 parity（bf16、sm_120、triton、四條不等長 prompt 打成一個 batch）
+
+```
+bge-small-en-v1.5      cls  + normalize      worst cosine 0.999916
+multilingual-e5-base   mean + normalize      worst cosine 0.999947
+gte-base-en-v1.5       cls  + 不 normalize    worst cosine 0.999939
+```
+
+pooling 模式是**由命令列明確傳入**而不是從 checkpoint 讀，所以這同時測到 engine 自己的
+`resolve_pooling_config` 有沒有得到同一個答案。三個都對，包含 **GTE 沒有 Normalize
+module** 這一項——一個永遠做 L2 正規化的 server 會對它回傳一個格式完美的錯向量。
+
+### prefill graph 對這個家族**不能**開（已量、已歸因）
+
+先量了再拒絕：bge-small 上 breakable prefill graph 值
+**6.69 → 3.29 ms（2.03x）**，兩臂都有機制證據。倍率比 Qwen3-Embedding-8B 的 1.33x 大，
+和 dense 0.6B 拿到 2.0x 是同一個原因——模型小，launch 開銷佔比高。
+
+但**以 graph 目前的形狀不能拿**。這個 stack 是在**被捕捉的區域內**讀 `ctx.gather_ids`
+取批次佈局，而 graph 捕捉時用的是 `make_dummy_batch` 的 context，捕捉結束後就把它丟掉
+（`execution/prefill_graph.py` `self._ctx = None`）。沒有任何東西在每次 replay 時刷新
+那個 tensor 的內容，所以每次 replay 都會用 **dummy batch 的序列邊界**去 attend。
+
+驗過，不是推測——開著 graph 重跑 parity：
+
+```
+bge-small-en-v1.5     0.999916 -> 0.295324
+multilingual-e5-base  0.999947 -> 0.682696
+```
+
+**格式完美、算在錯的 row 上的向量。** 這也再次說明為什麼 §6.6 那條紀律要對兩個方向都
+成立：先前那三次 PASS 是在 graph 停用時跑的（當時模型沒有 `embed_tokens`，被靜默擋掉），
+所以把 graph 接上之後**必須重驗**，不能沿用。
+
+pooling **decoder** 不受影響：它的 reduction 跑在 `replay()` 的 eager tail，用的是呼叫端
+的真實 context；只有在 forward 途中就需要佈局的模型會撞到。
+
+要解開，得讓 prefill graph 提供一個每次 replay 都刷新的批次佈局 buffer
+（`positions_buf` 本來就會刷新，cu_seqlens 可以用固定形狀從它導出）。那是動到每個模型
+共用的機制，該有它自己的驗證，所以這一輪把它做成**模型明確宣告的拒絕**
+（`supports_prefill_graph = False`，graph 端有具名的停用理由），而不是靠「沒有
+`embed_tokens`」意外擋掉。
+
+### 一個在 reference 那一側的陷阱
+
+`AutoModel.from_pretrained`（transformers 5.12）從 meta 具現化模型再用 checkpoint 填，
+而 `persistent=False` 註冊的 buffer **依定義不在任何 checkpoint 裡**，也沒有人重跑
+建構子，所以它們拿到的是當時那塊記憶體的內容。GTE 上三個全死：
+
+```
+rotary_emb.cos_cached   全 0
+rotary_emb.sin_cached   全 0
+rotary_emb.inv_freq     -1.09e30, 4.47e-41, ...
+embeddings.position_ids -1.07e12, -9.4e11, -59873, ...
+```
+
+`cos = sin = 0` 讓 reference 的 `apply_rotary_pos_emb` 回傳
+`q*0 + rotate_half(q)*0`——它把每一個 query 和 key 歸零，attention 退化成對 V 的
+均勻平均。**輸出的形狀與 norm 幾乎不變。** 拿一個*正確*的實作去比，得到 cosine 0.31，
+讀起來完全像是自己的模型壞了。只修 cos/sin 到 0.73，剩下的是那個垃圾 `position_ids`。
+
+修法不是逐個打補丁，是換一條建構路徑：`from_config` 會真的跑建構子，再明確
+`load_state_dict`。`_assert_buffers_live` 是「這次真的有效」的檢查，而不是等下一個
+靜默變體。這條與 `gemma4-no-backend-sm120` 正好是一體兩面：那條說「叫自己的模型壞掉
+之前先對 HF reference」，這條說 HF reference 本身也是會靜默壞掉的東西。
+
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder

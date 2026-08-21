@@ -11,14 +11,16 @@
 
 | 能力 | 狀態 | 證據 |
 |---|---|---|
-| Embedding（pooled 向量） | **可服務** | 對 HF 逐句餘弦 0.999864–0.999883 |
+| Embedding：因果 LLM 當 embedder | **可服務** | 對 HF 逐句餘弦 0.999864–0.999883 |
+| Embedding：encoder-only（BERT / XLM-R / GTE-v1.5） | **可服務** | 對 HF 最差餘弦 0.999916 / 0.999947 / 0.999939 |
 | Whisper（encoder-decoder ASR） | **可服務** | 轉譯與 HF **逐字相同**、token id 相同 |
 | `/v1/embeddings`、`/v1/audio/transcriptions` | **端點未做** | 引擎端已備妥；見 §5 |
 
 「端點未做」不等於不支援：引擎路徑完整且驗證過，缺的是 repo 外那兩個 wheel 的
 proto 與 handler。
 
-重跑證據：`unieinfra/bench/embedding_parity.py`、`whisper_transcribe_parity.py`。
+重跑證據：`unieinfra/bench/embedding_parity.py`、`encoder_embedding_parity.py`、
+`whisper_transcribe_parity.py`。
 
 ## 2　支援哪些模型
 
@@ -34,8 +36,19 @@ Embedding 走的是「**因果 LLM 當 embedder**」。三道關卡：
 不符合的 15 個是 NextN／draft head，以及包一層 `language_model` 的複合多模態模型
 （Whisper、Qwen3-ASR、Kimi、Inkling）。
 
-**尚未支援 encoder-only 家族**（BERT / GTE / BGE / RoBERTa / ModernBERT）：那需要
-非因果的模型類別加上零 KV group 的路徑（xref §3.2）。這是真正的缺口，不是設定問題。
+**encoder-only 家族現在也支援了**（`models/bert.py`，xref §6.7）。這是三個架構而不是
+一個：`BertModel`（bge-*-en-v1.5、thenlper/gte-*）、`XLMRobertaModel` /`RobertaModel`
+（multilingual-e5-*、bge-m3，位置從 `pad_token_id + 1` 起算）、`NewModel`
+（Alibaba-NLP/gte-*-en-v1.5，RoPE + NTK scaling + GeGLU）。
+
+非因果 attention 沒有新工作——三者都走 `mm_encoder_attention` 的 varlen backend，
+就是 Whisper encoder 用的那條 pool-free 路徑。批次佈局取自 `ctx.gather_ids`
+（`pool()` 本來就在用的同一個 tensor），所以 attention 與 pooling 不可能對
+「某個請求的 row 在哪」有分歧。
+
+**仍未支援**：`ModernBertModel`、Nomic、Jina v3、ColBERT 這些變體，以及 cross-encoder
+（reranker）的 `*ForSequenceClassification`。零 KV group 的路徑（xref §3.2）也還沒做——
+目前 pool 仍照 `num_hidden_layers` 配滿卻永遠不用，那是 SGLang 的行為。
 
 ## 3　設計上的分歧點，以及我們站哪一邊
 
@@ -77,6 +90,14 @@ cross-attention 那項要注意：**只看 kernel 是 7.55x，看整個 block �
 - **fp8 cross KV**：`FP8 is only supported on SM100 (compute capability 10.x)`。
   連同 `page_table`、`gather_kv_indices`，這是 sm_120 上第三道關著的門。
 
+- **encoder-only 模型開 prefill graph**：先量了才拒絕——bge-small 上值
+  **6.69 → 3.29 ms（2.03x）**，但以 graph 目前的形狀不能拿。encoder stack 是在
+  **被捕捉的區域內**讀 `ctx.gather_ids` 取批次佈局，而 graph 捕捉用的是 dummy batch 的
+  context 且捕捉後就丟掉，沒有東西每次 replay 刷新它。開著 graph 重驗 parity 掉到
+  0.295（bge）／0.683（e5）——**格式完美、算在錯的 row 上**。做成模型明確宣告的拒絕
+  （`supports_prefill_graph = False`），要解得先給 graph 一個每次 replay 刷新的
+  批次佈局 buffer。
+
 **判讀撤回**：先前記的「prefill graph 只省 0.35 ms」不算負面結果——那一輪
 graph 從未被捕捉（日誌行沒出現），所以狀態是**不確定**。
 
@@ -94,8 +115,15 @@ servicer。目前可用入口是 in-process 的 `Engine.encode(...)` 與帶 audi
 
 ## 6　下一步，按證據強度
 
-1. **encoder-only 架構**（BERT/GTE/BGE）：真正的能力缺口。
-2. **hold-window 聚合**（TRT-LLM 的 5ms）：治的是不同請求之間，與 §4 第 2 項不重疊；
+1. **給 prefill graph 一個每次 replay 刷新的批次佈局 buffer**，好讓 encoder-only 模型
+   也能用它。獎品已量到是 **2.03x**（見 §4），阻礙也已歸因；`positions_buf` 本來就會
+   刷新，cu_seqlens 可以用固定形狀從它導出。這動到每個模型共用的機制，要自己的驗證。
+2. **encoder-only 的其餘變體**：`ModernBertModel`、Nomic、Jina v3、ColBERT，以及
+   cross-encoder（reranker）的 `*ForSequenceClassification`。
+3. **零 KV group**（xref §3.2）：目前 encoder-only 模型的 pool 仍照 `num_hidden_layers`
+   配滿卻永遠不用，那是 SGLang 的行為；vLLM 的 0 group 與 TRT-LLM 的「不建 manager」
+   都更乾淨。
+4. **hold-window 聚合**（TRT-LLM 的 5ms）：治的是不同請求之間，與 §4 第 2 項不重疊；
    要等端點做起來、有真並發流量才量得準。那個 5ms 是慣例常數，**抄結構不要抄數字**。
 
 （原本列在此處第 1 項的「讓 pooling 模型也能用 prefill graph」**已完成**，見 §4 與

@@ -308,6 +308,15 @@ class PrefillGraph:
             ),
             ("model_runner is None", model_runner is None),
             ("model exposes no inner .model", self.inner_model is None),
+            # An encoder-only stack reads its batch layout inside the
+            # captured region, and the capture context is a dummy batch that
+            # nothing refreshes per replay. Opting out is the model's call,
+            # not a property of the graph, so the model declares it.
+            (
+                "model declares supports_prefill_graph = False",
+                self.inner_model is not None
+                and not getattr(self.inner_model, "supports_prefill_graph", True),
+            ),
             ("inner model exposes no embed_tokens", self._embed_tokens is None),
             # A pooling model was excluded outright here. The capture is
             # mode-agnostic -- it runs the inner stack and returns hidden

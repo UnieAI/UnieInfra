@@ -125,6 +125,11 @@ class ServerArgs:
     # exists so the optimization can be A/B'd against the path it replaced
     # (measured up to 1.80x, see unieinfra/xref/15-encoder-embedding.md §6.4).
     embedding_batch_tokenize: bool = True
+    # Skip the prefill KV write on a pooling model. Nothing reads it back:
+    # the request finishes on its first forward. On by default; the switch is
+    # here so the saving can be A/B'd. (SGLang does the same thing for
+    # embedding models, `fa_skip_kv_cache`; xref §1.)
+    embedding_skip_kv_write: bool = True
 
     # How an encoder-decoder reads its cross-attention KV on a decode step.
     # "padded" attends over every slot with the queries scattered by pool
@@ -1026,6 +1031,13 @@ class ServerArgs:
             help="Tokenize a whole list-valued embedding request before "
             "submitting any of it, so it lands in one prefill step instead "
             "of being split across two. Off restores the per-item submit.",
+        )
+        parser.add_argument(
+            "--embedding-skip-kv-write",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.embedding_skip_kv_write,
+            help="Skip the prefill KV write on a pooling model; nothing "
+            "reads it back. Off restores the write.",
         )
         parser.add_argument(
             "--cross-attn-path",

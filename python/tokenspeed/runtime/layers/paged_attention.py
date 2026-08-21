@@ -59,6 +59,11 @@ class PagedAttention(nn.Module):
         # paged cache group ("" -> single-table fallback in the backend).
         # make group_id mandatory once flat is the only path.
         self.group_id = group_id
+        # Pooling models never read their own KV back: one prefill, one
+        # vector, no decode. Set by BaseCausalLM when the server is in
+        # embedding mode, honoured by the backend, which refuses it on any
+        # path that would then read pages that were never written.
+        self.skip_kv_cache = False
         self.k_scale = None
         self.v_scale = None
 

@@ -450,6 +450,9 @@ class ModelConfig:
             # model class is constructed from the HF config alone, so the
             # decision has to travel on it.
             self.hf_config.pooling_config = self.pooling_config
+            self.hf_config.embedding_skip_kv_write = bool(
+                getattr(server_args, "embedding_skip_kv_write", True)
+            )
             if hasattr(self.hf_config, "text_config"):
                 self.hf_config.text_config.pooling_config = self.pooling_config
         self.is_multimodal = is_multimodal_model(self.hf_config.architectures)

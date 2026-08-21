@@ -273,6 +273,27 @@ n     文字       input_ids   ratio          修正後文字   ratio
 
 回歸探針：`unieinfra/bench/embedding_batch_shape.py`（門檻 1.15x，超過即失敗）。
 
+## 6.5　embedding 省掉 prefill 的 KV 寫入：在這台目前拿不到（2026-08-21）
+
+§1 記了 SGLang 對 embedding 模型有 `fa_skip_kv_cache`——pooling 請求不會回讀自己的 KV，
+所以那次寫入是純浪費。照著做了，但**在這個 backend 上拿不到**，原因值得記。
+
+MHA backend 的 extend 有兩種模式。**postwrite** 會先用傳入的 raw k/v 算出 attention、
+之後才寫頁，所以那次寫入可以省。**prewrite** 反過來：先寫頁、再從頁讀回來算，
+省掉寫入就等於讀未初始化的記憶體。
+
+模式由 kernel plan 決定：只有在該 dtype／traits 有 **PERFORMANT 優先級的 prefill kernel**
+時才選 postwrite（`tokenspeed_kernel/ops/attention/__init__.py:3276`）。這台 bf16 + triton
+解析成 **prewrite**，所以省不掉。
+
+**這是被守門擋下來的，不是被量出來的。** 第一版直接把 `save_kv_cache=False` 傳下去，
+守門立刻報 `extend_mode='prewrite'`——如果沒有那個檢查，就會 attend 到未初始化的頁，
+回傳形狀正確、範數正確、但數值錯誤的向量，下游沒有任何東西攔得住。
+
+目前的行為是偵測到就退回寫入並記錄一次（不是 crash：一個用不上的優化不該讓伺服器停擺）。
+開關 `--embedding-skip-kv-write` 預設開著，實際生效與否取決於有沒有 postwrite kernel。
+**要讓它生效的前提是為 bf16 註冊一支 PERFORMANT 的 prefill kernel**，那是另一件事。
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder

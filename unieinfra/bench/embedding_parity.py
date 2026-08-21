@@ -30,7 +30,7 @@ PROMPTS = [
 ]
 
 
-def ours(model: str, prompts: list[str]) -> np.ndarray:
+def ours(model: str, prompts: list[str], **engine_kwargs) -> np.ndarray:
     from tokenspeed.runtime.entrypoints.engine import Engine
 
     engine = Engine(
@@ -41,6 +41,7 @@ def ours(model: str, prompts: list[str]) -> np.ndarray:
         max_num_seqs=8,
         disable_kvstore=True,
         attention_backend="triton",
+        **engine_kwargs,
     )
     sa = engine.server_args
     # The resolved values, not the requested ones: an embedding server turns
@@ -52,7 +53,8 @@ def ours(model: str, prompts: list[str]) -> np.ndarray:
     print(
         f"  resolved prefix_caching={sa.enable_prefix_caching} "
         f"chunked_prefill_size={sa.chunked_prefill_size} "
-        f"overlap_disabled={sa.disable_overlap_schedule}"
+        f"overlap_disabled={sa.disable_overlap_schedule} "
+        f"skip_kv_write={sa.embedding_skip_kv_write}"
     )
     out = engine.encode(prompt=prompts)
     if isinstance(out, dict):
@@ -87,6 +89,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--arm", choices=["ours", "reference", "both"], default="both")
+    parser.add_argument(
+        "--no-skip-kv-write",
+        action="store_true",
+        help="Restore the prefill KV write. The vectors must be identical "
+        "either way -- nothing reads those pages back, so if the answer "
+        "moves, the assumption behind the optimization is wrong.",
+    )
     parser.add_argument("--ours-npy", default=".embed_ours.npy")
     parser.add_argument("--reference-npy", default=".embed_ref.npy")
     parser.add_argument(
@@ -99,7 +108,14 @@ def main() -> None:
 
     if args.arm in ("ours", "both"):
         print("engine arm:")
-        np.save(args.ours_npy, ours(args.model, PROMPTS))
+        np.save(
+            args.ours_npy,
+            ours(
+                args.model,
+                PROMPTS,
+                embedding_skip_kv_write=not args.no_skip_kv_write,
+            ),
+        )
     if args.arm in ("reference", "both"):
         print("reference arm:")
         np.save(args.reference_npy, reference(args.model, PROMPTS))

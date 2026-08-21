@@ -343,9 +343,36 @@ forward。最符合全部數據的模型是：
 這同時解釋了為什麼地板跟著層數走（每輪成本）而不跟 prompt 長度走，以及為什麼並發時會被
 攤掉（多個請求共用同一批輪次）。
 
-**仍未定位到是哪幾輪。** 已排除：模型計算、prompt 長度、client 橋接、串流間隔、
-detokenizer、前綴快取、eager prefill。要再往下必須在事件迴圈裡埋量測點——那會動到共用
-路徑，尚未進行。
+### 定位：整個地板都在 `prefill_ms`
+
+不需要新增量測點——引擎自己的 `--enable-log-request-stats` 已經在量了，先前只是沒去讀
+它的 log（它走 `logger.info`，預設 log level 看不到）。Qwen3-0.6B、5-token prompt、
+1 token out：
+
+```
+queue_ms     0.4–0.7 ms    created -> scheduled（前端 hop + 准入）
+prefill_ms  15.4–16.4 ms   scheduled -> prefill 完成          <- 地板全在這
+ttft_ms     15.8–17.1 ms
+CLIENT wall 17.2–18.3 ms   （所以 client 橋接約 1 ms）
+```
+
+**不是排隊、不是准入、不是回程**，是 scheduled 到 prefill 完成之間那一段。
+
+### 一個要撤回的判讀
+
+上面表中「prefill graph 512 只省 0.35 ms」**不能當成負面結果**：那一輪的
+`prefill breakable graph: captured buckets ...` 日誌行從未出現，也沒有 capture failed，
+**graph 根本沒有被捕捉過**。旗標確實有進到 resolved config
+（`prefill_graph_max_tokens=2048`、`disable_prefill_graph=False`），所以是被
+`runtime/execution/prefill_graph.py:289 self.disable` 那組條件中的某一個靜默擋掉的，尚未查出是哪一個。
+
+所以正確的狀態是**不確定**，不是「prefill graph 沒用」。這正是 memory 裡
+`a-negative-result-is-easy-to-produce-by-accident` 那條：先證明機制有 engage，
+再相信 null。
+
+**仍未定位 `prefill_ms` 內部。** 已排除：模型計算、prompt 長度、client 橋接、串流間隔、
+detokenizer、前綴快取、排隊與准入。下一步是查 prefill graph 為何靜默停用，以及
+`prefill_ms` 這 15 ms 裡 forward dispatch、實際 forward、結果 sync 各佔多少。
 
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 

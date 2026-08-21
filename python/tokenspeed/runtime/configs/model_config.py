@@ -1027,6 +1027,21 @@ def read_sentence_transformers_pooling(model_path: str) -> PoolingConfig | None:
     return PoolingConfig(pooling_type=selected[0], normalize=normalize)
 
 
+_CROSS_ENCODER_SUFFIX = "ForSequenceClassification"
+
+
+def read_cross_encoder_pooling(model_path: str) -> "PoolingConfig | None":
+    """CLS, unnormalized, if this checkpoint is a cross-encoder reranker."""
+    try:
+        with open(os.path.join(model_path, "config.json")) as handle:
+            architectures = json.load(handle).get("architectures") or []
+    except (OSError, ValueError):
+        return None
+    if not any(str(a).endswith(_CROSS_ENCODER_SUFFIX) for a in architectures):
+        return None
+    return PoolingConfig(pooling_type=PoolingType.CLS, normalize=False)
+
+
 def resolve_pooling_config(
     model_path: str, server_args: ServerArgs | None
 ) -> PoolingConfig | None:
@@ -1037,6 +1052,17 @@ def resolve_pooling_config(
     override -- an embedding server that guessed its reduction would answer
     every request with a plausible wrong vector.
     """
+    cross_encoder = read_cross_encoder_pooling(model_path)
+    if cross_encoder is not None:
+        # A reranker's reduction is a property of its architecture, not a
+        # deployment choice: it pools CLS into a classifier head and its
+        # output is a score, so normalizing would destroy the quantity. These
+        # checkpoints ship no 1_Pooling directory to declare it, so the
+        # architecture declares it instead -- and an operator who passes
+        # --pooling-type at one of them is overriding something that is not
+        # theirs to choose.
+        return cross_encoder
+
     declared = read_sentence_transformers_pooling(model_path)
     requested = getattr(server_args, "is_embedding", None)
     if requested is False:

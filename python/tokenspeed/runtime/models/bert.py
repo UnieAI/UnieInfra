@@ -83,6 +83,7 @@ from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.pooler import Pooler, PoolerOutput, PoolingType
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
@@ -101,6 +102,10 @@ __all__ = [
     "GteModel",
     "NomicBertModel",
     "ModernBertModel",
+    "BertForSequenceClassification",
+    "RobertaForSequenceClassification",
+    "XLMRobertaForSequenceClassification",
+    "NewForSequenceClassification",
 ]
 
 
@@ -143,6 +148,39 @@ def encoder_batch_layout(ctx: ForwardContext) -> tuple[torch.Tensor, int]:
     return cu_seqlens, int(ctx.input_num_tokens)
 
 
+# A cross-encoder scores a *pair*, and BERT tells the two halves apart with
+# segment ids. Rather than thread a second per-token tensor through the
+# engine -- a new persistent buffer, a new request field, and a new thing for
+# the prefill graph to refresh -- the segment rides in the high bits of the
+# token id, the same trick vLLM uses
+# (``model_executor/models/bert.py:524 _encode_token_type_ids``).
+# Vocabularies here reach ~250k, so bit 30 of an id is free.
+TOKEN_TYPE_SHIFT = 30
+
+
+def encode_token_type_ids(
+    input_ids: torch.Tensor, token_type_ids: torch.Tensor
+) -> torch.Tensor:
+    """Pack segment ids into ``input_ids``; returns a new tensor."""
+    return input_ids | (token_type_ids << TOKEN_TYPE_SHIFT)
+
+
+def decode_token_type_ids(
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack ``(real_ids, token_type_ids)``.
+
+    Deliberately not in place. vLLM masks ``input_ids`` in place because
+    everything entering a ``@support_torch_compile`` region has to be a
+    persistent tensor; here the ids arrive in a static buffer the prefill
+    graph refreshes, and mutating it would leave a half-decoded buffer for
+    whatever reads it after this layer -- including the graph's own
+    out-of-capture word gather.
+    """
+    mask = 1 << TOKEN_TYPE_SHIFT
+    return input_ids & ~mask, (input_ids & mask) >> TOKEN_TYPE_SHIFT
+
+
 class BertEmbedding(nn.Module):
     """Word + learned-position + token-type, then LayerNorm."""
 
@@ -179,17 +217,19 @@ class BertEmbedding(nn.Module):
         # the graph runs the word gather outside the capture and hands the
         # result back. Everything after it reads ``positions``, so it stays
         # inside.
+        token_type_ids = None
+        if self.token_type_embeddings is not None:
+            input_ids, token_type_ids = decode_token_type_ids(input_ids)
         embeddings = (
             self.word_embeddings(input_ids) if word_embeds is None else word_embeds
         )
         embeddings = embeddings + self.position_embeddings(
             positions + self.position_offset
         )
-        if self.token_type_embeddings is not None:
-            # Single-sequence embedding: segment 0 for every token. A
-            # cross-encoder pair would need real token_type_ids plumbed from
-            # the tokenizer; this server has no endpoint that produces them.
-            embeddings = embeddings + self.token_type_embeddings.weight[0]
+        if token_type_ids is not None:
+            # Segment 0 everywhere for an ordinary embedding request; 0 for
+            # the query and 1 for the document on a cross-encoder pair.
+            embeddings = embeddings + self.token_type_embeddings(token_type_ids)
         return self.LayerNorm(embeddings)
 
 
@@ -233,11 +273,14 @@ class NewEmbedding(nn.Module):
         positions: torch.Tensor,
         word_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        token_type_ids = None
+        if self.token_type_embeddings is not None:
+            input_ids, token_type_ids = decode_token_type_ids(input_ids)
         embeddings = (
             self.word_embeddings(input_ids) if word_embeds is None else word_embeds
         )
-        if self.token_type_embeddings is not None:
-            embeddings = embeddings + self.token_type_embeddings.weight[0]
+        if token_type_ids is not None:
+            embeddings = embeddings + self.token_type_embeddings(token_type_ids)
         return self.LayerNorm(embeddings)
 
 
@@ -901,12 +944,24 @@ class BertTransformer(nn.Module):
         terms read ``positions``, a static buffer the graph refreshes, so
         they belong inside the capture.
 
-        Deliberately *not* named ``get_input_embeddings``. That seam exists
-        for models whose embedding needs post-processing (gemma's sqrt
-        scale), and taking it here would move the position add outside the
-        capture, where it would be computed once against the dummy batch.
+        Named ``embed_tokens`` and not ``get_input_embeddings`` for the
+        *sizing*: the graph reads ``.weight`` off this to allocate its
+        input-embeds buffer. The compute-form seam is
+        :meth:`get_input_embeddings` below, which exists only because a
+        cross-encoder's ids carry a packed segment bit -- gathering with
+        those unmasked indexes past the end of the vocabulary.
         """
         return self.embeddings.word_embeddings
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """The word gather the prefill graph runs outside its captured region.
+
+        Only the *word* lookup moves out. The position and segment terms read
+        ``positions`` and the packed ids, both of which the graph refreshes
+        per replay, so they stay inside the capture.
+        """
+        real_ids, _ = decode_token_type_ids(input_ids)
+        return self.embeddings.word_embeddings(real_ids)
 
     def rotary(
         self, positions: torch.Tensor
@@ -1217,10 +1272,6 @@ class EncoderOnlyEmbeddingModel(BaseCausalLM):
                 continue
 
             name = self._rewrite(raw_name)
-            # The checkpoints are flat (``embeddings.``/``encoder.``); this
-            # tree nests the transformer under ``model.``.
-            if not name.startswith("model."):
-                name = "model." + name
 
             shard_id = forced_shard
             if shard_id is None:
@@ -1229,6 +1280,16 @@ class EncoderOnlyEmbeddingModel(BaseCausalLM):
                         name = name.replace(source, target)
                         shard_id = sid
                         break
+
+            # Resolve the prefix last, after every rename has run: the
+            # checkpoints are flat (``embeddings.``/``encoder.``) and this
+            # tree nests the transformer under ``model.`` -- but not
+            # everything, since a cross-encoder's classifier head hangs off
+            # the outer model beside ``model`` rather than inside it. Trying
+            # the name as written first lets the rename tables name either
+            # without a second table saying which.
+            if name not in params_dict and f"model.{name}" in params_dict:
+                name = f"model.{name}"
 
             param = params_dict.get(name)
             if param is None:
@@ -1470,6 +1531,165 @@ class ModernBertModel(EncoderOnlyEmbeddingModel):
                 yield name, weight
 
 
+class SequenceClassifierHead(nn.Module):
+    """CLS -> dense -> tanh -> linear(num_labels).
+
+    All three cross-encoder families in this file share this shape and differ
+    only in where the checkpoint puts it: BERT splits it across
+    ``bert.pooler.dense`` and a top-level ``classifier``, RoBERTa keeps both
+    halves under ``classifier`` (``dense`` / ``out_proj``), and GTE splits it
+    like BERT under ``new.pooler.dense``. The rename tables reconcile them.
+    """
+
+    def __init__(self, config: PretrainedConfig, num_labels: int) -> None:
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.out_proj = nn.Linear(config.hidden_size, num_labels)
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        return self.out_proj(torch.tanh(self.dense(pooled)))
+
+
+def resolve_num_labels(config: PretrainedConfig) -> int:
+    """``num_labels``, which these configs mostly decline to state.
+
+    Every reranker checkpoint here leaves ``num_labels`` null and carries a
+    one-entry ``id2label`` instead; transformers derives it the same way.
+    Defaulting to 2 (the transformers default for a bare config) would build
+    a head twice the checkpoint's width and fail the loader, which is the
+    good case -- so this derives it rather than guessing.
+    """
+    declared = getattr(config, "num_labels", None)
+    if declared:
+        return int(declared)
+    id2label = getattr(config, "id2label", None)
+    if id2label:
+        return len(id2label)
+    raise ValueError(
+        f"{type(config).__name__} states neither num_labels nor id2label; a "
+        "classifier head cannot be sized from it."
+    )
+
+
+class CrossEncoderModel(EncoderOnlyEmbeddingModel):
+    """A reranker: score one (query, document) pair, not embed one text.
+
+    The output is still one row per request -- ``num_labels`` wide instead of
+    ``hidden`` -- so it rides the existing pooled-embedding transport
+    unchanged. What is genuinely different is the *input*: a pair, whose two
+    halves BERT distinguishes with segment ids. Those ride packed into the
+    token ids (see ``encode_token_type_ids``).
+
+    Scores are the raw logits, matching what
+    ``AutoModelForSequenceClassification`` returns and what every one of these
+    checkpoints' own README compares against. bge-reranker's README says to
+    apply sigmoid *if* a 0-1 range is wanted; doing that here would silently
+    change the numbers a caller compares against the reference.
+    """
+
+    # Cross-encoders pool CLS and never normalize -- a normalized score is
+    # not a score. Declared here rather than read from a 1_Pooling directory,
+    # which none of these checkpoints ship.
+    pooling_type = PoolingType.CLS
+
+    def __init__(self, config: PretrainedConfig, *args, **kwargs) -> None:
+        self.num_labels = resolve_num_labels(config)
+        super().__init__(config, *args, **kwargs)
+        self.classifier = SequenceClassifierHead(config, self.num_labels)
+
+    def resolve_pooler(self, config: PretrainedConfig):
+        return Pooler(pooling_type=self.pooling_type, normalize=False)
+
+    def pool(self, ctx: ForwardContext, hidden_states: torch.Tensor):
+        pooled = super().pool(ctx, hidden_states)
+        scores = self.classifier(
+            pooled.embeddings.to(self.classifier.dense.weight.dtype)
+        )
+        return PoolerOutput(embeddings=scores)
+
+
+class BertForSequenceClassification(CrossEncoderModel):
+    """``cross-encoder/ms-marco-*``, and other BERT rerankers."""
+
+    model_cls = BertTransformer
+
+    _RENAMES = (
+        ("bert.encoder.layer.", "encoder.layers."),
+        ("bert.embeddings", "embeddings"),
+        ("attention.output.LayerNorm", "attention_LayerNorm"),
+        ("attention.output.dense", "attention.attn.proj"),
+        ("intermediate.dense", "intermediate"),
+        ("output.LayerNorm", "output_LayerNorm"),
+        ("output.dense", "output"),
+        # The head: BERT keeps its two halves apart, we keep them together.
+        ("bert.pooler.dense", "classifier.dense"),
+        ("classifier.weight", "classifier.out_proj.weight"),
+        ("classifier.bias", "classifier.out_proj.bias"),
+    )
+
+    _SKIP = ("position_ids",)
+
+
+class RobertaForSequenceClassification(CrossEncoderModel):
+    """``BAAI/bge-reranker-base``, ``bge-reranker-v2-m3``."""
+
+    model_cls = RobertaTransformer
+
+    _RENAMES = (
+        ("roberta.encoder.layer.", "encoder.layers."),
+        ("roberta.embeddings", "embeddings"),
+        ("attention.output.LayerNorm", "attention_LayerNorm"),
+        ("attention.output.dense", "attention.attn.proj"),
+        ("intermediate.dense", "intermediate"),
+        ("output.LayerNorm", "output_LayerNorm"),
+        ("output.dense", "output"),
+        # RoBERTa already keeps dense and out_proj under `classifier`.
+    )
+
+    _SKIP = ("position_ids",)
+
+
+class XLMRobertaForSequenceClassification(RobertaForSequenceClassification):
+    pass
+
+
+class NewForSequenceClassification(CrossEncoderModel):
+    """``Alibaba-NLP/gte-multilingual-reranker-base``."""
+
+    model_cls = NewTransformer
+
+    _STACKED_QKV = ()
+
+    _RENAMES = (
+        ("new.encoder.layer.", "encoder.layers."),
+        ("new.embeddings", "embeddings"),
+        ("attention.o_proj", "attention.attn.proj"),
+        ("mlp.down_proj", "down_proj"),
+        ("new.pooler.dense", "classifier.dense"),
+        ("classifier.weight", "classifier.out_proj.weight"),
+        ("classifier.bias", "classifier.out_proj.bias"),
+    )
+
+    _SKIP = ("position_ids",)
+
+    def _iter_weights(self, weights):
+        for name, weight in weights:
+            if "attention.qkv_proj" in name:
+                yield from self._split_packed(
+                    name,
+                    weight,
+                    "attention.qkv_proj",
+                    "attention.attn.qkv_proj",
+                    ("q", "k", "v"),
+                )
+            elif "mlp.up_gate_proj" in name:
+                yield from self._split_packed(
+                    name, weight, "mlp.up_gate_proj", "up_gate_proj", (0, 1)
+                )
+            else:
+                yield name, weight
+
+
 EntryClass = [
     BertModel,
     RobertaModel,
@@ -1478,4 +1698,8 @@ EntryClass = [
     GteModel,
     NomicBertModel,
     ModernBertModel,
+    BertForSequenceClassification,
+    RobertaForSequenceClassification,
+    XLMRobertaForSequenceClassification,
+    NewForSequenceClassification,
 ]

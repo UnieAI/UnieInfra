@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.paged_cache_spec import split_groups_to_equal_depth
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
@@ -68,12 +69,26 @@ class MHAConfig(BaseAttnConfig):
             kv_cache_dtype = "bfloat16"
 
         hf_config = getattr(model_config, "hf_config", None)
+        # Gemma 3/4 ship as *ForConditionalGeneration: the decoder's labels and
+        # window live on text_config and the top level carries NEITHER, so
+        # reading only the top level published one full-history group for all
+        # 60 layers -- 960 KiB/token on gemma-4-31B-it where the windowed
+        # layers are worth 80.
+        text_config = getattr(hf_config, "text_config", None) or hf_config
         # paged_cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
-        layer_types = tuple(
-            getattr(hf_config, "paged_cache_layer_types", None)
-            or getattr(hf_config, "layer_types", None)
-            or ()
+        published_types = getattr(hf_config, "paged_cache_layer_types", None) or getattr(
+            text_config, "paged_cache_layer_types", None
         )
+        raw_layer_types = getattr(hf_config, "layer_types", None) or getattr(
+            text_config, "layer_types", None
+        )
+        layer_types = tuple(published_types or ())
+        if not layer_types and raw_layer_types:
+            # Same derivation the model side assigns group_id from
+            # (models/gemma.py), so a layer's group id and the pool's published
+            # groups cannot drift apart. A no-op for equal-depth stacks, which
+            # is every other MHA model that labels its layers (gpt-oss is 1:1).
+            layer_types = split_groups_to_equal_depth(tuple(raw_layer_types))
         if (
             is_draft
             and layer_types
@@ -82,6 +97,11 @@ class MHAConfig(BaseAttnConfig):
             # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
             layer_types = ()
         sliding_window_tokens = getattr(hf_config, "sliding_window", None)
+        if sliding_window_tokens is None and layer_types:
+            # Only ever read through with labels in hand: a scalar window
+            # broadcasts to every sliding layer, and an unlabelled stack would
+            # take it on ALL of them.
+            sliding_window_tokens = getattr(text_config, "sliding_window", None)
         return cls(
             device=server_args.device,
             context_len=model_config.context_len + server_args.spec_context_pad,

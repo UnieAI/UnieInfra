@@ -513,6 +513,7 @@ class EventLoop:
             admission_reserve=server_args.admission_reserve,
             context_chunk_policy=server_args.context_chunk_policy,
             context_chunk_unit=server_args.context_chunk_unit,
+            max_cold_prefills=server_args.max_cold_prefills,
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(

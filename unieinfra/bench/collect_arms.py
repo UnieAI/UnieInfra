@@ -52,7 +52,9 @@ LABELS = {
     "tpot99": r"P99 TPOT \(ms\)",
 }
 
-TAG = re.compile(r"^E-(?P<engine>ours|vllm)-(?P<model>.+)-(?P<shape>agent-127k|agent-26k|RAG|general)-(?P<conc>\d+)$")
+TAG = re.compile(
+    r"^E-(?P<engine>ours|vllm)-(?P<model>.+)-(?P<shape>agent-127k|agent-26k|RAG|general)-(?P<conc>\d+)$"
+)
 
 
 def metrics(path):
@@ -73,7 +75,9 @@ def reuse(log, engine):
     text = log.read_bytes().decode("utf-8", "ignore")
     if engine == "ours":
         new = sum(int(m.group(1)) for m in re.finditer(r"#new-token: (\d+)", text))
-        cached = sum(int(m.group(1)) for m in re.finditer(r"#cached-token: (\d+)", text))
+        cached = sum(
+            int(m.group(1)) for m in re.finditer(r"#cached-token: (\d+)", text)
+        )
         return 100 * cached / (new + cached) if new + cached else None
     hits = re.findall(r"Prefix cache hit rate: ([0-9.]+)", text)
     return float(hits[-1]) if hits else None
@@ -85,7 +89,10 @@ def failure_reason(log):
         return "no log (never started)"
     text = log.read_bytes().decode("utf-8", "ignore")
     for pattern, reason in (
-        (r"exceeds maximum input length|input exceeds", "prompt exceeds the model's clamped max input"),
+        (
+            r"exceeds maximum input length|input exceeds",
+            "prompt exceeds the model's clamped max input",
+        ),
         (r"peer access is not supported", "non-peer GPU pair"),
         (r"illegal memory access", "illegal memory access in a kernel"),
         (r"CUDA out of memory|torch.OutOfMemoryError", "out of memory"),
@@ -102,7 +109,9 @@ def failure_reason(log):
 def main():
     rows, failures = [], []
     seen = set()
-    for bench in sorted(ROOT.glob(".ag-*-E-*.bench")) + sorted(ROOT.glob(".ix*-E-*.bench")):
+    for bench in sorted(ROOT.glob(".ag-*-E-*.bench")) + sorted(
+        ROOT.glob(".ix*-E-*.bench")
+    ):
         # Recover the tag by finding where it starts rather than by slicing a
         # fixed prefix: the vLLM InferenceX harness writes ".ixv-", one
         # character longer than ".ix-", so a fixed slice ate the leading "E"
@@ -114,7 +123,12 @@ def main():
         m = TAG.match(name[start:].removesuffix(".bench"))
         if not m:
             continue
-        key = (m.group("engine"), m.group("model"), m.group("shape"), int(m.group("conc")))
+        key = (
+            m.group("engine"),
+            m.group("model"),
+            m.group("shape"),
+            int(m.group("conc")),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -124,23 +138,32 @@ def main():
             failures.append((key, failure_reason(log)))
             continue
         engine, model, shape, conc = key
-        rows.append({
-            "engine": engine, "model": model, "shape": shape, "conc": conc,
-            **met,
-            "reuse": reuse(log, engine),
-            "pass_rate": 100 * met["gp"] / met["rps"] if met.get("rps") else None,
-            "per_user": 1000 / met["tpot50"] if met.get("tpot50") else None,
-        })
+        rows.append(
+            {
+                "engine": engine,
+                "model": model,
+                "shape": shape,
+                "conc": conc,
+                **met,
+                "reuse": reuse(log, engine),
+                "pass_rate": 100 * met["gp"] / met["rps"] if met.get("rps") else None,
+                "per_user": 1000 / met["tpot50"] if met.get("tpot50") else None,
+            }
+        )
 
     json.dump(rows, open(OUT, "w"), indent=1)
     hdr = f"{'engine':6} {'model':14} {'shape':11} {'C':>4} {'ok':>4} {'tok/s':>8} {'gp/min':>8} {'pass%':>6} {'TTFTp50':>8} {'TPOTp50':>8} {'reuse%':>7}"
     print(hdr)
     print("-" * len(hdr))
-    for r in sorted(rows, key=lambda r: (r["model"], r["shape"], r["conc"], r["engine"])):
-        print(f"{r['engine']:6} {r['model']:14} {r['shape']:11} {r['conc']:4d} "
-              f"{int(r.get('ok', 0)):4d} {r.get('tps', 0):8.1f} {(r.get('gp') or 0) * 60:8.1f} "
-              f"{r.get('pass_rate') or 0:6.0f} {r.get('ttft50', 0):8.0f} {r.get('tpot50', 0):8.1f} "
-              f"{r.get('reuse') or 0:7.1f}")
+    for r in sorted(
+        rows, key=lambda r: (r["model"], r["shape"], r["conc"], r["engine"])
+    ):
+        print(
+            f"{r['engine']:6} {r['model']:14} {r['shape']:11} {r['conc']:4d} "
+            f"{int(r.get('ok', 0)):4d} {r.get('tps', 0):8.1f} {(r.get('gp') or 0) * 60:8.1f} "
+            f"{r.get('pass_rate') or 0:6.0f} {r.get('ttft50', 0):8.0f} {r.get('tpot50', 0):8.1f} "
+            f"{r.get('reuse') or 0:7.1f}"
+        )
     print(f"\n{len(rows)} cells with data -> {OUT}")
     if failures:
         print(f"\n{len(failures)} cells attempted but empty:")

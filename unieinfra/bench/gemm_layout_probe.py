@@ -91,8 +91,12 @@ def gbps(m, k, n, ms):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rotate", type=int, default=4,
-                    help="distinct weight copies to cycle, to defeat L2 reuse")
+    ap.add_argument(
+        "--rotate",
+        type=int,
+        default=4,
+        help="distinct weight copies to cycle, to defeat L2 reuse",
+    )
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -101,16 +105,20 @@ def main():
 
     dev = torch.device("cuda")
     print(f"{torch.cuda.get_device_name(0)}  HBM peak {HBM_PEAK_GBPS:.0f} GB/s")
-    print(f"{'M':>6} {'K':>6} {'N':>6}  {'tn ms':>8} {'tn GB/s':>9} "
-          f"{'nn ms':>8} {'nn GB/s':>9}  {'nn/tn':>7}")
+    print(
+        f"{'M':>6} {'K':>6} {'N':>6}  {'tn ms':>8} {'tn GB/s':>9} "
+        f"{'nn ms':>8} {'nn GB/s':>9}  {'nn/tn':>7}"
+    )
     print("-" * 72)
 
     for m, k, n in SHAPES:
         x = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
         # Rotate weights so a small shape cannot answer from L2; this card has
         # 128 MB of it, which is enough to hold a whole projection.
-        w_t = [torch.randn(n, k, dtype=torch.bfloat16, device=dev)
-               for _ in range(args.rotate)]
+        w_t = [
+            torch.randn(n, k, dtype=torch.bfloat16, device=dev)
+            for _ in range(args.rotate)
+        ]
         w_n = [w.t().contiguous() for w in w_t]
         out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
 
@@ -128,8 +136,10 @@ def main():
 
         ms_tn = timed(run_tn)
         ms_nn = timed(run_nn)
-        print(f"{m:6d} {k:6d} {n:6d}  {ms_tn:8.3f} {gbps(m,k,n,ms_tn):9.1f} "
-              f"{ms_nn:8.3f} {gbps(m,k,n,ms_nn):9.1f}  {ms_tn/ms_nn:6.2f}x")
+        print(
+            f"{m:6d} {k:6d} {n:6d}  {ms_tn:8.3f} {gbps(m,k,n,ms_tn):9.1f} "
+            f"{ms_nn:8.3f} {gbps(m,k,n,ms_nn):9.1f}  {ms_tn/ms_nn:6.2f}x"
+        )
 
     print("\nnn/tn > 1 means storing the weight pre-transposed is faster.")
     print("Any GB/s above the HBM peak means the operands were served from L2.")

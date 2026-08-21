@@ -50,11 +50,11 @@ def main() -> None:
     parser.add_argument("--max-num-seqs", type=int, default=16)
     args = parser.parse_args()
 
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.models.whisper import (
         CrossAttentionPlan,
         WhisperDecoder,
     )
-    from tokenspeed.runtime.distributed.mapping import Mapping
 
     snapshot = glob.glob(args.snapshot_glob)[0]
     config = AutoConfig.from_pretrained(snapshot)

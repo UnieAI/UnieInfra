@@ -81,11 +81,11 @@ from tokenspeed.runtime.layers.logits_processor import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
-from tokenspeed.runtime.multimodal.inputs import Modality
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from tokenspeed.runtime.multimodal.inputs import Modality
 from tokenspeed.runtime.utils import add_prefix
 
 

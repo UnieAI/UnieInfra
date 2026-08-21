@@ -76,9 +76,9 @@ class MHAConfig(BaseAttnConfig):
         # layers are worth 80.
         text_config = getattr(hf_config, "text_config", None) or hf_config
         # paged_cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
-        published_types = getattr(hf_config, "paged_cache_layer_types", None) or getattr(
-            text_config, "paged_cache_layer_types", None
-        )
+        published_types = getattr(
+            hf_config, "paged_cache_layer_types", None
+        ) or getattr(text_config, "paged_cache_layer_types", None)
         raw_layer_types = getattr(hf_config, "layer_types", None) or getattr(
             text_config, "layer_types", None
         )

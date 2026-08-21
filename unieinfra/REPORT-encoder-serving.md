@@ -78,6 +78,7 @@ Embedding 走的是「**因果 LLM 當 embedder**」。三道關卡：
 | **讓 pooling 模型也能捕捉 prefill graph** | embedding 單請求 **19.75 → 14.84 ms（1.33x）**；cosine 與 eager 相同 |
 | Whisper cross-attention 去掉每步 gather | 高佔用 **1.79x**（turbo）／**1.84x**（large-v3）；低佔用 0.87x，故依佔用率選路 |
 | Embedding 列表請求整批 tokenize | **最高 1.80x**；關掉開關斷崖回來且探針 FAIL（雙向驗證） |
+| **encoder-only 模型用 prefill graph**（attention 標成 break） | bge-small 單請求 **7.83 → 5.70 ms（1.37x）**；兩臂 cosine 逐位相同 |
 
 cross-attention 那項要注意：**只看 kernel 是 7.55x，看整個 block 只有 1.79x**。
 小批次時 block 是 launch-bound，該引用的是 block 的數字。
@@ -90,16 +91,14 @@ cross-attention 那項要注意：**只看 kernel 是 7.55x，看整個 block �
 - **fp8 cross KV**：`FP8 is only supported on SM100 (compute capability 10.x)`。
   連同 `page_table`、`gather_kv_indices`，這是 sm_120 上第三道關著的門。
 
-- **encoder-only 模型開 prefill graph**：先量了才拒絕——bge-small 上值
-  **6.69 → 3.29 ms（2.03x）**，但以 graph 目前的形狀不能拿。encoder stack 是在
-  **被捕捉的區域內**讀 `ctx.gather_ids` 取批次佈局，而 graph 捕捉用的是 dummy batch 的
-  context 且捕捉後就丟掉，沒有東西每次 replay 刷新它。開著 graph 重驗 parity 掉到
-  0.295（bge）／0.683（e5）——**格式完美、算在錯的 row 上**。做成模型明確宣告的拒絕
-  （`supports_prefill_graph = False`），要解得先給 graph 一個每次 replay 刷新的
-  批次佈局 buffer。
+**兩處判讀撤回**：
 
-**判讀撤回**：先前記的「prefill graph 只省 0.35 ms」不算負面結果——那一輪
-graph 從未被捕捉（日誌行沒出現），所以狀態是**不確定**。
+- 先前記的「prefill graph 只省 0.35 ms」不算負面結果——那一輪 graph 從未被捕捉
+  （日誌行沒出現），所以狀態是**不確定**。
+- 先前記的「encoder-only 開 prefill graph 值 **2.03x**」要撤回。那個數字是在 attention
+  被**錯誤地捕捉進 graph** 時量到的——它快正是因為它錯：把批次佈局凍結進 graph 就省掉了
+  每次 replay 的 attention launch，代價是算在錯的 row 上。正確的版本讓 attention 保持
+  eager（標成 break），獎品是 **1.37x**。這是「快」與「對」互斥時的實際價碼。
 
 ## 5　端點：缺什麼
 
@@ -115,15 +114,12 @@ servicer。目前可用入口是 in-process 的 `Engine.encode(...)` 與帶 audi
 
 ## 6　下一步，按證據強度
 
-1. **給 prefill graph 一個每次 replay 刷新的批次佈局 buffer**，好讓 encoder-only 模型
-   也能用它。獎品已量到是 **2.03x**（見 §4），阻礙也已歸因；`positions_buf` 本來就會
-   刷新，cu_seqlens 可以用固定形狀從它導出。這動到每個模型共用的機制，要自己的驗證。
-2. **encoder-only 的其餘變體**：`ModernBertModel`、Nomic、Jina v3、ColBERT，以及
+1. **encoder-only 的其餘變體**：`ModernBertModel`、Nomic、Jina v3、ColBERT，以及
    cross-encoder（reranker）的 `*ForSequenceClassification`。
 3. **零 KV group**（xref §3.2）：目前 encoder-only 模型的 pool 仍照 `num_hidden_layers`
    配滿卻永遠不用，那是 SGLang 的行為；vLLM 的 0 group 與 TRT-LLM 的「不建 manager」
    都更乾淨。
-4. **hold-window 聚合**（TRT-LLM 的 5ms）：治的是不同請求之間，與 §4 第 2 項不重疊；
+3. **hold-window 聚合**（TRT-LLM 的 5ms）：治的是不同請求之間，與 §4 第 2 項不重疊；
    要等端點做起來、有真並發流量才量得準。那個 5ms 是慣例常數，**抄結構不要抄數字**。
 
 （原本列在此處第 1 項的「讓 pooling 模型也能用 prefill graph」**已完成**，見 §4 與

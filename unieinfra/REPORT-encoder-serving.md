@@ -12,7 +12,7 @@
 | 能力 | 狀態 | 證據 |
 |---|---|---|
 | Embedding：因果 LLM 當 embedder | **可服務** | 對 HF 逐句餘弦 0.999864–0.999883 |
-| Embedding：encoder-only（BERT / XLM-R / GTE / Nomic / ModernBERT） | **可服務** | 對 HF 最差餘弦 0.9999 級；ModernBERT 見 §2 註 |
+| Embedding：encoder-only（BERT / XLM-R / GTE / Nomic / ModernBERT / Jina v3） | **可服務** | 對 HF 最差餘弦 0.9999 級；ModernBERT 見 §2 註 |
 | Whisper（encoder-decoder ASR） | **可服務** | 轉譯與 HF **逐字相同**、token id 相同 |
 | `/v1/embeddings`、`/v1/audio/transcriptions` | **端點未做** | 引擎端已備妥；見 §5 |
 
@@ -59,6 +59,7 @@ bge-small-en-v1.5      cls  + normalize      0.999916
 multilingual-e5-base   mean + normalize      0.999947
 gte-base-en-v1.5       cls  + 不 normalize    0.999939
 nomic-embed-text-v1.5  mean + 不 normalize    0.999921
+jina-embeddings-v3     mean + normalize      0.999948   （text-matching adapter）
 modernbert-embed-base  mean + normalize      0.996891   <- 見下
 ```
 
@@ -67,9 +68,15 @@ modernbert-embed-base  mean + normalize      0.996891   <- 見下
 22 層 pre-LN 加上 mean pooling 在 bf16 下比其他家族更容易累積誤差。要用 bf16 服務
 ModernBERT 的人應該知道這個數字。
 
-**仍未支援**：Jina v3（需要載入時合併 LoRA）、ColBERT（每 token 多向量）、
-以及 cross-encoder（reranker）的 `*ForSequenceClassification`。後兩者不是模型檔的問題
-——它們改的是輸出契約（多向量 / 一個分數），不是 `/v1/embeddings` 的形狀。
+**再加一個：`jina-embeddings-v3`**（xref §6.9）。它宣告的 `architectures` 就是
+`XLMRobertaModel`，和 multilingual-e5 同一個字串，只有 `position_embedding_type`
+分得出來；MLP 是這個 RoPE post-LN 家族裡唯一未 gated 的；五個 task LoRA 在載入時
+合併一個，預設 `text-matching`，**用名字解析而不是索引 -1**，可用
+`--hf-overrides '{"lora_task": "..."}'` 覆寫。最差餘弦 **0.999948**。
+
+**仍未支援**：ColBERT（每 token 多向量）與 cross-encoder（reranker）的
+`*ForSequenceClassification`。這兩者不是模型檔的問題——它們改的是輸出契約
+（多向量 / 一個分數），不是 `/v1/embeddings` 的形狀。
 零 KV group 的路徑（xref §3.2）也還沒做——目前 pool 仍照 `num_hidden_layers` 配滿卻
 永遠不用，那是 SGLang 的行為。
 

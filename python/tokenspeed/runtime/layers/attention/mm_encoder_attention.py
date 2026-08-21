@@ -184,6 +184,114 @@ def vision_attn_fa3(
     )
 
 
+def vision_attn_fa_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    bsz: int,
+    seq_len: int,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
+    window_size: tuple[int, int] | None = None,
+    **_: Any,
+) -> torch.Tensor:
+    """Non-causal varlen attention with an optional symmetric local window.
+
+    Separate from ``fa3``/``fa4``, which ``_resolve_backend`` restricts by
+    architecture, because this one has to run wherever the model does:
+    ModernBERT makes two of every three layers local, so a backend that
+    refuses on this card would leave the model with no correct path at all.
+    The underlying ``flash_attn_varlen_func`` dispatches its own per-arch
+    kernel (``flash_fwd_sm120`` here) and honours ``window_size`` there --
+    verified against a banded-mask reference rather than assumed, since
+    several of this kernel's options are silently closed on sm_120
+    (``unieinfra/xref/15-encoder-embedding.md`` §6.1).
+
+    ``window_size`` is ``(left, right)`` in the kernel's terms. A
+    bidirectional encoder wants it symmetric: ModernBERT's ``local_attention``
+    is the *total* width, so each side is half of it.
+    """
+    cu_seqlens, _, max_seqlen = _varlen_metadata(
+        cu_seqlens, bsz, seq_len, device=q.device, max_seqlen=max_seqlen
+    )
+    result = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        softmax_scale=softmax_scale,
+        causal=False,
+        **({} if window_size is None else {"window_size": window_size}),
+    )
+    return result[0] if isinstance(result, tuple) else result
+
+
+def vision_attn_sdpa_window(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    bsz: int,
+    seq_len: int,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
+    window_size: tuple[int, int] | None = None,
+    **_: Any,
+) -> torch.Tensor:
+    """Non-causal varlen attention with a band mask, one sequence at a time.
+
+    The slow, correct local-attention path. ``fa_varlen`` is the fast one and
+    honours ``window_size`` on this card, but it raises
+    ``cudaErrorIllegalAddress`` intermittently once several attention modules
+    with different weights run in one process -- ModernBERT's shape exactly.
+    The fault is not reproducible on demand: the same 22-layer configuration
+    faulted at layer 2 on three runs and completed on the next two, which is
+    what an out-of-bounds access looks like when whether it faults depends on
+    what happens to be mapped next to the buffer. A path that passes for that
+    reason is not a path to serve on. Measured 2026-08-21; see
+    ``unieinfra/xref/15-encoder-embedding.md`` §6.8 before switching back.
+
+    The triton backend is stable but has no window parameter, so this fills
+    the gap with ``scaled_dot_product_attention`` under an explicit band
+    mask. Cost is the usual quadratic one: the mask is
+    ``[heads, L, L]`` per sequence, so it is fine for the few-hundred-token
+    prompts an embedding server sees and would need revisiting for
+    ModernBERT's full 8192-token context.
+    """
+    cu_seqlens, seq_lens, max_seqlen = _varlen_metadata(
+        cu_seqlens, bsz, seq_len, device=q.device, max_seqlen=max_seqlen
+    )
+    bounds = cu_seqlens.tolist()
+    output = torch.empty_like(q)
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        length = end - start
+        if length <= 0:
+            continue
+        # [heads, L, head_dim]
+        qs = q[start:end].transpose(0, 1)
+        ks = k[start:end].transpose(0, 1)
+        vs = v[start:end].transpose(0, 1)
+        mask = None
+        if window_size is not None:
+            left, right = window_size
+            idx = torch.arange(length, device=q.device)
+            offset = idx[:, None] - idx[None, :]
+            mask = (offset <= left) & (-offset <= right)
+        attended = torch.nn.functional.scaled_dot_product_attention(
+            qs, ks, vs, attn_mask=mask, scale=scale
+        )
+        output[start:end] = attended.transpose(0, 1)
+    return output
+
+
 def vision_attn_fa4(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -336,6 +444,8 @@ _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
     "triton_attn": vision_attn_triton,
     "fa3": vision_attn_fa3,
     "fa4": vision_attn_fa4,
+    "fa_varlen": vision_attn_fa_varlen,
+    "sdpa_window": vision_attn_sdpa_window,
     "flashinfer_cudnn": vision_attn_flashinfer_cudnn,
 }
 
@@ -480,6 +590,7 @@ class MultimodalEncoderAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         rotary_pos_emb_cos: torch.Tensor | None = None,
         rotary_pos_emb_sin: torch.Tensor | None = None,
+        window_size: tuple[int, int] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -595,6 +706,7 @@ class MultimodalEncoderAttention(nn.Module):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
             workspace_buffer=self._workspace_buffer,
+            window_size=window_size,
         )
 
         output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)

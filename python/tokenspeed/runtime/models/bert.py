@@ -63,6 +63,7 @@ tensor ``BaseCausalLM.pool`` already trusts to say where each request's rows
 start and end.
 """
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -79,14 +80,13 @@ from tokenspeed.runtime.layers.attention.mm_encoder_attention import (
 )
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
-
-import os
 
 # Set TOKENSPEED_ENCODER_DEBUG=1 to log the batch layout each forward.
 _DEBUG_BATCH = bool(os.environ.get("TOKENSPEED_ENCODER_DEBUG"))
@@ -99,6 +99,8 @@ __all__ = [
     "XLMRobertaModel",
     "NewModel",
     "GteModel",
+    "NomicBertModel",
+    "ModernBertModel",
 ]
 
 
@@ -239,8 +241,37 @@ class NewEmbedding(nn.Module):
         return self.LayerNorm(embeddings)
 
 
-class NTKScalingRotaryCache(nn.Module):
-    """RoPE cos/sin for GTE-v1.5, including its fixed NTK rescaling.
+def _rope_base(config: PretrainedConfig) -> float:
+    """The rope theta, under whichever name this family publishes it.
+
+    GTE says ``rope_theta``. Nomic says ``rotary_emb_base`` (1000 -- an order
+    of magnitude off the usual default) and also carries the normalised
+    ``rope_parameters``. Falling through to a 10000 default reads as a small
+    systematic error, not as a failure: measured cosine 0.97-0.99 against the
+    reference, which is wrong but not obviously wrong.
+    """
+    parameters = getattr(config, "rope_parameters", None)
+    if isinstance(parameters, dict) and "rope_theta" in parameters:
+        return float(parameters["rope_theta"])
+    for name in ("rope_theta", "rotary_emb_base"):
+        value = getattr(config, name, None)
+        if value is not None:
+            return float(value)
+    raise ValueError(
+        f"{type(config).__name__} declares no rope base "
+        "(rope_parameters/rope_theta/rotary_emb_base); refusing to guess one, "
+        "because a wrong base returns a plausible embedding."
+    )
+
+
+class EncoderRotaryCache(nn.Module):
+    """RoPE cos/sin for the encoder families that use it.
+
+    Built from explicit ``base`` / ``max_position`` rather than from the
+    config, because ModernBERT needs two of these with *different* thetas in
+    one model -- its local layers use ``local_rope_theta`` and its global
+    layers ``global_rope_theta``. :meth:`from_config` is the GTE path, which
+    reads them off the config and applies NTK scaling.
 
     Ported from the checkpoint's own reference implementation
     (``Alibaba-NLP/new-impl`` ``modeling.py`` ``NTKScalingRotaryEmbedding``),
@@ -263,16 +294,37 @@ class NTKScalingRotaryCache(nn.Module):
     refinement.
     """
 
-    def __init__(self, config: PretrainedConfig, dtype: torch.dtype) -> None:
-        super().__init__()
-        head_dim = config.hidden_size // config.num_attention_heads
-        base = float(getattr(config, "rope_theta", 10000.0))
-        max_position = int(config.max_position_embeddings)
+    @classmethod
+    def from_config(
+        cls, config: PretrainedConfig, dtype: torch.dtype
+    ) -> "EncoderRotaryCache":
+        return cls(
+            head_dim=config.hidden_size // config.num_attention_heads,
+            base=_rope_base(config),
+            max_position=int(config.max_position_embeddings),
+            dtype=dtype,
+            scaling=getattr(config, "rope_scaling", None),
+        )
 
-        scaling = getattr(config, "rope_scaling", None) or {}
+    def __init__(
+        self,
+        head_dim: int,
+        base: float,
+        max_position: int,
+        dtype: torch.dtype,
+        scaling: dict | None = None,
+    ) -> None:
+        super().__init__()
+        scaling = scaling or {}
         scaling_type = scaling.get("type") or scaling.get("rope_type")
         factor = float(scaling.get("factor", 1.0)) if scaling else 1.0
-        if scaling and scaling_type != "ntk":
+        if scaling_type == "default":
+            # Present-but-inert: transformers normalises an unscaled rope into
+            # ``{"rope_type": "default"}``. Treat it as no scaling rather than
+            # as an unknown type.
+            factor = 1.0
+            scaling = {}
+        if scaling and scaling_type not in ("ntk",):
             raise ValueError(
                 f"{type(self).__name__} supports rope_scaling type 'ntk'; got "
                 f"{scaling_type!r}. Add the variant here rather than letting "
@@ -338,8 +390,15 @@ class EncoderSelfAttention(nn.Module):
         qkv_bias: bool = True,
         proj_bias: bool = True,
         mm_attention_backend: str | None = None,
+        window_size: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
+        # (left, right) for a local layer, None for a global one. Frozen at
+        # construction because it is a property of the layer, not of the
+        # batch -- a break's loose scalar args are frozen to their
+        # capture-time value anyway, so per-request quantities could not live
+        # here even if they wanted to.
+        self.window_size = window_size
         self.attn = MultimodalEncoderAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -381,6 +440,7 @@ class EncoderSelfAttention(nn.Module):
             max_seqlen=max_seqlen,
             rotary_pos_emb_cos=cos,
             rotary_pos_emb_sin=sin,
+            window_size=self.window_size,
         ).squeeze(0)
 
 
@@ -470,21 +530,31 @@ class NewLayer(nn.Module):
     ) -> None:
         super().__init__()
         attn = mapping.vision
+        # GTE carries a bias on qkv and o_proj; Nomic carries none. Read off
+        # the config rather than defaulted -- a bias this model allocates but
+        # the checkpoint never fills is uninitialised memory, and the
+        # loader's unfilled-parameter check is what turns that into an error
+        # instead of a plausible vector.
+        attn_bias = bool(getattr(config, "qkv_proj_bias", True))
         self.attention = EncoderSelfAttention(
             config,
             mapping,
             quant_config=quant_config,
             prefix=add_prefix("attention", prefix),
+            qkv_bias=attn_bias,
+            proj_bias=attn_bias,
             mm_attention_backend=mm_attention_backend,
         )
         self.attn_ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        # up and gate are one checkpoint tensor (``mlp.up_gate_proj``, no
-        # bias) split at load time; keeping them as one column-parallel
-        # projection preserves that layout and keeps the split a view.
-        self.up_gate_proj = ColumnParallelLinear(
+        # Two shards rather than one wide projection, so the same module
+        # serves both layouts in this family: GTE ships them packed as one
+        # ``mlp.up_gate_proj`` tensor (split into shards at load), Nomic
+        # ships them already separate as ``mlp.fc11`` / ``mlp.fc12``. Shard 0
+        # is up, shard 1 is gate.
+        self.up_gate_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            config.intermediate_size * 2,
-            bias=False,
+            [config.intermediate_size, config.intermediate_size],
+            bias=bool(getattr(config, "mlp_fc1_bias", False)),
             quant_config=quant_config,
             prefix=add_prefix("up_gate_proj", prefix),
             tp_rank=attn.tp_rank,
@@ -494,7 +564,7 @@ class NewLayer(nn.Module):
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
-            bias=True,
+            bias=bool(getattr(config, "mlp_fc2_bias", True)),
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
             tp_rank=attn.tp_rank,
@@ -504,9 +574,10 @@ class NewLayer(nn.Module):
         )
         self.mlp_ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.intermediate_size = config.intermediate_size
-        # Exact gelu (erf), not the tanh approximation: the reference calls
-        # ``ACT2FN["gelu"]`` on the gate half.
-        self.act_fn = _resolve_bert_activation("gelu")
+        # GTE's config says "gelu" and means GeGLU; Nomic's says
+        # "swiglu" and means silu. Both put the activation on the gate half.
+        act = getattr(config, "activation_function", None) or config.hidden_act
+        self.act_fn = _resolve_bert_activation("silu" if act == "swiglu" else act)
 
     def forward(
         self,
@@ -519,11 +590,211 @@ class NewLayer(nn.Module):
         hidden_states = self.attn_ln(hidden_states + attended)
 
         up_gate, _ = self.up_gate_proj(hidden_states)
-        # Checkpoint order is [up; gate], the opposite of this tree's fused
-        # gate_up convention.
+        # Shard 0 is up, shard 1 is gate -- the opposite of this tree's fused
+        # gate_up convention, and the order both checkpoints in this family
+        # use once their tensors are named.
         up_states, gate = up_gate.split(up_gate.shape[-1] // 2, dim=-1)
         gated, _ = self.down_proj(self.act_fn(gate) * up_states)
         return self.mlp_ln(hidden_states + gated)
+
+
+class ModernBertEmbedding(nn.Module):
+    """Token lookup then LayerNorm. No position table -- ModernBERT is RoPE."""
+
+    def __init__(self, config: PretrainedConfig, prefix: str = "") -> None:
+        super().__init__()
+        self.tok_embeddings = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("tok_embeddings", prefix),
+        )
+        self.norm = nn.LayerNorm(
+            config.hidden_size,
+            eps=_modernbert_norm_eps(config),
+            bias=bool(getattr(config, "norm_bias", True)),
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        word_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        embeddings = (
+            self.tok_embeddings(input_ids) if word_embeds is None else word_embeds
+        )
+        return self.norm(embeddings)
+
+
+def modernbert_layer_plan(
+    config: PretrainedConfig,
+) -> list[tuple[bool, tuple[int, int] | None, float]]:
+    """Per layer: ``(is_global, window, rope_theta)``.
+
+    Two config vocabularies describe the same model, and a server has to read
+    whichever one it is handed:
+
+      * **transformers v5** publishes ``layer_types`` per layer, a
+        ``rope_parameters`` dict keyed by layer type, and ``sliding_window``
+        (64 here) as the per-side offset.
+      * **transformers v4** publishes ``global_attn_every_n_layers``,
+        ``global_rope_theta`` / ``local_rope_theta``, and ``local_attention``
+        as the *total* window width, so each side is half of it.
+
+    They agree on this checkpoint -- v5's ``layer_types`` is exactly
+    ``i % 3 == 0``, and its ``sliding_window`` is exactly
+    ``local_attention // 2`` -- which is worth knowing, because a server that
+    reads the wrong vocabulary still runs and still returns a plausible
+    embedding. transformers 5.12 drops the v4 names entirely.
+
+    The window is ``(left, right)`` in ``flash_attn_varlen_func``'s terms.
+    vLLM's ``sliding_window + 1`` (``models/modernbert.py:96``) is a
+    different quantity: its attention layer counts window *positions* where
+    this one takes offsets, and the reference implementation passes
+    ``(local_attention // 2, local_attention // 2)``.
+    """
+    num_layers = int(config.num_hidden_layers)
+    layer_types = getattr(config, "layer_types", None)
+    half = getattr(config, "sliding_window", None)
+    if half is None:
+        half = int(config.local_attention) // 2
+    window = (int(half), int(half))
+
+    plan: list[tuple[bool, tuple[int, int] | None, float]] = []
+    if layer_types:
+        rope_parameters = config.rope_parameters
+        for layer_id in range(num_layers):
+            layer_type = layer_types[layer_id]
+            is_global = layer_type != "sliding_attention"
+            theta = float(rope_parameters[layer_type]["rope_theta"])
+            plan.append((is_global, None if is_global else window, theta))
+        return plan
+
+    every = int(getattr(config, "global_attn_every_n_layers", 1) or 1)
+    global_theta = float(config.global_rope_theta)
+    local_theta = float(getattr(config, "local_rope_theta", None) or global_theta)
+    for layer_id in range(num_layers):
+        is_global = layer_id % every == 0
+        plan.append(
+            (
+                is_global,
+                None if is_global else window,
+                global_theta if is_global else local_theta,
+            )
+        )
+    return plan
+
+
+def _modernbert_norm_eps(config: PretrainedConfig) -> float:
+    return float(
+        getattr(config, "norm_eps", None)
+        or getattr(config, "layer_norm_eps", None)
+        or 1e-5
+    )
+
+
+class ModernBertLayer(nn.Module):
+    """Pre-LN block with alternating global and local attention.
+
+    Three things differ from the other families in this file, and each one
+    silently produces a plausible embedding if you get it wrong:
+
+      * **Pre-LN.** The norm runs *before* attention and MLP and the residual
+        adds their raw output; BERT, RoBERTa and GTE all post-LN.
+      * **Layer 0 has no attention norm.** The checkpoint ships no
+        ``layers.0.attn_norm``, because the embedding LayerNorm already
+        normalised its input. It is ``Identity``, not a missing weight.
+      * **Two of every three layers are local**, with their own rope theta.
+        ``local_attention`` in the config is the *total* window width, so
+        each side gets half.
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mapping: Mapping,
+        layer_id: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        mm_attention_backend: str | None = None,
+    ) -> None:
+        super().__init__()
+        attn = mapping.vision
+        eps = _modernbert_norm_eps(config)
+        norm_bias = bool(getattr(config, "norm_bias", True))
+        self.is_global, window, _ = modernbert_layer_plan(config)[layer_id]
+
+        self.attn_norm = (
+            nn.Identity()
+            if layer_id == 0
+            else nn.LayerNorm(config.hidden_size, eps=eps, bias=norm_bias)
+        )
+        self.attention = EncoderSelfAttention(
+            config,
+            mapping,
+            quant_config=quant_config,
+            prefix=add_prefix("attention", prefix),
+            qkv_bias=bool(getattr(config, "attention_bias", True)),
+            proj_bias=bool(getattr(config, "attention_bias", True)),
+            # Not the platform default: the local layers need a windowed
+            # kernel, and running the global and local halves of one model on
+            # two different backends would make any divergence between them
+            # impossible to attribute.
+            #
+            # ``sdpa_window`` rather than the faster ``fa_varlen``: that one
+            # honours the window on this card but raises
+            # cudaErrorIllegalAddress intermittently once a stack of
+            # attention modules runs in one process. Override with
+            # --mm-attention-backend fa_varlen once that is fixed; the
+            # measurement and the reasoning are in xref §6.8.
+            mm_attention_backend=mm_attention_backend or "sdpa_window",
+            window_size=window,
+        )
+        self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=eps, bias=norm_bias)
+        mlp_bias = bool(getattr(config, "mlp_bias", True))
+        self.mlp = nn.Module()
+        self.mlp.Wi = ColumnParallelLinear(
+            config.hidden_size,
+            int(config.intermediate_size) * 2,
+            bias=mlp_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp.Wi", prefix),
+            tp_rank=attn.tp_rank,
+            tp_size=attn.tp_size,
+            tp_group=attn.tp_group,
+        )
+        self.mlp.Wo = RowParallelLinear(
+            int(config.intermediate_size),
+            config.hidden_size,
+            bias=mlp_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp.Wo", prefix),
+            tp_rank=attn.tp_rank,
+            tp_size=attn.tp_size,
+            tp_group=attn.tp_group,
+            reduce_results=True,
+        )
+        self.act_fn = _resolve_bert_activation(
+            getattr(config, "hidden_activation", None) or config.hidden_act
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attention(
+            self.attn_norm(hidden_states), ctx, cos, sin
+        )
+        gated, _ = self.mlp.Wi(self.mlp_norm(hidden_states))
+        # ``act(first) * second``: the activation goes on the *first* half
+        # here, the opposite of GTE's ``up_gate_proj``. Both orders load
+        # cleanly and both return a unit-norm vector.
+        first, second = gated.split(gated.shape[-1] // 2, dim=-1)
+        projected, _ = self.mlp.Wo(self.act_fn(first) * second)
+        return hidden_states + projected
 
 
 def _resolve_bert_activation(name: str):
@@ -537,6 +808,8 @@ def _resolve_bert_activation(name: str):
         return F.gelu
     if name == "gelu_new" or name == "gelu_pytorch_tanh":
         return lambda x: F.gelu(x, approximate="tanh")
+    if name == "silu":
+        return F.silu
     if name == "relu":
         return F.relu
     raise ValueError(f"unsupported encoder hidden_act: {name!r}")
@@ -665,10 +938,83 @@ class NewTransformer(BertTransformer):
     ) -> None:
         super().__init__(config, mapping, quant_config, prefix)
         dtype = self.embeddings.LayerNorm.weight.dtype
-        self.rotary_emb = NTKScalingRotaryCache(config, dtype)
+        self.rotary_emb = EncoderRotaryCache.from_config(config, dtype)
 
     def rotary(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.rotary_emb(positions)
+
+
+class ModernBertTransformer(BertTransformer):
+    """ModernBERT's stack: two rope tables, a final norm, pre-LN blocks."""
+
+    embedding_cls = ModernBertEmbedding
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.mapping = mapping
+        backend = getattr(config, "mm_attention_backend", None)
+        self.embeddings = self.embedding_cls(
+            config, prefix=add_prefix("embeddings", prefix)
+        )
+        self.encoder = nn.Module()
+        self.encoder.layers = nn.ModuleList(
+            [
+                ModernBertLayer(
+                    config,
+                    mapping,
+                    layer_id=idx,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"encoder.layers.{idx}", prefix),
+                    mm_attention_backend=backend,
+                )
+                for idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(
+            config.hidden_size,
+            eps=_modernbert_norm_eps(config),
+            bias=bool(getattr(config, "norm_bias", True)),
+        )
+        self.layers_to_capture: list[int] = []
+
+        dtype = self.final_norm.weight.dtype
+        head_dim = config.hidden_size // config.num_attention_heads
+        max_position = int(config.max_position_embeddings)
+        # One table per distinct theta, shared by every layer that uses it.
+        # Reusing the global theta for the local layers is invisible in the
+        # output, so the thetas come off the plan rather than from a default.
+        plan = modernbert_layer_plan(config)
+        caches: dict[float, EncoderRotaryCache] = {}
+        for _, _, theta in plan:
+            if theta not in caches:
+                caches[theta] = EncoderRotaryCache(head_dim, theta, max_position, dtype)
+        self.rotary_caches = nn.ModuleList(caches.values())
+        self._layer_rotary = [list(caches).index(theta) for _, _, theta in plan]
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, None]:
+        hidden_states = self.embeddings(
+            input_ids, positions, kwargs.get("input_embeds")
+        )
+        for idx, layer in enumerate(self.encoder.layers):
+            # Per layer, and per layer *type*: see BertTransformer.forward for
+            # why this is not hoisted out of the loop.
+            cos, sin = self.rotary_caches[self._layer_rotary[idx]](positions)
+            hidden_states = layer(hidden_states, ctx, cos, sin)
+        return self.final_norm(hidden_states), None
 
 
 class EncoderOnlyEmbeddingModel(BaseCausalLM):
@@ -725,17 +1071,36 @@ class EncoderOnlyEmbeddingModel(BaseCausalLM):
             name = name.replace(source, target)
         return name
 
-    def _iter_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Hook for per-architecture weight surgery before the common loader."""
+    def _iter_weights(self, weights):
+        """Hook for per-architecture weight surgery before the common loader.
+
+        Yields ``(name, weight)``, or ``(name, weight, shard_id)`` when the
+        checkpoint packs several projections into one tensor and the split
+        already knows which shard each piece is.
+        """
         return weights
+
+    @staticmethod
+    def _split_packed(name, weight, source, dest, shards):
+        """Cut a packed tensor along dim 0 into one triple per shard."""
+        pieces = weight.chunk(len(shards), dim=0)
+        for shard, piece in zip(shards, pieces):
+            yield name.replace(source, dest), piece, shard
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
 
-        for raw_name, loaded_weight in self._iter_weights(weights):
+        for item in self._iter_weights(weights):
+            # A packed checkpoint tensor is split upstream and arrives as a
+            # triple naming its destination shard directly; everything else
+            # is an ordinary (name, weight) pair routed through the rename
+            # table and ``_STACKED_QKV``.
+            forced_shard = None
+            if len(item) == 3:
+                raw_name, loaded_weight, forced_shard = item
+            else:
+                raw_name, loaded_weight = item
             if any(skip in raw_name for skip in self._SKIP):
                 continue
 
@@ -745,12 +1110,13 @@ class EncoderOnlyEmbeddingModel(BaseCausalLM):
             if not name.startswith("model."):
                 name = "model." + name
 
-            shard_id = None
-            for target, source, sid in self._STACKED_QKV:
-                if source in name:
-                    name = name.replace(source, target)
-                    shard_id = sid
-                    break
+            shard_id = forced_shard
+            if shard_id is None:
+                for target, source, sid in self._STACKED_QKV:
+                    if source in name:
+                        name = name.replace(source, target)
+                        shard_id = sid
+                        break
 
             param = params_dict.get(name)
             if param is None:
@@ -803,43 +1169,135 @@ class NewModel(EncoderOnlyEmbeddingModel):
 
     model_cls = NewTransformer
 
-    # Same fused destination as BERT; ``_iter_weights`` below cuts the
-    # checkpoint's already-packed tensor into the three shard names first.
-    _STACKED_QKV = (
-        ("attention.attn.qkv_proj", "attention.self.query", "q"),
-        ("attention.attn.qkv_proj", "attention.self.key", "k"),
-        ("attention.attn.qkv_proj", "attention.self.value", "v"),
-    )
+    # Both packed tensors are cut by ``_iter_weights`` below, which names
+    # their destination shards directly, so no string table is needed here.
+    _STACKED_QKV = ()
 
     _RENAMES = (
         ("encoder.layer.", "encoder.layers."),
         ("attention.o_proj", "attention.attn.proj"),
-        ("mlp.up_gate_proj", "up_gate_proj"),
         ("mlp.down_proj", "down_proj"),
     )
 
     _SKIP = ("classifier", "position_ids")
 
     def _iter_weights(self, weights):
-        """Split the packed QKV so the fused projection loads shard by shard.
+        """Split this checkpoint's two packed tensors into shards.
 
-        The checkpoint already ships ``attention.qkv_proj`` fused, and at
-        TP=1 it could be copied whole. Splitting it anyway means the same
-        path serves TP>1, where the fused tensor has to be cut per rank and a
+        ``attention.qkv_proj`` and ``mlp.up_gate_proj`` both ship fused. At
+        TP=1 either could be copied whole; splitting serves TP>1 too, where a
         whole-tensor copy would silently give every rank the full weight.
+
+        ``up_gate_proj`` is packed ``[up; gate]``, so shard 0 is up and shard
+        1 is gate -- matching the reference's
+        ``up_states, gate = split(up_gate)``.
         """
         for name, weight in weights:
-            if "attention.qkv_proj" not in name:
+            if "attention.qkv_proj" in name:
+                yield from self._split_packed(
+                    name,
+                    weight,
+                    "attention.qkv_proj",
+                    "attention.attn.qkv_proj",
+                    ("q", "k", "v"),
+                )
+            elif "mlp.up_gate_proj" in name:
+                yield from self._split_packed(
+                    name, weight, "mlp.up_gate_proj", "up_gate_proj", (0, 1)
+                )
+            else:
                 yield name, weight
-                continue
-            q, k, v = weight.chunk(3, dim=0)
-            yield name.replace("attention.qkv_proj", "attention.self.query"), q
-            yield name.replace("attention.qkv_proj", "attention.self.key"), k
-            yield name.replace("attention.qkv_proj", "attention.self.value"), v
 
 
 class GteModel(NewModel):
     """``GteModel`` -- Snowflake/snowflake-arctic-embed-*-v2.0."""
+
+
+class NomicBertModel(NewModel):
+    """``NomicBertModel`` -- nomic-ai/nomic-embed-text-v1.5, nomic-bert-2048.
+
+    Structurally the same block as GTE-v1.5 (post-LN, RoPE, gated MLP), with
+    three differences that all live in the config or the names:
+
+      * the gate and up projections ship *unfused* as ``mlp.fc11`` /
+        ``mlp.fc12``, so there is no packed tensor to split;
+      * ``activation_function: "swiglu"`` means silu on the gate, where GTE
+        says ``"gelu"`` and means GeGLU (vLLM rewrites both fields --
+        ``model_executor/models/config.py:660`` for this one);
+      * the projections carry no bias while the norms do, the opposite of
+        GTE. Read off the config rather than assumed; an absent bias that
+        this model allocates anyway would be caught by the loader's
+        unfilled-parameter check, but a *present* one silently dropped would
+        not.
+    """
+
+    _STACKED_QKV = ()
+
+    _RENAMES = (
+        ("emb_ln", "embeddings.LayerNorm"),
+        ("attn.out_proj", "attention.attn.proj"),
+        ("norm1", "attn_ln"),
+        ("norm2", "mlp_ln"),
+        ("mlp.fc2", "down_proj"),
+    )
+
+    _SKIP = ("position_ids",)
+
+    def _iter_weights(self, weights):
+        """Split the packed QKV; route the already-separate MLP halves.
+
+        ``fc11`` is up and ``fc12`` is gate -- the mapping vLLM's
+        ``NomicBertModel`` uses (``bert_with_rope.py:538``). Getting the two
+        the wrong way round swaps which half the activation lands on and
+        still returns a well-formed unit vector.
+        """
+        for name, weight in weights:
+            if "attn.Wqkv" in name:
+                yield from self._split_packed(
+                    name,
+                    weight,
+                    "attn.Wqkv",
+                    "attention.attn.qkv_proj",
+                    ("q", "k", "v"),
+                )
+            elif "mlp.fc11" in name:
+                yield name.replace("mlp.fc11", "up_gate_proj"), weight, 0
+            elif "mlp.fc12" in name:
+                yield name.replace("mlp.fc12", "up_gate_proj"), weight, 1
+            else:
+                yield name, weight
+
+
+class ModernBertModel(EncoderOnlyEmbeddingModel):
+    """``ModernBertModel`` -- answerdotai/ModernBERT-*, nomic-ai/modernbert-embed-*."""
+
+    model_cls = ModernBertTransformer
+
+    _STACKED_QKV = ()
+
+    _RENAMES = (
+        # ``attn.Wo`` first: the bare ``layers.`` rewrite must not reach it,
+        # and the MLP has its own ``Wo`` that has to survive untouched.
+        ("attn.Wo", "attention.attn.proj"),
+        ("layers.", "encoder.layers."),
+    )
+
+    # ``head.*`` and ``decoder.*`` are the masked-LM head some ModernBERT
+    # checkpoints ship; an embedding server never calls it.
+    _SKIP = ("position_ids", "head.", "decoder.", "classifier")
+
+    def _iter_weights(self, weights):
+        for name, weight in weights:
+            if "attn.Wqkv" in name:
+                yield from self._split_packed(
+                    name,
+                    weight,
+                    "attn.Wqkv",
+                    "attention.attn.qkv_proj",
+                    ("q", "k", "v"),
+                )
+            else:
+                yield name, weight
 
 
 EntryClass = [
@@ -848,4 +1306,6 @@ EntryClass = [
     XLMRobertaModel,
     NewModel,
     GteModel,
+    NomicBertModel,
+    ModernBertModel,
 ]

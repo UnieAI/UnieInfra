@@ -596,6 +596,79 @@ embeddings.position_ids -1.07e12, -9.4e11, -59873, ...
 之前先對 HF reference」，這條說 HF reference 本身也是會靜默壞掉的東西。
 
 
+## 6.8　ModernBERT 與 Nomic：兩個新架構，以及 sm_120 上第四扇關著的門（2026-08-21）
+
+### ModernBERT 有三件事和前面四個家族都不同
+
+`answerdotai/ModernBERT-*`、`nomic-ai/modernbert-embed-*`。每一件寫錯都會得到一個
+「看起來合理」的向量：
+
+1. **pre-LN**。norm 在 attention 與 MLP *之前*，殘差加的是它們的原始輸出。BERT、
+   RoBERTa、GTE、Nomic 全是 post-LN。
+2. **第 0 層沒有 attention norm**。checkpoint 裡就沒有 `layers.0.attn_norm`——
+   embedding 的 LayerNorm 已經正規化過它的輸入。那是 `Identity`，不是缺權重。
+3. **每三層有兩層是 local**，而且**各有自己的 rope theta**（global 160000、
+   local 10000）。config 裡的 `local_attention` 是**總**寬度，每一側取一半。
+
+另外 MLP 的 `Wi` 打包成 `[first; second]`，輸出是 `Wo(act(first) * second)`——
+**激活落在第一半**，與 GTE 的 `up_gate_proj` 正好相反。
+
+**兩套 config 詞彙描述同一個模型**，服務端拿到哪一套就得讀哪一套：transformers v5 給
+`layer_types`、每種類型一組 `rope_parameters`、以及作為**每側偏移**的 `sliding_window`；
+v4 給 `global_attn_every_n_layers`、`global_rope_theta` / `local_rope_theta`、以及作為
+**總寬度**的 `local_attention`。這個 checkpoint 上兩者一致（v5 的 `layer_types` 恰好是
+`i % 3 == 0`，`sliding_window` 恰好是 `local_attention // 2`），而 transformers 5.12
+**完全不再提供 v4 那組名字**。
+
+### Nomic 幾乎就是 GTE 的同一個 block
+
+`nomic-ai/nomic-embed-text-v1.5`。post-LN、RoPE、gated MLP，差別全在 config 或名字上：
+gate/up 是**未打包**的 `mlp.fc11` / `mlp.fc12`（fc11 是 up、fc12 是 gate）、
+`activation_function: "swiglu"` 意思是 silu（GTE 寫 `"gelu"` 意思是 GeGLU，vLLM 兩個
+欄位都改寫）、投影**沒有** bias 而 norm **有**，與 GTE 相反。
+
+最後這一項是被 loader 的「未填滿參數」檢查攔下來的：
+`NomicBertModel: 24 parameters were never filled by the checkpoint`。一個模型配置了、
+checkpoint 卻從不填的 bias 就是未初始化記憶體；沒有那個檢查，它會 pool 成一個
+單位範數的向量。
+
+### sm_120：`flash_attn_varlen_func` 在多模組堆疊下會間歇性非法存取
+
+ModernBERT 的 local 層需要 sliding window，而本樹 sm_120 的預設 mm backend
+`triton_attn` 的 `context_attention_fwd` **沒有 window 參數**。`flash_attn_varlen_func`
+有，而且探測顯示它在這張卡上**確實生效**（對上帶狀遮罩參考差 5.2e-3，對上完整
+attention 差 1.61，所以旗標不是被忽略）。
+
+但把它接進模型後，engine 在一個含長序列的多序列批次上丟
+`cudaErrorIllegalAddress`。逐步縮小：
+
+```
+單一組態重複 20 次                     穩定
+形狀（含長度 9 對上 ±64 的 window）     穩定
+q/k/v 為 strided view                  穩定
+over-declared max_seqlen（總長 vs 最長）穩定，且結果逐位相同
+22 個 attention 模組堆在一個行程裡      第 2 層 FAILED
+   ...同一組態再跑                      有時全過
+```
+
+**不可穩定重現**——同一個 22 層組態三次崩在第 2 層、兩次全過。那是越界存取在
+「隔壁那塊記憶體剛好有沒有被映射」上的表現。**因為這個理由而通過的路徑，不是可以拿來
+服務的路徑。**
+
+所以 local 層走 `sdpa_window`：逐序列的 `scaled_dot_product_attention` 加一個顯式帶狀
+遮罩。慢（每序列 `[heads, L, L]` 的遮罩，二次成本），但穩定，而且與 `fa_varlen`
+在單次呼叫上吻合到 bf16 精度（0.0078，有無 window 皆然）——這同時證明帶狀遮罩的語意
+與 FA 的 `window_size` 相同。ModernBERT 完整的 8192 context 需要重新檢視這個選擇。
+
+這是 §6.1 那份清單上的**第四扇**門：`page_table`、`gather_kv_indices`、fp8，現在加上
+「多模組堆疊下的 varlen」。前三扇是乾脆地拒絕，這一扇不是——它會回答，只是偶爾踩爛
+記憶體。
+
+**注意**：Whisper 的 cross-attention 也用 `flash_attn_varlen_func`（§6.2），但它是
+每個請求一次、q 只有一列的呼叫形狀，與這裡的 22 層自注意力堆疊不同，且已逐字驗證過。
+這一節不撤回那條路徑，但它是下一個該複驗的地方。
+
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder

@@ -294,6 +294,35 @@ MHA backend 的 extend 有兩種模式。**postwrite** 會先用傳入的 raw k/
 開關 `--embedding-skip-kv-write` 預設開著，實際生效與否取決於有沒有 postwrite kernel。
 **要讓它生效的前提是為 bf16 註冊一支 PERFORMANT 的 prefill kernel**，那是另一件事。
 
+## 6.6　每請求約 16–18 ms 的固定延遲地板（2026-08-21）
+
+追 Whisper decode 的過程中，注意到兩個不相干的數字撞在一起：embedding 的 8-token
+單一請求是 19.3 ms，Whisper 的固定成本（encoder 跑 1500 frames + prefill）是 23.0 ms。
+不同模型、差了兩個數量級的工作量，卻都落在 20 ms 附近。
+
+用小 13 倍的模型驗證：
+
+```
+Qwen3-0.6B   5-token prompt,  1 token out    17.3 ms
+             500-word prompt, 1 token out    17.8 ms   ← prompt 大 100 倍，只多 0.5 ms
+             每 token ≈ 1.60 ms，固定 ≈ 15.7 ms
+```
+
+**這個地板與模型大小和 prompt 長度都無關**，所以不是計算。而且 `e2e_latency`（引擎內部
+量的，17.6 ms）與 client 的 wall clock（18.0 ms）幾乎相同，所以也不是 Python 橋接。
+
+**它是管線延遲，不是 CPU 工作量**——證據是它會被分攤掉：32 條 embedding 請求總共
+31.6 ms（每條約 1 ms），而 1 條要 19.5 ms。
+
+影響面：
+- **吞吐**（大量並發）：不受影響，已經攤掉了。
+- **延遲**（單請求）：這是主成本。Whisper 一段 23-token 轉譯共 46 ms，其中 23 ms 是它；
+  embedding 單一短請求 19.3 ms，其中約 16 ms 是它。
+
+**尚未定位。** 已排除：模型計算、prompt 長度、client 橋接。未排除：ZMQ 來回、
+scheduler 每輪的地板、admission 要等幾輪、overlap 排程延後一步。要再往下必須在引擎內部
+埋量測點，那會動到共用路徑。
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder

@@ -46,20 +46,10 @@ def _select_scheduler_ext(raw_argv: list[str]) -> None:
         select_flat_kvcache_ext_for_model_path(model)
 
 
-# Routes the in-repo control server and the smg gateway can answer today.
-# Keyed by the runtime a checkpoint resolves to; an empty tuple means the
-# engine will start and then have nothing to answer with.
-_RUNTIME_ROUTES: dict[str, tuple[str, ...]] = {
-    "generate": ("/v1/completions", "/v1/chat/completions", "/v1/responses"),
-    "embed": (),
-    "rerank": (),
-    "asr": (),
-    "diffusion": (),
-}
-
+# Runtimes whose route does not exist anywhere yet. embed and rerank are
+# absent because ts serve now launches entrypoints/pooling_http for them
+# rather than a gateway that cannot answer.
 _RUNTIME_MISSING: dict[str, str] = {
-    "embed": "/v1/embeddings",
-    "rerank": "/v1/rerank",
     "asr": "/v1/audio/transcriptions",
 }
 
@@ -77,7 +67,7 @@ def _announce_runtime(raw_argv: list[str]) -> None:
 
     model = next((arg for arg in raw_argv if arg and not arg.startswith("-")), None)
     if model is None:
-        return
+        return "generate"
     runtime = resolve_serving_runtime(model)
     print(f"[ts serve] runtime: {runtime} -- {describe_runtime(runtime)}")
 
@@ -90,21 +80,51 @@ def _announce_runtime(raw_argv: list[str]) -> None:
 
     missing = _RUNTIME_MISSING.get(runtime)
     if missing:
-        # Start anyway: the engine path is real and reachable in-process via
-        # Engine.encode(...), and refusing would block the people using it.
-        # But say plainly that HTTP cannot reach it, because "the server
-        # started" would otherwise read as "the model is being served".
+        # asr only: /v1/audio/transcriptions has no server yet. Start anyway
+        # -- the engine path is real and reachable in-process -- but say so,
+        # because "the server started" would otherwise read as "the model is
+        # being served".
         print(
             f"[ts serve] warning: no {missing} route exists yet, so this "
             f"model is not reachable over HTTP.\n"
-            f"           The engine path is verified and usable in-process "
-            f"(Engine.encode). See unieinfra/REPORT-encoder-serving.md §5."
+            f"           The engine path is verified and usable in-process. "
+            f"See unieinfra/REPORT-encoder-serving.md §5."
         )
+    return runtime
+
+
+def _serve_pooling(raw_argv: list[str]) -> None:
+    """``ts serve`` for an embedding or reranking checkpoint.
+
+    A different server, not a different flag. The smg gateway reaches the
+    engine over a proto with no Embed RPC, so pointing it at a pooling model
+    starts something that cannot answer; ``entrypoints/pooling_http`` owns
+    its engine and serves /v1/embeddings and /v1/rerank directly.
+    """
+    from tokenspeed.cli._argsplit import split_argv
+    from tokenspeed.runtime.entrypoints.pooling_http import serve
+
+    split = split_argv(raw_argv)
+    host, port = "127.0.0.1", 8000
+    gateway = list(split.gateway)
+    for flag, setter in (("--host", "host"), ("--port", "port")):
+        if flag in gateway:
+            value = gateway[gateway.index(flag) + 1]
+            if setter == "host":
+                host = value
+            else:
+                port = int(value)
+    print(f"[ts serve] pooling server on http://{host}:{port}")
+    serve(split.engine, host=host, port=port)
 
 
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     _select_scheduler_ext(raw_argv)
-    _announce_runtime(raw_argv)
+    runtime = _announce_runtime(raw_argv)
+
+    if runtime in ("embed", "rerank") and not getattr(args, "headless", False):
+        _serve_pooling(raw_argv)
+        return
 
     from tokenspeed.cli.serve_smg import run_smg_from_args
 

@@ -226,3 +226,32 @@ def create_app(engine, served_model_name: str) -> FastAPI:
         return _rerank(body)
 
     return app
+
+
+def serve(argv: list[str], *, host: str, port: int) -> None:
+    """Build the engine from ``argv`` and serve the pooling routes on it.
+
+    The engine is constructed here, in the process that runs uvicorn, and
+    reached through its sync facade -- see the module docstring for why that
+    is not an implementation detail.
+    """
+    import uvicorn
+
+    from tokenspeed.runtime.entrypoints.engine import Engine
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    server_args = prepare_server_args(argv)
+    engine = Engine(server_args=server_args)
+    served = server_args.served_model_name or server_args.model
+    logger.info(
+        "pooling server: model=%s is_embedding=%s pooling_type=%s normalize=%s",
+        served,
+        server_args.is_embedding,
+        server_args.pooling_type,
+        server_args.pooling_normalize,
+    )
+    app = create_app(engine, served_model_name=served)
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    finally:
+        engine.shutdown()

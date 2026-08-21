@@ -33,6 +33,11 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.layers.pooler import (
+    Pooler,
+    PoolerOutput,
+    seq_lens_from_gather_ids,
+)
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -59,6 +64,12 @@ class BaseCausalLM(nn.Module):
         self.quant_config = quant_config
         self.capture_aux_hidden_states: bool = False
 
+        # An embedding server pools instead of producing logits. The decision
+        # rides on the HF config (same idiom as ``encoder_only``) because the
+        # model class is constructed from that config alone, and it has to be
+        # known before lm_head construction below.
+        self.pooler = self.resolve_pooler(config)
+
         self.encoder_only = encoder_only
         if encoder_only:
             # Vision-only role (EPD encode): never allocate the LM / lm_head /
@@ -70,9 +81,27 @@ class BaseCausalLM(nn.Module):
             self.logits_processor = None
         else:
             self.model = self.resolve_model(config, mapping, quant_config, prefix)
-            self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
-            self.logits_processor = self.resolve_logits_processor(config)
+            if self.pooler is None:
+                self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
+                self.logits_processor = self.resolve_logits_processor(config)
+            else:
+                # A pooling checkpoint has no lm_head to load (Qwen3-Embedding
+                # ships `embed_tokens` + `layers.*` and nothing else), and a
+                # pooling forward never reaches the logits processor. Building
+                # them would allocate a vocab-sized projection that no weight
+                # ever fills.
+                self.lm_head = None
+                self.logits_processor = None
         self.post_init()
+
+    def resolve_pooler(self, config: PretrainedConfig) -> Pooler | None:
+        pooling_config = getattr(config, "pooling_config", None)
+        if pooling_config is None:
+            return None
+        return Pooler(
+            pooling_type=pooling_config.pooling_type,
+            normalize=pooling_config.normalize,
+        )
 
     def resolve_model(
         self,
@@ -162,6 +191,9 @@ class BaseCausalLM(nn.Module):
             out_cache_loc,
             **model_kwargs,
         )
+        if kwargs.get("get_embedding"):
+            return self.pool(ctx, hidden_states)
+
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
 
         return self.logits_processor(
@@ -170,6 +202,26 @@ class BaseCausalLM(nn.Module):
             self.lm_head,
             logits_metadata,
             aux_hidden_states,
+        )
+
+    def pool(self, ctx: ForwardContext, hidden_states: torch.Tensor) -> PoolerOutput:
+        """Reduce this prefill's hidden states to one vector per request."""
+        if self.pooler is None:
+            raise RuntimeError(
+                "get_embedding was requested but this model has no pooler; "
+                "start the server with --is-embedding on a pooling checkpoint."
+            )
+        if ctx.gather_ids is None:
+            raise RuntimeError(
+                "pooling requires ForwardContext.gather_ids, which only an "
+                "extend forward carries. Got forward_mode="
+                f"{ctx.forward_mode} bs={ctx.bs} num_extends={ctx.num_extends} "
+                f"input_num_tokens={ctx.input_num_tokens}"
+            )
+        return self.pooler(
+            hidden_states,
+            gather_ids=ctx.gather_ids,
+            extend_seq_lens=seq_lens_from_gather_ids(ctx.gather_ids),
         )
 
     def prepare_model_kwargs(

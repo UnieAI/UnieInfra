@@ -154,7 +154,14 @@ def main() -> None:
 
     # Reference first, and freed before the engine starts: both want the card.
     reference_text = reference(snapshot, processor, feats, args.max_new_tokens)
-    our_text = ours(snapshot, processor, feats, args.max_new_tokens, args.max_num_seqs)
+    our_text = ours(
+        snapshot,
+        processor,
+        feats,
+        args.max_new_tokens,
+        args.max_num_seqs,
+        args.cross_attn_path,
+    )
 
     if args.truth:
         print(f"truth      {args.truth!r}")

@@ -285,6 +285,10 @@ class PrefillGraph:
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
 
+        # A pooling model finishes its forward with the pooler instead of the
+        # logits processor; both take the same captured hidden states.
+        self._pools = getattr(self.text_model, "pooler", None) is not None
+
         self.capture_buckets = get_prefill_token_buckets(config)
         # Ordered so the first hit is the most specific reason, and named so a
         # disabled graph says why. An operator who passes
@@ -305,9 +309,20 @@ class PrefillGraph:
             ("model_runner is None", model_runner is None),
             ("model exposes no inner .model", self.inner_model is None),
             ("inner model exposes no embed_tokens", self._embed_tokens is None),
+            # A pooling model was excluded outright here. The capture is
+            # mode-agnostic -- it runs the inner stack and returns hidden
+            # states (`_run_inner`); what differs is the tail replay() runs on
+            # those states, logits processor against pooler. So the real
+            # requirement is that the model has a usable tail, not that it
+            # generates.
             (
-                "model is not a generation model",
-                model_runner is not None and not model_runner.is_generation,
+                "pooling model and --no-pooling-prefill-graph",
+                self._pools and not config.pooling_prefill_graph,
+            ),
+            (
+                "model has neither a logits processor nor a pooler",
+                not self._pools
+                and getattr(self.text_model, "logits_processor", None) is None,
             ),
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
@@ -447,7 +462,13 @@ class PrefillGraph:
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
         torch.cuda.synchronize()
-        stream = decode_wrapper.stream if decode_wrapper is not None else None
+        # getattr, not attribute access: the decode wrapper only creates its
+        # capture stream when it captures, and it does not capture for a
+        # pooling model (its captured shape is the token tuple, which pooling
+        # does not produce). Sharing that stream keeps both graphs in one
+        # mempool-reuse domain when it exists; when it does not there is no
+        # decode graph to share with, and None makes the capture open its own.
+        stream = getattr(decode_wrapper, "stream", None)
         cap = BreakableCapture(pool=self._pool, stream=stream)
         with cap:
             self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
@@ -737,6 +758,12 @@ class PrefillGraph:
         with self._padded_to(ctx, bucket):
             self._captures[bucket].replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
+        if self._pools:
+            # The eager pooling tail of BaseCausalLM.forward. A pooling model
+            # has no lm_head and no logits processor to call, and the reduction
+            # reads ctx.gather_ids, which indexes the same real-token rows
+            # `sliced` just returned.
+            return self.text_model.pool(ctx, hidden_states)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.text_model.logits_processor(

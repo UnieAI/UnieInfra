@@ -130,6 +130,12 @@ class ServerArgs:
     # here so the saving can be A/B'd. (SGLang does the same thing for
     # embedding models, `fa_skip_kv_cache`; xref §1.)
     embedding_skip_kv_write: bool = True
+    # Let a pooling model use the breakable prefill CUDA graph. The graph
+    # captures the inner transformer stack and returns hidden states; only the
+    # tail run at replay differs between generation (logits processor) and
+    # pooling (pooler), so the capture itself is mode-agnostic. On by default;
+    # the switch is here so it can be A/B'd.
+    pooling_prefill_graph: bool = True
 
     # How an encoder-decoder reads its cross-attention KV on a decode step.
     # "padded" attends over every slot with the queries scattered by pool
@@ -1038,6 +1044,13 @@ class ServerArgs:
             default=ServerArgs.embedding_skip_kv_write,
             help="Skip the prefill KV write on a pooling model; nothing "
             "reads it back. Off restores the write.",
+        )
+        parser.add_argument(
+            "--pooling-prefill-graph",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pooling_prefill_graph,
+            help="Allow a pooling (embedding) model to use the breakable "
+            "prefill CUDA graph. Off makes pooling models run eager prefill.",
         )
         parser.add_argument(
             "--cross-attn-path",

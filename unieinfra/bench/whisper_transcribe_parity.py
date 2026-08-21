@@ -77,7 +77,9 @@ def reference(snapshot: str, processor, feats, max_new_tokens: int) -> str:
     return processor.tokenizer.decode(ids[0], skip_special_tokens=True)
 
 
-def ours(snapshot: str, processor, feats, max_new_tokens: int) -> str:
+def ours(
+    snapshot: str, processor, feats, max_new_tokens: int, max_num_seqs: int
+) -> str:
     from tokenspeed.runtime.engine.io_struct import GenerateReqInput
     from tokenspeed.runtime.entrypoints.engine import Engine
     from tokenspeed.runtime.multimodal.inputs import (
@@ -91,7 +93,7 @@ def ours(snapshot: str, processor, feats, max_new_tokens: int) -> str:
         dtype="bfloat16",
         max_model_len=448,
         gpu_memory_utilization=0.25,
-        max_num_seqs=4,
+        max_num_seqs=max_num_seqs,
         disable_kvstore=True,
         attention_backend="triton",
     )
@@ -117,6 +119,14 @@ def main() -> None:
     parser.add_argument("--snapshot-glob", default=DEFAULT_SNAPSHOT_GLOB)
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--truth", default=None, help="Optional ground-truth text.")
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=4,
+        help="Cross-attention picks its read path by batch occupancy "
+        "(bs*2 >= slots). Set this to 1 so a single request exercises the "
+        "padded path; leave it larger to exercise the gather path.",
+    )
     args = parser.parse_args()
 
     matches = glob.glob(args.snapshot_glob)
@@ -131,7 +141,7 @@ def main() -> None:
 
     # Reference first, and freed before the engine starts: both want the card.
     reference_text = reference(snapshot, processor, feats, args.max_new_tokens)
-    our_text = ours(snapshot, processor, feats, args.max_new_tokens)
+    our_text = ours(snapshot, processor, feats, args.max_new_tokens, args.max_num_seqs)
 
     if args.truth:
         print(f"truth      {args.truth!r}")

@@ -35,15 +35,27 @@ PROMPTS = [
     "sequence length correctly rather than accidentally agreeing on a "
     "uniform one.",
     "巴黎是法國的首都。",
+    # Long enough that ModernBERT's local layers actually clip. Its window is
+    # 64 tokens each side, so anything under ~129 tokens leaves every token
+    # inside every other token's window and the local and global layers
+    # differ only by their rope theta -- a sliding-window bug would score a
+    # clean 0.9999 on the four short prompts above.
+    " ".join(
+        f"Sentence number {i} carries its own distinct content so that "
+        f"positions far apart cannot be confused with positions nearby."
+        for i in range(12)
+    ),
 ]
 
 
-def ours(model: str, prompts: list[str], **engine_kwargs) -> np.ndarray:
+def ours(
+    model: str, prompts: list[str], dtype: str = "bfloat16", **engine_kwargs
+) -> np.ndarray:
     from tokenspeed.runtime.entrypoints.engine import Engine
 
     engine = Engine(
         model=model,
-        dtype="bfloat16",
+        dtype=dtype,
         max_model_len=512,
         gpu_memory_utilization=0.25,
         max_num_seqs=8,
@@ -142,7 +154,11 @@ def _build_reference(model: str, dtype):
         state.update(load_file(shard))
 
     missing, unexpected = hf.load_state_dict(state, strict=False)
-    real_missing = [m for m in missing if "position_ids" not in m]
+    # ``position_ids`` is a buffer, and ``pooler.*`` is the classification
+    # head an embedding checkpoint does not ship. Neither absence means the
+    # reference is incomplete.
+    ignorable = ("position_ids", "pooler.")
+    real_missing = [m for m in missing if not any(i in m for i in ignorable)]
     if real_missing:
         raise RuntimeError(
             f"reference is missing {len(real_missing)} weights, e.g. "
@@ -157,13 +173,17 @@ def _build_reference(model: str, dtype):
 
 
 def reference(
-    model: str, prompts: list[str], pooling: str, normalize: bool
+    model: str,
+    prompts: list[str],
+    pooling: str,
+    normalize: bool,
+    dtype: str = "bfloat16",
 ) -> np.ndarray:
     import torch
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    hf = _build_reference(model, torch.bfloat16)
+    hf = _build_reference(model, getattr(torch, dtype))
 
     vectors = []
     with torch.no_grad():
@@ -209,16 +229,23 @@ def main() -> None:
     parser.add_argument("--ours-npy", default=".enc_ours.npy")
     parser.add_argument("--reference-npy", default=".enc_ref.npy")
     parser.add_argument("--min-cosine", type=float, default=0.999)
+    parser.add_argument(
+        "--dtype",
+        default="bfloat16",
+        choices=["bfloat16", "float32"],
+        help="Both arms. float32 separates a precision gap from a real one: "
+        "a cosine that stays put in fp32 is a bug, one that closes was noise.",
+    )
     args = parser.parse_args()
 
     if args.arm in ("ours", "both"):
         print("engine arm:", flush=True)
-        np.save(args.ours_npy, ours(args.model, PROMPTS))
+        np.save(args.ours_npy, ours(args.model, PROMPTS, dtype=args.dtype))
     if args.arm in ("reference", "both"):
         print("reference arm:", flush=True)
         np.save(
             args.reference_npy,
-            reference(args.model, PROMPTS, args.pooling, args.normalize),
+            reference(args.model, PROMPTS, args.pooling, args.normalize, args.dtype),
         )
     if args.arm != "both":
         other = "reference" if args.arm == "ours" else "ours"

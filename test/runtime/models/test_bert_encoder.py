@@ -14,12 +14,12 @@ import torch
 from tokenspeed.runtime.models.bert import (
     BertEmbedding,
     BertModel,
+    EncoderRotaryCache,
     NewModel,
-    NTKScalingRotaryCache,
     RobertaEmbedding,
     XLMRobertaModel,
-    encoder_batch_layout,
     _resolve_bert_activation,
+    encoder_batch_layout,
 )
 
 
@@ -131,7 +131,7 @@ def test_ntk_rope_matches_the_closed_form():
         max_position_embeddings=16,
         rope_scaling={"type": "ntk", "factor": 2.0},
     )
-    cache = NTKScalingRotaryCache(config, torch.float32)
+    cache = EncoderRotaryCache.from_config(config, torch.float32)
 
     head_dim = 32
     base = 500000.0 * 2.0
@@ -158,7 +158,7 @@ def test_ntk_cache_is_long_enough_for_the_scaled_window():
         max_position_embeddings=16,
         rope_scaling={"type": "ntk", "factor": 2.0},
     )
-    cache = NTKScalingRotaryCache(config, torch.float32)
+    cache = EncoderRotaryCache.from_config(config, torch.float32)
     assert cache.cos_cached.shape[0] == 32
 
 
@@ -170,7 +170,7 @@ def test_rope_without_scaling_uses_the_plain_base():
         max_position_embeddings=16,
         rope_scaling=None,
     )
-    cache = NTKScalingRotaryCache(config, torch.float32)
+    cache = EncoderRotaryCache.from_config(config, torch.float32)
     inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 32, 2, dtype=torch.float32) / 32))
     cos, _ = cache(torch.arange(3))
     assert torch.allclose(
@@ -186,7 +186,7 @@ def test_unknown_rope_scaling_is_refused_not_ignored():
         rope_scaling={"type": "yarn", "factor": 2.0},
     )
     with pytest.raises(ValueError, match="ntk"):
-        NTKScalingRotaryCache(config, torch.float32)
+        EncoderRotaryCache.from_config(config, torch.float32)
 
 
 def test_mixed_b_ntk_is_refused():
@@ -197,7 +197,7 @@ def test_mixed_b_ntk_is_refused():
         rope_scaling={"type": "ntk", "factor": 2.0, "mixed_b": 0.5},
     )
     with pytest.raises(ValueError, match="mixed_b"):
-        NTKScalingRotaryCache(config, torch.float32)
+        EncoderRotaryCache.from_config(config, torch.float32)
 
 
 # ------------------------------------------------------------------ renaming
@@ -237,10 +237,6 @@ def test_bert_rename_table(source, expected):
             "encoder.layer.1.attention.o_proj.weight",
             "encoder.layers.1.attention.attn.proj.weight",
         ),
-        (
-            "encoder.layer.1.mlp.up_gate_proj.weight",
-            "encoder.layers.1.up_gate_proj.weight",
-        ),
         ("encoder.layer.1.mlp.down_proj.bias", "encoder.layers.1.down_proj.bias"),
         ("encoder.layer.1.attn_ln.weight", "encoder.layers.1.attn_ln.weight"),
         ("encoder.layer.1.mlp_ln.bias", "encoder.layers.1.mlp_ln.bias"),
@@ -257,10 +253,11 @@ def test_new_model_splits_packed_qkv_into_three_shards():
             NewModel, [("encoder.layer.0.attention.qkv_proj.weight", weight)]
         )
     )
-    assert [n for n, _ in out] == [
-        "encoder.layer.0.attention.self.query.weight",
-        "encoder.layer.0.attention.self.key.weight",
-        "encoder.layer.0.attention.self.value.weight",
+    dest = "encoder.layer.0.attention.attn.qkv_proj.weight"
+    assert [(n, sh) for n, _, sh in out] == [
+        (dest, "q"),
+        (dest, "k"),
+        (dest, "v"),
     ]
     # Contiguous [q; k; v], the layout the reference's
     # ``qkv_proj(x).split(all_head_size, dim=-1)`` implies.
@@ -307,3 +304,192 @@ def test_tanh_gelu_is_a_different_function():
 def test_unsupported_activation_is_refused():
     with pytest.raises(ValueError, match="hidden_act"):
         _resolve_bert_activation("swiglu")
+
+
+# ------------------------------------------------------- modernbert / nomic
+
+
+def _modernbert_config(**overrides):
+    from types import SimpleNamespace
+
+    base = dict(
+        vocab_size=64,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_hidden_layers=4,
+        intermediate_size=16,
+        max_position_embeddings=32,
+        norm_eps=1e-5,
+        norm_bias=False,
+        attention_bias=False,
+        mlp_bias=False,
+        hidden_activation="gelu",
+        hidden_act="gelu",
+        global_attn_every_n_layers=3,
+        local_attention=8,
+        global_rope_theta=160000.0,
+        local_rope_theta=10000.0,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_modernbert_alternates_global_and_local_layers():
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.bert import ModernBertLayer
+
+    config = _modernbert_config(num_hidden_layers=6)
+    mapping = Mapping(world_size=1, rank=0)
+    kinds = []
+    for layer_id in range(6):
+        layer = ModernBertLayer(config, mapping, layer_id=layer_id)
+        kinds.append((layer.is_global, layer.attention.window_size))
+    # global_attn_every_n_layers=3 -> layers 0, 3 are global; the rest local
+    # with a window of local_attention // 2 on each side.
+    assert [g for g, _ in kinds] == [True, False, False, True, False, False]
+    assert [w for _, w in kinds] == [None, (4, 4), (4, 4), None, (4, 4), (4, 4)]
+
+
+def test_modernbert_reads_either_config_vocabulary():
+    from tokenspeed.runtime.models.bert import modernbert_layer_plan
+
+    v4 = _modernbert_config(num_hidden_layers=6)
+    # transformers v5 says the same thing in different words: explicit layer
+    # types, per-type rope parameters, and sliding_window as the per-side
+    # offset rather than the total width.
+    v5 = _modernbert_config(
+        num_hidden_layers=6,
+        layer_types=[
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+        ],
+        rope_parameters={
+            "full_attention": {"rope_type": "default", "rope_theta": 160000.0},
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        },
+        sliding_window=4,
+    )
+    assert modernbert_layer_plan(v4) == modernbert_layer_plan(v5)
+
+
+def test_modernbert_plan_pairs_each_layer_with_its_own_theta():
+    from tokenspeed.runtime.models.bert import modernbert_layer_plan
+
+    plan = modernbert_layer_plan(_modernbert_config(num_hidden_layers=4))
+    assert [theta for _, _, theta in plan] == [160000.0, 10000.0, 10000.0, 160000.0]
+
+
+def test_modernbert_layer_zero_has_no_attention_norm():
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.bert import ModernBertLayer
+
+    config = _modernbert_config()
+    mapping = Mapping(world_size=1, rank=0)
+    # The checkpoint ships no layers.0.attn_norm: the embedding LayerNorm
+    # already normalised that input. Identity, not a missing weight.
+    assert isinstance(
+        ModernBertLayer(config, mapping, layer_id=0).attn_norm, torch.nn.Identity
+    )
+    assert isinstance(
+        ModernBertLayer(config, mapping, layer_id=1).attn_norm, torch.nn.LayerNorm
+    )
+
+
+def test_modernbert_uses_two_rope_tables_when_thetas_differ():
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.bert import ModernBertTransformer
+
+    mapping = Mapping(world_size=1, rank=0)
+    model = ModernBertTransformer(_modernbert_config(), mapping)
+    # Two distinct thetas -> two tables, and every layer points at the one
+    # for its own type.
+    assert len(model.rotary_caches) == 2
+    assert model._layer_rotary == [0, 1, 1, 0]
+    assert not torch.allclose(
+        model.rotary_caches[0].cos_cached, model.rotary_caches[1].cos_cached
+    )
+    # Same theta -> one shared table, not two identical ones.
+    same = ModernBertTransformer(_modernbert_config(local_rope_theta=160000.0), mapping)
+    assert len(same.rotary_caches) == 1
+    assert same._layer_rotary == [0, 0, 0, 0]
+
+
+def test_modernbert_splits_packed_wqkv_with_shard_ids():
+    from tokenspeed.runtime.models.bert import ModernBertModel
+
+    weight = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3 * 4, 2)
+    out = list(
+        ModernBertModel._iter_weights(
+            ModernBertModel, [("layers.0.attn.Wqkv.weight", weight)]
+        )
+    )
+    assert [(n, sh) for n, _, sh in out] == [
+        ("layers.0.attention.attn.qkv_proj.weight", "q"),
+        ("layers.0.attention.attn.qkv_proj.weight", "k"),
+        ("layers.0.attention.attn.qkv_proj.weight", "v"),
+    ]
+    assert torch.equal(out[0][1], weight[:4])
+
+
+def test_modernbert_rename_keeps_the_mlp_output_projection():
+    from tokenspeed.runtime.models.bert import ModernBertModel
+
+    # attn.Wo must become the attention out-projection while mlp.Wo, which
+    # shares the name, must survive untouched.
+    assert (
+        ModernBertModel._rewrite(ModernBertModel, "layers.3.attn.Wo.weight")
+        == "encoder.layers.3.attention.attn.proj.weight"
+    )
+    assert (
+        ModernBertModel._rewrite(ModernBertModel, "layers.3.mlp.Wo.weight")
+        == "encoder.layers.3.mlp.Wo.weight"
+    )
+
+
+def test_nomic_maps_fc11_to_up_and_fc12_to_gate():
+    from tokenspeed.runtime.models.bert import NomicBertModel
+
+    w = torch.zeros(4, 2)
+    out = list(
+        NomicBertModel._iter_weights(
+            NomicBertModel,
+            [
+                ("encoder.layers.0.mlp.fc11.weight", w),
+                ("encoder.layers.0.mlp.fc12.weight", w),
+            ],
+        )
+    )
+    # Shard 0 is up, shard 1 is gate. Swapping them moves the activation onto
+    # the other half and still returns a well-formed unit vector.
+    assert [(n, sh) for n, _, sh in out] == [
+        ("encoder.layers.0.up_gate_proj.weight", 0),
+        ("encoder.layers.0.up_gate_proj.weight", 1),
+    ]
+
+
+def test_gte_splits_packed_up_gate_into_up_then_gate():
+    from tokenspeed.runtime.models.bert import NewModel
+
+    weight = torch.arange(2 * 3 * 2, dtype=torch.float32).reshape(2 * 3, 2)
+    out = list(
+        NewModel._iter_weights(
+            NewModel, [("encoder.layer.0.mlp.up_gate_proj.weight", weight)]
+        )
+    )
+    assert [(n, sh) for n, _, sh in out] == [
+        ("encoder.layer.0.up_gate_proj.weight", 0),
+        ("encoder.layer.0.up_gate_proj.weight", 1),
+    ]
+    assert torch.equal(out[0][1], weight[:3])
+    assert torch.equal(out[1][1], weight[3:])
+
+
+def test_swiglu_config_string_resolves_to_silu():
+    from tokenspeed.runtime.models.bert import _resolve_bert_activation
+
+    x = torch.tensor([0.5, -1.25, 2.0])
+    assert torch.allclose(_resolve_bert_activation("silu")(x), x * torch.sigmoid(x))

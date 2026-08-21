@@ -98,7 +98,10 @@ def main():
 
     fn = getattr(cutlass_unquant, "flashinfer_cutlass_unquant_moe_apply", None)
     if fn is None:
-        print("unquantized cutlass MoE is not registered on this platform", file=sys.stderr)
+        print(
+            "unquantized cutlass MoE is not registered on this platform",
+            file=sys.stderr,
+        )
         return 1
     raw = getattr(cutlass_unquant, "cutlass_fused_moe", None)
 
@@ -108,9 +111,13 @@ def main():
             getattr(cutlass_unquant, cand)({}, w)
             break
 
-    print(f"hidden={HIDDEN} experts={EXPERTS} top_k={TOP_K} inter={INTER}  "
-          f"device={torch.cuda.get_device_name(0)}")
-    print(f"{'tokens':>7} {'ours ms':>9} {'raw ms':>9} {'splitK ms':>10} {'splitK vs ours':>15}")
+    print(
+        f"hidden={HIDDEN} experts={EXPERTS} top_k={TOP_K} inter={INTER}  "
+        f"device={torch.cuda.get_device_name(0)}"
+    )
+    print(
+        f"{'tokens':>7} {'ours ms':>9} {'raw ms':>9} {'splitK ms':>10} {'splitK vs ours':>15}"
+    )
     print("-" * 56)
 
     for tokens in args.tokens:
@@ -142,8 +149,10 @@ def main():
             try:
                 raw_ms = timed(call_raw)
             except Exception as exc:
-                print(f"{tokens:7d} {ours:9.3f}  raw call unavailable: "
-                      f"{type(exc).__name__}: {str(exc).splitlines()[0][:60]}")
+                print(
+                    f"{tokens:7d} {ours:9.3f}  raw call unavailable: "
+                    f"{type(exc).__name__}: {str(exc).splitlines()[0][:60]}"
+                )
                 continue
 
         split_ms = float("nan")

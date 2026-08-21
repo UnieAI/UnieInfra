@@ -46,7 +46,7 @@ Embedding 走的是「**因果 LLM 當 embedder**」。三道關卡：
 | cross KV 在 paged arena 之外 | vLLM、TRT-LLM | 寫一次、不成長、不前綴比對；**實作成 per-slot buffer，不需要新 cache family，C++ 未動** |
 | Whisper 的 paged 層數 = `decoder_layers` | 都不是 | SGLang 配 `encoder_layers + 2*decoder_layers`（turbo 是 40 個 slot，32 個永不索引） |
 
-## 4　優化：兩項有效、兩項此路不通、一項判讀撤回
+## 4　優化：三項有效、兩項此路不通、一項判讀撤回
 
 所有優化都有開關，可獨立 A/B（`ServerArgs`，會出現在 resolved config）：
 
@@ -54,13 +54,15 @@ Embedding 走的是「**因果 LLM 當 embedder**」。三道關卡：
 --embedding-batch-tokenize / --no-...      預設 on
 --embedding-skip-kv-write / --no-...       預設 on（目前無效，見下）
 --cross-attn-path {auto,padded,gather}     預設 auto
+--pooling-prefill-graph / --no-...         預設 on
 ```
 
 **有效**
 
 | 項目 | 結果 |
 |---|---|
-| **Prefill graph 守門過寬**（對每個模型都關） | dense 單請求 **17.3 → 8.71 ms（2.0x）**；embedding 不受惠，見 §6 第 1 項 |
+| **Prefill graph 守門過寬**（對每個模型都關） | dense 單請求 **17.3 → 8.71 ms（2.0x）** |
+| **讓 pooling 模型也能捕捉 prefill graph** | embedding 單請求 **19.75 → 14.84 ms（1.33x）**；cosine 與 eager 相同 |
 | Whisper cross-attention 去掉每步 gather | 高佔用 **1.79x**（turbo）／**1.84x**（large-v3）；低佔用 0.87x，故依佔用率選路 |
 | Embedding 列表請求整批 tokenize | **最高 1.80x**；關掉開關斷崖回來且探針 FAIL（雙向驗證） |
 
@@ -92,11 +94,11 @@ servicer。目前可用入口是 in-process 的 `Engine.encode(...)` 與帶 audi
 
 ## 6　下一步，按證據強度
 
-1. **讓 pooling 模型也能用 prefill graph**（xref §6.6）。那個延遲地板的根因已經找到並
-   修掉（GDN 守門對每個模型都關掉 prefill graph），dense 從 17.3 → 8.71 ms（**2.0x**）。
-   但 **embedding 沒受惠**：`prefill_graph.py:296` 明確排除非生成模型，所以它仍跑
-   eager prefill（19.3 → 19.78 ms，無變化）。依 dense 的倍數推斷，這是 embedding
-   單請求延遲最大的一塊未動空間。
-2. **encoder-only 架構**（BERT/GTE/BGE）：真正的能力缺口。
-3. **hold-window 聚合**（TRT-LLM 的 5ms）：治的是不同請求之間，與 §4 第 2 項不重疊；
+1. **encoder-only 架構**（BERT/GTE/BGE）：真正的能力缺口。
+2. **hold-window 聚合**（TRT-LLM 的 5ms）：治的是不同請求之間，與 §4 第 2 項不重疊；
    要等端點做起來、有真並發流量才量得準。那個 5ms 是慣例常數，**抄結構不要抄數字**。
+
+（原本列在此處第 1 項的「讓 pooling 模型也能用 prefill graph」**已完成**，見 §4 與
+xref §6.6：排除條件從 `not model_runner.is_generation` 收窄成
+`--no-pooling-prefill-graph` 加「logits processor 與 pooler 皆無」，`replay()` 分支到
+pooler。）

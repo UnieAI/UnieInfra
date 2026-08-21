@@ -970,6 +970,21 @@ def create_attn_components(
             for group in spec.memory_plan.groups
         },
     )
+    # The parent count, not token_capacity, is what bounds admission: a request
+    # binds a parent in EVERY group, so concurrency is num_lcm_blocks divided by
+    # the group count -- and a group whose binding leaves most of its parent
+    # unused pays that whole parent anyway. Neither number is visible above.
+    logger.info(
+        "Cache binding: groups=%d, parents_per_request=%d, admission_bound=%d, "
+        "binding_utilization=%s",
+        len(spec.memory_plan.groups),
+        len(spec.memory_plan.groups),
+        spec.memory_plan.num_lcm_blocks // max(1, len(spec.memory_plan.groups)),
+        {
+            gid: round(entry["binding_utilization"], 4)
+            for gid, entry in spec.memory_plan.capacity_report().items()
+        },
+    )
 
     if max_num_tokens <= 0:
         raise ValueError(

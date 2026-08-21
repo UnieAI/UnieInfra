@@ -15,6 +15,7 @@ feature 臨時做一次」變成查表。跳過那一步在單一 feature 上曾
 |---|---|
 | `10-api.md` | API layer |
 | `15-encoder-embedding.md` | encoder-only（embedding）與 encoder-decoder（Whisper）；四方，TurboMind 缺席 |
+| `16-diffusion.md` | 影像/影片 diffusion（FLUX / Qwen-Image / MiniMax-H3）；只有 SGLang 與 FastVideo 做了 |
 | `20-scheduler.md` | scheduler |
 | `30-prefill.md` | prefill（到 kernel） |
 | `40-decode.md` | decode（到 kernel） |

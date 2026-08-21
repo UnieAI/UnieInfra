@@ -546,6 +546,16 @@ class ModelConfig:
         else:
             self.context_len = derived_context_len
 
+        self._clamp_prefill_budget_to_context(server_args)
+
+        if getattr(self.hf_config, "is_encoder_decoder", False):
+            # Model-facing gate, same idiom as ``encoder_only`` and
+            # ``pooling_config``: an encoder-decoder keeps its cross-attention
+            # KV in a per-slot buffer outside the paged arena, and the model
+            # is constructed from the HF config alone, so the pool bound has
+            # to travel on it. `+ 1` mirrors the scheduler's own padding slot.
+            self.hf_config.cross_attn_slots = int(server_args.max_num_seqs) + 1
+
         if self.pooling_config is not None:
             # Deferred to here, not to where pooling_config is resolved: the
             # prefill-chunk guard below is stated against context_len, which
@@ -628,6 +638,39 @@ class ModelConfig:
 
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
+
+    def _clamp_prefill_budget_to_context(self, server_args: ServerArgs) -> None:
+        """Cap the per-step prefill budget at what the request pool can hold.
+
+        A step can prefill at most ``context_len`` tokens per request and at
+        most ``max_num_seqs`` requests, so a budget above that product names
+        capacity that cannot exist. On long-context models the product is far
+        above the default and nothing changes; a short-context model is where
+        it bites -- Whisper's decoder holds 448 positions, so the default
+        8192-token budget implies 19 concurrent requests against a pool of 5,
+        and the autotuner's dummy batch (``prefill_graph.make_dummy_batch``)
+        indexes past the pool while building a shape that can never occur.
+
+        Clamped rather than refused: the operator did not choose an
+        unreachable number, they took a default that predates short-context
+        models. The clamp is logged with both numbers.
+        """
+        reachable = int(self.context_len) * max(1, int(server_args.max_num_seqs))
+        for field in ("chunked_prefill_size", "max_prefill_tokens"):
+            current = getattr(server_args, field, None)
+            if current is None or current <= 0 or current <= reachable:
+                continue
+            logger.info(
+                "%s=%s exceeds what the request pool can hold (context_len %s "
+                "x max_num_seqs %s = %s); clamping to %s.",
+                field,
+                current,
+                self.context_len,
+                server_args.max_num_seqs,
+                reachable,
+                reachable,
+            )
+            setattr(server_args, field, reachable)
 
     def _resolve_embedding_server_args(self, server_args: ServerArgs) -> None:
         """Force off the features a pooling forward cannot express.

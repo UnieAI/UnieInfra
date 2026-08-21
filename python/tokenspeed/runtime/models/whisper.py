@@ -81,6 +81,7 @@ from tokenspeed.runtime.layers.logits_processor import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
+from tokenspeed.runtime.multimodal.inputs import Modality
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -271,6 +272,7 @@ class CrossAttentionCache:
 
     def __init__(
         self,
+        num_slots: int,
         num_layers: int,
         encoder_len: int,
         kv_heads: int,
@@ -278,41 +280,19 @@ class CrossAttentionCache:
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
+        self.num_slots = num_slots
         self.num_layers = num_layers
         self.encoder_len = encoder_len
-        self.kv_heads = kv_heads
-        self.head_dim = head_dim
-        self.dtype = dtype
-        self.device = device
-        self.k: torch.Tensor | None = None
-        self.v: torch.Tensor | None = None
+        shape = (num_slots, num_layers, encoder_len, kv_heads, head_dim)
+        # Allocated once, up front. Growing it lazily would mean reading
+        # ``slots.max()`` on the read path, and that is a device-to-host sync
+        # on every decode step -- illegal under CUDA graph capture and a
+        # per-step stall otherwise.
+        self.k = torch.zeros(shape, dtype=dtype, device=device)
+        self.v = torch.zeros(shape, dtype=dtype, device=device)
 
-    def bytes_per_slot(self) -> int:
-        return (
-            2  # k and v
-            * self.num_layers
-            * self.encoder_len
-            * self.kv_heads
-            * self.head_dim
-            * torch.tensor([], dtype=self.dtype).element_size()
-        )
-
-    def _ensure(self, num_slots: int) -> None:
-        if self.k is not None and self.k.shape[0] >= num_slots:
-            return
-        shape = (
-            num_slots,
-            self.num_layers,
-            self.encoder_len,
-            self.kv_heads,
-            self.head_dim,
-        )
-        new_k = torch.zeros(shape, dtype=self.dtype, device=self.device)
-        new_v = torch.zeros(shape, dtype=self.dtype, device=self.device)
-        if self.k is not None:
-            new_k[: self.k.shape[0]].copy_(self.k)
-            new_v[: self.v.shape[0]].copy_(self.v)
-        self.k, self.v = new_k, new_v
+    def bytes_total(self) -> int:
+        return self.k.numel() * self.k.element_size() * 2
 
     def write(
         self,
@@ -322,7 +302,11 @@ class CrossAttentionCache:
         v: torch.Tensor,
     ) -> None:
         """Store one request's encoder K/V for one decoder layer."""
-        self._ensure(slot + 1)
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(
+                f"cross-attention slot {slot} outside the pool of "
+                f"{self.num_slots}; the buffer is sized from max_num_seqs"
+            )
         if k.shape[0] != self.encoder_len:
             raise ValueError(
                 f"cross-attention KV for slot {slot} has {k.shape[0]} rows but "
@@ -334,14 +318,15 @@ class CrossAttentionCache:
         self.v[slot, layer_id].copy_(v)
 
     def gather(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Batch-ordered, contiguous K/V for every layer: [bs, layers, ...]."""
-        if self.k is None:
-            raise RuntimeError(
-                "cross-attention KV was read before any encoder output was "
-                "written; a decode step reached the decoder without its "
-                "request having been prefilled"
-            )
-        self._ensure(int(slots.max().item()) + 1)
+        """Batch-ordered, contiguous K/V for every layer: [bs, layers, ...].
+
+        No validation here, deliberately. That a request reaching decode has
+        been prefilled is a scheduler invariant (``prefill_finished`` gates
+        the output path), and re-deriving it here would cost a host sync per
+        step to read the slot ids. An unwritten slot reads as the zeros it
+        was allocated with, which is also what the engine's warmup and
+        autotune batches want -- they carry no audio at all.
+        """
         index = slots.to(device=self.k.device, dtype=torch.long)
         return self.k.index_select(0, index), self.v.index_select(0, index)
 
@@ -698,9 +683,20 @@ class WhisperForConditionalGeneration(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ) -> None:
         super().__init__()
+        if not is_multimodal_active:
+            # --language-model-only strips the tower from a prefix-style
+            # multimodal model and still leaves a usable LM. Whisper's decoder
+            # has nothing to attend to without its encoder, so there is no
+            # meaningful text-only mode to fall back to.
+            raise ValueError(
+                "--language-model-only is not meaningful for Whisper: the "
+                "decoder cross-attends to the encoder on every step, so "
+                "dropping the encoder leaves no model to run."
+            )
         self.config = config
         self.mapping = mapping
         self.encoder = WhisperEncoder(
@@ -724,6 +720,11 @@ class WhisperForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.cross_cache = CrossAttentionCache(
+            # Bounded by the request pool, which the scheduler sizes at
+            # per_rank_max_batch + 1 (event_loop.py:369). ModelConfig stamps
+            # the bound on the HF config because the model is constructed
+            # from that config alone.
+            num_slots=int(getattr(config, "cross_attn_slots", 0) or 1),
             num_layers=config.decoder_layers,
             encoder_len=config.max_source_positions,
             kv_heads=config.decoder_attention_heads // mapping.attn.tp_size,
@@ -746,6 +747,31 @@ class WhisperForConditionalGeneration(nn.Module):
             for layer_id, layer in enumerate(self.decoder.layers):
                 key, value = layer.encoder_attn.project_encoder_kv(span)
                 self.cross_cache.write(slot, layer_id, key, value)
+
+    # ------------------------------------------------------------------
+    # Multimodal hooks
+    # ------------------------------------------------------------------
+
+    def get_multimodal_encoder_specs(self) -> dict:
+        """No registered encoder: Whisper's encoder output is not scattered.
+
+        The ``MultimodalEmbedder`` pipeline exists to run a tower and splice
+        its output into the LM's input embeddings at placeholder offsets --
+        that is what ``qwen3_asr.py`` needs. Whisper's encoder output goes to
+        every decoder layer's cross-attention instead, so the model runs the
+        encoder itself in :meth:`encode_audio` and registers nothing here.
+        """
+        return {}
+
+    def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
+        """Audio reserves no positions in the decoder's token sequence.
+
+        A prefix-style audio model pads placeholder tokens so the tower's
+        output has somewhere to land. Whisper's decoder sequence is only the
+        transcript prompt and what it generates; the audio lives in the
+        cross-attention cache, outside this sequence entirely.
+        """
+        return input_ids
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -896,7 +922,15 @@ class WhisperForConditionalGeneration(nn.Module):
             cross_value,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=int(query_lengths.max().item()),
+            # A python int, never ``.max().item()``: reading a device tensor
+            # here is a host sync on every step and is outright illegal while
+            # a CUDA graph is capturing. flash-attn uses max_seqlen_q to size
+            # its schedule, so an upper bound is as good as the exact value --
+            # one row per request on a decode, and the whole token count on an
+            # extend.
+            max_seqlen_q=(
+                1 if ctx.forward_mode.is_decode_or_idle() else int(ctx.input_num_tokens)
+            ),
             max_seqlen_k=encoder_len,
         )
         return self.logits_processor(
@@ -923,27 +957,72 @@ def _query_lengths(ctx: ForwardContext, bs: int, device: torch.device) -> torch.
     return (ends - starts).to(device=device, dtype=torch.int32)
 
 
+def _materialize_feature(item: Any) -> torch.Tensor:
+    """Get an item's log-mel tensor, pulling it out of shared memory if needed.
+
+    Features cross the process boundary as SHM handles (``publish_shm_features``
+    nulls ``feature`` on the way out). Models that go through
+    ``MultimodalEmbedder`` get them materialized by its feature transport;
+    Whisper does not use that path -- its encoder output feeds
+    cross-attention, not input embeddings -- so it consumes the handle here.
+
+    Single-rank only for now: the transport also decides which rank owns which
+    item under TP, and doing that wrong would give one rank a silently empty
+    tensor. Refused rather than guessed.
+    """
+    if isinstance(item.feature, torch.Tensor):
+        return item.feature
+    handle = item.feature_shm
+    if handle is None:
+        raise ValueError(
+            "Whisper audio item carries neither a feature tensor nor a shared "
+            "memory handle"
+        )
+    handle.attach()
+    tensor = handle.consume()
+    item.feature = tensor
+    item.feature_shm = None
+    return tensor
+
+
 def _audio_features_for_extend(
     multimodal_context: Any, req_pool_indices: torch.Tensor
 ) -> tuple[torch.Tensor | None, list[int]]:
     """Collect the log-mel features of the requests being prefilled.
 
-    Returns ``(None, [])`` when this extend carries no fresh audio -- a
-    chunked continuation, or a batch whose requests were all encoded already.
+    ``mm_inputs`` is per request and aligned with the batch, so its index is
+    the batch position and ``req_pool_indices[position]`` is that request's
+    cross-attention slot.
+
+    Only a *fresh* prefill carries audio to encode: a chunked continuation
+    (``extend_prefix_lens > 0``) has already had its encoder run and its
+    cross KV written, and re-encoding would redo the work and rewrite the
+    same slot. Returns ``(None, [])`` when this extend has no fresh audio.
     """
-    items = getattr(multimodal_context, "extend_items", None)
-    if not items:
+    mm_inputs = getattr(multimodal_context, "mm_inputs", None)
+    if not mm_inputs:
         return None, []
-    features = []
+    prefix_lens = getattr(multimodal_context, "extend_prefix_lens", []) or []
+
+    features: list[torch.Tensor] = []
     slots: list[int] = []
-    for position, item in enumerate(items):
-        feature = getattr(item, "feature", None)
-        if feature is None:
+    for position, entry in enumerate(mm_inputs):
+        if entry is None or position >= req_pool_indices.shape[0]:
             continue
-        if feature.ndim == 2:
-            feature = feature.unsqueeze(0)
-        features.append(feature)
-        slots.append(int(req_pool_indices[position].item()))
+        if position < len(prefix_lens) and prefix_lens[position] > 0:
+            continue
+        for item in entry.mm_items:
+            if item is None or item.modality != Modality.AUDIO:
+                continue
+            feature = _materialize_feature(item)
+            if feature.ndim == 2:
+                feature = feature.unsqueeze(0)
+            features.append(feature)
+            slots.append(int(req_pool_indices[position].item()))
+            # One audio window per request: Whisper's encoder consumes a
+            # fixed 30s window, and a second item would overwrite the first
+            # request's cross KV rather than extend it.
+            break
     if not features:
         return None, []
     return torch.cat(features, dim=0), slots

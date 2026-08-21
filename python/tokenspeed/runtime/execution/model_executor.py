@@ -249,8 +249,19 @@ class ModelExecutorConfig:
         # but the prefill graph rebinds only the live ForwardContext at replay --
         # the backend metadata object stays frozen at capture-time (dummy) values.
         # So the two are fundamentally incompatible; force eager prefill for DSA.
-        disable_prefill_graph = bool(server_args.disable_prefill_graph) or (
-            model_config.attention_arch == AttentionArch.DSA
+        # Encoder-decoder models keep their cross-attention KV outside the
+        # paged arena, addressed by each request's pool slot. Those slots
+        # change from one replay to the next, and a captured graph would
+        # freeze the first batch's. Same reason as DSA below: the graph
+        # rebinds only the live ForwardContext, not what the model reads
+        # around it.
+        is_encoder_decoder = bool(
+            getattr(model_config.hf_config, "is_encoder_decoder", False)
+        )
+        disable_prefill_graph = (
+            bool(server_args.disable_prefill_graph)
+            or model_config.attention_arch == AttentionArch.DSA
+            or is_encoder_decoder
         )
 
         return ModelExecutorConfig(
@@ -620,6 +631,13 @@ class ModelExecutor:
                     input_ids=ib.input_ids_buf[:num_tokens],
                     positions=positions,
                     out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
+                    # make_dummy_batch already filled these; a model that
+                    # reads per-request state (encoder-decoder cross-attention
+                    # addresses its KV by pool slot) needs them to tune on the
+                    # same shape it will serve.
+                    req_pool_indices=ib.req_pool_indices_buf[: ctx.bs],
+                    seq_lens=ib.seq_lens_buf[: ctx.bs],
+                    extend_prefix_lens=ib.extend_prefix_lens_buf[: ctx.num_extends],
                 )
         set_autotune_process_group(None)
         torch.cuda.synchronize()

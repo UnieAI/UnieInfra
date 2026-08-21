@@ -370,9 +370,48 @@ CLIENT wall 17.2–18.3 ms   （所以 client 橋接約 1 ms）
 `a-negative-result-is-easy-to-produce-by-accident` 那條：先證明機制有 engage，
 再相信 null。
 
-**仍未定位 `prefill_ms` 內部。** 已排除：模型計算、prompt 長度、client 橋接、串流間隔、
-detokenizer、前綴快取、排隊與准入。下一步是查 prefill graph 為何靜默停用，以及
-`prefill_ms` 這 15 ms 裡 forward dispatch、實際 forward、結果 sync 各佔多少。
+### 根因：GDN 守門對每一個模型都關掉 prefill graph
+
+先讓「被停用」自己說原因（`runtime/execution/prefill_graph.py:293` 現在會印出是哪一個
+條件命中），一跑就出來了：
+
+```
+prefill breakable graph disabled: disable_prefill_graph
+```
+
+而 server_args 的 `disable_prefill_graph` 是 False。真正動手腳的是
+`runtime/engine/event_loop.py:227 resolve_fi_gdn_prefill_graph`：它的 docstring 說
+「當 flashinfer GDN chunk-prefill kernel 在使用時關掉 prefill graph」，**但它從來沒有
+檢查模型是否真的有 GDN 層**——只看兩個環境變數，然後無條件關掉。
+
+Qwen3-0.6B 是完全沒有 linear attention 的稠密模型，也被關了。用環境變數繞過後：
+
+```
+TOKENSPEED_ENABLE_FI_GDN_SM120=0
+  prefill breakable graph: captured buckets [16, 32, ..., 2048] (segments=57)
+  prefill breakable graph ENGAGED (text): bucket=16
+  p50 17.3 ms -> 8.98 ms
+```
+
+**單請求延遲約 2 倍**，而且這次有 `ENGAGED` 日誌證明機制生效——正是先前那個假陰性缺的。
+
+修法是讓守門精確：檢查 text config 的 `layer_types` 有沒有 linear attention 層。
+沒有那種層，GDN kernel 就不可能在使用。兩個方向都驗過：
+
+| 模型 | 守門 | prefill graph | 輸出 |
+|---|---|---|---|
+| 稠密 Qwen3-0.6B | 不觸發 | 捕捉並 ENGAGED | 正確 |
+| Hybrid Qwen3.5-2B | **仍然觸發** | 停用 | 正確（非垃圾） |
+
+hybrid 那個方向是危險方向：GDN + prefill graph 會回傳垃圾但吞吐數字更好，沒有 gate
+攔得住，所以守門必須繼續生效。
+
+**注意**：`engine.server_args.disable_prefill_graph` 從前端讀是 False，因為那個改寫發生在
+scheduler 子行程裡。要確認實際狀態，看 scheduler 的日誌行，不要看前端的欄位。
+
+**影響面遠大於 embedding／Whisper**：這台上每一個稠密與 MoE 模型的 prefill 都在跑 eager。
+
+
 
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 

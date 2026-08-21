@@ -360,6 +360,12 @@ CONTEXT_LENGTH_KEYS = [
     "max_seq_len",
     "model_max_length",
     "max_position_embeddings",
+    # Encoder-decoder models (Whisper) carry none of the above: what bounds a
+    # request is how far the *decoder* can go, and its learned position table
+    # is exactly that long. Without this the default 2048 silently exceeds a
+    # 448-row table and positions index past it. Last in the list, so any
+    # model that publishes a standard key is unaffected.
+    "max_target_positions",
 ]
 
 

@@ -164,6 +164,25 @@ embedding 流量是大量短而獨立的請求，**排隊聚合的收益來自 h
 3. **cross KV 獨立池 vs 折進主池**（§3.3）。同一個 Whisper 形狀下，量兩種配置的
    併發上限與 TTFT。這決定我們要不要為 cross 開第三個 `family`。
 
+## 6.1　sm_120 上的 cross-attention KV：實測到的限制
+
+為 Whisper 的 cross-attention 找「decode 時不複製 encoder KV」的路徑時，
+`tokenspeed_kernel.ops.attention.flash_attn` 的三條候選在這張卡上實測（bf16、H=4、
+D=64、ENC=128、BS=3）：
+
+| 路徑 | 結果 |
+|---|---|
+| `cu_seqlens_q` + `cu_seqlens_k` 分開（cross-attn 的基本形狀） | **可用**，是正確性基準 |
+| `page_table`（配 `cu_seqlens_k`） | `AssertionError: page_table is not supported with cu_seqlens_k` |
+| `page_table` + `seqused_k`（分頁 decode 的標準 API） | `AssertionError: **Paged KV not supported on SM 12.0 in this PR**` |
+| `gather_kv_indices` | `AssertionError: gather_kv_indices is only supported with qv` |
+| `flash_attn_with_kvcache` | 在此容器是未註冊的 placeholder，呼叫即拋 |
+
+也就是說 **cross-attention 的分頁／索引讀取在 sm_120 上沒有可用的 kernel 路徑**，
+decode 時只能把該請求的 encoder KV 複製成連續 buffer。這不是設計選擇，是 kernel 現況；
+換卡或換 kernel 版本就該重測，不要把「必須複製」寫成永久前提。
+（同一形狀的教訓見 memory 的 `sm120-closed-allowlist-tables`。）
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder

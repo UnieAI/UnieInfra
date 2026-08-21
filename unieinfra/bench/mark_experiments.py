@@ -59,9 +59,7 @@ LINE = re.compile(
 
 
 def index(rows):
-    return {
-        (r["engine"], r["model"], r["shape"], r["conc"]): r for r in rows
-    }
+    return {(r["engine"], r["model"], r["shape"], r["conc"]): r for r in rows}
 
 
 def summarise(r):
@@ -134,7 +132,9 @@ def main():
     TABLE.write_text("\n".join(out) + "\n")
     print(f"{done} cells measured, {todo} outstanding")
     if lost:
-        print(f"\n{len(lost)} cells not yet passing the +10% bar -- the optimisation queue:")
+        print(
+            f"\n{len(lost)} cells not yet passing the +10% bar -- the optimisation queue:"
+        )
         for item in lost:
             print(f"  {item}")
     return 0

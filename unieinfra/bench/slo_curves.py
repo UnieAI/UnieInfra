@@ -39,15 +39,35 @@ ROOT = pathlib.Path("/workspace/roy")
 OUT = ROOT / ".slo_curves.json"
 
 # Deadline grid, log-spaced from a quarter second to a minute and a half.
-GRID = [250, 500, 750, 1000, 1500, 2000, 3000, 4000, 5000, 7500,
-        10000, 15000, 20000, 30000, 45000, 60000, 90000, 150000]
+GRID = [
+    250,
+    500,
+    750,
+    1000,
+    1500,
+    2000,
+    3000,
+    4000,
+    5000,
+    7500,
+    10000,
+    15000,
+    20000,
+    30000,
+    45000,
+    60000,
+    90000,
+    150000,
+]
 
 # The TPOT bound stays fixed per shape while the TTFT deadline sweeps; agent
 # prompts are two orders of magnitude longer, so they carry a looser budget.
 TPOT_BOUND = {"agent-127k": 200, "agent-26k": 200, "RAG": 100, "general": 100}
 REPORTED = {"agent-127k": 10000, "agent-26k": 10000, "RAG": 5000, "general": 5000}
 
-TAG = re.compile(r"E-(?P<engine>ours|vllm)-(?P<model>.+?)-(?P<shape>agent-127k|agent-26k|RAG|general)-(?P<conc>\d+)")
+TAG = re.compile(
+    r"E-(?P<engine>ours|vllm)-(?P<model>.+?)-(?P<shape>agent-127k|agent-26k|RAG|general)-(?P<conc>\d+)"
+)
 
 
 def per_request(path):
@@ -74,7 +94,11 @@ def collect():
         if not m:
             continue
         engine, model, shape, conc = (
-            m.group("engine"), m.group("model"), m.group("shape"), int(m.group("conc")))
+            m.group("engine"),
+            m.group("model"),
+            m.group("shape"),
+            int(m.group("conc")),
+        )
         try:
             reqs, dur, n = per_request(path)
         except Exception as exc:  # pragma: no cover - diagnostic
@@ -83,10 +107,16 @@ def collect():
         if not reqs or dur <= 0:
             continue
         bound = TPOT_BOUND[shape]
-        pts = [[t, round(60 * sum(1 for a, b in reqs if a <= t and b <= bound) / dur, 2)]
-               for t in GRID]
-        curves.setdefault(model, {}).setdefault(shape, {}).setdefault(engine, {})[conc] = {
-            "pts": pts, "n": n, "dur": round(dur, 1),
+        pts = [
+            [t, round(60 * sum(1 for a, b in reqs if a <= t and b <= bound) / dur, 2)]
+            for t in GRID
+        ]
+        curves.setdefault(model, {}).setdefault(shape, {}).setdefault(engine, {})[
+            conc
+        ] = {
+            "pts": pts,
+            "n": n,
+            "dur": round(dur, 1),
             "ttft_p50": round(sorted(a for a, _ in reqs)[len(reqs) // 2]),
             "tpot_p50": round(sorted(b for _, b in reqs)[len(reqs) // 2], 1),
         }
@@ -95,8 +125,12 @@ def collect():
 
 def main():
     curves = collect()
-    payload = {"tpot_bound": TPOT_BOUND, "reported_deadline": REPORTED,
-               "grid": GRID, "curves": curves}
+    payload = {
+        "tpot_bound": TPOT_BOUND,
+        "reported_deadline": REPORTED,
+        "grid": GRID,
+        "curves": curves,
+    }
     json.dump(payload, open(OUT, "w"), ensure_ascii=False)
 
     total = 0
@@ -104,7 +138,10 @@ def main():
         for shape, engines in sorted(shapes.items()):
             got = {e: sorted(c) for e, c in sorted(engines.items())}
             total += sum(len(v) for v in got.values())
-            print(f"{model:14} {shape:11} " + "  ".join(f"{e}={v}" for e, v in got.items()))
+            print(
+                f"{model:14} {shape:11} "
+                + "  ".join(f"{e}={v}" for e, v in got.items())
+            )
     print(f"\n{total} curves -> {OUT}")
     return 0
 

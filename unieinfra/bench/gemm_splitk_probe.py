@@ -53,11 +53,22 @@ SHAPES = [
 
 @triton.jit
 def _splitk_mm(
-    a_ptr, b_ptr, part_ptr,
-    M, N, K,
-    stride_am, stride_ak, stride_bk, stride_bn,
-    stride_ps, stride_pm, stride_pn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    part_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_ps,
+    stride_pm,
+    stride_pn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
 ):
     """One K-slice of ``a @ b`` into a per-slice partial buffer."""
@@ -76,16 +87,20 @@ def _splitk_mm(
         k = k_start + k0 + offs_k
         a = tl.load(
             a_ptr + offs_m[:, None] * stride_am + k[None, :] * stride_ak,
-            mask=(offs_m[:, None] < M) & (k[None, :] < K), other=0.0,
+            mask=(offs_m[:, None] < M) & (k[None, :] < K),
+            other=0.0,
         )
         b = tl.load(
             b_ptr + k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
-            mask=(k[:, None] < K) & (offs_n[None, :] < N), other=0.0,
+            mask=(k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
         )
         acc += tl.dot(a, b)
 
     tl.store(
-        part_ptr + pid_k * stride_ps + offs_m[:, None] * stride_pm
+        part_ptr
+        + pid_k * stride_ps
+        + offs_m[:, None] * stride_pm
         + offs_n[None, :] * stride_pn,
         acc,
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
@@ -93,9 +108,20 @@ def _splitk_mm(
 
 
 @triton.jit
-def _reduce(part_ptr, out_ptr, M, N, stride_ps, stride_pm, stride_pn,
-            stride_om, stride_on, SPLIT_K: tl.constexpr,
-            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+def _reduce(
+    part_ptr,
+    out_ptr,
+    M,
+    N,
+    stride_ps,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
     """Sum the K-slices. A buffer rather than atomics, so the result is
     bit-reproducible: an atomic order that depends on which program finishes
     first cannot validate anything downstream of it."""
@@ -107,10 +133,18 @@ def _reduce(part_ptr, out_ptr, M, N, stride_ps, stride_pm, stride_pn,
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for s in range(SPLIT_K):
         acc += tl.load(
-            part_ptr + s * stride_ps + offs_m[:, None] * stride_pm
-            + offs_n[None, :] * stride_pn, mask=mask, other=0.0)
-    tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
-             acc.to(out_ptr.dtype.element_ty), mask=mask)
+            part_ptr
+            + s * stride_ps
+            + offs_m[:, None] * stride_pm
+            + offs_n[None, :] * stride_pn,
+            mask=mask,
+            other=0.0,
+        )
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def splitk_mm(a, b, split_k, block_m=64, block_n=64, block_k=64):
@@ -121,17 +155,38 @@ def splitk_mm(a, b, split_k, block_m=64, block_n=64, block_k=64):
     out = torch.empty((m, n), dtype=a.dtype, device=a.device)
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n), split_k)
     _splitk_mm[grid](
-        a, b, part, m, n, k,
-        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
-        part.stride(0), part.stride(1), part.stride(2),
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, SPLIT_K=split_k,
+        a,
+        b,
+        part,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        SPLIT_K=split_k,
     )
     rgrid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
     _reduce[rgrid](
-        part, out, m, n,
-        part.stride(0), part.stride(1), part.stride(2),
-        out.stride(0), out.stride(1),
-        SPLIT_K=split_k, BLOCK_M=block_m, BLOCK_N=block_n,
+        part,
+        out,
+        m,
+        n,
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        out.stride(0),
+        out.stride(1),
+        SPLIT_K=split_k,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
     )
     return out
 
@@ -174,8 +229,10 @@ def main():
         flop = 2 * m * k * n
         ms_torch = timed(lambda: torch.mm(a, b))
         tiles = ((m + 31) // 32) * ((n + 31) // 32)
-        row = f"{m:6d} {k:6d} {n:6d} {tiles:6d} {ms_torch:9.3f} " \
-              f"{flop / (ms_torch * 1e-3) / 1e12:7.1f}"
+        row = (
+            f"{m:6d} {k:6d} {n:6d} {tiles:6d} {ms_torch:9.3f} "
+            f"{flop / (ms_torch * 1e-3) / 1e12:7.1f}"
+        )
         best = ms_torch
         for s in args.splits:
             try:

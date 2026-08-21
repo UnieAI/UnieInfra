@@ -32,7 +32,6 @@ from tokenspeed_kernel import (
     mha_plan,
     mha_prefill,
 )
-from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed_kernel.ops.attention.flashinfer import (
     clear_paged_extend_plan,
     install_paged_extend_plan,
@@ -56,6 +55,7 @@ from tokenspeed.runtime.layers.attention.backends.cache_groups import (
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:

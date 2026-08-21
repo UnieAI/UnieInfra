@@ -172,6 +172,8 @@ class ModelExecutorConfig:
     # ``unieinfra/xref/15-encoder-embedding.md`` for how the reference engines
     # express the same "one step, then done" shape.
     is_embedding: bool = False
+    # Whether a pooling model may use the breakable prefill graph.
+    pooling_prefill_graph: bool = True
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -269,6 +271,9 @@ class ModelExecutorConfig:
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
             is_embedding=not model_config.is_generation,
+            pooling_prefill_graph=bool(
+                getattr(server_args, "pooling_prefill_graph", True)
+            ),
             logical_page_size=logical_page_size,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,

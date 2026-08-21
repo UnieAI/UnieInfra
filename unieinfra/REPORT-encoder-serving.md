@@ -60,6 +60,7 @@ Embedding 走的是「**因果 LLM 當 embedder**」。三道關卡：
 
 | 項目 | 結果 |
 |---|---|
+| **Prefill graph 守門過寬**（對每個模型都關） | dense 單請求 **17.3 → 8.71 ms（2.0x）**；embedding 不受惠，見 §6 第 1 項 |
 | Whisper cross-attention 去掉每步 gather | 高佔用 **1.79x**（turbo）／**1.84x**（large-v3）；低佔用 0.87x，故依佔用率選路 |
 | Embedding 列表請求整批 tokenize | **最高 1.80x**；關掉開關斷崖回來且探針 FAIL（雙向驗證） |
 
@@ -91,9 +92,11 @@ servicer。目前可用入口是 in-process 的 `Engine.encode(...)` 與帶 audi
 
 ## 6　下一步，按證據強度
 
-1. **每請求 ~16–18 ms 的延遲地板**（xref §6.6）。與模型大小、prompt 長度無關，並發會
-   攤掉；已定位到 `prefill_ms`（15.4–16.4 ms of 17.5）。這是單請求延遲的主成本，
-   embedding 與 Whisper 同時受它支配。先查 prefill graph 為何靜默停用。
+1. **讓 pooling 模型也能用 prefill graph**（xref §6.6）。那個延遲地板的根因已經找到並
+   修掉（GDN 守門對每個模型都關掉 prefill graph），dense 從 17.3 → 8.71 ms（**2.0x**）。
+   但 **embedding 沒受惠**：`prefill_graph.py:296` 明確排除非生成模型，所以它仍跑
+   eager prefill（19.3 → 19.78 ms，無變化）。依 dense 的倍數推斷，這是 embedding
+   單請求延遲最大的一塊未動空間。
 2. **encoder-only 架構**（BERT/GTE/BGE）：真正的能力缺口。
 3. **hold-window 聚合**（TRT-LLM 的 5ms）：治的是不同請求之間，與 §4 第 2 項不重疊；
    要等端點做起來、有真並發流量才量得準。那個 5ms 是慣例常數，**抄結構不要抄數字**。

@@ -411,6 +411,22 @@ scheduler 子行程裡。要確認實際狀態，看 scheduler 的日誌行，�
 
 **影響面遠大於 embedding／Whisper**：這台上每一個稠密與 MoE 模型的 prefill 都在跑 eager。
 
+### 但 embedding 沒有受惠——原因已知
+
+用**實際的修法**（不是環境變數繞過）重量，出現不對稱：
+
+```
+dense     Qwen3-0.6B           17.3 -> 8.71 ms   2.0x
+embedding Qwen3-Embedding-8B   19.3 -> 19.78 ms  無改善
+```
+
+因為 `runtime/execution/prefill_graph.py:296` 的停用條件裡有 `not model_runner.is_generation`
+——**prefill graph 對 pooling 模型是被明確排除的**。embedding 仍在跑 eager prefill。
+
+依 dense 的 2.0x 推斷，這是 embedding 單請求延遲上最大的一塊未動空間。要做的話得讓
+capture 處理 pooling 的輸出形狀（graph 目前捕捉的是走 logits processor 那條路，而
+pooling 回傳 `PoolerOutput`）。**尚未進行。**
+
 
 
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）

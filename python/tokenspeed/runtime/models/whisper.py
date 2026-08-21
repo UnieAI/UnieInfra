@@ -783,6 +783,12 @@ class WhisperForConditionalGeneration(nn.Module):
             prefix=add_prefix("proj_out", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
+        self._cross_attn_path = str(getattr(config, "cross_attn_path", "auto"))
+        if self._cross_attn_path not in ("auto", "padded", "gather"):
+            raise ValueError(
+                f"--cross-attn-path must be auto|padded|gather, got "
+                f"{self._cross_attn_path!r}"
+            )
         self._pad_cu_seqlens_q: torch.Tensor | None = None
         self._pad_cu_seqlens_k: torch.Tensor | None = None
         self._pad_query_buffer: torch.Tensor | None = None
@@ -960,7 +966,7 @@ class WhisperForConditionalGeneration(nn.Module):
         # The branch depends only on bs and a constant, and the decode graph
         # captures one graph per batch-size bucket, so it is stable within
         # any captured graph.
-        if ctx.num_extends == 0 and bs * 2 >= self.cross_cache.num_slots:
+        if ctx.num_extends == 0 and self._use_padded_cross_attention(bs):
             self._ensure_padded_buffers(device)
             return CrossAttentionPlan(
                 cache=self.cross_cache,
@@ -998,6 +1004,19 @@ class WhisperForConditionalGeneration(nn.Module):
             key=key,
             value=value,
         )
+
+    def _use_padded_cross_attention(self, bs: int) -> bool:
+        """Which read path a decode step takes.
+
+        ``auto`` is the measured default; ``padded`` and ``gather`` force one
+        so the two can be A/B'd against each other on the same build.
+        """
+        choice = self._cross_attn_path
+        if choice == "padded":
+            return True
+        if choice == "gather":
+            return False
+        return bs * 2 >= self.cross_cache.num_slots
 
     def _ensure_padded_buffers(self, device: torch.device) -> None:
         """Constant tensors for the padded path, built once.

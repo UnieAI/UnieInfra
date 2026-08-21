@@ -120,6 +120,18 @@ class ServerArgs:
     # Only needed for a checkpoint that ships no sentence-transformers config.
     pooling_type: str | None = None
     pooling_normalize: bool | None = None
+    # Tokenize a list-valued embedding request in full before submitting any
+    # of it, so the list lands in one prefill step. On by default; the switch
+    # exists so the optimization can be A/B'd against the path it replaced
+    # (measured up to 1.80x, see unieinfra/xref/15-encoder-embedding.md §6.4).
+    embedding_batch_tokenize: bool = True
+
+    # How an encoder-decoder reads its cross-attention KV on a decode step.
+    # "padded" attends over every slot with the queries scattered by pool
+    # index (no copy, flat in batch size); "gather" copies the batch's slots
+    # into a contiguous block (cheaper at low occupancy); "auto" picks per
+    # step by occupancy. See §6.3 for the crossover.
+    cross_attn_path: str = "auto"
 
     # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
     # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
@@ -1006,6 +1018,23 @@ class ServerArgs:
             default=ServerArgs.pooling_type,
             help="Override the pooling reduction. Needed only for an "
             "embedding checkpoint that ships no sentence-transformers config.",
+        )
+        parser.add_argument(
+            "--embedding-batch-tokenize",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.embedding_batch_tokenize,
+            help="Tokenize a whole list-valued embedding request before "
+            "submitting any of it, so it lands in one prefill step instead "
+            "of being split across two. Off restores the per-item submit.",
+        )
+        parser.add_argument(
+            "--cross-attn-path",
+            type=str,
+            choices=["auto", "padded", "gather"],
+            default=ServerArgs.cross_attn_path,
+            help="Encoder-decoder cross-attention KV read path on decode: "
+            "'padded' never copies but always reads every slot, 'gather' "
+            "copies the batch's slots, 'auto' picks by batch occupancy.",
         )
         parser.add_argument(
             "--pooling-normalize",

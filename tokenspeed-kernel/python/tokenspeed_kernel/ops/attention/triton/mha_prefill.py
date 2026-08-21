@@ -405,6 +405,8 @@ def prefill_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
+    num_stages_override: int | None = None
+
     if platform.is_amd:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
@@ -427,12 +429,40 @@ def prefill_attention_fwd(
         elif platform.is_ampere_plus:
             if small_smem:
                 # sm_86/sm_89, and sm_120 which lands here for the same reason.
+                #
+                # The wide-head tiles below were measured on sm_120 at
+                # gemma-4-31B-it's two prefill geometries (32 q heads x 16 kv x
+                # 256, and 32 x 4 x 512) and at Qwen3.5-27B's head_dim 256.
+                # The inherited values -- (64, 64) at Lq == 256 and one pipeline
+                # stage at Lq > 256 -- were carried over from the small-shared-
+                # memory Ampere parts and had never been measured for a head
+                # this wide. Both replacements are bit-identical to what they
+                # replace (max|diff| 0.00e+00 against the old config at
+                # M = 256 / 747 / 2048): BLOCK_N and the reduction order are
+                # unchanged, so no softmax accumulates in a new order.
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256 and sliding_window_size >= 0:
+                    # Windowed layers only. 64 -> 32 query rows is 1.44x at
+                    # M=747 and 1.34x at M=2048 on gemma-4-31B-it's sliding
+                    # layers (32 q x 16 kv x 256, window 1024) -- and 0.70x on
+                    # Qwen3.5-27B's full-attention layers, which are the same
+                    # Lq. head_dim is not the discriminator: the SAME 32x16x256
+                    # geometry measured 0.81x / 0.71x with the window switched
+                    # off, so it is the window, not the shape. A narrower query
+                    # tile only pays when the window keeps each CTA's KV walk
+                    # short; without one, halving BLOCK_M just doubles the CTAs
+                    # that each stream the whole KV.
+                    BLOCK_M, BLOCK_N = (32, 64)
                 elif Lq <= 256:
                     BLOCK_M, BLOCK_N = (64, 64)
                 else:
+                    # Same (32, 32) tile, two pipeline stages instead of one:
+                    # 1.20x / 1.29x / 1.37x at M=256 / 747 / 2048. At
+                    # BLOCK_DMODEL 512 the KV loads are 32 KB per stage and a
+                    # single stage left the tensor cores waiting on them.
                     BLOCK_M, BLOCK_N = (32, 32)
+                    num_stages_override = 2
             else:
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (128, 128)
@@ -459,7 +489,7 @@ def prefill_attention_fwd(
     page_table_arg = page_table if page_table is not None else cache_seqlens
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = 1 if num_stages_override is None else num_stages_override
 
     extra_kargs = {}
     if platform.is_amd:

@@ -38,16 +38,29 @@ from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 
 logger = logging.getLogger(__name__)
 
+# Checkpoint quant_algo -> the weight dtype a MoE layer should build for.
+# `W4A16_NVFP4` stores its weights in exactly the NVFP4 layout and differs only
+# in the activation width, which is the kernel's choice rather than the
+# checkpoint's: with the 4-bit tensor-core path gated behind CUDA 13 on this
+# box, it resolves to Marlin and reads the same e2m1 weights with e4m3 block
+# scales. `FP8` is per-tensor, unlike the block-scaled `MXFP8` above it, so it
+# needs its own config rather than borrowing that one -- pointing it at the
+# MXFP8 config makes it look for block scales the checkpoint never wrote.
 _MOE_WEIGHT_DTYPES = {
     "NVFP4": "nvfp4",
+    "W4A16_NVFP4": "nvfp4",
     "MXFP8": "fp8",
+    "FP8": "fp8",
 }
+
+# Algorithms whose weights the NVFP4 config can load unchanged.
+_NVFP4_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4"})
 
 _FUSED_PROJECTION_SHARDS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj"),
@@ -59,8 +72,8 @@ class ModelOptMixedConfig(QuantizationConfig):
     """Config for ModelOpt MIXED_PRECISION checkpoints.
 
     Args:
-        quantized_layers: Checkpoint module name -> upper-cased quant_algo
-            (``"NVFP4"`` or ``"MXFP8"``). Keys use checkpoint naming until
+        quantized_layers: Checkpoint module name -> upper-cased quant_algo,
+            one of ``_MOE_WEIGHT_DTYPES``. Keys use checkpoint naming until
             :meth:`apply_checkpoint_name_replacements` rewrites them to
             runtime naming.
         exclude_modules: Checkpoint module names left unquantized.
@@ -88,6 +101,12 @@ class ModelOptMixedConfig(QuantizationConfig):
         self.nvfp4_config = Nvfp4Config(
             kv_cache_quant_algo=kv_cache_quant_algo,
             group_size=group_size,
+        )
+        # Per-tensor fp8: no weight_block_size and no scale_fmt, which is what
+        # separates it from the MXFP8 config above.
+        self.fp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
         )
         # MoE layers read this when their experts resolve to an fp8 algo.
         self.weight_block_size = self.mxfp8_config.weight_block_size
@@ -242,7 +261,9 @@ class ModelOptMixedConfig(QuantizationConfig):
             return UnquantizedLinearMethod()
         if algo == "MXFP8":
             return Fp8LinearMethod(self.mxfp8_config)
-        if algo == "NVFP4":
+        if algo == "FP8":
+            return Fp8LinearMethod(self.fp8_config)
+        if algo in _NVFP4_ALGOS:
             return Nvfp4LinearMethod(self.nvfp4_config)
         raise ValueError(f"Unsupported quant_algo {algo!r} for layer {prefix!r}")
 

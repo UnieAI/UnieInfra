@@ -1159,14 +1159,16 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                          "budget %d->%d used=%d candidates=%zu prefill_ops=%d first_chunk=%d "
                          "decode_ops=%d waiting=%zu skipped(retract=%d reserve=%d) "
                          "state(sub=%d pre=%d dec=%d other=%d) "
-                         "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d) stop=\"%s\"\n",
+                         "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d cold_cap=%d) cold=%d "
+                         "stop=\"%s\"\n",
                          trace_budget_start, token_budget, trace_budget_start - token_budget,
                          trace_candidates, trace_prefill_ops, trace_first_chunk_tokens,
                          trace_decode_ops,
                          trace_candidates - static_cast<std::size_t>(trace_prefill_ops + trace_decode_ops),
                          trace_skip_retract, trace_skip_reserve,
                          st_submitted, st_prefilling, st_decode, st_other,
-                         rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, trace_stop);
+                         rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, rej_cold_cap,
+                         cold_prefills, trace_stop);
             std::fflush(trace_file);
         }
     }

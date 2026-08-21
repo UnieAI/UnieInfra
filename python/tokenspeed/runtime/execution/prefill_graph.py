@@ -308,10 +308,11 @@ class PrefillGraph:
             ),
             ("model_runner is None", model_runner is None),
             ("model exposes no inner .model", self.inner_model is None),
-            # An encoder-only stack reads its batch layout inside the
-            # captured region, and the capture context is a dummy batch that
-            # nothing refreshes per replay. Opting out is the model's call,
-            # not a property of the graph, so the model declares it.
+            # A model that cannot be captured says so itself; the graph
+            # does not try to infer it. Left in place with no current user:
+            # the encoder-only family needed it until its attention became a
+            # break point, and the next family to need it should find the
+            # seam rather than rediscover it.
             (
                 "model declares supports_prefill_graph = False",
                 self.inner_model is not None

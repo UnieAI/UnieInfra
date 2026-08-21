@@ -72,6 +72,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import (
     MultimodalEncoderAttention,
@@ -104,6 +105,13 @@ __all__ = [
 def encoder_batch_layout(ctx: ForwardContext) -> tuple[torch.Tensor, int]:
     """Return ``(cu_seqlens, max_seqlen_bound)`` for this forward.
 
+    Called from inside the attention break, so ``ctx`` is the *live* forward
+    context even under a graph replay -- ``break_point`` rebinds the context
+    argument by identity to the ambient one on every replay. Computing this
+    in the captured region instead would freeze the capture-time dummy
+    batch's boundaries into every replay, which is exactly the bug this
+    file's history records.
+
     Taken from ``ctx.gather_ids`` rather than from the attention backend's
     extend metadata. Two reasons: an encoder-only model has no attention
     layer to drive that backend, and ``gather_ids`` is already the tensor
@@ -114,12 +122,12 @@ def encoder_batch_layout(ctx: ForwardContext) -> tuple[torch.Tensor, int]:
     ``cat([0, gather_ids + 1])`` *is* the cu_seqlens vector.
 
     The second return value is an upper bound on the longest sequence, not
-    the exact maximum: deriving the exact value needs ``.item()``, which is a
-    device sync and is illegal inside a captured CUDA graph (the same
-    constraint Whisper's decoder hit). ``input_num_tokens`` is the total
-    across the batch, so it bounds any single request. Varlen kernels use it
-    only to size the grid and mask by the per-request lengths, so an
-    over-estimate costs empty blocks, never wrong rows.
+    the exact maximum: deriving the exact value needs ``.item()``, a device
+    sync. Under a padded replay ``input_num_tokens`` reads as the bucket
+    (``PrefillGraph._padded_to`` sets it), which is still a bound on any one
+    request. Varlen kernels use it only to size the grid and mask by the
+    per-request lengths, so an over-estimate costs empty blocks, never wrong
+    rows.
     """
     if ctx.gather_ids is None:
         raise RuntimeError(
@@ -163,8 +171,15 @@ class BertEmbedding(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        word_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        embeddings = self.word_embeddings(input_ids)
+        # ``word_embeds`` is the prefill graph's static input-embeds buffer:
+        # the graph runs the word gather outside the capture and hands the
+        # result back. Everything after it reads ``positions``, so it stays
+        # inside.
+        embeddings = (
+            self.word_embeddings(input_ids) if word_embeds is None else word_embeds
+        )
         embeddings = embeddings + self.position_embeddings(
             positions + self.position_offset
         )
@@ -214,8 +229,11 @@ class NewEmbedding(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        word_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        embeddings = self.word_embeddings(input_ids)
+        embeddings = (
+            self.word_embeddings(input_ids) if word_embeds is None else word_embeds
+        )
         if self.token_type_embeddings is not None:
             embeddings = embeddings + self.token_type_embeddings.weight[0]
         return self.LayerNorm(embeddings)
@@ -333,14 +351,30 @@ class EncoderSelfAttention(nn.Module):
             mm_attention_backend=mm_attention_backend,
         )
 
+    @break_point
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ctx: ForwardContext,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        cos, sin = (None, None) if rotary is None else rotary
+        """Mix across the sequence. Runs eagerly, including under a replay.
+
+        This is the one method in the file that must not be captured. It is
+        where the batch layout enters the computation, and the layout is the
+        one thing a padded-bucket replay changes from forward to forward:
+        ``break_point`` reruns the body on every replay with ``ctx`` rebound
+        by identity to the live ambient context, so ``cu_seqlens`` is
+        recomputed each time. The norms, projections and MLP around it are
+        token-shaped and stay captured, which is where the speedup comes
+        from.
+
+        ``cos``/``sin`` arrive as separate tensors rather than one tuple so
+        the break machinery weak-refs them; a tuple would pass through as an
+        opaque object and pin its pool block for the graph's lifetime.
+        """
+        cu_seqlens, max_seqlen = encoder_batch_layout(ctx)
         return self.attn(
             hidden_states.unsqueeze(0),
             cu_seqlens=cu_seqlens,
@@ -406,16 +440,15 @@ class BertLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ctx: ForwardContext,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # ``rotary`` is always None here -- BERT and RoBERTa carry position
-        # information in the embedding table, not in the attention scores.
-        # The parameter exists so the encoder stack calls every layer type
-        # with one signature.
-        attended = self.attention(hidden_states, cu_seqlens, max_seqlen)
+        # ``cos``/``sin`` are always None here -- BERT and RoBERTa carry
+        # position information in the embedding table, not in the attention
+        # scores. The parameters exist so the encoder stack calls every layer
+        # type with one signature.
+        attended = self.attention(hidden_states, ctx)
         hidden_states = self.attention_LayerNorm(hidden_states + attended)
 
         intermediate, _ = self.intermediate(hidden_states)
@@ -478,12 +511,11 @@ class NewLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ctx: ForwardContext,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        attended = self.attention(hidden_states, cu_seqlens, max_seqlen, rotary=rotary)
+        attended = self.attention(hidden_states, ctx, cos, sin)
         hidden_states = self.attn_ln(hidden_states + attended)
 
         up_gate, _ = self.up_gate_proj(hidden_states)
@@ -527,29 +559,6 @@ class BertTransformer(nn.Module):
     embedding_cls: type[nn.Module] = BertEmbedding
     layer_cls: type[nn.Module] = BertLayer
 
-    # Refused, and measured before refusing: on bge-small the breakable
-    # prefill graph is worth 6.69 -> 3.29 ms (2.03x), so this is a real
-    # prize, not a shrug.
-    #
-    # It cannot be taken as the graph stands. This stack reads its batch
-    # layout from ``ctx.gather_ids`` *inside* the region that gets captured,
-    # and the graph captures against ``make_dummy_batch``'s context, which it
-    # drops (``self._ctx = None``) once capture finishes. Nothing refreshes
-    # that tensor's contents per replay, so every replay would attend with
-    # the dummy batch's sequence boundaries. Verified, not assumed: with the
-    # graph engaged, parity fell to 0.295 (bge) and 0.683 (e5) -- a
-    # well-formed embedding computed over the wrong rows.
-    #
-    # A pooling *decoder* is unaffected because its reduction runs in
-    # ``replay()``'s eager tail against the caller's real context; only a
-    # model that needs the layout during the forward hits this.
-    #
-    # Lifting it means giving the prefill graph a per-replay batch-layout
-    # buffer (positions_buf already refreshes; cu_seqlens could be derived
-    # from it with fixed shapes), which is a change to machinery every model
-    # shares and wants its own verification.
-    supports_prefill_graph: bool = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -579,10 +588,27 @@ class BertTransformer(nn.Module):
         )
         self.layers_to_capture: list[int] = []
 
+    @property
+    def embed_tokens(self) -> nn.Module:
+        """The word lookup, under the name the prefill graph looks for.
+
+        ``PrefillGraph`` runs this one gather outside the captured region and
+        hands the result back as ``input_embeds``. For this family that is
+        exactly the word table and nothing else: the position and segment
+        terms read ``positions``, a static buffer the graph refreshes, so
+        they belong inside the capture.
+
+        Deliberately *not* named ``get_input_embeddings``. That seam exists
+        for models whose embedding needs post-processing (gemma's sqrt
+        scale), and taking it here would move the position add outside the
+        capture, where it would be computed once against the dummy batch.
+        """
+        return self.embeddings.word_embeddings
+
     def rotary(
         self, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        return None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return None, None
 
     def forward(
         self,
@@ -592,12 +618,12 @@ class BertTransformer(nn.Module):
         out_cache_loc: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
-        cu_seqlens, max_seqlen = encoder_batch_layout(ctx)
         if _DEBUG_BATCH:
             # Off by default, and worth keeping: every encoder-only bug found
             # during this port was invisible in the output and obvious in
             # this line -- which tokenizer ran, whether positions restart per
             # request, whether cu_seqlens agrees with them.
+            cu_seqlens, _ = encoder_batch_layout(ctx)
             logger.info(
                 "encoder batch: n=%d cu=%s pos[:12]=%s ids[:12]=%s",
                 input_ids.shape[0],
@@ -605,12 +631,20 @@ class BertTransformer(nn.Module):
                 positions[:12].tolist(),
                 input_ids[:12].tolist(),
             )
-        hidden_states = self.embeddings(input_ids, positions)
-        rotary = self.rotary(positions)
+        hidden_states = self.embeddings(
+            input_ids, positions, kwargs.get("input_embeds")
+        )
         for layer in self.encoder.layers:
-            hidden_states = layer(
-                hidden_states, positions, cu_seqlens, max_seqlen, rotary
-            )
+            # Rope is recomputed per layer rather than hoisted out of the
+            # loop. Both are correct eagerly; under capture the hoisted
+            # version hands every break a tensor produced by segment 0, and
+            # break arguments alias pool storage on the promise that "the
+            # captured segment rewrites the aliased address before the break
+            # reads it" -- which only holds for the segment immediately
+            # before the break. Recomputing keeps that promise. The cost is
+            # eleven extra index_selects on a cached table.
+            cos, sin = self.rotary(positions)
+            hidden_states = layer(hidden_states, ctx, cos, sin)
         return hidden_states, None
 
 

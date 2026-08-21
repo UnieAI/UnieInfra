@@ -524,36 +524,53 @@ pooling 模式是**由命令列明確傳入**而不是從 checkpoint 讀，所�
 `resolve_pooling_config` 有沒有得到同一個答案。三個都對，包含 **GTE 沒有 Normalize
 module** 這一項——一個永遠做 L2 正規化的 server 會對它回傳一個格式完美的錯向量。
 
-### prefill graph 對這個家族**不能**開（已量、已歸因）
+### prefill graph：問題不在缺 buffer，在於 attention 沒有被標成 break（2026-08-21）
 
-先量了再拒絕：bge-small 上 breakable prefill graph 值
-**6.69 → 3.29 ms（2.03x）**，兩臂都有機制證據。倍率比 Qwen3-Embedding-8B 的 1.33x 大，
-和 dense 0.6B 拿到 2.0x 是同一個原因——模型小，launch 開銷佔比高。
+一開始的結論是「不能開」：這個 stack 在**被捕捉的區域內**讀 `ctx.gather_ids` 取批次佈局，
+而 graph 捕捉時用的是 `make_dummy_batch` 的 context，捕捉完就丟掉
+（`execution/prefill_graph.py` `self._ctx = None`），沒有東西每次 replay 刷新它。開著 graph
+重驗 parity 掉到 0.295（bge）／0.683（e5）——**格式完美、算在錯的 row 上的向量**。
 
-但**以 graph 目前的形狀不能拿**。這個 stack 是在**被捕捉的區域內**讀 `ctx.gather_ids`
-取批次佈局，而 graph 捕捉時用的是 `make_dummy_batch` 的 context，捕捉結束後就把它丟掉
-（`execution/prefill_graph.py` `self._ctx = None`）。沒有任何東西在每次 replay 時刷新
-那個 tensor 的內容，所以每次 replay 都會用 **dummy batch 的序列邊界**去 attend。
+那個歸因是對的，但**開出的藥方（做一個每次 replay 刷新的批次佈局 buffer）是多餘的**。
+這棵樹已經有正確答案，而且每個 decoder 都在用：`@break_point`
+（`execution/breakable_cuda_graph.py`）。被它標記的 sequence-mixing 方法在**每次 replay
+以 eager 重跑**，周圍 token 形狀的計算（norm、投影、MLP）才被捕捉；而且
+`_record_break` 對參數的處理有兩個「活的」例外：
 
-驗過，不是推測——開著 graph 重跑 parity：
+1. **tensor 參數別名到持久儲存**（static input buffer／pool-pinned 的 segment 中間值），
+   所以 replay 時帶的是新值；
+2. **`ForwardContext` 參數每次 replay 按 identity 重新綁定到 ambient context**
+   （`active_forward` / `current_forward_ctx`）——docstring 寫得很直接：
+   「so break bodies read live `ctx` fields exactly like the eager path」。
+
+所以正確的修法是把 `EncoderSelfAttention.forward` 標成 `@break_point` 並讓它收 `ctx`，
+在 break body 內才算 `cu_seqlens`。encoder 之所以壞掉，不是 graph 少了什麼設施，
+**是它沒有像其他模型那樣把 attention 標成 break**。
+
+一個實作細節值得記：rope 的 cos/sin **逐層重算**，沒有提到迴圈外。兩種寫法 eager 都對，
+但在捕捉下，提到外面等於把 segment 0 產生的 tensor 交給第 11 個 break，而 break 參數
+別名 pool 儲存的安全前提是「捕捉的 segment 會在 break 讀取前改寫該位址」——那只對
+**緊鄰 break 的前一個 segment**成立。逐層重算維持這個前提，代價是 11 次額外的
+`index_select`。cos/sin 也拆成兩個參數而不是一個 tuple，否則 tuple 會被當成不透明物件
+整個 pin 住 pool block。
+
+### 量到的結果，以及倍率為什麼縮水
 
 ```
-bge-small-en-v1.5     0.999916 -> 0.295324
-multilingual-e5-base  0.999947 -> 0.682696
+--pooling-prefill-graph      p50 5.70 ms   ENGAGED (bucket=80)
+--no-pooling-prefill-graph   p50 7.83 ms   disabled
 ```
 
-**格式完美、算在錯的 row 上的向量。** 這也再次說明為什麼 §6.6 那條紀律要對兩個方向都
-成立：先前那三次 PASS 是在 graph 停用時跑的（當時模型沒有 `embed_tokens`，被靜默擋掉），
-所以把 graph 接上之後**必須重驗**，不能沿用。
+**1.37x**，兩個方向都有機制證據，而且**兩臂的 cosine 逐位相同**
+（`[0.999959, 0.999964, 0.999969, 0.999916]`），所以 graph 沒有動到任何數值。
 
-pooling **decoder** 不受影響：它的 reduction 跑在 `replay()` 的 eager tail，用的是呼叫端
-的真實 context；只有在 forward 途中就需要佈局的模型會撞到。
+先前記的 **2.03x 要撤回**。那個數字是在 attention 被**錯誤地捕捉進 graph** 的情況下量到的
+——它快，正是因為它錯：把佈局凍結進 graph 就省掉了每次 replay 的 attention launch。
+正確的版本讓 attention 保持 eager，於是每層多一次 kernel launch 與一次 graph segment 邊界，
+獎品從 2.03x 縮到 1.37x。**這是「快」與「對」互斥時的實際價碼，不是實作沒調好。**
 
-要解開，得讓 prefill graph 提供一個每次 replay 都刷新的批次佈局 buffer
-（`positions_buf` 本來就會刷新，cu_seqlens 可以用固定形狀從它導出）。那是動到每個模型
-共用的機制，該有它自己的驗證，所以這一輪把它做成**模型明確宣告的拒絕**
-（`supports_prefill_graph = False`，graph 端有具名的停用理由），而不是靠「沒有
-`embed_tokens`」意外擋掉。
+`supports_prefill_graph` 這個宣告式退出留在 graph 端但目前無人使用：encoder 家族在
+attention 變成 break 之前需要它，下一個需要的家族應該找到這個接縫而不是重新發明。
 
 ### 一個在 reference 那一側的陷阱
 

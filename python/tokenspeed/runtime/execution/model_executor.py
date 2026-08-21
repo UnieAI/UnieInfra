@@ -572,6 +572,15 @@ class ModelExecutor:
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
+        # Cumulative prefix reuse, same definition vLLM prints as
+        # "Prefix cache hit rate": hits / (hits + prompt tokens computed).
+        # The Prometheus counter `tokenspeed:prefix_cache_hits` already carried
+        # this, but a benchmark harness reads stdout, not /metrics -- so on
+        # 2026-08-21 an ours-vs-vLLM matrix had vLLM's hit rate in every log
+        # since 08-15 and ours in none, and the one variable that explained
+        # every ratio in the matrix was only legible on one side.
+        self._prefix_hit_tokens = 0
+        self._prefix_prompt_tokens = 0
         self._prev_decode_bs: int = 0
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
         self.mm_runtime = MultimodalRuntime(
@@ -1098,15 +1107,27 @@ class ModelExecutor:
             if len(self._seen_prefill_ids) > 100_000:
                 self._seen_prefill_ids.clear()  # log-dedup only; bound the growth
             self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
+            # Denominator is the EXTEND rows only: a Mix batch also carries one
+            # token per decode row, and counting those would dilute the ratio
+            # by the decode length rather than measuring the prompt.
+            computed_prompt_tokens = sum(forward_op.input_lengths[:num_extends])
+            self._prefix_hit_tokens += cached_tokens
+            self._prefix_prompt_tokens += computed_prompt_tokens + cached_tokens
+            hit_rate = (
+                100.0 * self._prefix_hit_tokens / self._prefix_prompt_tokens
+                if self._prefix_prompt_tokens
+                else 0.0
+            )
             logger.info(
                 "%s batch. #new-seq: %s, #new-token: %s, #cached-token: %s, "
-                "#running-req: %s, #queue-req: %s",
+                "#running-req: %s, #queue-req: %s, prefix cache hit rate: %.1f%%",
                 mode,
                 num_extends,
                 total_tokens,
                 cached_tokens,
                 bs,
                 num_queue_reqs,
+                hit_rate,
             )
 
         result = self.execute_forward_op(

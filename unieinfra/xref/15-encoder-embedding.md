@@ -183,6 +183,33 @@ decode 時只能把該請求的 encoder KV 複製成連續 buffer。這不是設
 換卡或換 kernel 版本就該重測，不要把「必須複製」寫成永久前提。
 （同一形狀的教訓見 memory 的 `sm120-closed-allowlist-tables`。）
 
+## 6.2　移植後的實測結果（2026-08-21）
+
+whisper-large-v3-turbo、bf16、sm_120、triton backend，LibriSpeech dummy clip 0：
+
+```
+truth      MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL
+reference  ' Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.'
+ours       ' Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.'
+```
+
+逐字相同，token id 亦相同。重跑：`unieinfra/bench/whisper_transcribe_parity.py`。
+
+第一版這個檢查用隨機噪音當輸入，參考本身只吐一個 token——「通過」但幾乎沒有證據力。
+**ASR 的正確性檢查一定要用真實語音**，否則測不到多步 decode，也測不到 cross-attention
+在幾十步之後是否還對。
+
+移植過程中被迫處理、而且不是 Whisper 特有的三件事：
+
+1. `chunked_prefill_size` 的預設 8192 對 `context_len=448` 的模型代表 19 個併發請求，
+   但 request pool 只有 `max_num_seqs+1` 個 slot，autotune 的 dummy batch 會索引越界。
+   已改成啟動期夾到 `context_len × max_num_seqs` 並印出兩個數字。
+2. autotune 的合成 batch 原本不傳 `req_pool_indices`，讀 per-request 狀態的模型會拿不到；
+   `make_dummy_batch` 其實已經填好了，補傳即可。
+3. **CUDA graph 捕捉期間不能有 `.item()`**。cross-attention 的 `max_seqlen_q` 第一版用
+   `query_lengths.max().item()`，那是每個 decode step 一次 host 同步，捕捉時直接違法。
+   flash-attn 只拿它排程，給上界即可。
+
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）
 
 **修正**：交接說明寫「`python/tokenspeed/runtime/models/` 沒有任何 whisper/bert/embed/encoder

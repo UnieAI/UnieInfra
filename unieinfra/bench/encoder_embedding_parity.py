@@ -144,6 +144,17 @@ def _build_reference(model: str, dtype):
     from transformers import AutoConfig, AutoModel
 
     config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    if getattr(config, "use_flash_attn", False):
+        # jina-v3's remote code asserts on the Dao-AILab ``flash_attn``
+        # package, which is not what this container has. Turn it off so the
+        # reference runs its portable path.
+        #
+        # This is the opposite of the rule for a *performance* comparison,
+        # where a reference on a slow path invents a win. For a correctness
+        # comparison the slow path is the point: it is the same arithmetic
+        # without the dependency.
+        config.use_flash_attn = False
+        print("  reference: use_flash_attn=False (portable path)", flush=True)
     hf = AutoModel.from_config(config, trust_remote_code=True)
 
     state: dict[str, torch.Tensor] = {}
@@ -178,12 +189,21 @@ def reference(
     pooling: str,
     normalize: bool,
     dtype: str = "bfloat16",
+    lora_task: str | None = None,
 ) -> np.ndarray:
     import torch
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     hf = _build_reference(model, getattr(torch, dtype))
+
+    adaptations = list(getattr(hf.config, "lora_adaptations", None) or [])
+    if adaptations and lora_task is None:
+        raise SystemExit(
+            f"{model} carries {len(adaptations)} LoRA adaptations "
+            f"{adaptations}; pass --lora-task to say which one to compare."
+        )
+    task_id = adaptations.index(lora_task) if adaptations else None
 
     vectors = []
     with torch.no_grad():
@@ -192,7 +212,17 @@ def reference(
             # silently include a pad row -- which is the exact failure MEAN
             # pooling has when a reference is batched carelessly.
             batch = tokenizer(text, return_tensors="pt").to("cuda")
-            states = hf(**batch).last_hidden_state[0].float()
+            extra = {}
+            if task_id is not None:
+                # Per-example task id, the same shape the checkpoint's own
+                # sentence-transformers module builds.
+                extra["adapter_mask"] = torch.full(
+                    (batch["input_ids"].shape[0],),
+                    task_id,
+                    dtype=torch.int32,
+                    device=batch["input_ids"].device,
+                )
+            states = hf(**batch, **extra).last_hidden_state[0].float()
             if pooling == "cls":
                 pooled = states[0]
             elif pooling == "mean":
@@ -210,7 +240,14 @@ def reference(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--arm", choices=["ours", "reference", "both"], default="both")
+    parser.add_argument(
+        "--arm",
+        choices=["ours", "reference", "both", "compare"],
+        default="both",
+        help="'compare' scores two arms saved earlier without rerunning "
+        "either -- the arms are slow and a comparison should not cost a "
+        "reload.",
+    )
     parser.add_argument(
         "--pooling",
         choices=["cls", "mean", "last"],
@@ -230,6 +267,15 @@ def main() -> None:
     parser.add_argument("--reference-npy", default=".enc_ref.npy")
     parser.add_argument("--min-cosine", type=float, default=0.999)
     parser.add_argument(
+        "--lora-task",
+        default=None,
+        help="For jina-embeddings-v3: which of the five task adaptations to "
+        "compare. Required for that checkpoint -- its reference disables "
+        "LoRA entirely when no task is given, so leaving this unset would "
+        "score a merged-adapter engine against an unadapted reference and "
+        "call the difference a bug.",
+    )
+    parser.add_argument(
         "--dtype",
         default="bfloat16",
         choices=["bfloat16", "float32"],
@@ -245,9 +291,16 @@ def main() -> None:
         print("reference arm:", flush=True)
         np.save(
             args.reference_npy,
-            reference(args.model, PROMPTS, args.pooling, args.normalize, args.dtype),
+            reference(
+                args.model,
+                PROMPTS,
+                pooling=args.pooling,
+                normalize=args.normalize,
+                dtype=args.dtype,
+                lora_task=args.lora_task,
+            ),
         )
-    if args.arm != "both":
+    if args.arm not in ("both", "compare"):
         other = "reference" if args.arm == "ours" else "ours"
         print(f"saved one arm; rerun with --arm {other}")
         return

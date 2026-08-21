@@ -518,7 +518,17 @@ class BertLayer(nn.Module):
 
 
 class NewLayer(nn.Module):
-    """GTE-v1.5 block: RoPE attention, GeGLU MLP, post-LN."""
+    """Post-LN block with RoPE attention: GTE-v1.5, Nomic, Jina v3.
+
+    ``gated_mlp`` is a class attribute rather than a config read because the
+    three checkpoints that share this block cannot be told apart by their
+    config: GTE and Jina both say ``hidden_act: "gelu"`` and only one of them
+    is gated. vLLM distinguishes them by rewriting the field per architecture
+    (``models/config.py``); the architecture name is the actual signal, and
+    that is what the registry already keys on.
+    """
+
+    gated_mlp: bool = True
 
     def __init__(
         self,
@@ -546,21 +556,36 @@ class NewLayer(nn.Module):
             mm_attention_backend=mm_attention_backend,
         )
         self.attn_ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        # Two shards rather than one wide projection, so the same module
-        # serves both layouts in this family: GTE ships them packed as one
-        # ``mlp.up_gate_proj`` tensor (split into shards at load), Nomic
-        # ships them already separate as ``mlp.fc11`` / ``mlp.fc12``. Shard 0
-        # is up, shard 1 is gate.
-        self.up_gate_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.intermediate_size, config.intermediate_size],
-            bias=bool(getattr(config, "mlp_fc1_bias", False)),
-            quant_config=quant_config,
-            prefix=add_prefix("up_gate_proj", prefix),
-            tp_rank=attn.tp_rank,
-            tp_size=attn.tp_size,
-            tp_group=attn.tp_group,
-        )
+        mlp_in_bias = bool(getattr(config, "mlp_fc1_bias", not self.gated_mlp))
+        if self.gated_mlp:
+            # Two shards rather than one wide projection, so the same module
+            # serves both layouts: GTE ships them packed as one
+            # ``mlp.up_gate_proj`` tensor (split into shards at load), Nomic
+            # ships them already separate as ``mlp.fc11`` / ``mlp.fc12``.
+            # Shard 0 is up, shard 1 is gate.
+            self.up_gate_proj = MergedColumnParallelLinear(
+                config.hidden_size,
+                [config.intermediate_size, config.intermediate_size],
+                bias=mlp_in_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("up_gate_proj", prefix),
+                tp_rank=attn.tp_rank,
+                tp_size=attn.tp_size,
+                tp_group=attn.tp_group,
+            )
+        else:
+            # Jina v3 is the ungated member: one projection, activation, one
+            # projection back.
+            self.fc1 = ColumnParallelLinear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=mlp_in_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("fc1", prefix),
+                tp_rank=attn.tp_rank,
+                tp_size=attn.tp_size,
+                tp_group=attn.tp_group,
+            )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
@@ -589,13 +614,18 @@ class NewLayer(nn.Module):
         attended = self.attention(hidden_states, ctx, cos, sin)
         hidden_states = self.attn_ln(hidden_states + attended)
 
-        up_gate, _ = self.up_gate_proj(hidden_states)
-        # Shard 0 is up, shard 1 is gate -- the opposite of this tree's fused
-        # gate_up convention, and the order both checkpoints in this family
-        # use once their tensors are named.
-        up_states, gate = up_gate.split(up_gate.shape[-1] // 2, dim=-1)
-        gated, _ = self.down_proj(self.act_fn(gate) * up_states)
-        return self.mlp_ln(hidden_states + gated)
+        if self.gated_mlp:
+            up_gate, _ = self.up_gate_proj(hidden_states)
+            # Shard 0 is up, shard 1 is gate -- the opposite of this tree's
+            # fused gate_up convention, and the order both gated checkpoints
+            # in this family use once their tensors are named.
+            up_states, gate = up_gate.split(up_gate.shape[-1] // 2, dim=-1)
+            inner = self.act_fn(gate) * up_states
+        else:
+            inner, _ = self.fc1(hidden_states)
+            inner = self.act_fn(inner)
+        projected, _ = self.down_proj(inner)
+        return self.mlp_ln(hidden_states + projected)
 
 
 class ModernBertEmbedding(nn.Module):
@@ -1017,6 +1047,88 @@ class ModernBertTransformer(BertTransformer):
         return self.final_norm(hidden_states), None
 
 
+class JinaLayer(NewLayer):
+    """jina-embeddings-v3's block: the ungated member of the RoPE post-LN family."""
+
+    gated_mlp = False
+
+
+class JinaTransformer(NewTransformer):
+    layer_cls = JinaLayer
+
+
+def merge_jina_lora(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    config: PretrainedConfig,
+    task: str,
+) -> list[tuple[str, torch.Tensor]]:
+    """Fold one of jina-v3's five task LoRAs into the base weights.
+
+    The checkpoint ships every LoRA-adapted parameter as a torch
+    parametrization triple -- ``X.parametrizations.weight.original`` plus
+    ``.0.lora_A`` and ``.0.lora_B``, each stacked over the five adaptations.
+    Serving one task means picking a slice and merging it; this engine has no
+    per-request adapter switching, so the task is fixed at load.
+
+    **The task is resolved by name, not by index.** vLLM takes ``i = -1`` and
+    comments that it is text-matching (``bert_with_rope.py:637``), which is
+    true for this checkpoint's ``lora_adaptations`` order and would silently
+    become a different adapter if that list were ever reordered. Every task
+    returns a well-formed unit vector, so the wrong one is invisible.
+
+    The two factors are stored transposed between the embedding tables and
+    the linear layers -- an embedding's ``lora_A`` is ``[tasks, vocab, rank]``
+    while a linear's is ``[tasks, rank, in]`` -- so the multiplication order
+    is chosen from the shapes and the result is checked against the base
+    tensor rather than reshaped into it.
+    """
+    adaptations = list(getattr(config, "lora_adaptations", None) or [])
+    if task not in adaptations:
+        raise ValueError(
+            f"jina lora task {task!r} is not one of {adaptations}; pass a "
+            'valid one via --hf-overrides \'{"lora_task": "..."}\'. '
+            "Guessing would serve a well-formed embedding from the wrong "
+            "adapter."
+        )
+    index = adaptations.index(task)
+    scaling = float(config.lora_alpha) / float(config.lora_rank)
+    logger.info(
+        "jina lora: merging adaptation %r (index %d of %d), scaling %.4f",
+        task,
+        index,
+        len(adaptations),
+        scaling,
+    )
+
+    table = dict(weights)
+    merged: list[tuple[str, torch.Tensor]] = []
+    for name in list(table):
+        if not name.endswith(".original"):
+            continue
+        stem = name[: -len(".original")]
+        base = table.pop(name)
+        lora_a = table.pop(f"{stem}.0.lora_A")[index].float()
+        lora_b = table.pop(f"{stem}.0.lora_B")[index].float()
+
+        if lora_a.shape[0] == base.shape[0]:
+            delta = lora_a @ lora_b  # embedding layout: [rows, rank] x [rank, cols]
+        else:
+            delta = lora_b @ lora_a  # linear layout: [out, rank] x [rank, in]
+        if delta.shape != base.shape:
+            raise ValueError(
+                f"jina lora merge for {stem!r} produced {tuple(delta.shape)} "
+                f"against a base of {tuple(base.shape)}"
+            )
+        merged.append(
+            (
+                stem.replace(".parametrizations", ""),
+                (base.float() + delta * scaling).to(base.dtype),
+            )
+        )
+
+    return list(table.items()) + merged
+
+
 class EncoderOnlyEmbeddingModel(BaseCausalLM):
     """Shared wiring for the encoder-only pooling models in this file.
 
@@ -1154,10 +1266,68 @@ class BertModel(EncoderOnlyEmbeddingModel):
     model_cls = BertTransformer
 
 
+# jina-embeddings-v3's rename table. Kept beside RobertaModel rather than on
+# its own class because the checkpoint declares ``XLMRobertaModel`` -- the
+# same architecture string as multilingual-e5 -- and only
+# ``position_embedding_type`` tells them apart.
+_JINA_RENAMES = (
+    ("roberta.", ""),
+    ("emb_ln", "embeddings.LayerNorm"),
+    ("mixer.out_proj", "attention.attn.proj"),
+    ("norm1", "attn_ln"),
+    ("norm2", "mlp_ln"),
+    ("mlp.fc1", "fc1"),
+    ("mlp.fc2", "down_proj"),
+)
+
+_JINA_SKIP = ("pooler.", "position_ids")
+
+
 class RobertaModel(EncoderOnlyEmbeddingModel):
-    """``RobertaModel`` / ``XLMRobertaModel`` -- multilingual-e5-*, bge-m3."""
+    """``RobertaModel`` / ``XLMRobertaModel``.
+
+    Two unrelated models answer to this architecture string, and the config
+    is the only thing that separates them: multilingual-e5 and bge-m3 use
+    learned absolute positions, while jina-embeddings-v3 sets
+    ``position_embedding_type: "rotary"`` and is a different block entirely
+    (RoPE, ungated MLP, LoRA-parametrised weights). vLLM branches at the same
+    place (``roberta.py:141 _build_model``).
+    """
 
     model_cls = RobertaTransformer
+
+    def __init__(self, config: PretrainedConfig, *args, **kwargs) -> None:
+        self.is_jina = getattr(config, "position_embedding_type", "absolute") in (
+            "rotary",
+            "rope",
+        )
+        if self.is_jina:
+            # Instance attributes shadow the class tables the base loader
+            # reads, so the shared loader needs no branch of its own.
+            self.model_cls = JinaTransformer
+            self._RENAMES = _JINA_RENAMES
+            self._SKIP = _JINA_SKIP
+            self._STACKED_QKV = ()
+            self._lora_task = str(getattr(config, "lora_task", "text-matching"))
+        super().__init__(config, *args, **kwargs)
+
+    def _iter_weights(self, weights):
+        if not self.is_jina:
+            return super()._iter_weights(weights)
+        return self._iter_jina_weights(weights)
+
+    def _iter_jina_weights(self, weights):
+        for name, weight in merge_jina_lora(weights, self.config, self._lora_task):
+            if "mixer.Wqkv" in name:
+                yield from self._split_packed(
+                    name,
+                    weight,
+                    "mixer.Wqkv",
+                    "attention.attn.qkv_proj",
+                    ("q", "k", "v"),
+                )
+            else:
+                yield name, weight
 
 
 class XLMRobertaModel(RobertaModel):

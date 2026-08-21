@@ -475,8 +475,7 @@ RoBERTa 那個位移就是兩家 forward 的全部差異，也是為什麼那些
 ### 第三個架構裡兩個「照 config 寫就會錯」的地方
 
 1. **`hidden_act` 是 `"gelu"`，但 checkpoint 出的是 `mlp.up_gate_proj`——MLP 其實是 GeGLU。**
-   vLLM 在 config 層改寫這個欄位（`model_executor/models/config.py:391
-   config.hidden_act = "geglu"`）；checkpoint 自己的 reference 實作
+   vLLM 在 config 層改寫這個欄位（`model_executor/models/config.py:390 config.hidden_act`）；checkpoint 自己的 reference 實作
    （`Alibaba-NLP/new-impl` `modeling.py` `NewGatedMLP`）殊途同歸，它只把
    `ACT2FN[hidden_act]` 套在 gate 那一半。照字面讀 config 會得到一個非 gated 的 MLP，
    而且**對著一半的權重載入得乾乾淨淨**。
@@ -613,7 +612,7 @@ embeddings.position_ids -1.07e12, -9.4e11, -59873, ...
 另外 MLP 的 `Wi` 打包成 `[first; second]`，輸出是 `Wo(act(first) * second)`——
 **激活落在第一半**，與 GTE 的 `up_gate_proj` 正好相反。
 
-**兩套 config 詞彙描述同一個模型**，服務端拿到哪一套就得讀哪一套：transformers v5 給
+**兩套 config 詞彙描述同一個模型**，服務端拿到哪一套就得讀哪一套（vLLM 在同一處分支，`model_executor/models/modernbert.py:91 layer_types`）：transformers v5 給
 `layer_types`、每種類型一組 `rope_parameters`、以及作為**每側偏移**的 `sliding_window`；
 v4 給 `global_attn_every_n_layers`、`global_rope_theta` / `local_rope_theta`、以及作為
 **總寬度**的 `local_attention`。這個 checkpoint 上兩者一致（v5 的 `layer_types` 恰好是
@@ -623,7 +622,7 @@ v4 給 `global_attn_every_n_layers`、`global_rope_theta` / `local_rope_theta`�
 ### Nomic 幾乎就是 GTE 的同一個 block
 
 `nomic-ai/nomic-embed-text-v1.5`。post-LN、RoPE、gated MLP，差別全在 config 或名字上：
-gate/up 是**未打包**的 `mlp.fc11` / `mlp.fc12`（fc11 是 up、fc12 是 gate）、
+gate/up 是**未打包**的 `mlp.fc11` / `mlp.fc12`（fc11 是 up、fc12 是 gate，見 vLLM 的 `model_executor/models/bert_with_rope.py:544`）、
 `activation_function: "swiglu"` 意思是 silu（GTE 寫 `"gelu"` 意思是 GeGLU，vLLM 兩個
 欄位都改寫）、投影**沒有** bias 而 norm **有**，與 GTE 相反。
 
@@ -667,6 +666,66 @@ over-declared max_seqlen（總長 vs 最長）穩定，且結果逐位相同
 **注意**：Whisper 的 cross-attention 也用 `flash_attn_varlen_func`（§6.2），但它是
 每個請求一次、q 只有一列的呼叫形狀，與這裡的 22 層自注意力堆疊不同，且已逐字驗證過。
 這一節不撤回那條路徑，但它是下一個該複驗的地方。
+
+
+## 6.9　jina-embeddings-v3：一個架構名下的兩個模型，以及載入時合併的 LoRA（2026-08-21）
+
+### 它宣告 `XLMRobertaModel`，但不是 XLM-R
+
+`jinaai/jina-embeddings-v3` 的 `architectures` 就是 `XLMRobertaModel`——和
+`multilingual-e5-*`、`bge-m3` 同一個字串。**只有 config 分得出來**：後者是 learned
+absolute positions，前者設 `position_embedding_type: "rotary"`，是完全不同的 block
+（RoPE、**未 gated** 的 MLP、post-LN、LoRA parametrized 權重）。vLLM 在同一個位置分支
+（`model_executor/models/roberta.py:138 _build_model`）。
+
+這一項如果沒做，會用 RoBERTa 的絕對位置路徑去載一個 RoPE 模型——載入會失敗（名字對不上），
+所以不至於靜默；但反過來若名字碰巧對得上就會靜默。
+
+MLP 是這個 RoPE post-LN 家族裡唯一未 gated 的成員（`mlp.fc1` → act → `mlp.fc2`），而
+**GTE 和 Jina 的 config 都寫 `hidden_act: "gelu"`**，光看 config 分不出誰是 gated。
+vLLM 靠逐架構改寫那個欄位；本樹改成 `NewLayer.gated_mlp` 這個類別屬性，因為
+**架構名才是真正的訊號**，而 registry 本來就以它為鍵。
+
+### LoRA 在載入時合併，而 task 用名字解析不用索引
+
+checkpoint 把每個被 LoRA 調整的參數存成 torch parametrization 三元組
+（`X.parametrizations.weight.original` 加 `.0.lora_A` / `.0.lora_B`，兩個因子都在
+task 維度上疊了五份）。本引擎沒有 per-request adapter 切換，所以 task 在載入時固定。
+
+**用名字解析，不用 `-1`。** vLLM 取 `i = -1` 並註解說那是 text-matching
+（`model_executor/models/bert_with_rope.py:642 i = -1`）——對這個 checkpoint 的 `lora_adaptations` 順序而言是對的，
+但那份清單一旦被重排就會靜默變成別的 adapter。**每個 task 都回傳格式完美的單位向量**，
+所以選錯看不出來。本樹以 `text-matching` 為預設、可用
+`--hf-overrides '{"lora_task": "..."}'` 覆寫，並在解析不到時拒絕啟動。
+
+兩個因子在 embedding 與線性層之間**是轉置存放的**：embedding 的 `lora_A` 是
+`[tasks, vocab, rank]`，線性層的是 `[tasks, rank, in]`。vLLM 用交換變數名處理
+（`B = weights[name + a]`），本樹改成**依形狀選乘序並斷言結果形狀等於 base**——
+乘反了會在形狀上炸開，而不是安靜地產出東西。
+
+### 一個在參考那一側、與 §6.7 不同類的陷阱
+
+Jina 的遠端程式碼 `assert` 依賴 Dao-AILab 的 `flash_attn` 套件，這個容器沒有。修法是
+把參考的 `use_flash_attn` 關掉走可攜路徑。
+
+**這與「確認參考引擎在快路徑上」那條紀律方向相反，而且應該相反**：那條講的是*效能*
+比較，參考跑在慢路徑上會憑空造出一個勝利。這裡是*正確性*比較，慢路徑正是重點——
+同樣的算術，少一個依賴。
+
+還有一項：參考的 forward 收 `adapter_mask`，**不傳就等於完全不啟用 LoRA**。所以 bench
+必須傳對應 task 的 mask，否則會拿「無 LoRA 的參考」對上「已合併 text-matching 的我們」，
+再把差異當成臭蟲。bench 現在在 config 有 `lora_adaptations` 時**強制**要求 `--lora-task`。
+
+### 對 HF 的 parity（bf16、五條不等長 prompt）
+
+```
+cosine       [0.999948, 0.99995, 0.99996, 0.999959, 0.999979]
+pairwise ours [1.0, 0.110, 0.010, 0.792, 0.038]
+pairwise ref  [1.0, 0.110, 0.009, 0.791, 0.038]
+```
+
+pairwise 那兩列是逐 prompt 餘弦會漏掉的東西：一個系統性偏移可以讓每一條都對得很好，
+卻把向量之間的關係弄壞。
 
 
 ## 7　對 UnieInfra 的落點（含對交接前提的一處修正）

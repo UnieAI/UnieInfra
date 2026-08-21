@@ -493,3 +493,172 @@ def test_swiglu_config_string_resolves_to_silu():
 
     x = torch.tensor([0.5, -1.25, 2.0])
     assert torch.allclose(_resolve_bert_activation("silu")(x), x * torch.sigmoid(x))
+
+
+# ---------------------------------------------------------------- jina v3
+
+
+def _jina_config(**overrides):
+    from types import SimpleNamespace
+
+    base = dict(
+        vocab_size=32,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_hidden_layers=2,
+        intermediate_size=16,
+        max_position_embeddings=32,
+        type_vocab_size=1,
+        layer_norm_eps=1e-5,
+        hidden_act="gelu",
+        pad_token_id=1,
+        position_embedding_type="rotary",
+        rotary_emb_base=20000.0,
+        lora_adaptations=[
+            "retrieval.query",
+            "retrieval.passage",
+            "separation",
+            "classification",
+            "text-matching",
+        ],
+        lora_alpha=1,
+        lora_rank=4,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _lora_triple(name, base_shape, rank, tasks, embedding_layout):
+    """One parametrization triple, laid out the way the checkpoint stores it."""
+    rows, cols = base_shape
+    base = torch.zeros(rows, cols)
+    if embedding_layout:
+        a = torch.zeros(tasks, rows, rank)
+        b = torch.zeros(tasks, rank, cols)
+    else:
+        a = torch.zeros(tasks, rank, cols)
+        b = torch.zeros(tasks, rows, rank)
+    return [
+        (f"{name}.original", base),
+        (f"{name}.0.lora_A", a),
+        (f"{name}.0.lora_B", b),
+    ]
+
+
+def test_jina_lora_merge_picks_the_task_by_name():
+    from tokenspeed.runtime.models.bert import merge_jina_lora
+
+    config = _jina_config()
+    rank, tasks = 4, 5
+    weights = _lora_triple(
+        "encoder.layers.0.mixer.Wqkv.parametrizations.weight",
+        (6, 8),
+        rank,
+        tasks,
+        embedding_layout=False,
+    )
+    # Make only the text-matching slice non-zero, so a merge that picked any
+    # other adaptation would leave the base untouched.
+    lookup = dict(weights)
+    lookup["encoder.layers.0.mixer.Wqkv.parametrizations.weight.0.lora_A"][4].fill_(1.0)
+    lookup["encoder.layers.0.mixer.Wqkv.parametrizations.weight.0.lora_B"][4].fill_(1.0)
+
+    merged = dict(merge_jina_lora(list(lookup.items()), config, "text-matching"))
+    name = "encoder.layers.0.mixer.Wqkv.weight"
+    assert name in merged
+    # rank 4, alpha 1 -> scaling 0.25; each entry is sum over rank of 1*1.
+    assert torch.allclose(merged[name], torch.full((6, 8), rank * 0.25))
+
+    other = dict(merge_jina_lora(list(lookup.items()), config, "classification"))
+    assert torch.allclose(other[name], torch.zeros(6, 8))
+
+
+def test_jina_lora_merge_handles_the_transposed_embedding_layout():
+    from tokenspeed.runtime.models.bert import merge_jina_lora
+
+    config = _jina_config()
+    weights = dict(
+        _lora_triple(
+            "embeddings.word_embeddings.parametrizations.weight",
+            (32, 8),
+            4,
+            5,
+            embedding_layout=True,
+        )
+    )
+    weights["embeddings.word_embeddings.parametrizations.weight.0.lora_A"][4].fill_(1.0)
+    weights["embeddings.word_embeddings.parametrizations.weight.0.lora_B"][4].fill_(1.0)
+
+    merged = dict(merge_jina_lora(list(weights.items()), config, "text-matching"))
+    # The embedding's factors are stored transposed relative to a linear's;
+    # multiplying them in the linear order would raise on the shapes rather
+    # than quietly produce something.
+    assert merged["embeddings.word_embeddings.weight"].shape == (32, 8)
+    assert torch.allclose(
+        merged["embeddings.word_embeddings.weight"], torch.full((32, 8), 1.0)
+    )
+
+
+def test_jina_lora_merge_refuses_an_unknown_task():
+    from tokenspeed.runtime.models.bert import merge_jina_lora
+
+    with pytest.raises(ValueError, match="not one of"):
+        merge_jina_lora([], _jina_config(), "retrieval")
+
+
+def test_jina_lora_merge_passes_unparametrised_weights_through():
+    from tokenspeed.runtime.models.bert import merge_jina_lora
+
+    bias = torch.ones(6)
+    out = dict(
+        merge_jina_lora(
+            [("encoder.layers.0.mixer.Wqkv.bias", bias)],
+            _jina_config(),
+            "text-matching",
+        )
+    )
+    assert torch.equal(out["encoder.layers.0.mixer.Wqkv.bias"], bias)
+
+
+def test_xlm_roberta_dispatches_on_position_embedding_type():
+    from tokenspeed.runtime.models.bert import (
+        JinaTransformer,
+        RobertaTransformer,
+        XLMRobertaModel,
+    )
+
+    # Two unrelated models answer to XLMRobertaModel; only the config
+    # separates multilingual-e5 (absolute) from jina-v3 (rotary).
+    assert XLMRobertaModel.model_cls is RobertaTransformer
+    assert JinaTransformer.layer_cls.gated_mlp is False
+    assert RobertaTransformer.embedding_cls.__name__ == "RobertaEmbedding"
+
+
+def test_jina_layer_is_the_ungated_member():
+    from tokenspeed.runtime.models.bert import JinaLayer, NewLayer
+
+    assert NewLayer.gated_mlp is True
+    assert JinaLayer.gated_mlp is False
+
+
+def test_rope_base_reads_whichever_name_the_family_publishes():
+    from tokenspeed.runtime.models.bert import _rope_base
+
+    assert _rope_base(_config(rope_theta=500000.0)) == 500000.0
+    # Nomic publishes rotary_emb_base; jina too. A 10000 default here reads
+    # as a small systematic error, not a failure.
+    assert _rope_base(_jina_config()) == 20000.0
+    # rope_parameters wins when it carries the theta.
+    assert (
+        _rope_base(_config(rope_parameters={"rope_theta": 1000.0}, rope_theta=9.0))
+        == 1000.0
+    )
+
+
+def test_rope_base_refuses_to_guess():
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.models.bert import _rope_base
+
+    with pytest.raises(ValueError, match="rope base"):
+        _rope_base(SimpleNamespace(hidden_size=8, num_attention_heads=2))

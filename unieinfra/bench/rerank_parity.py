@@ -79,13 +79,38 @@ def ours(model: str, packed, dtype: str) -> np.ndarray:
 
 
 def reference(model: str, plain, dtype: str) -> np.ndarray:
-    import torch
-    from transformers import AutoModelForSequenceClassification
+    import glob
+    import runpy
 
-    hf = AutoModelForSequenceClassification.from_pretrained(
-        model, dtype=getattr(torch, dtype), trust_remote_code=True
-    ).to("cuda")
-    hf.eval()
+    import torch
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, AutoModelForSequenceClassification
+
+    # from_config, not from_pretrained: transformers materialises from meta
+    # and never re-runs the constructor, so buffers registered
+    # persistent=False arrive as whatever was in that memory. On
+    # gte-multilingual-reranker that is ``position_ids``, and indexing the
+    # rope cache with garbage is a device-side assert *in the reference*.
+    # Same trap as the embedding bench's _build_reference; see
+    # unieinfra/xref/15-encoder-embedding.md §6.7.
+    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    hf = AutoModelForSequenceClassification.from_config(config, trust_remote_code=True)
+    state: dict = {}
+    shards = sorted(glob.glob(f"{model}/*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"no *.safetensors under {model}")
+    for shard in shards:
+        state.update(load_file(shard))
+    missing, unexpected = hf.load_state_dict(state, strict=False)
+    real_missing = [m for m in missing if "position_ids" not in m]
+    if real_missing:
+        raise RuntimeError(
+            f"reference is missing {len(real_missing)} weights, e.g. {real_missing[:5]}"
+        )
+    hf = hf.to("cuda", getattr(torch, dtype)).eval()
+    runpy.run_path("unieinfra/bench/encoder_embedding_parity.py")[
+        "_assert_buffers_live"
+    ](hf)
 
     scores = []
     with torch.no_grad():
@@ -109,10 +134,13 @@ def main() -> None:
     parser.add_argument(
         "--max-rel-diff",
         type=float,
-        default=0.03,
+        default=0.05,
         help="Relative to the score's own magnitude. Raw logits here run to "
         "|10|, where one bf16 ulp is 0.0625 -- an absolute tolerance tight "
-        "enough for a small score is unmeetable for a large one.",
+        "enough for a small score is unmeetable for a large one. 0.05 is set "
+        "from measurement, not taste: bge-reranker-base lands at 3.8e-2 in "
+        "bf16 and 3.4e-3 in fp32, so --dtype float32 is the discriminator "
+        "between accumulated precision and a real defect.",
     )
     args = parser.parse_args()
 

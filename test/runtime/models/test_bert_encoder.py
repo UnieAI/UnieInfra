@@ -662,3 +662,53 @@ def test_rope_base_refuses_to_guess():
 
     with pytest.raises(ValueError, match="rope base"):
         _rope_base(SimpleNamespace(hidden_size=8, num_attention_heads=2))
+
+
+# ------------------------------------------------------- packed segment ids
+
+
+def test_packed_segment_bit_round_trips():
+    from tokenspeed.runtime.models.bert import (
+        decode_token_type_ids,
+        encode_token_type_ids,
+    )
+
+    ids = torch.tensor([101, 2054, 102, 3000, 2003, 102], dtype=torch.int32)
+    types = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32)
+    packed = encode_token_type_ids(ids, types)
+    # The packed value must still fit an int32 buffer: bit 30, not bit 31,
+    # so it never turns negative.
+    assert int(packed.max()) > 0
+    back_ids, back_types = decode_token_type_ids(packed)
+    assert torch.equal(back_ids, ids)
+    assert torch.equal(back_types, types)
+
+
+def test_packed_segment_bit_matches_the_input_buffer_mask():
+    from tokenspeed.runtime.execution.input_buffer import _PACKED_TOKEN_TYPE_MASK
+    from tokenspeed.runtime.models.bert import TOKEN_TYPE_SHIFT
+
+    # Two files have to agree on where the segment lives: the model decodes
+    # it, and the input buffer's vocab clamp has to leave it alone. Disagree
+    # and the clamp erases the segment *and* the token under it, which still
+    # produces a score -- against the wrong text.
+    assert _PACKED_TOKEN_TYPE_MASK == 1 << TOKEN_TYPE_SHIFT
+
+
+def test_cross_encoder_architectures_are_the_ones_that_pack():
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.execution.model_executor import _packs_token_type_ids
+
+    def cfg(*architectures):
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=list(architectures))
+        )
+
+    assert _packs_token_type_ids(cfg("BertForSequenceClassification"))
+    assert _packs_token_type_ids(cfg("XLMRobertaForSequenceClassification"))
+    # A generative or plain embedding model must keep the clamp: an id with
+    # bit 30 set there is a corrupt id, not a segment.
+    assert not _packs_token_type_ids(cfg("BertModel"))
+    assert not _packs_token_type_ids(cfg("Qwen3ForCausalLM"))
+    assert not _packs_token_type_ids(cfg())

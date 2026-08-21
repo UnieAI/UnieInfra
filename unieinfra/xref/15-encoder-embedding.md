@@ -411,21 +411,47 @@ scheduler 子行程裡。要確認實際狀態，看 scheduler 的日誌行，�
 
 **影響面遠大於 embedding／Whisper**：這台上每一個稠密與 MoE 模型的 prefill 都在跑 eager。
 
-### 但 embedding 沒有受惠——原因已知
+### embedding 一度沒有受惠——已解決（2026-08-21）
 
-用**實際的修法**（不是環境變數繞過）重量，出現不對稱：
+用**實際的修法**（不是環境變數繞過）重量，先前出現不對稱：
 
 ```
 dense     Qwen3-0.6B           17.3 -> 8.71 ms   2.0x
 embedding Qwen3-Embedding-8B   19.3 -> 19.78 ms  無改善
 ```
 
-因為 `runtime/execution/prefill_graph.py:296` 的停用條件裡有 `not model_runner.is_generation`
-——**prefill graph 對 pooling 模型是被明確排除的**。embedding 仍在跑 eager prefill。
+原因是 `runtime/execution/prefill_graph.py` 的停用條件裡有 `not model_runner.is_generation`
+——**prefill graph 對 pooling 模型被明確排除**，embedding 仍在跑 eager prefill。
 
-依 dense 的 2.0x 推斷，這是 embedding 單請求延遲上最大的一塊未動空間。要做的話得讓
-capture 處理 pooling 的輸出形狀（graph 目前捕捉的是走 logits processor 那條路，而
-pooling 回傳 `PoolerOutput`）。**尚未進行。**
+**這個排除比機制本身的需求更嚴。** capture 捕的是內層 transformer stack、回傳 hidden
+states（`_run_inner`）；generation 與 pooling 的差別只在 `replay()` 之後跑的那個 tail
+（logits processor 對上 pooler），**capture 本身與模式無關**。所以排除條件換成兩個更窄的：
+pooling 模型預設進來、`--no-pooling-prefill-graph` 可關；而 logits processor 與 pooler
+兩者皆無的模型仍然沒有 tail 可跑，繼續排除。`replay()` 分支到
+`text_model.pool(ctx, hidden_states)`，就是 `BaseCausalLM.forward` 原本的 eager tail。
+
+過程中還有一個會靜默吃掉整個效果的細節：`_capture_bucket` 取 decode wrapper 的
+capture stream 必須用 `getattr`。那個 wrapper 只有在自己 capture 時才會建 `.stream`，
+而它對 pooling 模型不 capture，直接屬性存取會在 capture 失敗處理裡丟 AttributeError，
+**每個 bucket 都靜默 fallback 回 eager**。
+
+量到的結果（Qwen3-Embedding-8B、單一短請求、暖機後 20 次的 p50/min）：
+
+```
+--pooling-prefill-graph      p50 14.84 ms   min 14.66 ms
+--no-pooling-prefill-graph   p50 19.75 ms   min 19.41 ms
+```
+
+**1.33x，而且兩個方向都有機制證據**：ON 那臂印出 `captured buckets [16, 32, ...]` 與
+`prefill breakable graph ENGAGED (text): bucket=16`，OFF 那臂印出
+`disabled: pooling model and --no-pooling-prefill-graph`。
+
+正確性是**在 graph 確實 engage 的同一次執行裡**重驗的——先前那次 parity 的
+`breakable graph` 日誌行數為 0，所以不能算數：對 HF reference 的 cosine
+`[0.999864, 0.999882, 0.999883]`，與 eager 路徑相同。
+
+注意 embedding 的 1.33x 小於 dense 的 2.0x。兩者不是同一個量：dense 是 0.6B、17.3 ->
+8.71 ms，embedding 是 8B，模型大 13 倍，被 graph 消掉的 launch 開銷佔比自然較小。
 
 
 

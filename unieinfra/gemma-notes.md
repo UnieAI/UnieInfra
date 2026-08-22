@@ -644,3 +644,70 @@ RuntimeError` 都會退回 eager prefill，**只有 OOM 是重新拋出**。一�
 
 本輪的 a127 量測用 `--prefill-graph-max-tokens 0` 跑，並在腳本裡寫明原因——**把代價記下來，
 不是繞過去**。
+
+---
+
+# 修正不完整：長 context／併發下仍是垃圾，而我先前的「已驗證」有盲點
+
+`40f2478a` 之後跑 agent-26k（`agent_real`、c=4、NREQ=32、GMU 0.90、chunk 8192），
+32 條全部成功、TTFT/TPOT 都有數字，**但生成的文字是垃圾**：
+
+```
+'LT나L deL0 de--나etsL--y laLCy-y나yL-나나-- de나BL deL de나yLLL-1y deyyyLaguars...'
+```
+
+## 我的三級驗證為什麼沒抓到
+
+**三級全部在一個 page 之內**（page size = 64）：
+
+| 驗證 | prompt | page 數 |
+|---|---|---|
+| `gemma_attn_layer_check.py` | 5 token | 1 |
+| 逐層對 HF | 5 token | 1 |
+| 端到端對 vLLM | 25 token（chat template） | 1 |
+
+三個綠燈都是真的，也都不足以支持「修好了」。**一個只覆蓋單一 page 的驗證，對分頁快取
+等於沒有驗。**
+
+## 兩個被實測推翻的假設（都是我猜的，不要重做）
+
+| 假設 | 探針 | 結果 |
+|---|---|---|
+| page 與 page 重疊（stride 減半） | 250 token，跨 4 頁，單 chunk | layer 5 **1.70e-03，通過** |
+| 跨過 1024 滑動窗會壞 | 1,500 token，逐層對 HF | 全部 ~4e-3，final_norm **1.65e-02，通過** |
+
+**先測才沒有去改 page-size 那套機制**——那會是一個建立在錯誤診斷上的大改動。
+
+## 對照：不是語料也不是 harness
+
+我自己的記憶裡就有這條規則（「說模型壞掉之前先讓同一個 prompt 走參考路徑」），這次差點
+又漏掉。同一個語料、同一支 harness、同一組參數，只換引擎：
+
+```
+vLLM: 'This text consists of repeated strings combining a phonetic alphabet
+       word (e.g., "india", "juliet", "kilo") with a sequential numeric
+       identifier...'        32/32 成功, TTFT p50 10,539 ms, TPOT 103.8 ms
+```
+
+**乾淨的英文。所以 ours 確實還壞著。**
+
+（附帶發現：`agent_real.jsonl` 是「音標字母＋流水號」的合成語料，不是 `.agent.sh`
+註解宣稱的真實 Claude Code trace。那個註解會誤導下一個人。）
+
+## 剩下的變數只有三個
+
+| 條件 | 結果 |
+|---|---|
+| 5 token 單請求 | 正確 |
+| 250 token，跨 4 頁 | 正確 |
+| 1,500 token，跨滑動窗 | 正確 |
+| 10,000 token 單請求（**多 chunk**，2 段） | 量測中 |
+| 27k、c=4、多 chunk、有跨請求重用 | **垃圾** |
+
+多 chunk 預填 / 併發 / 跨請求前綴重用。10k 單請求把第一個單獨拆出來。
+
+## 對探針本身的更正
+
+`gemma_attn_layer_check.py` 的 SDPA 參考**沒有套用該層的滑動窗**，所以 context > 1024
+時 sliding 層會誤報（1,500 token 上 layer 0 讀到 2.4e-02，那是參考的問題）。
+≤1024 無差別。要補窗，否則它在長 context 上不可信。

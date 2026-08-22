@@ -113,6 +113,39 @@ def layer_head_dim(config, layer_type: str) -> int:
 _HIDDEN_DUMP_DONE = False
 
 
+_ATTN_DUMP_DONE = False
+
+
+def _attn_dump_path(layer_id: int, num_tokens: int) -> str | None:
+    """Path for a one-shot single-layer attention dump, or None.
+
+    `TOKENSPEED_DUMP_ATTN=<path>` plus `TOKENSPEED_DUMP_ATTN_LAYER=<id>`, and
+    the same exact-row-count gate as the hidden dump so the kernel tuner's
+    8,192-token warm-up and the graph captures do not consume it.
+    """
+    if _ATTN_DUMP_DONE:
+        return None
+    path = os.environ.get("TOKENSPEED_DUMP_ATTN")
+    if not path:
+        return None
+    want_layer = os.environ.get("TOKENSPEED_DUMP_ATTN_LAYER")
+    if want_layer and int(want_layer) != int(layer_id):
+        return None
+    want = os.environ.get("TOKENSPEED_DUMP_HIDDEN_TOKENS")
+    if want:
+        allowed = {int(x) for x in want.replace(" ", "").split(",") if x}
+        if int(num_tokens) not in allowed:
+            return None
+    elif num_tokens > 64:
+        return None
+    return path
+
+
+def _mark_attn_dumped() -> None:
+    global _ATTN_DUMP_DONE
+    _ATTN_DUMP_DONE = True
+
+
 def _hidden_dump_path(num_tokens: int) -> str | None:
     """Path for a one-shot layer dump, or None.
 
@@ -340,6 +373,7 @@ class Gemma4Attention(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.layer_type = layer_type
+        self.layer_id = layer_id
         # The paged-cache group this layer's KV lives in. Distinct from
         # layer_type: the sliding layers are relabelled into equal-depth
         # sub-groups so no slab row is left dead (see
@@ -469,6 +503,36 @@ class Gemma4Attention(nn.Module):
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
         if attn_output.dim() == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
+        # One layer's intermediates, for the same reason as the per-layer dump
+        # above: the per-layer comparison put the fault in the ten
+        # full_attention layers and nowhere else, and the three things those
+        # layers do differently (head_dim 512, attention_k_eq_v, partial rope)
+        # cannot be told apart from the layer's output alone. Dumping q/k/v and
+        # the attention output splits it: recomputing attention from the dumped
+        # q/k/v with SDPA says whether the fault is the cache round trip or what
+        # this function hands the kernel.
+        _adump = _attn_dump_path(self.layer_id, hidden_states.shape[0])
+        if _adump is not None:
+            import torch as _t
+
+            _t.save(
+                {
+                    "layer_id": self.layer_id,
+                    "layer_type": self.layer_type,
+                    "head_dim": self.head_dim,
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "k_eq_v": self.k_eq_v,
+                    "hidden_in": hidden_states.detach().float().cpu(),
+                    "k_raw": k_raw.detach().float().cpu(),
+                    "q": q.detach().float().cpu(),
+                    "k": k.detach().float().cpu(),
+                    "v": v.detach().float().cpu(),
+                    "attn_out": attn_output.detach().float().cpu(),
+                },
+                _adump,
+            )
+            _mark_attn_dumped()
         output, _ = self.o_proj(attn_output)
         return output
 

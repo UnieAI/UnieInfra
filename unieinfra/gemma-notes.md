@@ -446,3 +446,84 @@ softmax 退化成單元素，attention 恆等於 V，而 RoPE 在位置 0 的角
 同時上卡）、驅動 `.lpcmp.sh`。
 
 **在分診收斂之前，本檔所有 ours 的效能數字都只是「壞路徑的效能」。**
+
+---
+
+# 根因：KV 池只模型化一個 head_dim，gemma-4 有兩個
+
+## 證據鏈
+
+**1. 逐層對 HF 比對（`TOKENSPEED_DUMP_HIDDEN` + `.hf_ref.py` + `.hidden_cmp.py`）**
+
+同一組 input_ids（直接取自引擎自己的 dump，所以 BOS 差異不可能冒充成壞層）：
+
+```
+embed        rel_l2 = 0.0000e+00     完全相同
+layer0..4    rel_l2 ≈ 4.4e-03        bf16 雜訊
+layer5       rel_l2 = 3.16e-01       <-- 第一次跳躍
+layer11      1.73e-01   layer17  2.06e-01   ...   final_norm  1.26e+00
+```
+
+`[5, 11, 17, 23, 29, 35, 41, 47, 53, 59]` 正好是 gemma-4 的十個 `full_attention` 層。
+**50 個 sliding 層全對，10 個全域層全錯。**
+
+**2. 層內拆分（`TOKENSPEED_DUMP_ATTN` + `.attn_cmp.py`），含對照**
+
+| 層 | 幾何 | `attn_out` 對 SDPA(它自己傳入的 q,k,v) | `v` 對 v_norm(投影) |
+|---|---|---|---|
+| 0（sliding） | 32q × 16kv × **256** | **1.42e-03 相符** | 2.3e-03 |
+| 5（full） | 32q × 4kv × **512** | **1.13 不符** | 2.4e-03 |
+
+投影正確（`k_raw` 對 `h @ k_proj.T` = 1.6e-03）、V 正確、kernel 本身在同樣幾何的合成張量上
+已對 SDPA 驗證過（`kernel_gemma_correctness.py`）、RoPE 的套用也驗證過
+（`kernel_gemma_rope.py`，含 head_dim 512 的 partial rotary）。
+**所以 kernel 讀到的 K/V 不是我們寫進去的那一組。**
+
+## 機制
+
+`kv_cache/mha.py:210` `_layer_row_view`：
+
+```python
+heads_l = self._layer_heads_per_rank(layer_id)
+return buf.reshape(-1, heads_l, self.head_dim)     # <-- 池子的 head_dim，不是該層的
+```
+
+池子只有**一個** `head_dim`（`factory.py:168-169` 取 `config.num_kv_heads` 與
+`config.head_dim`，也就是頂層的 16 與 256——全域層的 4 與 512 藏在
+`num_global_key_value_heads` / `global_head_dim`，工廠看不到）。它的異質機制只讓
+**頭數**變動：頭少的層把同樣的位元組重新解釋成更多列。
+
+gemma-4 是第一個 **head_dim 也逐層不同**的模型：
+
+| | 每 token 每層每個 K 的元素數 |
+|---|---|
+| 配置寬度（sliding） | 16 × 256 = **4096** |
+| 全域層實際需要 | 4 × 512 = **2048**（配置寬度的 1/2） |
+| `_layer_row_view` 給它的列 | 4 × 256 = **1024**（配置寬度的 1/4） |
+
+**差剛好一倍。** `set_kv_buffer` 以 token 為單位的 `loc` 寫進 1024 元素的列，而
+`_get_kv_cache` 把同一塊記憶體看成 `(-1, page_size, 4, 512)`，每個 token 是 2048 元素——
+於是每個 token 的 K/V 都落在錯的位移上，只在那 10 層。
+
+日誌自己印得出來：`parent_bytes=10485760 / (64 token × 10 層 × 2) = 8192 B` = 4096 個
+bf16 = **16 × 256**，而六個群組共用 `page size 64`。
+
+## 建議的修法（未實作）
+
+`_layer_heads_per_rank` 回傳的本來就是「以配置寬度為基準的等效頭數」，不是真實頭數
+（它的 docstring 已經這樣寫了）。所以：
+
+1. 讓池子接受 `layer_kv_head_dims`，等效頭數改成
+   `served_heads × dim_l // alloc_head_dim`。gemma-4：sliding 16×256/256 = **16**、
+   full 4×512/256 = **8** → 列變成 8 × 256 = 2048 元素，正確。
+2. gemma 的 cache recipe 供給每層的 head_dim（目前 `layer_kv_head_counts` 對 gemma 是
+   `None`，只有 qwen35 與 inkling 有給）。
+
+**必須一起驗的**：全域層每個 byte 能裝 2 倍的 token，所以 `token_capacity` 與群組的
+page 記帳會變；`_layer_kv_head_counts` 的其他使用者（mxfp8 的 scale buffer 與
+`quantize_store_kv_mxfp8`）在 head_dim 一致時語意不變，但要確認。這是對共用配置器的
+設計改動，值得自己一輪量測，不該在一個長 session 的尾巴半途改完——這棵樹的
+「impossible state」缺陷正是那樣來的。
+
+**回歸測試**：`.attn_cmp.py` 對 layer 5 的那一列（`attn_out` 對 SDPA）就是判準，
+layer 0 是對照。兩者都在同一支腳本裡，改完直接重跑。

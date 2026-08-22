@@ -417,6 +417,22 @@ def _ordinary_setup(
     )
     token_capacity = num_pages * page_size
 
+    # Per-layer KV geometry, for a model whose layers disagree about head_dim
+    # (gemma-4). Target-only: a draft stack is a different model and its layers
+    # continue the numbering, so an unaligned tuple is dropped whole.
+    merged_kv_head_counts = tuple(
+        getattr(attn_config, "layer_kv_head_counts", None) or ()
+    ) or None
+    merged_kv_head_dims = tuple(
+        getattr(attn_config, "layer_kv_head_dims", None) or ()
+    ) or None
+    if merged_kv_head_dims is not None and (
+        len(merged_kv_head_dims) != len(merged_group_ids)
+        or merged_kv_head_counts is None
+        or len(merged_kv_head_counts) != len(merged_group_ids)
+    ):
+        merged_kv_head_counts = merged_kv_head_dims = None
+
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         build_paged_cache_group_specs,
     )
@@ -443,6 +459,11 @@ def _ordinary_setup(
             ),
             state_field_dtypes={},
             token_capacity=token_capacity,
+            # Same empty-or-aligned invariant as merged_layer_types above: a
+            # per-layer geometry that does not cover the merged stack cannot be
+            # attributed to layers, so it is dropped rather than misapplied.
+            layer_kv_head_counts=merged_kv_head_counts,
+            layer_kv_head_dims=merged_kv_head_dims,
         ),
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,

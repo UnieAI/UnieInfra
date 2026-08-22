@@ -21,6 +21,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.distributed
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -215,17 +216,31 @@ class DistributedInitializer:
             mapping.attn.dp_rank,
         )
 
-        # Get minimum available GPU memory across all ranks
-        min_per_gpu_memory = get_available_gpu_memory(
-            config.device,
-            config.gpu_id,
-            distributed=config.world_size > 1,
-            cpu_group=pg_manager.get_process_group("gloo", mapping.world_group),
-        )
+        # One reading, then reduce it. This used to take the collective MIN
+        # first and re-read this rank's free memory afterwards, comparing two
+        # samples taken at different times against a flat 10% tolerance --
+        # 9.6 GB on a 96 GB card. Both calls run torch.cuda.empty_cache(), so
+        # the second could free more and inflate `local` against a `min`
+        # already frozen, and across two ranks loading a 118 GB checkpoint a
+        # >9.6 GB divergence in that gap is ordinary.
+        #
+        # Qwen3.5-122B-A10B-FP8 at --attn-tp-size 2 hit this repeatedly and it
+        # reads as a neighbour taking the card: on 2026-08-22 an arm failed
+        # here at 01:39 while the only other job on the box did not start until
+        # 01:56, with both cards verified at 3 MiB when it launched. Comparing
+        # a value against the minimum of *itself* across ranks is what the
+        # check means, and it cannot false-positive on sampling skew.
+        local_gpu_memory = get_available_gpu_memory(config.device, config.gpu_id)
+        min_per_gpu_memory = local_gpu_memory
 
-        # Verify memory balance for tensor parallelism
         if config.world_size > 1:
-            local_gpu_memory = get_available_gpu_memory(config.device, config.gpu_id)
+            tensor = torch.tensor(local_gpu_memory, dtype=torch.float32)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=pg_manager.get_process_group("gloo", mapping.world_group),
+            )
+            min_per_gpu_memory = tensor.item()
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. "

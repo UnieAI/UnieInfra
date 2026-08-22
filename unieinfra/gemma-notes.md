@@ -603,3 +603,44 @@ KV geometry: allocation 16 heads x 256, per-layer widths ['16x256', '4x512']
 ## 本檔前面所有 ours 的效能數字都作廢
 
 它們是在輸出錯誤的路徑上量的。正在於修正後的建置上重跑。
+
+---
+
+# 回歸：`fc897601` 讓 gemma 拿回 prefill graph，但那在 GMU 0.945 起不來
+
+agent-127k 的第一格 `ours` 直接啟動失敗：
+
+```
+ERROR - Prefill graph capture ran out of GPU memory. Free up
+        --gpu-memory-utilization headroom, lower --prefill-graph-max-tokens
+torch.OutOfMemoryError: Tried to allocate 70.00 MiB ... 320.00 KiB is free
+```
+
+**歷史上的 a127 grid 能在 0.945 跑，正是因為那個 GDN 閘門把 graph 關著。** 我修掉閘門
+（它問的是錯的問題——gemma 一個 GDN 層都沒有），graph 於是開始捕捉，把餘裕吃掉。
+
+值得對照的是它的效益：**在 gemma、c=1 上量到的是 0**
+（R1 96.85 → 98.44、R3 1835.02 → 1836.28、每 decode token 45.80 → 45.55），而且是在
+確認過 `prefill breakable graph ENGAGED` 的前提下量的。併發形狀還沒量。
+
+所以現況是：**一個未量到效益的優化，讓一個原本可用的配置起不來。**
+
+`prefill_graph.py:374` 對 `NotImplementedError / AttributeError / KeyError /
+RuntimeError` 都會退回 eager prefill，**只有 OOM 是重新拋出**。一個「可選」的優化不該
+讓伺服器起不來——但我沒有在這裡直接改，因為：
+
+1. 部分捕捉之後繼續服務，會留下 CUDA graph mempool 拿著的記憶體，而現有的退場分支也
+   沒有把它還回去；能不能安全繼續需要實測。
+2. 重現這個 OOM 要一次完整啟動（GMU 0.945），而卡正被量測佔著。
+
+**盲改共用的啟動路徑，正是這棵樹「impossible state」缺陷的來源。** 三個選項留給下一步，
+按我的偏好排序：
+
+| | 做法 | 代價 |
+|---|---|---|
+| A | 捕捉前先估成本，不合就跳過並印出數字 | 估計不準；但「跳過」永遠比「死掉」安全，且不會留下半個捕捉 |
+| B | OOM 改成退場（清掉 captures、`empty_cache`、`disable = True`） | 需要驗證繼續服務不會因殘留 mempool 而在執行期 OOM |
+| C | 撤回 `fc897601` | 閘門的邏輯是對的，撤回會把一個真缺陷放回去 |
+
+本輪的 a127 量測用 `--prefill-graph-max-tokens 0` 跑，並在腳本裡寫明原因——**把代價記下來，
+不是繞過去**。

@@ -312,3 +312,70 @@ vLLM 的 84 ms 是它的 **93%**，我們的 152 ms 是 **51%**。
 
 **所以差距在 decode attention 怎麼讀分頁 KV，而且只有在 context 夠長時才看得見。**
 下一輪（`.decodescale.py`）用兩個 context 長度掃 batch 1→64，短的那個應該看不到差距。
+
+## decode 隨 batch 的成長：沒有 1.8x，兩邊都撞同一面牆
+
+`.decodescale.py`，串流量 ITL（所以不含 prefill），unique prompt（共用前綴會讓兩臂做
+不同量的 prefill，那是另一個實驗），`--max-num-seqs 64`、GMU 0.90、bf16 KV。
+
+**短 prompt（約 120 token）**
+
+| c | ours ITL | vLLM ITL | ours decode tok/s | vLLM |
+|---|---|---|---|---|
+| 1 | 46.8 | 44.8 | 20.5 | 21.4 |
+| 4 | 47.3 | 44.8 | 63.5 | 79.6 |
+| 16 | 51.6 | 50.0 | 194.7 | 224.7 |
+| 32 | 55.9 | 54.3 | 293.6 | 336.9 |
+| 64 | 70.6 | 66.0 | 380.6 | 433.4 |
+
+**輸 3–7%（ITL）／12–14%（吞吐），不是 1.8x。** 本檔前面那個「約 420 對約 760」是把兩次
+不同跑的引擎自報 `gen throughput` 拿來相除得到的，受控 A/B 下不成立。**撤回。**
+
+**約 1,000 token 的 prompt**
+
+| c | ours ITL | vLLM ITL | ours tok/s | vLLM tok/s | ours TTFT | vLLM TTFT |
+|---|---|---|---|---|---|---|
+| 1 | 46.9 | 45.2 | 17.4 | 17.4 | 545 | 579 |
+| 4 | 49.0 | 47.1 | 43.7 | 41.8 | 1,744 | 2,223 |
+| 16 | 60.1 | 59.0 | 50.6 | 56.0 | 8,293 | 6,467 |
+| 32 | 60.9 | 61.9 | 52.3 | 54.7 | 12,695 | 11,445 |
+| 64 | 61.7 | 63.1 | 55.5 | 54.2 | 25,677 | 25,950 |
+
+**兩邊在誤差內相同**，而且都在 c≥16 之後不再成長。原因兩邊的日誌都自己說了：
+
+```
+ours  Decode batch. #running-req: 18, page ratio: 0.91
+vLLM  Running: 16 reqs, Waiting: 30 reqs
+```
+
+**這面牆是 gemma-4 的物理，不是誰的缺陷。** 50 個 sliding 層每 token 16 KiB、窗 1024，
+一條 1k 請求就佔約 880 MiB；27 GB 的 KV 池只裝得下約 28 條，實測常駐 16–19。
+`--max-num-seqs 64` 在兩個引擎上都是一個到不了的數字。
+
+**推論：一般場景要贏，槓桿是 fp8 KV（容量直接翻倍），不是 decode kernel。**
+（vLLM 側先前量過 gemma-4 RAG c=64 的 fp8 是 +57%，而且是門檻效應不是斜坡。）
+
+## 但在做任何優化之前：ours 在 gemma-4 上的輸出是壞的
+
+同一組設定、同一支客戶端、同一個問題（`/v1/chat/completions`, temperature 0）：
+
+| | 回答 |
+|---|---|
+| **ours** | `' de de de de de de11 singular1 singular1 single de1 single de1allyally...'` |
+| **vLLM** | `'The capital of France is Paris. It is famous for its world-class art museums, iconic landmarks like the Eiffel Tower, and its reputation as a global center for fashion and gastronomy.'` |
+
+**這不是新的。** 2026-08-01 的筆記已經記著「TokenSpeed 的 triton backend 在 gemma-4 上吐
+`'を______11111'`，與 HF 參考不符，可能是真 bug，**未分診**」。三週沒有人接。
+
+gemma-4 在 ours 上會選到**四顆**不同的 attention kernel，所以「backend」在這裡不是單數：
+
+```
+mha_decode_with_kvcache -> flashinfer_trtllm_mha_decode_with_kvcache   (sliding, head_dim 256)
+mha_decode_with_kvcache -> triton_mha_decode_with_kvcache_cached       (global,  head_dim 512)
+mha_extend_with_kvcache -> flashinfer_paged_mha_extend_with_kvcache
+mha_extend_with_kvcache -> triton_mha_extend_with_kvcache
+```
+
+**今天量到的 ours 那一側全部是在量一條輸出錯誤的路徑**，包括 prefill 快 6.4% 那一格——
+一個加速有可能正是因為它算錯了才快。在分診收斂之前，本節與上面幾節的 ours 數字都只能
+當成「壞路徑的效能」，不能當成引擎的效能。

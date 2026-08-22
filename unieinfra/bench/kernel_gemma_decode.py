@@ -56,6 +56,7 @@ def build(nq, nkv, d, batch, ctx, device="cuda"):
         page_table=page_table,
         cache_seqlens=torch.full((batch,), ctx, dtype=torch.int32, device=device),
         max_seqlen_k=ctx,
+        max_seqlen_q=1,
     )
 
 
@@ -119,18 +120,33 @@ def main():
                                 dev = (out - ref).abs().max().item()
                             t = device_us(fn)
                         except Exception as exc:  # noqa: BLE001
+                            # Say what failed. Swallowing it printed
+                            # "'NoneType' object is not subscriptable" from the
+                            # summary line instead of the actual error.
+                            print(f"{name:>8} {batch:6d} {ctx:6d} split {sp:3d}: "
+                                  f"{type(exc).__name__}: {str(exc)[:90]}")
                             row.append((sp, float("inf"), float("nan")))
                             continue
                         row.append((sp, t, dev))
                         if best is None or t < best[1]:
                             best = (sp, t, dev)
                     os.environ.pop("TS_TRITON_DECODE_KV_SPLITS", None)
+                    if best is None:
+                        print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d}  every split failed")
+                        del a
+                        torch.cuda.empty_cache()
+                        continue
                     kv_bytes = 2 * eff * nkv * d * 2 * batch
+                    gbs = kv_bytes / (best[1] * 1e-6) / 1e9
+                    # An L2-resident working set reads faster than HBM can
+                    # deliver, so its GB/s is not a bandwidth number. Say so on
+                    # the row rather than leaving a >100% figure to be quoted.
+                    l2 = " L2!" if kv_bytes < L2_BYTES else "    "
                     print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d} "
                           + "  ".join(f"s{sp}={t:7.1f}" for sp, t, _ in row)
                           + f"   best=s{best[0]} "
-                          f"{kv_bytes / (best[1] * 1e-6) / 1e9:6.0f} GB/s "
-                          f"({100 * kv_bytes / (best[1] * 1e-6) / 1e9 / HBM_READ_GBS:3.0f}%)"
+                          f"{gbs:6.0f} GB/s ({100 * gbs / HBM_READ_GBS:3.0f}%)"
+                          f"{l2} set={kv_bytes / 1e6:6.1f}MB"
                           f"  max|d|={max(d for _, _, d in row if d == d):.2e}")
                     del a
                     torch.cuda.empty_cache()

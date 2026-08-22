@@ -170,9 +170,17 @@ repo 裡有兩套，不相容：
 | 誰在用 | diffusers 本家 | SGLang（`model_variant="fl2va"`） |
 | 任務 | — | `t2va`, `fl2va`；`sigma_shift_scales {video:12, audio:3}` |
 
-**選 root。** 理由是它能釘在發行版的 diffusers 上，符合「先包 diffusers 跑通」的
-既定做法；FL2VA 那套的元件類別在任何發行的 diffusers 裡都不存在，選它等於第一步
-就要自己實作 VAE。
+**兩份都要，而且先要 FL2VA（2026-08-22 修正）。** 初稿只選 root，理由是它能釘在
+發行版 diffusers 上。但改成「先追平」之後，第一個要跑起來的是**參考引擎**，而
+SGLang 的 `MiniMaxH3Pipeline._load_config()` **只接受 `FL2VA/` 或 `Ref2VA/`**：
+它從子目錄讀 `model_index.json`，再用 `MiniMaxH3ReleaseMetadata.from_model_index()`
+驗 `partition`，而該函式第一行就要 `_minimax_h3` 這個 key——**root 的
+`model_index.json` 沒有這個 key，直接 `ValueError`**。root 佈局在 SGLang 上載不起來。
+
+所以：**FL2VA 是 parity baseline 的 checkpoint，root 是之後 diffusers 側的正確性
+參考。** 兩份都已在磁碟上（各 144 GB，見 §10）。順帶一提，這也解決了初稿擔心的
+audio sigma shift 來源問題——SGLang 從 FL2VA 的中繼資料讀到
+`{'video': 12.0, 'audio': 3.0}`，已用 CPU 驗過。
 
 但 FL2VA 的 `_minimax_h3` 中繼資料仍要讀：`sigma_shift_scales` 與任務清單是
 **模型常數**，root 的 `scheduler_config.json` 只給了 `shift: 12.0`（video），audio 的
@@ -363,7 +371,19 @@ predenoise / denoise 第 i 步 / postdenoise）。SGLang 的規矩是：把一�
    53 GB 的 `python3.13`（ComfyUI），已經跑了十幾天。那張卡是第三方的、不能碰。
    值得先問清楚那是誰的、在跑什麼——如果是同一個團隊的 H3/影像部署，這份設計的
    第一個切片可能已經有現成的參考輸出可以對，省掉一輪。
-3. **本箱可用的卡。** 現在 GPU 1 與 GPU 3 空著（0 有別人的 tokenspeed scheduler，
+3. **參考引擎已就緒，但卡上不去。** SGLang main（pin `05c584c`）裝在
+   `/workspace/roy/sglang-diffusion/.venv`（專用 venv，沒碰共用的 vLLM venv），
+   `sglang 0.0.0.dev1+g05c584c44` / `torch 2.13.0+cu130` / `diffusers 0.37.0`。
+   跑法在 `unieinfra/bench/h3_reference_run.sh`。
+
+   **有一個會靜默毀掉基準線的環境陷阱**：本箱系統 nvcc 是 12.0，而 flashinfer 對
+   SM 12.x 要求 CUDA >= 12.9，否則 `_normalize_cuda_arch()` 直接
+   `raise RuntimeError("SM 12.x requires CUDA >= 12.9")`，`TARGET_CUDA_ARCHS` 變成
+   空集合——它只印兩行 `Failed to get device capability`，然後帶著退化的 flashinfer
+   繼續跑。venv 內自帶 CUDA 13.3 的 nvcc，把 `CUDA_HOME` 指過去就得到
+   `TARGET_CUDA_ARCHS = {(12, '0f')}`。這條寫在 `sglang-diffusion/env.sh` 裡。
+
+4. **本箱可用的卡。** 現在 GPU 1 與 GPU 3 空著（0 有別人的 tokenspeed scheduler，
    2 是第三方）。M1 只需要一張。跑之前照規矩 `hclaim`，並且用 `nvidia-smi` 確認，
    不是只看 claim。
 4. **`ts serve <whisper>` 的 dtype 解析**仍未修（fp16 模型對上 bf16 KV cache）。

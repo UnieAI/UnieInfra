@@ -265,47 +265,52 @@ GET  /v1/videos/{id}/content -> mp4 bytes
 3. 記錄實測的單步時間、峰值顯存、端到端時間。這三個數字之後每次替換都要重測，
    §3 的算術估計從此作廢，只引用實測。
 
-## 7　逐步 latent 驗證 harness
+## 7　驗收指標（2026-08-22 改寫）
 
-`unieinfra/bench/h3_latent_parity.py`。設計上要避開這棵樹已經踩過的坑：
+**初稿這一節寫錯了。** 我原本訂的驗收是「固定 seed，逐去噪步比對 latent 的
+`max|Δ|` 與 cos」。四方 survey 後（`xref/16-diffusion.md` §4.2）沒有任何一家這樣驗。
+照他們的做法分成兩層：
 
-* **固定 seed 且兩邊共用同一份初始 latent。** 不是「兩邊都設 seed 42」——
-  兩邊的 RNG 消耗順序不同就會拿到不同的 noise。做法是我方產生一次，dump 成
-  tensor，reference 那邊直接餵進去。
-* **比對每一步之後的 video rows 與 audio rows**，不是只比最終影像。去噪迴圈會放大
-  誤差；只比最後一張圖，一旦不合就沒有歸因線索。輸出一張表：step、
-  `max|Δ|`、`cos`、兩模態分開。
-* **先驗證 reference 自己是活的。** `verify-the-reference-engine-is-on-its-fast-path`
-  與 GTE 那次（`AutoModel.from_pretrained` 留下未初始化的 `persistent=False` buffer，
-  參考本身壞掉，害我追了半天自己的實作）都是同一課。具體檢查：DiT 的
-  `rope.inv_freq` 非零、`_keep_in_fp32_modules` 裡的模組真的是 fp32、
-  兩條 sigma 排程首項為 1、末項為 0 且長度相等。
-* **報告要印出中繼資料**：解析度、步數、seed、dtype、兩個 shift 值。
-  三個 result path 各自為政害過我一次（`ix-harness-writes-vllm-to-ixv-path`）。
+| 層 | 內容 | 何時跑 |
+|---|---|---|
+| **sanity** | 有產生內容、形狀合法、**影格非全黑**、音軌非靜音 | 每次，廣泛地跑 |
+| **品質閘** | **LPIPS**（或等價指標）對**參考框架**產生的 baseline，門檻寫死 | 動到數值的每一次 |
 
-容差：bf16 block stack，逐步 `max|Δ|` 用相對容差，起手設 2e-2 並記錄實際值；
-`cos` 要 > 0.999。第一步就偏通常是 embedding / dtype 界線，中途才偏通常是排程。
+跑小：照 TRT-LLM 的 `ENGINEERING_CRITERIA.md` §5.2，E2E 用**減少的步數與解析度**
+（他們對 FLUX 用 4 步、LTX-2 用 8 步、256×256）。變體矩陣留在離線。
 
-## 8　M2 以後：逐塊替換的順序
+**逐步 latent 比對降格為除錯工具，不是驗收指標。** 它回答的是「偏差從第幾步開始」，
+在品質閘紅燈之後才拿出來用。把除錯工具當門檻是我初稿的錯誤。
 
-順序由 §3 的成本結構決定，不是由「哪塊好寫」決定：
+換 kernel 時另外還有 SGLang 訂的**數值契約**（§8 表格第 1、2 項）：
+kernel 要複製 H3 eager 的 BF16 捨入邊界，不得以數學等價為由改變縮並順序。
 
-| 順位 | 塊 | 為什麼 | 判準 |
-|---|---|---|---|
-| 1 | **self-attention** | 48.8k row，佔 2.3/3.3 的算力，且對時長平方 | 單步時間；同時比 raw kernel 與整合路徑 |
-| 2 | packed forward 的 layout | `index_copy`/`index_select` 每層都在動 48.8k row | profiler 找到符號後用獨立迴圈確認絕對成本 |
-| 3 | AdaLN 查表 | 每層兩次 `index_select(0, adaln_indices)`，48.8k row x 5376 | 同上 |
-| 4 | GEMM / MLP | 剩下的 1.5 PFLOP | GB/s 要印在旁邊 |
-| 5 | VAE decode | 一次性，但 36 層 decoder + 注意力，不小 | 端到端時間的差 |
+## 8　追平清單（2026-08-22 改寫）
 
-每一塊換完都要重跑 §7 的逐步 latent 比對——這是「換掉」跟「換壞」的唯一分界。
-SGLang 的 `runtime/models/dits/minimax_h3.py` 與 `vaes/minimax_h3_video_vae/` 在這裡
-是**地圖**：它們告訴我們每塊換完之後應該長什麼形狀（例如它把 q/k/v 融成
-`qkv_proj`，diffusers 是分開的三個），不是要整份抄。
+**初稿這一節也寫錯了。** 我用自己的 FLOP 算術排出「attention 第一、GEMM 第四」。
+那是我自己想的，不是量測出來的，也不是任何引擎做過的。正確的順序見
+`xref/16-diffusion.md` §4.3——SGLang 已經替 H3 做過的 fast path 清單：
 
-sm_120 的既有前提也要帶進來：`fi-gdn-sm120-produces-garbage` 那次是 kernel 正確但
-graph capture 之後輸出全壞。H3 的 DiT 是固定形狀的重複 forward，**CUDA graph 的收益
-很大**，但捕獲後一定要重跑逐步 latent 比對，不能只看它沒 crash。
+| # | fast path | 單卡適用 |
+|---|---|---|
+| 1 | indexed AdaLN modulation + gated residual 融合 | **是** |
+| 2 | fused QK norm + RoPE（`round_norm_before_rope=True`） | **是** |
+| 3 | packed Ulysses QKV + output relayout | 否，要 SP>1 |
+| 4 | batched TP AdaLN collectives | 否，要 TP>1 |
+| 5 | 最終投影前先移除死的 text/padding row | 否，要 TP>1 |
+
+我排第一的「換掉 self-attention kernel」不在清單上——注意力本身已經是 FA/flashinfer
+的函式庫呼叫；他們動的是它的**前處理**（QK norm + RoPE 融合）與每層兩次的
+**indexed modulation**。單卡上能做的是 1 與 2。
+
+**而且順序不由這張表決定，由量測決定。** §3 那些 FLOP 數字只能當量級感，
+真正的順序要等 §6 的歸因跑完（`xref/16-diffusion.md` §4.1 的三層探針：
+predenoise / denoise 第 i 步 / postdenoise）。SGLang 的規矩是：把一個熱點叫做
+「新的」之前，先用他們的清單分類。
+
+一個會擋掉不少計畫的事實：**H3 在 SGLang main 上永遠是 eager consistency case**，
+他們的 preset 強制關掉 torch.compile 預設。所以「先 compile」「先捕 CUDA graph」
+在追平之前都不成立——設計初稿 §8 末段講 CUDA graph 收益很大的那段，作廢。
 
 ## 9　依賴與提交切分
 

@@ -32,13 +32,43 @@ H3 多一條 audio 支線（`sigma_shift_scales` 對 video 是 12.0、對 audio 
 
 ## 1　哪個引擎真的做了這件事
 
-| 引擎 | 影像/影片 diffusion |
-|---|---|
-| **SGLang（main，pin 之後）** | **有**：`python/sglang/multimodal_gen/`，948 個 .py、311,716 行 |
-| FastVideo | **有**：獨立框架，`fastvideo/{pipelines,models,attention,layers,workflow}` |
-| vLLM | **沒有** —— 見下面那一節 |
-| TensorRT-LLM | 無 |
-| TurboMind | 無 |
+| 引擎 | 影像/影片 diffusion | 支援 H3？ |
+|---|---|---|
+| **SGLang（main，pin 之後）** | **有**：`python/sglang/multimodal_gen/`，948 個 .py、311,716 行 | **有** |
+| **TensorRT-LLM** | **有**：`tensorrt_llm/_torch/visual_gen/`，**139 檔** | 無（最近的同類是 LTX-2） |
+| FastVideo | **有**：獨立框架，`fastvideo/{pipelines,models,attention,layers,workflow}` | 無 |
+| vLLM | **沒有** —— 見下面那一節 | — |
+| TurboMind | **沒有**（已查證，見下） | — |
+
+> **更正（2026-08-22）**：這張表初稿把 TensorRT-LLM 與 TurboMind 都寫成「無」，
+> 那是**假陰性**。`legacy/third_party/` 底下三份參考全是 **sparse checkout**
+> （`git sparse-checkout list` 可見），稀疏樣式本來就不含任何 diffusion 路徑，
+> 所以在本地 `find | grep` 得到 0 命中是必然的，跟遠端有沒有無關。
+> 不動 pin 的查法：對同一個 commit 打 GitHub tree API 列全樹再篩。結果是
+> TensorRT-LLM `d8b67db2` 有 139 個 `visual_gen/` 檔案，lmdeploy `a1e5674`
+> 全樹 1936 筆、`truncated: false`、0 命中——後者這次才算真的成立。
+> （對照 memory `a-negative-result-is-easy-to-produce-by-accident`。）
+
+### TensorRT-LLM `visual_gen` 的形狀
+
+比 SGLang 小一個量級，而且結構對我們特別合：
+
+```
+visual_gen/
+  pipeline.py  executor.py  pipeline_registry.py  cuda_graph_runner.py  profiler.py
+  attention_backend/   flash_attn4 / trtllm / cute_dsl / vanilla
+  cute_dsl_kernels/blackwell/          <- 9 檔，就是我們這張卡的世代
+  cache/               teacache / cache_dit（跨步快取）
+  models/              ltx2(48) wan(11) cosmos3(8) flux(8) qwen_image(4+3)
+  modules/             attention / rms_norm / vae
+  quantization/        loader / ops
+  ENGINEERING_CRITERIA.md
+```
+
+`models/ltx2/ltx2_core/audio_vae/` 是**影片＋音訊聯合生成**，和 H3 的 audio 支線同類；
+H3 本身它沒有。`AGENTS.md` 要求 NVIDIA kernel 優先用 CuteDSL，而
+`cute_dsl_kernels/blackwell/` 正是 CuteDSL 寫的 Blackwell kernel——這是四家裡唯一
+和本樹 kernel 方針對得上的一份。
 
 ### vLLM 的 "diffusion" 是表親，不是同一件事
 
@@ -119,3 +149,79 @@ MiniMax-H3 的 audio VAE 與 t2va/fl2va 雙任務留到骨架穩定之後。
 會改變本節判斷的事：H3 的 repo **未 gated**，而且 `diffusers` **0.40.0 正式版**已經
 內含 `MiniMaxH3Transformer3DModel` / `AutoencoderKLMiniMaxH3`——所以「先包 diffusers」
 這條路可以釘在發行版號上，而 H3 少了 FLUX 那道 gated 的關卡。
+
+## 4　他們怎麼量、怎麼驗（2026-08-22 補）
+
+初稿只比了「架構長什麼樣」，沒比**方法**。而方法正是 `AGENTS.local.md` 第 0 步與
+第 2 步要的東西。以下兩張表是四方的實際做法，不是我的設計。
+
+### 4.1 歸因：一個 diffusion 請求切成哪幾層
+
+| 引擎 | 儀器 | 切法 |
+|---|---|---|
+| **TensorRT-LLM** | `visual_gen/profiler.py`，`TLLM_PROFILE_VISUAL_GEN_START_STOP` | `predenoise`（text encode + latent prep）／`A-B`（指定去噪步）／`postdenoise`（VAE decode）／`all` |
+| **SGLang** | `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` + `scripts/bench_diffusion_denoise.py` | 每個 stage 一段，且**同步**後才計時 |
+| FastVideo | `fastvideo/profiler.py` | torch.profiler 包整條 |
+| vLLM / TurboMind | — | 不適用 |
+
+**兩家獨立收斂到同一個切法**：`text encode + latent prep` / `denoise 第 i 步` /
+`VAE decode`。這就是 diffusion 版的探針階梯，對應 `AGENTS.local.md` §0 那張
+HTTP→prefill→decode 表。TRT-LLM 的 profiler docstring 還記了一個他們自己的限制：
+`postdenoise` 是綁在**第一個** denoise loop 之後，所以在 LTX-2 那種兩段式 pipeline 上
+它的視窗是 VAE decode 的**超集**——多段 pipeline 要隔離 decode，今天沒有任何模式做得到。
+H3 是單段，這個坑對我們不成立，但抄的時候要知道它為什麼長這樣。
+
+兩條他們寫下來的量測紀律，跟本樹既有的教訓是同一件事：
+
+* SGLang **Native Backend Gate**：log 只要出現 `Falling back to diffusers backend` /
+  `Using diffusers backend` / `Loaded diffusers pipeline`，**立刻停止**，那次的數字與
+  trace 都不得當作引擎證據。對照本樹 memory
+  `verify-the-reference-engine-is-on-its-fast-path`（vLLM 的 RMSNorm 在裸
+  `VllmConfig()` 下跑 eager，換來 13x 的假勝）。
+* SGLang：`--profile` 會顯著改變延遲，**before/after 的宣告要用非 profile 的 perf dump**。
+  對照 memory `profiler-cpu-times-are-inflated`（本箱實測 3.6x 灌水）。
+
+### 4.2 parity：怎麼證明「換掉」不是「換壞」
+
+| 引擎 | 指標 | 門檻 |
+|---|---|---|
+| **TensorRT-LLM** | **LPIPS**（或等價）對**參考框架**產生的 baseline 影像/影片 | 每個 checkpoint 每個任務一個**明確門檻**；lossless 類工作對既有 golden 算 LPIPS，「差一點點可接受，差多了就是紅旗」 |
+| **SGLang** | 每個 fast path 自帶**數值契約**（見 4.3），加 H3 consistency check | kernel 必須複製 eager 的 BF16 捨入邊界 |
+| FastVideo | `evaluator.py` / `metric.py`，含 LPIPS | — |
+
+TRT-LLM 還把測試分兩層（`ENGINEERING_CRITERIA.md` §5.1）：廣泛跑的**便宜 sanity**
+（有產生內容、形狀合法、**影格非全黑**），與只在該把關處跑的**品質閘**
+（LPIPS / VBench）。E2E 刻意跑小：**FLUX 4 步、LTX-2 8 步、256×256**。
+
+**這推翻了本專案設計初稿的 §7。** 我原本寫「固定 seed，逐去噪步比對 latent 的
+`max|Δ|` 與 cos」——四家沒有任何一家這樣驗。逐步 latent 是**歸因用的除錯工具**
+（偏差從第幾步開始），不是驗收指標；驗收指標是對參考框架輸出的 LPIPS，配一層
+非全黑 sanity。兩者要分開，不能拿除錯工具當門檻。
+
+### 4.3 H3 的追平清單（SGLang 已經做過的 fast path）
+
+SGLang 的 `existing-fast-paths.md` 明列了 H3 專屬的優化，並訂了一條規矩：
+**在把某個熱點叫做「新的」之前，先用這份清單分類**。這份清單就是「先追平」的標的：
+
+| # | fast path | 位置 | 單卡是否適用 |
+|---|---|---|---|
+| 1 | **indexed AdaLN modulation + gated residual 融合** | `triton/indexed_modulation.py` | **是** |
+| 2 | **fused QK norm + RoPE** | `fused_inplace_qknorm_rope`，`round_norm_before_rope=True` | **是** |
+| 3 | packed Ulysses QKV + output relayout | `triton/ulysses_qkv.py`, `usp_relayout.py` | 否（要 SP>1） |
+| 4 | batched TP AdaLN collectives（整疊 block 一次 all-gather） | `dits/minimax_h3.py` `_can_batch_block_adaln()` | 否（要 TP>1） |
+| 5 | 最終投影前先移除死的 text/padding row 再做 TP column gather | `dits/minimax_h3.py` | 否（要 TP>1） |
+
+**這和我初稿 §8 用 FLOP 算術排出來的順序不一樣，以這張表為準。** 我排的第一名是
+「換掉 self-attention kernel」——它不在他們的清單上，因為注意力本身已經是
+FA/flashinfer 的函式庫呼叫；他們動的是**注意力的前處理（QK norm + RoPE 融進去）**
+與**每層兩次的 indexed modulation**。單卡上真正能做的是 1 與 2，其餘三項要多卡才有意義。
+
+兩個必須跟著抄的約束：
+
+* 第 1 項的**數值契約**：kernel 必須複製 H3 eager 的 BF16 捨入邊界，
+  「不得用數學上等價的縮並取代，除非通過 H3 consistency check」。
+* 第 2 項的 `round_norm_before_rope=True` 同樣是 H3 eager 數值契約的一部分，不是效能旋鈕。
+
+另外一條會影響任何 M1 計畫的事實：**H3 在 SGLang main 上「永遠是 eager consistency
+case」**，他們的 preset 會強制關掉全域的 torch.compile 預設。所以任何「先 compile 起來」
+或「先捕 CUDA graph」的計畫，在追平之前都不成立。

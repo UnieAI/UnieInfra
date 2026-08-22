@@ -379,3 +379,70 @@ mha_extend_with_kvcache -> triton_mha_extend_with_kvcache
 **今天量到的 ours 那一側全部是在量一條輸出錯誤的路徑**，包括 prefill 快 6.4% 那一格——
 一個加速有可能正是因為它算錯了才快。在分診收斂之前，本節與上面幾節的 ours 數字都只能
 當成「壞路徑的效能」，不能當成引擎的效能。
+
+---
+
+# 正確性分診：gemma-4 在 ours 上的輸出是壞的
+
+`.rung.py` 那一輪照 `AGENTS.local.md` 的規定在每個配置後面印一段真實輸出，抓到這個。
+**這不是新缺陷**：2026-08-01 的筆記已經記著「TokenSpeed 的 triton backend 在 gemma-4 上
+吐 `'を______11111'`，與 HF 參考不符，可能是真 bug，**未分診**」。三週沒有人接，因為
+`--ignore-eos` 的吞吐 harness 看不見它——每個請求都會吐滿 `out_tokens`，不管吐的是不是語言。
+
+同一組設定、同一支客戶端、同一個問題、temperature 0：
+
+| | 回答 |
+|---|---|
+| **ours** | `'額LLLLLLL額額額額額額額額額...'` |
+| **vLLM** | `'The capital of France is Paris. It is famous for its world-class art museums...'` |
+
+## 已修的第一個 bug（commit 220e4a61）：softmax scale 從來沒被傳下去
+
+`backends/mha.py` 呼叫 `mha_extend_with_kvcache` 與 `mha_decode_with_kvcache` 時沒有傳
+`softmax_scale`，而每顆 kernel 對缺席的 scale 都退回 `1/sqrt(head_dim)`。這對樹裡
+`self.scaling == head_dim**-0.5` 的模型都對——除了不是的那幾個：
+
+| | scaling |
+|---|---|
+| `models/gemma.py:337` | **1.0**（gemma-4；與 HF `modeling_gemma4.py:1194` 一致，qk-norm 之後 q/k 已是單位 RMS） |
+| gemma-3-27b | `query_pre_attn_scalar=168` 開根號倒數，而 head_dim 是 128 |
+| `models/inkling.py:467` | `1.0 / head_dim`（不是開根號） |
+
+gemma-4 的 logits 因此被縮小 **16x**（50 個 sliding 層，head_dim 256）與 **22.6x**
+（10 個 global 層，512）。`backends/inkling.py` 包的是同一個 backend，它三個呼叫點
+**一直都有傳**；只有這條主路徑漏了。
+
+**但它不是全部**：修完之後輸出從 `'額LLLL...'` 變成 `'al outalerPP dees...'`——
+**變了但仍是垃圾**，所以 scale 確實有進到計算裡、確實是錯的，而且還有第二個因素。
+
+## 已排除（逐項對照過參考，不是推測）
+
+| 項目 | 怎麼排除的 |
+|---|---|
+| 四顆 attention kernel | `unieinfra/bench/kernel_gemma_correctness.py` 在 gemma-4 兩個真實幾何上逐顆對 `scaled_dot_product_attention`，decode 與 extend、ctx 512/2048，**全部 rel 2–3e-3**（bf16 雜訊），且確認它們吃 `softmax_scale=1.0` |
+| kernel 的**選擇** | 三個臂：FlashInfer extend 開／關／全部強制 Triton，**輸出都是垃圾** |
+| proportional RoPE 的頻率 | `build_rope_inv_freq` 與 HF `_compute_proportional_rope_parameters` 逐行相符，含「回傳整個 head_dim//2 長度、尾巴 192 個為零」這個關鍵——它與 `rotary_dim=128` 的一般 partial rotary **是不同的變換**（旋轉的維度集合、配對、頻率階梯三者全異），而我們的 docstring 早就寫明了這個陷阱 |
+| RMSNorm 形式 | HF `Gemma4RMSNorm` 是標準 `x * weight`（**不是** gemma-3 的 `1+w`），我們用的也是 |
+| 三明治 norm 與殘差順序 | 與 HF `Gemma4TextDecoderLayer.forward` 逐行相符 |
+| `layer_scalar` | checkpoint 有這個張量，HF 在層末 `hidden_states *= layer_scalar`，我們同位置 |
+| GeGLU 啟動 | `gelu_pytorch_tanh`，且對其他值直接 raise |
+| embedding 縮放 | `sqrt(hidden_size)`，與 HF `embed_scale=hidden_size**0.5` 相同 |
+| `attention_k_eq_v` | checkpoint 的 full 層確實沒有 `v_proj`（先前看到的是 vision tower 的），V 取 k_proj 的**原始**輸出（k-norm 與 RoPE 之前），與 HF 的物件繫結順序一致 |
+| chat template | 25 個 token，與 HF `apply_chat_template` 的參考完全相同 |
+| 權重載入 | 載入器對任何未寫入的參數或未認領的張量**直接 raise**，不會靜默 |
+
+## 下一個探針：逐位置的 prompt logprob
+
+`echo=True, max_tokens=1, logprobs=1` 回傳每個 **prompt** token 的 logprob，兩個引擎跑
+同一段文字再逐位置比。設計上最鋒利的一點是**位置 1**：只有一個 token 可以 attend，
+softmax 退化成單元素，attention 恆等於 V，而 RoPE 在位置 0 的角度是 0（cos=1, sin=0）
+也是恆等。**所以位置 1 的結果完全不含 RoPE、也不含任何 attention 權重計算。**
+
+- 位置 1 就不合 → RoPE 與 attention 同時出局，剩下 embedding 縮放、norms、MLP、
+  o_proj、`layer_scalar`、最終 norm、LM head，或 KV 快取的 V 往返。
+- 位置 1 合、之後才發散 → 是會累積的東西：KV 快取、視窗、或只有部分位置會走到的路徑。
+
+工具：`.logprob_cmp.py`（`--fetch` / `--compare` 兩段式，因為兩個 62 GB 的伺服器不能
+同時上卡）、驅動 `.lpcmp.sh`。
+
+**在分診收斂之前，本檔所有 ours 的效能數字都只是「壞路徑的效能」。**

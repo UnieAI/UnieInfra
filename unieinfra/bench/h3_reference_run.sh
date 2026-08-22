@@ -38,6 +38,9 @@ fi
 mkdir -p "$OUT"
 # shellcheck disable=SC1091
 source "$REF/env.sh"
+# The OOM report noted 1.06 GiB reserved-but-unallocated; this is the knob the
+# allocator itself names for that.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 case "$MODE" in
   # Cheap tier first, per TRT-LLM ENGINEERING_CRITERIA.md §5.2 ("reduced
@@ -73,7 +76,7 @@ sglang generate \
   --seed 1101 \
   --gpu-ids "$GPU" \
   --num-gpus=1 --tp-size=1 --sp-degree=1 --ulysses-degree=1 --ring-degree=1 \
-  --performance-mode=speed \
+  --performance-mode="${H3_PERF_MODE:-memory}" \
   --enable-torch-compile=false \
   --text-encoder-cpu-offload=true \
   --vae-cpu-offload=true \
@@ -91,6 +94,42 @@ if grep -qiE "Falling back to diffusers backend|Using diffusers backend|Loaded d
   echo "Numbers and traces in $OUT are NOT SGLang evidence. Fix backend selection first." >&2
   exit 3
 fi
+
+# --- Gate 3: the exit code is not the result. `sglang generate` catches a
+# failed request, prints "Generation failed", and still exits 0 -- both the
+# first smoke and the nightly chained after it OOM'd and reported success.
+# Scan for the failure the exit code hid.
+if grep -qE "Generation failed|Error executing request|OutOfMemoryError|Failed to generate output" "$OUT/run.log"; then
+  echo "RUN FAILED despite exit=$RC -- the log carries a failure the exit code did not:" >&2
+  grep -oE "(Generation failed|Error executing request [^:]*|torch\.OutOfMemoryError)[^\"]{0,160}" "$OUT/run.log" | head -3 >&2
+  exit 4
+fi
+
+# --- Gate 4: verify the artefact, not the report. A run that produced no file
+# is not a run, whatever it printed.
+shopt -s nullglob
+ARTEFACTS=("$OUT"/out*)
+shopt -u nullglob
+if [ ${#ARTEFACTS[@]} -eq 0 ]; then
+  echo "NO OUTPUT ARTEFACT under $OUT despite exit=$RC and a clean log." >&2
+  exit 5
+fi
+for a in "${ARTEFACTS[@]}"; do
+  sz=$(stat -c%s "$a")
+  echo "artefact: $a ($sz bytes)"
+  if [ "$sz" -lt 10240 ]; then
+    echo "  artefact is implausibly small for a video+audio clip" >&2; exit 5
+  fi
+done
+
+# --- Gate 5: the cheap verification tier (TRT-LLM ENGINEERING_CRITERIA.md
+# §5.1). A structurally valid mp4 of the right duration and resolution is what
+# a garbage denoise also produces; only the pixels and samples separate them.
+for a in "${ARTEFACTS[@]}"; do
+  case "$a" in
+    *.mp4) python3 "$(dirname "$0")/h3_sanity.py" "$a" || exit 6 ;;
+  esac
+done
 
 echo "exit=$RC  results in $OUT"
 exit "$RC"

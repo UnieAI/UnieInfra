@@ -333,8 +333,27 @@ graph capture 之後輸出全壞。H3 的 DiT 是固定形狀的重複 forward�
 
 ## 10　未解 / 需要決定
 
-1. **144 GB 下載要不要現在做。** `/workspace` 有 799 GB，放得下；但這是共用機器的
-   共用磁碟，而且下載期間頻寬是大家的。要先問過。
+1. ~~**144 GB 下載要不要現在做。**~~ **已完成（2026-08-22）。** root 佈局 102 檔、
+   144.09 GB，逐檔比對 HF manifest 大小全部相符、無 `.incomplete`，
+   四個元件的 safetensors index 與 header 都通過。落點：
+
+   ```
+   /workspace/.cache/hub/models--MiniMaxAI--MiniMax-H3/snapshots/42ed227ee7df40d41602854ae760620d6eb651fe
+   ```
+
+   （`HF_HOME=/workspace/.cache`，所以可以直接用 repo id `MiniMaxAI/MiniMax-H3` 解析；
+   `/workspace` 抓完後餘 664 GB。）`resolve_serving_runtime()` 對這個路徑回傳
+   `"diffusion"`，§5.1 說的辨識那一段確認可用。
+
+   checkpoint 本身印證了 §2.2 的混精度契約：`transformer` 是 BF16+F32 混合、
+   `vae` 與 `audio_vae` 純 F32、`text_encoder` 純 BF16。
+
+   **抓的時候踩到一個坑，記在這裡免得下一個人重踩**：
+   `hf download <repo> --exclude "FL2VA/*" "Ref2VA/*" ...` 會把那些 pattern 當成
+   **要下載的檔名**（它自己會 warn `Ignoring --exclude since filenames have been
+   explicitly set`，但那行淹在進度條裡），結果是抓了正好要排除的 42 GB。
+   改用 `snapshot_download(allow_patterns=[...])` 正向列舉，並且**送出前先在本地
+   用同一套 fnmatch 語意算一次選中集合**，確認檔數與位元組數符合預期再跑。
 2. **GPU 2 上已經有一套 diffusion 部署**：`vLLM-Omni::DiffusionWorker-0` 加一個
    53 GB 的 `python3.13`（ComfyUI），已經跑了十幾天。那張卡是第三方的、不能碰。
    值得先問清楚那是誰的、在跑什麼——如果是同一個團隊的 H3/影像部署，這份設計的

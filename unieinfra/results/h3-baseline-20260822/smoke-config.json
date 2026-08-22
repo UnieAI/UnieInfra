@@ -1,0 +1,8 @@
+{
+  "task": "t2va",
+  "conditions": [],
+  "target": {"short_edge": 384, "aspect_ratio": "16:9", "duration_seconds": 4.0},
+  "audio_flow_shift": 3.0,
+  "flow_shift": 12.0,
+  "num_inference_steps": 8
+}

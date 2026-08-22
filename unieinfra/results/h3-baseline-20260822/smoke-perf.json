@@ -1,0 +1,113 @@
+{
+  "timestamp": "2026-08-22T10:34:03.165163+00:00",
+  "request_id": "f6d14093-c1df-4f19-a70b-63a3fa49519b",
+  "commit_hash": "54f827a873f07315cb5012964441d521035cc763",
+  "tag": "cli_generate",
+  "total_duration_ms": 105471.84301167727,
+  "steps": [
+    {
+      "name": "InputValidationStage",
+      "duration_ms": 0.052245333790779114
+    },
+    {
+      "name": "MiniMaxH3PartitionAdmissionStage",
+      "duration_ms": 0.01714751124382019
+    },
+    {
+      "name": "MiniMaxH3TextEncodingStage",
+      "duration_ms": 464.9619944393635
+    },
+    {
+      "name": "MiniMaxH3VisualEncodingStage",
+      "duration_ms": 0.5976539105176926
+    },
+    {
+      "name": "MiniMaxH3AudioEncodingStage",
+      "duration_ms": 0.031186267733573914
+    },
+    {
+      "name": "MiniMaxH3LatentPreparationStage",
+      "duration_ms": 4.508607089519501
+    },
+    {
+      "name": "MiniMaxH3TimestepPreparationStage",
+      "duration_ms": 1.147812232375145
+    },
+    {
+      "name": "MiniMaxH3DenoisingStage",
+      "duration_ms": 55168.624613434076
+    },
+    {
+      "name": "MiniMaxH3DecodingStage",
+      "duration_ms": 10306.411810219288
+    },
+    {
+      "name": "Scheduler.return_result.spill_arrays",
+      "duration_ms": 0.028440728783607483
+    },
+    {
+      "name": "SchedulerClient.materialize_file_refs",
+      "duration_ms": 0.00844709575176239
+    }
+  ],
+  "denoise_steps_ms": [
+    {
+      "step": 0,
+      "duration_ms": 2679.6065401285887
+    },
+    {
+      "step": 1,
+      "duration_ms": 1204.3341808021069
+    },
+    {
+      "step": 2,
+      "duration_ms": 1200.091764330864
+    },
+    {
+      "step": 3,
+      "duration_ms": 1200.174255296588
+    },
+    {
+      "step": 4,
+      "duration_ms": 1202.8509210795164
+    },
+    {
+      "step": 5,
+      "duration_ms": 1202.525207772851
+    },
+    {
+      "step": 6,
+      "duration_ms": 1203.3861484378576
+    }
+  ],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 0.0,
+      "reserved_mb": 0.0,
+      "peak_allocated_mb": 0.0,
+      "peak_reserved_mb": 0.0
+    },
+    "after_forward": {
+      "allocated_mb": 352.33,
+      "reserved_mb": 10106.0,
+      "peak_allocated_mb": 73175.21,
+      "peak_reserved_mb": 95818.0
+    },
+    "load_peak": {
+      "allocated_mb": 35.26,
+      "reserved_mb": 10106.0,
+      "peak_allocated_mb": 73175.21,
+      "peak_reserved_mb": 0.0
+    },
+    "runtime_peak": {
+      "allocated_mb": 35.26,
+      "reserved_mb": 10106.0,
+      "peak_allocated_mb": 73175.21,
+      "peak_reserved_mb": 95818.0
+    }
+  },
+  "meta": {
+    "prompt": null,
+    "model": "/workspace/.cache/hub/models--MiniMaxAI--MiniMax-H3/snapshots/42ed227ee7df40d41602854ae760620d6eb651fe"
+  }
+}

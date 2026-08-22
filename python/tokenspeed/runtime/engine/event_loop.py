@@ -205,7 +205,36 @@ def validate_mixed_batch_backend(server_args, attn_backend) -> None:
         )
 
 
-def resolve_fi_gdn_prefill_graph(server_args) -> None:
+def model_may_use_fi_gdn(model_config) -> bool:
+    """Whether this model has a layer the flashinfer GDN kernel can serve.
+
+    The guard below turns off a correctness hazard that only exists on the GDN
+    chunk-prefill path. Only two model families in this tree reach that kernel
+    -- ``models/qwen3_5.py`` and ``models/kimi_k3.py`` -- and both declare a
+    per-layer ``layer_types`` carrying ``"linear_attention"``. Gemma declares
+    ``sliding_attention``/``full_attention`` and has no linear layer at all, so
+    the kernel cannot run, and taking its graph away costs every request a
+    prefill it could have replayed.
+
+    A config that declares no ``layer_types`` gets the conservative answer.
+    That is today's behaviour for those models, not a new cost: narrowing the
+    guard for a model whose mixers have not been read here would be trading a
+    correctness guard for a speedup on an untested path. Gemma is the case
+    this fixes; the rest keep what they had.
+    """
+    if model_config is None:
+        return True
+    for cfg in (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+    ):
+        layer_types = getattr(cfg, "layer_types", None)
+        if layer_types:
+            return any(str(t) == "linear_attention" for t in layer_types)
+    return True
+
+
+def resolve_fi_gdn_prefill_graph(server_args, model_config=None) -> None:
     """Turn the prefill graph off when the flashinfer GDN kernel is in use.
 
     The two cannot coexist: under a prefill capture that kernel answers every
@@ -233,6 +262,18 @@ def resolve_fi_gdn_prefill_graph(server_args) -> None:
     if os.getenv("TOKENSPEED_ENABLE_FI_GDN_SM120", "1") == "0":
         return
     if getattr(server_args, "disable_prefill_graph", False):
+        return
+    if not model_may_use_fi_gdn(model_config):
+        # Measured on gemma-4-31B-it, sm_120, concurrency 1: a 1-token request
+        # costs 96.9 ms with the graph off against 49.7 ms on vLLM for the same
+        # thing, while the per-decode-token cost is at parity (45.5 vs 44.1) and
+        # 8k prefill is 6.4% faster here. The whole gap was this intercept, and
+        # it was being paid for a kernel this model never calls.
+        logger.info(
+            "Keeping the prefill CUDA graph: this model declares no "
+            "linear_attention layer, so the flashinfer GDN chunk-prefill "
+            "kernel is unreachable and its capture hazard does not apply."
+        )
         return
     if os.getenv("TOKENSPEED_FI_GDN_ALLOW_PREFILL_GRAPH") == "1":
         # Diagnostic escape hatch for the combination this function exists to
@@ -372,7 +413,7 @@ class EventLoop:
         # and freezes the bucket ladder, so flipping the flag afterwards prints
         # a reassuring warning and changes nothing. That mistake shipped a
         # default that served "!!!!!!!!" at 586 tok/s with 0 failed requests.
-        resolve_fi_gdn_prefill_graph(server_args)
+        resolve_fi_gdn_prefill_graph(server_args, self.model_config)
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,

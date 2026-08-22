@@ -527,3 +527,79 @@ page 記帳會變；`_layer_kv_head_counts` 的其他使用者（mxfp8 的 scale
 
 **回歸測試**：`.attn_cmp.py` 對 layer 5 的那一列（`attn_out` 對 SDPA）就是判準，
 layer 0 是對照。兩者都在同一支腳本裡，改完直接重跑。
+
+---
+
+# 已修：每層要拿到屬於自己寬度的 cache 列（commit 40f2478a）
+
+## 修法
+
+池子把每層的欄位配置在**同一個寬度**，較窄的層把同樣的位元組重新解釋成更多列。
+那個重新解釋是用該層的**頭數**去除**配置的 head_dim**——而那只有在所有層共用一個
+head_dim 時才等於該層的寬度。
+
+改動有五處，但只有一個想法：**寬度要來自那一層**。
+
+| 檔 | 改動 |
+|---|---|
+| `configs/mha.py` | `_per_layer_kv_geometry` 從 decoder config 讀 `num_global_key_value_heads` 與 `global_head_dim`（gemma 是 `*ForConditionalGeneration`，頂層兩個都沒有——與 `09f124ac` 同一個陷阱）。所有層共用一個幾何時回 `(None, None)`；宣告了不同幾何但層標籤蓋不滿整個堆疊時**拒絕**，因為那時無法指認哪些層是全域的 |
+| `configs/mha.py` | `cache_cell_size` 取**最寬**的層。gemma-4 比頂層窄所以數值不變，但全域層更寬的模型本來會被配置不足 |
+| `recipes/{setup,ordinary}.py` | 把 `layer_kv_head_dims` 與 counts 一起帶、一起切片；拒絕「只有 dims 沒有 counts」（那會讓層以配置的頭數配自己的 head_dim，比它的欄位還寬） |
+| `kv_cache/mha.py` | `_layer_row_view` 改 reshape 成 `(-1, heads_l, dim_l)`；`_layer_page_tokens` 也改用**寬度**而非頭數——同一個錯誤，隔壁一個函式 |
+| `factory.py` | `family=="mha"` 那一支**連 `layer_kv_head_counts` 都沒傳**，所以整套每層機制對所有 ordinary MHA 模型都是死的。前面四處改完量不到任何東西，直到這一處補上 |
+
+## 驗證（三個層級）
+
+**1. kernel 輸入層級**（`.attn_cmp.py`，layer 0 是同一支腳本裡的對照）
+
+| | `attn_out` 對 SDPA(引擎自己傳入的 q,k,v) |
+|---|---|
+| layer 0（sliding 32×16×256） | 1.42e-03（修正前後皆同） |
+| layer 5（global 32×4×512）**修正前** | **1.13** |
+| layer 5 **修正後** | **1.48e-03** |
+
+**2. 逐層對 HF**（同樣五個 id）
+
+```
+layer5      3.16e-01  ->  5.49e-03
+final_norm  1.26e+00  ->  1.62e-02
+```
+每一層都回到 bf16 漂移的量級。
+
+（`layer59` 那列的 9.8e-01 是比對腳本的對齊差一位：HF 的 `hidden_states[-1]` 已過
+`model.norm`，我們的 `layer59` 是過 norm 之前；兩邊範數 23.96 對 723.6 就是這件事，
+而 `final_norm` 對得上。）
+
+**3. 端到端**——與 vLLM **逐字相同**（temperature 0，同一台卡串行）：
+
+| | ours | vLLM |
+|---|---|---|
+| 法國首都 | `'The capital of France is Paris.'` | 相同 |
+| 俳句 | `'Blue waves kiss the shore,\nEndless depths of salt and foam,\nTides drift in and out.'` | 相同 |
+| 17×23 | `'...Multiply 17 by 3 (the ones place): $17 \times 3 = 51$...'` | 相同 |
+
+## 為什麼三週沒被發現，以及現在怎麼防
+
+啟動日誌現在會印**解析後**的幾何：
+
+```
+KV geometry: allocation 16 heads x 256, per-layer widths ['16x256', '4x512']
+```
+
+一個悄悄退回單一幾何的池子，在其他任何觀測點上都與「本來就不需要每層寬度」的池子
+無法區分——這正是它藏了三週的方式。而 `--ignore-eos` 的吞吐 harness 看不見它：每個
+請求都吐滿 `out_tokens`，不管吐的是不是語言。
+
+測試 `test/runtime/test_per_layer_kv_head_dim.py`（9 例）其中一例**釘住缺陷本身**
+（沒有 dims 的池子必須仍產生舊的 1/4 寬度列），所以 revert 過不了；另一例斷言配置寬度
+恰為全域層的兩倍——若那個比值變成別的，就代表 row view 與配置在這個改動沒有描述到的
+地方又不一致了。
+
+## 刻意沒做的
+
+全域層現在只佔半個配置列，那十層有一半的位元組閒置。**那是容量問題，不是正確性問題**，
+值得自己一輪量測。
+
+## 本檔前面所有 ours 的效能數字都作廢
+
+它們是在輸出錯誤的路徑上量的。正在於修正後的建置上重跑。

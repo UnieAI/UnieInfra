@@ -23,6 +23,8 @@ visible rather than inferred.
     python3 unieinfra/bench/kernel_gemma_decode.py
 """
 
+import os
+
 import torch
 from tokenspeed_kernel.ops.attention import mha_decode_with_kvcache
 from torch.profiler import ProfilerActivity, profile
@@ -88,17 +90,52 @@ def main():
           f"{'GB/s':>8} {'%peak':>6} {'set MB':>8} {'L2?':>4} "
           f"{'step ms/60L':>12}")
 
+    # Split sweep. The registry's Triton decode reads
+    # TS_TRITON_DECODE_KV_SPLITS on every call, so setting it here selects the
+    # flash-decoding split count without a rebuild. 1 is the behaviour this
+    # tree shipped for years (`num_kv_splits` filled with ones); the rest is
+    # what the other four engines all do. The empirical minimum is what a cost
+    # model has to reproduce -- see unieinfra/xref/41-decode-kv-split.md.
+    splits = [int(x) for x in os.environ.get("SPLIT_SWEEP", "").split(",") if x]
     for name, (nq, nkv, d, win, layers) in GEOM.items():
         for ctx in CTXS:
             eff = ctx if win < 0 else min(ctx, win)
             for batch in BATCHES:
                 a = build(nq, nkv, d, batch, ctx)
+                fn = lambda: unwrap(
+                    mha_decode_with_kvcache(**a, window_left=win, solution="triton")
+                )
+                if splits:
+                    best, row = None, []
+                    ref = None
+                    for sp in splits:
+                        os.environ["TS_TRITON_DECODE_KV_SPLITS"] = str(sp)
+                        try:
+                            out = fn().float()
+                            if ref is None:
+                                ref = out
+                                dev = 0.0
+                            else:
+                                dev = (out - ref).abs().max().item()
+                            t = device_us(fn)
+                        except Exception as exc:  # noqa: BLE001
+                            row.append((sp, float("inf"), float("nan")))
+                            continue
+                        row.append((sp, t, dev))
+                        if best is None or t < best[1]:
+                            best = (sp, t, dev)
+                    os.environ.pop("TS_TRITON_DECODE_KV_SPLITS", None)
+                    kv_bytes = 2 * eff * nkv * d * 2 * batch
+                    print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d} "
+                          + "  ".join(f"s{sp}={t:7.1f}" for sp, t, _ in row)
+                          + f"   best=s{best[0]} "
+                          f"{kv_bytes / (best[1] * 1e-6) / 1e9:6.0f} GB/s "
+                          f"({100 * kv_bytes / (best[1] * 1e-6) / 1e9 / HBM_READ_GBS:3.0f}%)"
+                          f"  max|d|={max(d for _, _, d in row if d == d):.2e}")
+                    del a
+                    torch.cuda.empty_cache()
+                    continue
                 try:
-                    fn = lambda: unwrap(
-                        mha_decode_with_kvcache(
-                            **a, window_left=win, solution="triton"
-                        )
-                    )
                     us = device_us(fn)
                 except Exception as exc:  # noqa: BLE001
                     print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d}  "

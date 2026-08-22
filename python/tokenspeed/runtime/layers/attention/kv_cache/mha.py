@@ -63,6 +63,7 @@ class MHATokenToKVPool(CachePool):
         layer_group_ids: tuple[str, ...] = (),
         pd_disaggregation_enabled: bool = False,
         layer_kv_head_counts: tuple[int, ...] | None = None,
+        layer_kv_head_dims: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,
         backing_pool: CachePool | None = None,
@@ -104,6 +105,26 @@ class MHATokenToKVPool(CachePool):
         self._kv_alloc_head_count = (
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
+        # Per-layer head_dim, for a model whose layers disagree about it.
+        # `head_dim` remains the ALLOCATION width; this is what a given layer
+        # actually stores per head. gemma-4: 512 on its ten global layers
+        # against an allocation of 256.
+        self._layer_kv_head_dims = (
+            tuple(int(d) for d in layer_kv_head_dims) if layer_kv_head_dims else None
+        )
+        if self._layer_kv_head_dims is not None:
+            if self._layer_kv_head_counts is None:
+                raise ValueError(
+                    "layer_kv_head_dims requires layer_kv_head_counts: without "
+                    "the counts a layer is sized at the allocation head count "
+                    "against its own head_dim, which overruns its field"
+                )
+            if len(self._layer_kv_head_dims) != len(self._layer_kv_head_counts):
+                raise ValueError(
+                    "layer_kv_head_dims and layer_kv_head_counts must have the "
+                    f"same length ({len(self._layer_kv_head_dims)} != "
+                    f"{len(self._layer_kv_head_counts)})"
+                )
         self._layer_types = tuple(layer_types or ())
         # Physical group id per layer, from the cache recipe
         # (CachePoolSpec.layer_group_ids) — the single source the scheduler
@@ -117,6 +138,35 @@ class MHATokenToKVPool(CachePool):
                 "(CachePoolSpec.layer_group_ids)"
             )
         self._create_buffers()
+
+        # Print the RESOLVED per-layer geometry, not the requested one. A pool
+        # that quietly fell back to one geometry is indistinguishable at every
+        # other observation point from one that never needed per-layer widths,
+        # and on gemma-4 the difference is fluent nonsense.
+        if self._layer_kv_head_dims is not None:
+            widths = {
+                (h, d) for h, d in zip(self._layer_kv_head_counts, self._layer_kv_head_dims)
+            }
+            logger.info(
+                "KV geometry: allocation %d heads x %d, per-layer widths %s",
+                self.head_num,
+                self.head_dim,
+                sorted(f"{h}x{d}" for h, d in widths),
+            )
+        elif self._layer_kv_head_counts is not None:
+            logger.info(
+                "KV geometry: allocation %d heads x %d, per-layer head counts %s "
+                "(one head_dim)",
+                self.head_num,
+                self.head_dim,
+                sorted(set(self._layer_kv_head_counts)),
+            )
+        else:
+            logger.info(
+                "KV geometry: allocation %d heads x %d, uniform across layers",
+                self.head_num,
+                self.head_dim,
+            )
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
@@ -207,20 +257,42 @@ class MHATokenToKVPool(CachePool):
             for layer_id in range(self.layer_num)
         ]
 
+    def _layer_kv_dim(self, layer_id: int) -> int:
+        """This layer's head_dim; the allocation's when they all share one."""
+        dims = self._layer_kv_head_dims
+        return self.head_dim if dims is None else dims[layer_id]
+
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Per-layer token-row view over one byte-uniform cache field.
 
-        Fields are allocated ``(rows, head_num, head_dim)`` at the max head
-        count; a layer serving fewer heads reinterprets the same bytes as
-        ``rows * (head_num / heads_l)`` rows of ``heads_l`` heads (full
-        layers: 2x the token rows per slot — the zero-padding contract).
+        Fields are allocated ``(rows, head_num, head_dim)`` at the widest
+        layer; a narrower layer reinterprets the same bytes as more rows of its
+        OWN geometry, so one row is always exactly one token of that layer.
+
+        The head_dim has to come from the layer, not from the allocation. It
+        did not, and gemma-4 is the model that shows why: its ten global layers
+        are 4 heads x 512 = 2,048 elements per token against a 16 x 256 = 4,096
+        allocation, so the row is half the allocation -- while the head count
+        alone says a quarter. Every one of their tokens was written and read at
+        half stride. The 50 sliding layers, which share the allocation
+        geometry, were correct throughout, so the engine answered in fluent
+        nonsense rather than failing.
+
+        Args:
+            buf: The layer's field, viewed at the allocation geometry.
+            layer_id: Local layer id in this compute view.
+
+        Returns:
+            ``buf`` when this layer is the allocation geometry, else a view of
+            the same bytes as ``(-1, heads_l, dim_l)``.
         """
         if self._layer_kv_head_counts is None:
             return buf
         heads_l = self._layer_heads_per_rank(layer_id)
-        if heads_l == self.head_num:
+        dim_l = self._layer_kv_dim(layer_id)
+        if heads_l == self.head_num and dim_l == self.head_dim:
             return buf
-        return buf.reshape(-1, heads_l, self.head_dim)
+        return buf.reshape(-1, heads_l, dim_l)
 
     def _layer_heads_per_rank(self, layer_id: int) -> int:
         counts = self._layer_kv_head_counts
@@ -342,9 +414,12 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 
     def _layer_page_tokens(self, layer_id: int) -> int:
         """Tokens represented by one page id for this layer."""
-        # Byte-uniform slots factor one id through the layer's head count.
+        # Byte-uniform slots factor one id through the layer's WIDTH, not its
+        # head count: the two differ whenever head_dim varies per layer, and
+        # using the count alone is the same mistake _layer_row_view carried.
         heads_l = self._layer_heads_per_rank(layer_id)
-        return self.page_size * self.head_num // heads_l
+        dim_l = self._layer_kv_dim(layer_id)
+        return self.page_size * self.head_num * self.head_dim // (heads_l * dim_l)
 
     def _layer_scale_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """(num_ids, heads_l, k_l, 32, 4, 4) view over a layer's SF slots

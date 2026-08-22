@@ -77,6 +77,10 @@ class CachePoolSpec:
     state_field_dtypes: Mapping[str, torch.dtype]
     token_capacity: int
     layer_kv_head_counts: tuple[int, ...] | None = None
+    # Per-layer KV head_dim. Only set for models whose layers disagree about it
+    # (gemma-4: 4 x 512 on the ten global layers against 16 x 256 on the
+    # sliding half); None keeps the pool on its one-geometry path.
+    layer_kv_head_dims: tuple[int, ...] | None = None
     pool_options: object | None = None
 
     @property
@@ -119,6 +123,19 @@ class CachePoolSpec:
             len(self.layer_kv_head_counts) != total_layers
         ):
             raise ValueError("cache KV head counts must cover every layer")
+        if self.layer_kv_head_dims is not None and (
+            len(self.layer_kv_head_dims) != total_layers
+        ):
+            raise ValueError("cache KV head dims must cover every layer")
+        if self.layer_kv_head_dims is not None and self.layer_kv_head_counts is None:
+            # One-directional on purpose. Counts alone is a real and supported
+            # state (inkling: narrower layers, one head_dim). Dims alone is not:
+            # a layer would be sized at the ALLOCATION head count against its
+            # own head_dim, which is wider than its field, so the row view
+            # would run past the buffer.
+            raise ValueError(
+                "cache KV head dims require the matching head counts"
+            )
         return replace(
             self,
             family=family or self.family,
@@ -129,6 +146,11 @@ class CachePoolSpec:
             layer_kv_head_counts=(
                 self.layer_kv_head_counts[first_layer:last_layer]
                 if self.layer_kv_head_counts is not None
+                else None
+            ),
+            layer_kv_head_dims=(
+                self.layer_kv_head_dims[first_layer:last_layer]
+                if self.layer_kv_head_dims is not None
                 else None
             ),
             paged_cache_group_specs=(

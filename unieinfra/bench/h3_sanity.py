@@ -62,8 +62,16 @@ def _ffmpeg(path: str, args: list[str]) -> bytes:
 def video_stats(path: str) -> dict:
     raw = _ffmpeg(
         path,
-        ["-map", "0:v", "-f", "rawvideo", "-pix_fmt", "gray",
-         "-s", f"{PROBE_W}x{PROBE_H}"],
+        [
+            "-map",
+            "0:v",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-s",
+            f"{PROBE_W}x{PROBE_H}",
+        ],
     )
     frames = np.frombuffer(raw, dtype=np.uint8)
     n = frames.size // (PROBE_W * PROBE_H)
@@ -117,9 +125,7 @@ def check(path: str, *, require_audio: bool = True) -> list[str]:
 
     if require_audio:
         a = audio_stats(path)
-        print(
-            f"AUDIO  {a['seconds']:.2f} s  rms={a['rms']:.4f}  peak={a['peak']:.4f}"
-        )
+        print(f"AUDIO  {a['seconds']:.2f} s  rms={a['rms']:.4f}  peak={a['peak']:.4f}")
         if a["rms"] < 1e-4:
             failures.append(f"audio is silent (rms {a['rms']:.6f})")
     return failures
@@ -128,8 +134,11 @@ def check(path: str, *, require_audio: bool = True) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("path", help="generated .mp4")
-    ap.add_argument("--no-audio", action="store_true",
-                    help="skip the soundtrack check (H3 always has one)")
+    ap.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="skip the soundtrack check (H3 always has one)",
+    )
     args = ap.parse_args()
 
     failures = check(args.path, require_audio=not args.no_audio)

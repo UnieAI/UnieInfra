@@ -711,3 +711,60 @@ vLLM: 'This text consists of repeated strings combining a phonetic alphabet
 `gemma_attn_layer_check.py` 的 SDPA 參考**沒有套用該層的滑動窗**，所以 context > 1024
 時 sliding 層會誤報（1,500 token 上 layer 0 讀到 2.4e-02，那是參考的問題）。
 ≤1024 無差別。要補窗，否則它在長 context 上不可信。
+
+---
+
+# 定位：是混合批次（prefill + decode 同一個 forward）
+
+## 一個旗標的 A/B
+
+同一支四臂探針、同一組 prompt、同一台卡、串行：
+
+| 臂 | mixed ON（預設） | mixed OFF |
+|---|---|---|
+| 1 cold | ✅ | ✅ |
+| 2 warm（重用） | ✅ | ✅ |
+| 3 ×4 相同 prompt | **copy1 壞** | **4/4 全對** |
+| 4 ×4 不同 prompt | **3/4 壞** | **4/4 全對** |
+
+`--disable-mixed-batch` 讓 16 條回答從 4 條有缺陷變成 **0 條**，且與 vLLM 參考逐字相同。
+
+## 它解釋了先前每一個觀察
+
+| 觀察 | 機制 |
+|---|---|
+| 單請求永遠正確（5/250/1500/10000 token、多 chunk、重用皆然） | 一條序列不會有 prefill+decode 同車 |
+| 兩條並行乾淨、四條才壞 | 並行度不足時混合批次很少發生 |
+| 壞的那條每次都換（seq0 → seq1 → copy1） | 取決於誰先預填完、誰的 decode 被併進來 |
+| 逐層 L2 指認不出壞掉的序列 | **extend 那半是對的**，錯的是同車的 decode 列 |
+| 症狀有梯度（多吐一個 token → 局部亂碼 → 全崩） | 取決於該序列被污染了幾步 |
+
+## 逐序列 × 逐層的表（洗清 extend 那一半）
+
+3 條 × 1,502 token 的混合批次，對 HF 逐條單獨跑：
+
+| 層 | seq0 | seq1 | seq2 |
+|---|---|---|---|
+| embed | 0.00e+00 | 0.00e+00 | 0.00e+00 |
+| layer0 | 3.36e-03 | 3.38e-03 | 3.35e-03 |
+| layer49 | 6.17e-02 | **2.39e-02** | 4.00e-02 |
+| final_norm | 2.25e-02 | **1.97e-02** | 2.37e-02 |
+
+**seq1 是輸出錯誤的那條，卻是漂移最低的那條**，而 final_norm 的 ~2e-2 與已知正確的單序列
+1,500 token 跑（1.65e-2）同量級。逐層 L2 對這個缺陷**沒有鑑別力**——因為它量的是 extend
+列，而 extend 列是對的。
+
+那個 forward 有 4,507 列而三條 extend 序列只佔 4,506：**多的那一列就是被 mixed batching
+併進來的 decode 列**，也是這個差一列讓機制現形的。
+
+## 判準
+
+回歸測試是 `.reuse2.sh` 的第 3、4 臂（四條並行，相同與不同 prompt 各一組），**必須在
+mixed batching 開啟的預設下跑**。`--disable-mixed-batch` 是目前唯一已知的安全配置，
+但它是繞道不是修復：混合批次是吞吐的來源之一，關掉要付代價，代價還沒量。
+
+## 仍未回答
+
+「decode 列在混合批次裡拿到什麼是錯的」還沒有直接證據——上面全部是端到端與 extend 側的。
+下一步是 decode 側的 dump（現有的 dump 閘門掛在 `forward_extend_metadata` 上，對 decode
+批次是瞎的），或直接讀混合批次如何組出兩半的 metadata 與 page table。

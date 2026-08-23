@@ -617,6 +617,7 @@ def build_paged_cache_group_specs(
     group_ids: Sequence[str],
     sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
+    page_sizes: Mapping[str, int] | None = None,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     pd_disaggregation_enabled: bool = False,
     state_entry_stride_tokens: int = 1,
@@ -636,8 +637,15 @@ def build_paged_cache_group_specs(
         group_ids: Physical group id per layer, from the cache recipe
             (``CachePoolSpec.layer_group_ids``). Must line up 1:1 with
             layer_types when both are non-empty.
-        sliding_window_tokens / page_size / cache_blocks_per_lcm_block:
-            Forwarded to group_specs_from_layer_types.
+        sliding_window_tokens / page_size / page_sizes /
+        cache_blocks_per_lcm_block:
+            Forwarded to group_specs_from_layer_types. ``page_sizes`` is how a
+            group whose layers store fewer bytes per token than the arena's
+            uniform width claims its share: the arena reserves the same bytes
+            per page for every group, so a group at half the width holds twice
+            the tokens in one page. Getting this wrong does not fail loudly --
+            a single sequence is self-consistent either way, and only two
+            sequences with disjoint pages alias into each other.
         pd_disaggregation_enabled: Stamp PD transfer policies on the specs.
     """
     resolved_group_ids = tuple(group_ids)
@@ -656,6 +664,7 @@ def build_paged_cache_group_specs(
         group_ids=resolved_group_ids,
         sliding_window_tokens=sliding_window_tokens,
         page_size=page_size,
+        page_sizes=page_sizes,
         cache_blocks_per_lcm_block=cache_blocks_per_lcm_block,
         state_entry_stride_tokens=state_entry_stride_tokens,
     )

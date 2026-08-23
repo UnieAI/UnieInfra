@@ -146,7 +146,22 @@ def _mark_attn_dumped() -> None:
     _ATTN_DUMP_DONE = True
 
 
-def _hidden_dump_path(num_tokens: int) -> str | None:
+def _forward_seq_lens(ctx) -> list[int] | None:
+    """Per-sequence row counts for this forward, host-side, or None.
+
+    ``ForwardContext`` deliberately carries no tensors, so the boundaries live
+    on the attention backend's extend metadata. Without them a multi-sequence
+    dump is one undivided block of rows and cannot be compared against a
+    reference that runs each sequence on its own.
+    """
+    md = getattr(getattr(ctx, "attn_backend", None), "forward_extend_metadata", None)
+    cu = getattr(md, "cu_extend_seq_lens_cpu", None)
+    if not cu or len(cu) < 2:
+        return None
+    return [int(cu[i + 1]) - int(cu[i]) for i in range(len(cu) - 1)]
+
+
+def _hidden_dump_path(num_tokens: int, num_seqs: int = 1) -> str | None:
     """Path for a one-shot layer dump, or None.
 
     Gated on an EXACT row count, not on "the first forward". The first forward
@@ -166,6 +181,13 @@ def _hidden_dump_path(num_tokens: int) -> str | None:
     path = os.environ.get("TOKENSPEED_DUMP_HIDDEN")
     if not path:
         return None
+    # Multi-sequence mode. Every dump this project has taken held ONE sequence,
+    # and one sequence cannot show a page mapping that lands on ANOTHER
+    # sequence's pages -- the same blind spot as verifying a paged cache inside
+    # a single page. Gate on the sequence count instead when this is set.
+    min_seqs = os.environ.get("TOKENSPEED_DUMP_HIDDEN_MIN_SEQS")
+    if min_seqs:
+        return path if int(num_seqs) >= int(min_seqs) else None
     want = os.environ.get("TOKENSPEED_DUMP_HIDDEN_TOKENS")
     if want:
         # A comma list, because the caller usually knows the prompt but not
@@ -724,13 +746,17 @@ class Gemma4Model(nn.Module):
         # rotation -- so every cheap explanation (kernels, rope, norms, the
         # weight loader) had already been eliminated and only a numerical
         # comparison against HF was left.
-        _dump = _hidden_dump_path(hidden_states.shape[0])
+        _seq_lens = _forward_seq_lens(ctx)
+        _dump = _hidden_dump_path(
+            hidden_states.shape[0], len(_seq_lens) if _seq_lens else 1
+        )
         if _dump is not None:
             import torch as _t
 
             _rec = {
                 "input_ids": input_ids.detach().to("cpu"),
                 "positions": positions.detach().to("cpu"),
+                "seq_lens": _seq_lens,
                 "embed": hidden_states.detach().float().to("cpu"),
             }
             for _i, layer in enumerate(self.layers):

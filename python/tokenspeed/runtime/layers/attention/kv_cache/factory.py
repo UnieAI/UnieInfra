@@ -130,6 +130,14 @@ def create_cache_pool(
                 layer_types=spec.layer_types,
                 layer_group_ids=spec.layer_group_ids,
                 pd_disaggregation_enabled=config.pd_disaggregation_enabled,
+                # The family="mha" branch used to pass neither, so the pool's
+                # per-layer reinterpretation was dead for every ordinary MHA
+                # model -- including gemma-4, whose ten global layers are
+                # 4 heads x 512 against a 16 x 256 allocation and were
+                # therefore served rows of the wrong width.
+                layer_kv_head_counts=spec.layer_kv_head_counts,
+                layer_kv_head_dims=spec.layer_kv_head_dims,
+                kv_alloc_head_count=config.num_kv_heads,
                 memory_plan=plan,
                 paged_cache_group_specs=spec.paged_cache_group_specs,
                 token_capacity=spec.token_capacity,
@@ -175,6 +183,7 @@ def create_cache_pool(
             layer_types=spec.layer_types,
             pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             layer_kv_head_counts=spec.layer_kv_head_counts,
+            layer_kv_head_dims=spec.layer_kv_head_dims,
             kv_alloc_head_count=config.num_kv_heads,
             memory_plan=plan,
             layer_group_ids=spec.layer_group_ids,

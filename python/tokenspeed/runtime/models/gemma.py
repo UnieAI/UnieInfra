@@ -60,6 +60,8 @@ the checkpoint ``config.json``):
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Iterable
 
 import torch
@@ -106,6 +108,101 @@ def layer_head_dim(config, layer_type: str) -> int:
     if layer_type != SLIDING_ATTENTION and global_head_dim:
         return int(global_head_dim)
     return int(config.head_dim)
+
+
+_HIDDEN_DUMP_DONE = False
+
+
+_ATTN_DUMP_DONE = False
+
+
+def _attn_dump_path(layer_id: int, num_tokens: int) -> str | None:
+    """Path for a one-shot single-layer attention dump, or None.
+
+    `TOKENSPEED_DUMP_ATTN=<path>` plus `TOKENSPEED_DUMP_ATTN_LAYER=<id>`, and
+    the same exact-row-count gate as the hidden dump so the kernel tuner's
+    8,192-token warm-up and the graph captures do not consume it.
+    """
+    if _ATTN_DUMP_DONE:
+        return None
+    path = os.environ.get("TOKENSPEED_DUMP_ATTN")
+    if not path:
+        return None
+    want_layer = os.environ.get("TOKENSPEED_DUMP_ATTN_LAYER")
+    if want_layer and int(want_layer) != int(layer_id):
+        return None
+    want = os.environ.get("TOKENSPEED_DUMP_HIDDEN_TOKENS")
+    if want:
+        allowed = {int(x) for x in want.replace(" ", "").split(",") if x}
+        if int(num_tokens) not in allowed:
+            return None
+    elif num_tokens > 64:
+        return None
+    return path
+
+
+def _mark_attn_dumped() -> None:
+    global _ATTN_DUMP_DONE
+    _ATTN_DUMP_DONE = True
+
+
+def _forward_seq_lens(ctx) -> list[int] | None:
+    """Per-sequence row counts for this forward, host-side, or None.
+
+    ``ForwardContext`` deliberately carries no tensors, so the boundaries live
+    on the attention backend's extend metadata. Without them a multi-sequence
+    dump is one undivided block of rows and cannot be compared against a
+    reference that runs each sequence on its own.
+    """
+    md = getattr(getattr(ctx, "attn_backend", None), "forward_extend_metadata", None)
+    cu = getattr(md, "cu_extend_seq_lens_cpu", None)
+    if not cu or len(cu) < 2:
+        return None
+    return [int(cu[i + 1]) - int(cu[i]) for i in range(len(cu) - 1)]
+
+
+def _hidden_dump_path(num_tokens: int, num_seqs: int = 1) -> str | None:
+    """Path for a one-shot layer dump, or None.
+
+    Gated on an EXACT row count, not on "the first forward". The first forward
+    a server does is `Kernel tuning with a dummy prefill of 8192 tokens`
+    (model_executor.py), and after it come the prefill-graph bucket captures
+    (16, 32, ...) and the decode-graph captures (batch 1, 2, 4, ... 64). All of
+    those look like a forward and the first attempt at this dumped the kernel
+    tuner: 8,192 rows x 60 layers x 5,376 floats = 10.9 GB on disk and not one
+    row of the request.
+
+    So the caller states how many tokens the request has and nothing else is
+    dumped. Decode captures are batch-sized, so pick a prompt length that is not
+    one of them.
+    """
+    if _HIDDEN_DUMP_DONE:
+        return None
+    path = os.environ.get("TOKENSPEED_DUMP_HIDDEN")
+    if not path:
+        return None
+    # Multi-sequence mode. Every dump this project has taken held ONE sequence,
+    # and one sequence cannot show a page mapping that lands on ANOTHER
+    # sequence's pages -- the same blind spot as verifying a paged cache inside
+    # a single page. Gate on the sequence count instead when this is set.
+    min_seqs = os.environ.get("TOKENSPEED_DUMP_HIDDEN_MIN_SEQS")
+    if min_seqs:
+        return path if int(num_seqs) >= int(min_seqs) else None
+    want = os.environ.get("TOKENSPEED_DUMP_HIDDEN_TOKENS")
+    if want:
+        # A comma list, because the caller usually knows the prompt but not
+        # whether the server prepends BOS.
+        allowed = {int(x) for x in want.replace(" ", "").split(",") if x}
+        if int(num_tokens) not in allowed:
+            return None
+    if not want and num_tokens > 64:
+        return None
+    return path
+
+
+def _mark_hidden_dumped() -> None:
+    global _HIDDEN_DUMP_DONE
+    _HIDDEN_DUMP_DONE = True
 
 
 def build_rope_inv_freq(layer_type: str, config) -> torch.Tensor:
@@ -298,6 +395,7 @@ class Gemma4Attention(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.layer_type = layer_type
+        self.layer_id = layer_id
         # The paged-cache group this layer's KV lives in. Distinct from
         # layer_type: the sliding layers are relabelled into equal-depth
         # sub-groups so no slab row is left dead (see
@@ -427,6 +525,36 @@ class Gemma4Attention(nn.Module):
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
         if attn_output.dim() == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
+        # One layer's intermediates, for the same reason as the per-layer dump
+        # above: the per-layer comparison put the fault in the ten
+        # full_attention layers and nowhere else, and the three things those
+        # layers do differently (head_dim 512, attention_k_eq_v, partial rope)
+        # cannot be told apart from the layer's output alone. Dumping q/k/v and
+        # the attention output splits it: recomputing attention from the dumped
+        # q/k/v with SDPA says whether the fault is the cache round trip or what
+        # this function hands the kernel.
+        _adump = _attn_dump_path(self.layer_id, hidden_states.shape[0])
+        if _adump is not None:
+            import torch as _t
+
+            _t.save(
+                {
+                    "layer_id": self.layer_id,
+                    "layer_type": self.layer_type,
+                    "head_dim": self.head_dim,
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "k_eq_v": self.k_eq_v,
+                    "hidden_in": hidden_states.detach().float().cpu(),
+                    "k_raw": k_raw.detach().float().cpu(),
+                    "q": q.detach().float().cpu(),
+                    "k": k.detach().float().cpu(),
+                    "v": v.detach().float().cpu(),
+                    "attn_out": attn_output.detach().float().cpu(),
+                },
+                _adump,
+            )
+            _mark_attn_dumped()
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -610,6 +738,35 @@ class Gemma4Model(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         else:
             hidden_states = input_embeds
+        # Layer-by-layer capture for reference comparison. Off unless
+        # TOKENSPEED_DUMP_HIDDEN names a file, and it dumps ONE forward and then
+        # stops: this exists because gemma-4 answered "The" with 'H' here and in
+        # language on vLLM, and at one token of context the softmax has a single
+        # element -- attention returns V exactly and RoPE is a zero-angle
+        # rotation -- so every cheap explanation (kernels, rope, norms, the
+        # weight loader) had already been eliminated and only a numerical
+        # comparison against HF was left.
+        _seq_lens = _forward_seq_lens(ctx)
+        _dump = _hidden_dump_path(
+            hidden_states.shape[0], len(_seq_lens) if _seq_lens else 1
+        )
+        if _dump is not None:
+            import torch as _t
+
+            _rec = {
+                "input_ids": input_ids.detach().to("cpu"),
+                "positions": positions.detach().to("cpu"),
+                "seq_lens": _seq_lens,
+                "embed": hidden_states.detach().float().to("cpu"),
+            }
+            for _i, layer in enumerate(self.layers):
+                hidden_states = layer(positions, hidden_states, ctx, out_cache_loc)
+                _rec[f"layer{_i}"] = hidden_states.detach().float().to("cpu")
+            hidden_states = self.norm(hidden_states)
+            _rec["final_norm"] = hidden_states.detach().float().to("cpu")
+            _t.save(_rec, _dump)
+            _mark_hidden_dumped()
+            return hidden_states, None
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states, ctx, out_cache_loc)
         hidden_states = self.norm(hidden_states)

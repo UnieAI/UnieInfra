@@ -34,6 +34,72 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
+
+def _per_layer_kv_geometry(
+    text_config,
+    raw_layer_types: tuple[str, ...],
+    num_layers: int,
+    default_heads: int,
+    default_dim: int,
+) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+    """Per-layer (kv_heads, head_dim) when the non-sliding layers differ.
+
+    gemma-4 is the first model here whose head_dim varies per layer: the
+    checkpoint carries `num_global_key_value_heads` (4) and `global_head_dim`
+    (512) for the ten full-attention layers while the top level describes the
+    sliding half (16 x 256). A pool built from the top level alone gives the
+    global layers a row half the width they need, and every one of their tokens
+    lands at half stride -- measured as garbage output on gemma-4-31B-it with
+    the 50 sliding layers correct and the 10 global ones not.
+
+    Returns (None, None) for every model that shares one geometry, which is
+    every other model in this tree.
+
+    Args:
+        text_config: The decoder config (gemma ships as *ForConditionalGeneration,
+            so this is `hf_config.text_config`).
+        raw_layer_types: Checkpoint layer labels BEFORE the equal-depth split,
+            because that split renames only the sliding half and the geometry
+            decision must match `models/gemma.py`, which keys off the raw label.
+        num_layers: Attention layer count; a label list that does not cover it
+            is not trusted.
+        default_heads: Top-level KV head count (pre-TP).
+        default_dim: Top-level head_dim.
+
+    Returns:
+        `(heads_per_layer, dims_per_layer)`, or `(None, None)`.
+    """
+    global_heads = getattr(text_config, "num_global_key_value_heads", None)
+    global_dim = getattr(text_config, "global_head_dim", None)
+    if not global_heads and not global_dim:
+        return None, None
+    heads = int(global_heads or default_heads)
+    dim = int(global_dim or default_dim)
+    if heads == default_heads and dim == default_dim:
+        # Declared but identical: nothing to describe, and staying None keeps
+        # the pool on its uniform path.
+        return None, None
+    if len(raw_layer_types) != num_layers:
+        # Without per-layer labels there is no way to say WHICH layers are
+        # global. Refuse rather than guess: the uniform path is wrong here, but
+        # a wrong guess is wrong everywhere instead of somewhere.
+        raise ValueError(
+            "model declares a distinct global attention geometry "
+            f"({heads} x {dim} against {default_heads} x {default_dim}) but its "
+            f"{len(raw_layer_types)} layer_types do not cover {num_layers} "
+            "attention layers, so the global layers cannot be identified"
+        )
+    per_heads = []
+    per_dims = []
+    for label in raw_layer_types:
+        if str(label).startswith("sliding"):
+            per_heads.append(int(default_heads))
+            per_dims.append(int(default_dim))
+        else:
+            per_heads.append(heads)
+            per_dims.append(dim)
+    return tuple(per_heads), tuple(per_dims)
+
 @dataclass
 class MHAConfig(BaseAttnConfig):
     # Per-layer attention-type labels + window, forwarded to the KV pool for
@@ -48,6 +114,12 @@ class MHAConfig(BaseAttnConfig):
     # group-aware backends (backends/cache_groups.py).
     group_page_sizes: dict[str, int] | None = None
     layer_kv_head_counts: tuple[int, ...] | None = None
+    # Per-layer KV head_dim, for models whose layers do not share one.
+    # `layer_kv_head_counts` alone cannot describe gemma-4: its ten global
+    # layers are 4 heads x 512 against the sliding half's 16 x 256, so the
+    # per-token width is half the allocation width while the head COUNT says a
+    # quarter. See MHATokenToKVPool._layer_row_view.
+    layer_kv_head_dims: tuple[int, ...] | None = None
 
     @classmethod
     def generate(
@@ -96,6 +168,17 @@ class MHAConfig(BaseAttnConfig):
         ):
             # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
             layer_types = ()
+        kv_head_counts, kv_head_dims = _per_layer_kv_geometry(
+            text_config,
+            tuple(raw_layer_types or ()),
+            model_config.num_attention_layers,
+            model_config.num_key_value_heads,
+            model_config.head_dim,
+        )
+        if is_draft and kv_head_dims is not None:
+            # Same reason layer_types is dropped for a draft above: the target
+            # stack's per-layer geometry does not describe the draft depth.
+            kv_head_counts = kv_head_dims = None
         sliding_window_tokens = getattr(hf_config, "sliding_window", None)
         if sliding_window_tokens is None and layer_types:
             # Only ever read through with labels in hand: a scalar window
@@ -125,6 +208,8 @@ class MHAConfig(BaseAttnConfig):
             is_draft=is_draft,
             draft_block_decode=draft_block_decode,
             layer_types=layer_types,
+            layer_kv_head_counts=kv_head_counts,
+            layer_kv_head_dims=kv_head_dims,
             sliding_window_tokens=sliding_window_tokens,
             max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
             pd_disaggregation_enabled=getattr(
@@ -135,13 +220,26 @@ class MHAConfig(BaseAttnConfig):
         )
 
     def cache_cell_size(self) -> int:
-        cell = (
-            max(self.num_kv_heads // self.attn_tp_size, 1)
-            * self.head_dim
-            * 2
-            * torch._utils._element_size(self.kv_cache_dtype)
+        # The WIDEST layer, not the top-level one. Every layer is allocated at
+        # this width and a narrower layer reinterprets the same bytes as more
+        # rows (MHATokenToKVPool._layer_row_view), so a model whose global
+        # layers were wider than its top level would otherwise be allocated
+        # short. gemma-4 is the other way round -- 4 x 512 against 16 x 256 --
+        # so this is unchanged for it, and for every uniform model.
+        width = max(self._per_layer_kv_widths(), default=0) or (
+            max(self.num_kv_heads // self.attn_tp_size, 1) * self.head_dim
         )
+        cell = width * 2 * torch._utils._element_size(self.kv_cache_dtype)
         if self.kv_cache_mxfp8:
             # One UE8M0 byte per 32 fp8 data bytes.
             cell += cell // 32
         return cell
+
+    def _per_layer_kv_widths(self) -> list[int]:
+        """Per-layer KV elements per token (post-TP), empty when uniform."""
+        if not self.layer_kv_head_dims or not self.layer_kv_head_counts:
+            return []
+        return [
+            max(heads // self.attn_tp_size, 1) * dim
+            for heads, dim in zip(self.layer_kv_head_counts, self.layer_kv_head_dims)
+        ]

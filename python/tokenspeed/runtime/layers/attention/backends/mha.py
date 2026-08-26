@@ -1030,6 +1030,20 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
+            # Not optional. Every kernel behind this call defaults a missing
+            # scale to `1 / sqrt(head_dim)`, which is right for every model in
+            # this tree except the ones where it is not: gemma-4 sets 1.0
+            # (q and k are unit-RMS after qk-norm, matching HF
+            # modeling_gemma4.py:921), gemma-3 sets query_pre_attn_scalar**-0.5
+            # = 168**-0.5 against a head_dim of 128, and inkling sets
+            # 1/head_dim. Dropping it scaled gemma-4's logits by 1/16 on the
+            # sliding layers and 1/22.6 on the global ones, which flattens the
+            # softmax toward uniform and makes attention return the mean of V.
+            # The engine answered "What is the capital of France?" with
+            # '額LLLLLLL額額額額...' and every latency number looked fine.
+            # backends/inkling.py, which wraps this same backend, has passed it
+            # all along.
+            softmax_scale=layer.scaling,
             solution=self.kernel_solution,
             **scale_kwargs,
         )
@@ -1073,6 +1087,9 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
+            # See the extend path above: a missing scale is not "use the
+            # model's", it is "use 1/sqrt(head_dim)".
+            softmax_scale=layer.scaling,
             solution=self.kernel_solution,
             **scale_kwargs,
         )

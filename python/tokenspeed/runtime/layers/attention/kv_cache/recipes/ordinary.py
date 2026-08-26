@@ -48,8 +48,27 @@ def mha_cache_fields(
     kv_element_size,
     kv_scale_block_size=0,
     kv_scale_element_size=0,
+    layer_kv_heads=None,
+    layer_kv_head_dims=None,
 ) -> tuple[CacheFieldSpec, ...]:
-    """Describe fixed per-layer MHA views and their physical placement."""
+    """Describe fixed per-layer MHA views and their physical placement.
+
+    ``layer_kv_heads`` / ``layer_kv_head_dims`` give a layer its OWN geometry,
+    for a model whose layers disagree about it. gemma-4's ten global layers are
+    4 heads x 512 against the sliding half's 16 x 256 -- half the bytes per
+    token -- and a field that claims the wider geometry makes the allocator
+    reserve a page stride twice what the layer's rows actually span. That is
+    self-consistent for ONE sequence and aliases as soon as two sequences hold
+    disjoint pages, which is why it reads as correct on every single-request
+    probe and as mojibake at concurrency.
+
+    Declaring the real bytes is all that is needed: ``solve_cache_layout``
+    derives ``cache_blocks_per_lcm_block`` from the per-group field bytes, so
+    the narrower group packs two cache blocks into one LCM parent by itself,
+    keeps ``cache_block_tokens`` at the scheduler's page size (which the C++
+    scheduler requires it to divide), and the bytes those layers used to waste
+    come back as capacity.
+    """
     if logical_block_tokens <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
     if kv_element_size <= 0:
@@ -62,25 +81,57 @@ def mha_cache_fields(
     if kv_scale_block_size and head_dim % kv_scale_block_size:
         raise ValueError("head_dim must be divisible by kv_scale_block_size")
 
+    if (layer_kv_heads is None) != (layer_kv_head_dims is None):
+        raise ValueError(
+            "layer_kv_heads and layer_kv_head_dims must be given together"
+        )
+    if layer_kv_heads is not None and (
+        len(layer_kv_heads) != len(layer_group_ids)
+        or len(layer_kv_head_dims) != len(layer_group_ids)
+    ):
+        raise ValueError("per-layer KV geometry must cover every layer")
+
     occurrences: dict[str, int] = {}
     fields = []
     for layer_id, group_id in enumerate(layer_group_ids):
         unit = occurrences.get(group_id, 0)
         occurrences[group_id] = unit + 1
-        shape = (logical_block_tokens, kv_heads, head_dim)
+        if layer_kv_heads is None:
+            heads_l, dim_l = kv_heads, head_dim
+        else:
+            heads_l, dim_l = int(layer_kv_heads[layer_id]), int(
+                layer_kv_head_dims[layer_id]
+            )
+            if heads_l <= 0 or dim_l <= 0:
+                raise ValueError(
+                    f"layer {layer_id} has non-positive KV geometry "
+                    f"({heads_l} x {dim_l})"
+                )
+        shape = (logical_block_tokens, heads_l, dim_l)
+        # Planes are how groups share one LCM parent's bytes, and the planner
+        # requires every field on a plane to have the same payload: a field
+        # whose kernel walks pages by an implicit payload-sized stride "would
+        # read the wrong rows" otherwise (plan.py says exactly that, and it is
+        # the defect this whole change is fixing). So a layer whose geometry is
+        # not the allocation's gets its own plane rather than a wrong stride on
+        # a shared one. Same-geometry groups keep sharing, and every model with
+        # one geometry keeps byte-identical plane ids.
+        suffix = "" if (heads_l, dim_l) == (kv_heads, head_dim) else f".{heads_l}x{dim_l}"
+        plane_k = f"unit.{unit}{suffix}.k"
+        plane_v = f"unit.{unit}{suffix}.v"
         fields.extend(
             (
                 CacheFieldSpec(
                     group_id,
                     f"layer.{layer_id}.k",
-                    f"unit.{unit}.k",
+                    plane_k,
                     shape,
                     kv_element_size,
                 ),
                 CacheFieldSpec(
                     group_id,
                     f"layer.{layer_id}.v",
-                    f"unit.{unit}.v",
+                    plane_v,
                     shape,
                     kv_element_size,
                 ),
@@ -340,6 +391,15 @@ def _storage_layers(config, num_layers: int) -> int:
     return group_size if group_size is not None else num_layers
 
 
+# A narrower group does NOT get a bigger page. That was tried: the C++
+# scheduler asserts `config.block_size % cache_block_tokens == 0`
+# (scheduler/operations/cache.cpp:75), so a group's page must DIVIDE the
+# scheduler's block, and 128 against 64 is refused at startup. The mechanism
+# for "this group stores half the bytes per token" is packing --
+# `cache_blocks_per_lcm_block` -- and `solve_cache_layout` derives it from the
+# per-group field bytes on its own. So the fields have to carry the layer's own
+# geometry; see `_mha_fields`.
+
 def _ordinary_setup(
     *,
     family: str,
@@ -408,14 +468,66 @@ def _ordinary_setup(
     # labels cannot align; every merged group publishes full-history.
     if len(merged_layer_types) != len(merged_group_ids):
         merged_layer_types = ()
+    # Packing is pinned to 1 on this profiled path -- every group's block is
+    # one LCM parent -- EXCEPT when the groups are not the same width. A group
+    # storing half the bytes per token has to take two cache blocks per parent
+    # or it pays a full parent for half a parent's data, which the planner
+    # reports as a padding fraction of 2.0. Letting solve_cache_layout derive
+    # the packing from the per-group field bytes is the whole mechanism for a
+    # heterogeneous stack; pinning it would be asking for the uniform layout
+    # again under a different name.
+    _dims = tuple(getattr(attn_config, "layer_kv_head_dims", None) or ())
+    _heads = tuple(getattr(attn_config, "layer_kv_head_counts", None) or ())
+    uniform_widths = not _dims or len(
+        {int(h) * int(d) for h, d in zip(_heads, _dims)}
+    ) <= 1
     merged_layout = solve_cache_layout(
         merged_fields,
         logical_block_tokens=page_size,
-        cache_blocks_per_lcm_block={field.group_id: 1 for field in merged_fields},
+        cache_blocks_per_lcm_block=(
+            {field.group_id: 1 for field in merged_fields} if uniform_widths else None
+        ),
         alignment=1,
         max_padding_fraction=1.0,
     )
+    # The page count above was estimated from a per-token cell size before the
+    # layout was solved, which is only a good estimate while every group shares
+    # a geometry. It is not one here: giving the narrower group its own plane
+    # (it must have one -- see _mha_fields) makes the LCM parent larger, and
+    # the estimate then asks for an arena that does not fit. Measured on
+    # gemma-4-31B: "Tried to allocate 52.79 GiB" with 35.72 free.
+    #
+    # So take the count the solved layout can actually afford, the way the
+    # non-profiled path does. Only when the widths differ, so every uniform
+    # model keeps the page count it had.
+    if not uniform_widths and merged_layout.lcm_block_bytes > 0:
+        affordable = cache_budget_bytes // merged_layout.lcm_block_bytes
+        if affordable < 2:
+            raise ValueError(
+                "cache budget must hold a null parent and one usable parent: "
+                f"{cache_budget_bytes} bytes against "
+                f"{merged_layout.lcm_block_bytes} per parent"
+            )
+        # One parent is reserved as the null page, as in build_hybrid_cache_setup.
+        num_pages = max(1, min(num_pages, affordable - 1))
     token_capacity = num_pages * page_size
+
+    # Per-layer KV geometry, for a model whose layers disagree about head_dim
+    # (gemma-4). Target-only: a draft stack is a different model and its layers
+    # continue the numbering, so an unaligned tuple is dropped whole.
+    merged_kv_head_counts = tuple(
+        getattr(attn_config, "layer_kv_head_counts", None) or ()
+    ) or None
+    merged_kv_head_dims = tuple(
+        getattr(attn_config, "layer_kv_head_dims", None) or ()
+    ) or None
+    if merged_kv_head_dims is not None and (
+        len(merged_kv_head_dims) != len(merged_group_ids)
+        or merged_kv_head_counts is None
+        or len(merged_kv_head_counts) != len(merged_group_ids)
+    ):
+        merged_kv_head_counts = merged_kv_head_dims = None
+
 
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         build_paged_cache_group_specs,
@@ -443,6 +555,11 @@ def _ordinary_setup(
             ),
             state_field_dtypes={},
             token_capacity=token_capacity,
+            # Same empty-or-aligned invariant as merged_layer_types above: a
+            # per-layer geometry that does not cover the merged stack cannot be
+            # attributed to layers, so it is dropped rather than misapplied.
+            layer_kv_head_counts=merged_kv_head_counts,
+            layer_kv_head_dims=merged_kv_head_dims,
         ),
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
@@ -491,11 +608,21 @@ def _mha_fields(config, num_layers: int):
     )
     if len(group_ids) != num_layers:
         raise ValueError("cache group ids must cover every MHA layer")
+    tp = max(getattr(config, "attn_tp_size", 1), 1)
+    per_layer_heads = getattr(config, "layer_kv_head_counts", None)
+    per_layer_dims = getattr(config, "layer_kv_head_dims", None)
+    if per_layer_dims and per_layer_heads and len(per_layer_dims) == num_layers:
+        sharded_heads = tuple(max(int(h) // tp, 1) for h in per_layer_heads)
+        per_layer_dims = tuple(int(d) for d in per_layer_dims)
+    else:
+        sharded_heads = per_layer_dims = None
     fields = mha_cache_fields(
         layer_group_ids=group_ids,
         logical_block_tokens=config.page_size,
         kv_heads=max(config.num_kv_heads // config.attn_tp_size, 1),
         head_dim=config.head_dim,
+        layer_kv_heads=sharded_heads,
+        layer_kv_head_dims=per_layer_dims,
         kv_element_size=(
             1
             if config.kv_cache_mxfp8

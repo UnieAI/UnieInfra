@@ -205,23 +205,33 @@ def validate_mixed_batch_backend(server_args, attn_backend) -> None:
         )
 
 
-def _uses_gdn_linear_attention(model_config) -> bool:
-    """Does this checkpoint have linear-attention (GDN) layers at all?
+def model_may_use_fi_gdn(model_config) -> bool:
+    """Whether this model has a layer the flashinfer GDN kernel can serve.
 
-    Hybrid models declare them in ``layer_types`` on the text config
-    (``configs/qwen3_5_text_base_config.py:297``); a dense or MoE model either
-    has no such field or lists only attention layers. Read from the config
-    rather than from the attention-backend name: the backend is chosen later
-    and per layer, while what decides whether the GDN chunk-prefill kernel can
-    run at all is whether such a layer exists.
+    The guard below turns off a correctness hazard that only exists on the GDN
+    chunk-prefill path. Only two model families in this tree reach that kernel
+    -- ``models/qwen3_5.py`` and ``models/kimi_k3.py`` -- and both declare a
+    per-layer ``layer_types`` carrying ``"linear_attention"``. Gemma declares
+    ``sliding_attention``/``full_attention`` and has no linear layer at all, so
+    the kernel cannot run, and taking its graph away costs every request a
+    prefill it could have replayed.
+
+    A config that declares no ``layer_types`` gets the conservative answer.
+    That is today's behaviour for those models, not a new cost: narrowing the
+    guard for a model whose mixers have not been read here would be trading a
+    correctness guard for a speedup on an untested path. Gemma is the case
+    this fixes; the rest keep what they had.
     """
-    text_config = getattr(model_config, "hf_text_config", None)
-    if text_config is None:
-        return True  # unknown shape: keep the conservative behaviour
-    layer_types = getattr(text_config, "layer_types", None)
-    if not layer_types:
-        return False
-    return any("linear" in str(label) for label in layer_types)
+    if model_config is None:
+        return True
+    for cfg in (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+    ):
+        layer_types = getattr(cfg, "layer_types", None)
+        if layer_types:
+            return any(str(t) == "linear_attention" for t in layer_types)
+    return True
 
 
 def resolve_fi_gdn_prefill_graph(server_args, model_config=None) -> None:
@@ -253,13 +263,17 @@ def resolve_fi_gdn_prefill_graph(server_args, model_config=None) -> None:
         return
     if getattr(server_args, "disable_prefill_graph", False):
         return
-    if model_config is not None and not _uses_gdn_linear_attention(model_config):
-        # The kernel this function protects against only runs on models with
-        # linear-attention layers. Disabling the prefill graph for a dense or
-        # MoE model turns off a capture that has nothing to do with GDN, and
-        # that is not free: on Qwen3-0.6B a single short request costs 17.3 ms
-        # with the graph off against 8.98 ms with it on. The guard used to
-        # fire for every model, which is how that 8 ms hid.
+    if not model_may_use_fi_gdn(model_config):
+        # Measured on gemma-4-31B-it, sm_120, concurrency 1: a 1-token request
+        # costs 96.9 ms with the graph off against 49.7 ms on vLLM for the same
+        # thing, while the per-decode-token cost is at parity (45.5 vs 44.1) and
+        # 8k prefill is 6.4% faster here. The whole gap was this intercept, and
+        # it was being paid for a kernel this model never calls.
+        logger.info(
+            "Keeping the prefill CUDA graph: this model declares no "
+            "linear_attention layer, so the flashinfer GDN chunk-prefill "
+            "kernel is unreachable and its capture hazard does not apply."
+        )
         return
     if os.getenv("TOKENSPEED_FI_GDN_ALLOW_PREFILL_GRAPH") == "1":
         # Diagnostic escape hatch for the combination this function exists to

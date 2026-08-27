@@ -155,10 +155,22 @@ private:
     };
 
     static auto evictionKey(const VictimCandidate& candidate) {
+        // Recency first, tier second. Tried the reverse on 2026-08-21 to keep
+        // resumable SWA boundaries alive: gemma-4-31B agent-26k c=1, median
+        // TTFT 3547.73 -> 5335.39 ms (+50.4%), P99 9085.58 -> 9456.02 against
+        // a 39 ms spread over three runs of the same config. Reverted.
+        //
+        // The order decides the FIRST victim as much as the last, and
+        // kUncached means "allocated, owned only by the request table" -- a
+        // page an in-flight request is writing into. Promoting tier made every
+        // one of those the first thing evicted, and the recompute cost more
+        // than the retained boundaries saved. Keeping older boundaries alive
+        // needs a mechanism that does not also reorder the live set: refresh
+        // the epoch of a boundary when a match lands on it, or exclude
+        // kUncached from candidacy, not a global re-sort.
         return std::tuple{candidate.last_access_epoch, candidate.eviction_tier,         candidate.position_rank,
                           candidate.group_id,          candidate.location.lcm_block_id, candidate.location.slot_index};
     }
-
     static bool evictedAfter(const VictimCandidate& lhs, const VictimCandidate& rhs) {
         return evictionKey(rhs) < evictionKey(lhs);
     }

@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 from tokenspeed_kernel import (
     mha_decode_with_kvcache,
@@ -928,6 +930,26 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         """
         npt = metadata.mixed_prefill_tokens
         total = metadata.mixed_total_tokens
+
+        # State of the mixed forward, unconditionally. The first version of
+        # this sat inside `if save_kv_cache:` and printed nothing on a batch
+        # the scheduler had logged as "Mix" -- which says the branch is not
+        # taken, not that the write is fine. Print what decides it.
+        if os.environ.get("TOKENSPEED_LOG_MIXED_LOCS") == "1":
+            _dm = self.forward_decode_metadata
+            _dlocs = None if _dm is None else getattr(_dm, "out_cache_locs", None)
+            _elocs = getattr(metadata, "out_cache_locs", None)
+            def _n(d):
+                if d is None:
+                    return None
+                return {g: int(t.shape[0]) for g, t in d.items()}
+            logger.info(
+                "mixed layer=%s rows=%d (prefill=%d decode=%d) q=%d "
+                "save_kv=%s extend_locs=%s decode_locs=%s caller_locs=%s",
+                layer.layer_id, total, npt, total - npt, int(q.shape[0]),
+                save_kv_cache, _n(_elocs), _n(_dlocs),
+                None if out_cache_loc is None else int(out_cache_loc.shape[0]),
+            )
 
         # Scrub before the write so a padded tail cannot reach the cache, then
         # write both segments' KV in one call (see the docstring).

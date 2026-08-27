@@ -488,6 +488,26 @@ def prefill_attention_fwd(
     lse_arg = lse_extend if lse_extend is not None else o_extend
     page_table_arg = page_table if page_table is not None else cache_seqlens
 
+    # Tuning overrides for the sweep. The heuristic above carries measured
+    # sm_120 tuning, but for Lq > 256 -- gemma-4-31B's 10 full-attention layers
+    # at 32 q x 4 kv x 512 -- only num_stages was compared (1 vs 2). BLOCK_M and
+    # BLOCK_N were inherited at (32, 32) and never swept for a head this wide,
+    # and those 10 layers are 41.3% of prefill device time (137 ms per
+    # 1024-token chunk against 6.88 ms for all 50 sliding layers).
+    import os as _os
+    _bm = _os.environ.get("TS_TRITON_PREFILL_BLOCK_M")
+    _bn = _os.environ.get("TS_TRITON_PREFILL_BLOCK_N")
+    _nw = _os.environ.get("TS_TRITON_PREFILL_NUM_WARPS")
+    _ns = _os.environ.get("TS_TRITON_PREFILL_NUM_STAGES")
+    if _bm:
+        BLOCK_M = int(_bm)
+    if _bn:
+        BLOCK_N = int(_bn)
+    if _nw:
+        num_warps = int(_nw)
+    if _ns:
+        num_stages_override = int(_ns)
+
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1 if num_stages_override is None else num_stages_override
 

@@ -956,6 +956,33 @@ def create_attn_components(
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
     max_num_tokens = spec.pool_size
+    # The binding hole, named. `binding_utilization` reports 0.5 for every group
+    # on gemma-4, i.e. half the arena is dead by construction, but the aggregate
+    # does not say WHICH tenant sized the slab. Print the planes and the
+    # per-group block bytes so the widest tenant is identifiable without
+    # reverse-engineering solve_cache_layout.
+    try:
+        _plan = spec.memory_plan
+        _gb = {}
+        for _f in _plan.fields:
+            _gb[_f.group_id] = _gb.get(_f.group_id, 0) + _f.payload_bytes
+        logger.info(
+            "Cache layout: lcm_block_bytes=%d planes=%s group_block_bytes=%s packing=%s",
+            _plan.lcm_block_bytes,
+            [(getattr(pl, "plane_id", "?"), getattr(pl, "bytes_per_lcm_block", getattr(pl, "block_bytes", -1)))
+             for pl in _plan.planes],
+            _gb,
+            {g.group_id: g.cache_blocks_per_lcm_block for g in _plan.groups},
+        )
+        _g2p = {}
+        for _f in _plan.fields:
+            _g2p.setdefault(_f.group_id, set()).add(_f.plane_id)
+        logger.info(
+            "Cache layout: group->planes %s",
+            {g: (len(pl), sorted(pl)[:2]) for g, pl in sorted(_g2p.items())},
+        )
+    except Exception as _e:  # never let a diagnostic break startup
+        logger.info("Cache layout: unavailable (%s)", _e)
     logger.info(
         "Cache profile: parent_bytes=%d, P=%d, parents=%d, token_capacity=%d, "
         "layers=%d (draft %d), groups=%s",

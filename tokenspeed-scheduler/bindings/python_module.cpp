@@ -141,6 +141,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::PagedCacheGroupConfig::cache_blocks_per_lcm_block)
         .def_rw("checkpoint_stride_blocks", &tokenspeed::PagedCacheGroupConfig::checkpoint_stride_blocks)
+        .def_rw("max_scheduled_tokens", &tokenspeed::PagedCacheGroupConfig::max_scheduled_tokens)
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)

@@ -704,6 +704,9 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int3
             case AttnKind::kSlidingWindow:
                 manager = std::make_unique<SwaManager>(group_cache_block_tokens, spec.cache_blocks_per_lcm_block,
                                                        spec.sliding_window, group_id);
+                // Without this the group is charged the whole prompt span at
+                // admission instead of its true peak (window + one step).
+                static_cast<SwaManager&>(*manager).SetMaxScheduledTokens(spec.max_scheduled_tokens);
                 break;
             default:
                 FatalCheck(false, "unknown AttnKind in coordinator group spec");

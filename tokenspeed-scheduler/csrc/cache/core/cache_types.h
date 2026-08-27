@@ -84,6 +84,10 @@ struct KvCacheSpec {
     // prefix match resumes from the nearest earlier snapshot. Windowed groups
     // only.
     std::int32_t checkpoint_stride_blocks{1};
+    // Bound on what one scheduling step prefills; a sliding group's admission
+    // peak is its window plus this, not the whole prompt span. 0 = unknown,
+    // which falls back to the base (whole-span) charge.
+    std::int32_t max_scheduled_tokens{0};
 };
 
 // Per-group input for one admission. page_hashes is the request's cumulative

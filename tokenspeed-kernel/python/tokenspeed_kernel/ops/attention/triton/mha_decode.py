@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import math
+import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -515,6 +516,17 @@ def _decode_grouped_att_m_fwd(
     if platform.is_amd:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16}
         num_stages = 1
+    # Tuning overrides. gemma-4-31B's 10 full-attention layers are head_dim 512,
+    # which no specialised kernel in this tree accepts (trtllm XQA caps at 256,
+    # FA4 at 128), so this Triton path is the only one -- and on that shape it
+    # runs at 23% of HBM bandwidth: 2.02 ms/layer against a 0.47 ms floor.
+    # BLOCK_N=32 with BLOCK_DMODEL=512 and num_warps=4 leaves each thread four
+    # elements per token. Let the sweep say what the shape wants.
+    _nw = int(os.environ.get("TS_TRITON_DECODE_NUM_WARPS", "4"))
+    num_stages = int(os.environ.get("TS_TRITON_DECODE_NUM_STAGES", str(num_stages)))
+    _bn = os.environ.get("TS_TRITON_DECODE_BLOCK_N")
+    if _bn:
+        BLOCK = int(_bn)
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -548,7 +560,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
-        num_warps=4,
+        num_warps=_nw,
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
@@ -896,7 +908,35 @@ def triton_mha_decode_with_kvcache(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    max_kv_splits = 4
+    # Flash-decoding split count. This was `max_kv_splits = 4` with
+    # `num_kv_splits` filled with ONES, so every request ran a single split:
+    # the effective grid is (total_q, ceil(q_heads/kv_group), 1), which for
+    # gemma-4-31B's full-attention decode is 16 blocks on a 188-SM card -- 8.5%
+    # of the machine, each block walking all 813 KV blocks of a 26k context in
+    # sequence. Measured 2.02 ms/layer against a 0.47 ms bandwidth floor (23%).
+    # Splitting the KV axis is what flash-decoding exists to do at batch 1.
+    # Size the split count to the machine, not to a constant. Without a split
+    # the grid is (total_q, ceil(q_heads/kv_group), 1); at batch 1 that is 16
+    # blocks for gemma-4-31B full attention, 8.5% of a 188-SM card, each block
+    # walking every KV block of the context in sequence. Measured on that shape
+    # (head_dim 512, 26k ctx): 2.007 ms/layer at 1 split, 0.568 at 8 -- 3.54x,
+    # and 23% -> 83% of HBM bandwidth. Output matches the 1-split reference to
+    # 2.44e-04, one bf16 ULP at this magnitude.
+    #
+    # The cap matters as much as the floor: at batch 64 the head grid alone
+    # already exceeds the SM count, and splitting there only adds stage-2
+    # reduction work. 64 splits measured slower than 8 even at batch 1.
+    _env_splits = os.environ.get("TS_TRITON_DECODE_KV_SPLITS")
+    if _env_splits:
+        max_kv_splits = int(_env_splits)
+    else:
+        _kv_group = max(1, q.shape[1] // k_cache.shape[2])
+        _head_blocks = -(-q.shape[1] // min(16, _kv_group))
+        _base_blocks = max(1, q.shape[0] * _head_blocks)
+        _sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        _kv_blocks = max(1, -(-int(max_seqlen_k) // 32))
+        _want = max(1, min(16, -(-_sms // _base_blocks), _kv_blocks))
+        max_kv_splits = 1 << (_want.bit_length() - 1)
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
@@ -912,8 +952,8 @@ def triton_mha_decode_with_kvcache(
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    num_kv_splits = torch.full(
+        (cache_seqlens.shape[0],), max_kv_splits, dtype=torch.int32, device=q.device
     )
     decode_attention_fwd(
         q,

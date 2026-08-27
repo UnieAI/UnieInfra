@@ -111,6 +111,9 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             .cache_block_tokens = cache_block_tokens,
+            // Only a sliding group reads it; a full group's admission charge is
+            // the whole span by definition.
+            .max_scheduled_tokens = group.max_scheduled_tokens,
         });
     }
     return specs;

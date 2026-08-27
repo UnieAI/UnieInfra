@@ -43,6 +43,42 @@ public:
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }
 
+    // Admission must reserve what this group PEAKS at, not the span it covers.
+    //
+    // The base implementation returns the whole span whenever `BacksEveryPage()`
+    // -- correct for a full-attention group, wrong for a sliding one, and
+    // `SwaManager` never overrode it. A sliding group holds only
+    // [pos - window, pos]: `ReclaimExpired` nulls every page that has fully slid
+    // out between scheduling steps, so its high-water mark is the window plus
+    // the single step being written, no matter how long the prompt is.
+    //
+    // Measured on gemma-4-31B (window 1024, P 64, chunk 8192), c=14, from the
+    // engine's own refusal trace:
+    //   refuse groups=6 blocks_needed=1039 parents_needed=947 empty_parents=925
+    //     g0..g4(need=172 slots=1)   <- five sliding groups, each charged the
+    //     g5   (need=179 slots=2)       whole 11,008-token span
+    // 947 parents demanded against 925 free, so the request was refused -- 6,136
+    // times across 92 requests in one 112-request run, which is where the TTFT
+    // tail comes from (p50 3.8 s, max 41 s, while vLLM's max is 12.7 s at the
+    // same mean). The true peak is 145 pages: 8192 written plus 1024 of lookback
+    // is 9,216 tokens = 144 pages, plus the tail page.
+    //
+    // `max_scheduled_tokens` is 0 in unit tests and any caller that does not
+    // plumb it; the cap is then skipped and the base behaviour stands, so this
+    // can only ever reserve LESS than before, never more.
+    std::int32_t AdmissionBlocksNeededFor(const BlockTable& table, std::int32_t num_tokens,
+                                          std::int32_t base_index) const override {
+        const std::int32_t pages = KvCacheManager::AdmissionBlocksNeededFor(table, num_tokens, base_index);
+        if (max_scheduled_tokens_ <= 0) {
+            return pages;
+        }
+        const std::int32_t peak_tokens = sliding_window_ - 1 + max_scheduled_tokens_;
+        const std::int32_t peak_pages = (peak_tokens + cache_block_tokens_ - 1) / cache_block_tokens_ + 1;
+        return std::min(pages, peak_pages);
+    }
+
+    void SetMaxScheduledTokens(std::int32_t tokens) { max_scheduled_tokens_ = tokens; }
+
     // Non-closed: shortening a match can cut its trailing run below the window, so match bound-first.
     bool MatchIsPrefixClosed() const override { return false; }
     std::int32_t BoundaryLookbackBlocks() const override { return pagesNeededToResume(); }
@@ -278,6 +314,7 @@ private:
     }
 
     std::int32_t sliding_window_;
+    std::int32_t max_scheduled_tokens_{0};
 };
 
 }  // namespace tokenspeed

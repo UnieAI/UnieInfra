@@ -54,6 +54,18 @@ struct PagedCacheGroupConfig {
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
     PagedCacheTransferPolicy transfer_policy{PagedCacheTransferPolicy::Unspecified};
 
+    // NOTE: must stay LAST -- the nanobind constructor aggregate-initialises
+    // this struct positionally, so a field inserted earlier shifts every
+    // argument after it. Set it through def_rw, not the constructor.
+    // The largest token span one scheduling step can prefill. A sliding-window
+    // group never HOLDS more than its window plus the step being written --
+    // `ReclaimExpired` nulls every page that has fully slid out between steps --
+    // so this bounds what admission must reserve for it. Without it the base
+    // `AdmissionBlocksNeededFor` charges the whole prompt span, which on
+    // gemma-4 (window 1024, P 64, chunk 8192) over-charges each of the five
+    // sliding groups 172 pages where 145 is the true peak.
+    std::int32_t max_scheduled_tokens{0};
+
     std::int32_t CacheBlockTokens() const { return rows_per_page * entry_stride_tokens; }
     void Validate() const;
 };

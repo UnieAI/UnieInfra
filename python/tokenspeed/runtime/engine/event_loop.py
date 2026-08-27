@@ -402,6 +402,13 @@ class EventLoop:
                     max_scheduled_tokens,
                 )
                 server_args.chunked_prefill_size = max_scheduled_tokens
+        # A sliding-window group's admission peak is its window plus ONE step,
+        # not the whole prompt span: ReclaimExpired nulls every page that has
+        # fully slid out between steps. Without this the C++ side falls back to
+        # the whole-span charge -- on gemma-4 that demanded 947 parents against
+        # 925 free and refused the request 6,136 times in one 112-request run.
+        for group in paged_cache_groups:
+            group.max_scheduled_tokens = int(max_scheduled_tokens)
         mapping = server_args.mapping
         # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
         # real rows are 1..max_batch_size, row 0 is reserved, and CUDA graph

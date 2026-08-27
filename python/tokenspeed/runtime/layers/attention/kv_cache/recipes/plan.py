@@ -282,10 +282,44 @@ class CacheLayout:
                 fam = len(set(plane_family.values()))
             family_of_group[field.group_id] = fam
             plane_family[field.plane_id] = fam
+        # Overlaying is only sound when every plane has the SAME size. The
+        # layout is plane-major: parent k sits at `plane_offset + k *
+        # plane_bytes`. Two families that start at the same arena offset with
+        # DIFFERENT plane sizes put their parent k at different byte ranges, so
+        # parent k of one family lands inside parent 2k of the other -- and
+        # `BoundGroup` cannot catch it, because each parent really is bound to
+        # exactly one group. It is a silent wrong read, not a violated
+        # invariant.
+        #
+        # gemma-4 satisfies it (40 planes, all 524,288) which is why the
+        # overlay is correct there. Measured what happens when it does not:
+        # splitting Qwen3.5-27B's plane namespaces by layer kind gives FULL
+        # planes of 1,572,864 against LIN planes of 3,145,728, and the server
+        # answers correctly for eleven requests and then returns "!!!!!!!!"
+        # for every request after that, with no error anywhere.
+        #
+        # Fall back to consecutive (union) layout rather than refuse to serve:
+        # a union parent wastes bytes but reads the right ones.
+        distinct_plane_sizes = {size for _, size in self.plane_bytes}
+        overlay = len(set(plane_family.values())) <= 1 or len(
+            distinct_plane_sizes
+        ) == 1
+        if not overlay and len(set(plane_family.values())) > 1:
+            logger.warning(
+                "Cache arena: %d geometry families but %d distinct plane "
+                "sizes %s -- laying families out consecutively instead of "
+                "overlaying them. The parent is the UNION of the families and "
+                "every parent wastes 1 - 1/families of its bytes. Overlaying "
+                "needs one plane size across all families; see the comment "
+                "above this check.",
+                len(set(plane_family.values())),
+                len(distinct_plane_sizes),
+                sorted(distinct_plane_sizes),
+            )
         planes = []
         family_offset: dict[int, int] = {}
         for plane_id, bytes_per_lcm_block in self.plane_bytes:
-            fam = plane_family.get(plane_id, 0)
+            fam = plane_family.get(plane_id, 0) if overlay else 0
             arena_offset = family_offset.get(fam, 0)
             planes.append(
                 CachePlaneLayout(

@@ -33,6 +33,7 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
+import os
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
@@ -1721,6 +1722,20 @@ def mha_decode_with_kvcache(
         solution=solution,
         override=override,
     )
+
+    # Which kernel each decode call actually gets. The profile shows ~50 calls
+    # per step on trtllm XQA (1.0 ms total) and ~10 on Triton
+    # _fwd_grouped_kernel_stage1 (20.7 ms), matching gemma's 50 sliding / 10
+    # full split -- but querying select_kernel in isolation with the full
+    # attention traits returns the trtllm kernel, and page_size, head_dim,
+    # logit cap, arch and page-table width have all been ruled out. So the
+    # traits the engine actually passes differ from the ones I reconstructed.
+    # Print them rather than reconstruct them again.
+    if os.environ.get("TOKENSPEED_LOG_KERNEL_PICK") == "1":
+        import sys as _sys
+        print(f"[pick] mha_decode -> {kernel.name} q={tuple(q.shape)} "
+              f"kcache={tuple(k_cache.shape)} traits={traits}",
+              file=_sys.stderr, flush=True)
 
     # Record shapes
     shape_params = {

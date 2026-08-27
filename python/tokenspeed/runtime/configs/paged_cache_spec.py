@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import os
+
 from collections import Counter
 from collections.abc import Sequence
 
@@ -55,6 +57,15 @@ def split_groups_to_equal_depth(layer_types: Sequence[str]) -> tuple[str, ...]:
         no-op (one label, already equal depth, or an unlabelled stack).
     """
     if not layer_types:
+        return tuple(layer_types)
+    # A/B gate, not a feature. The split exists to avoid dead slab rows; it
+    # also multiplies gemma's sliding half into five cache groups, and
+    # SweepThenConverge takes std::min across groups -- so all five must hit
+    # for any reuse to count, and one zero discards a full-attention match of
+    # 1,580 blocks. Off means one sliding group instead of five: 2 parents per
+    # 64 tokens instead of 6, and two groups to agree instead of six, paid for
+    # with the dead rows the docstring above measured.
+    if os.environ.get("TOKENSPEED_NO_GROUP_SPLIT") == "1":
         return tuple(layer_types)
     counts = Counter(layer_types)
     if len(counts) < 2:

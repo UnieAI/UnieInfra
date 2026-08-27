@@ -252,9 +252,41 @@ class CacheLayout:
                 )
             )
 
+        # Planes of DIFFERENT geometry families overlay the same arena bytes.
+        #
+        # A parent is bound to exactly one group for as long as it holds any
+        # block (`block_pool.h` asserts "LCM parent binding changed while
+        # occupied", and `bound_group.reset()` runs only at occupied_count == 0,
+        # so no cached block outlives the binding either). A group only ever
+        # touches its own geometry's planes. So the planes of two families are
+        # never both live for the same parent id, and giving each family its own
+        # arena region only reserves bytes that parent can never use.
+        #
+        # Laying every plane out consecutively made the parent the UNION of all
+        # families. Measured on gemma-4-31B: 40 planes (10 units x {4x512.k,
+        # 4x512.v, k, v}), lcm_block_bytes 20,971,520, and the engine's own
+        # `binding_utilization` reporting 0.5 for all six groups -- 13.2 GiB of a
+        # 26.4 GiB arena dead from the moment it was allocated. The cost is
+        # 1 - 1/families, so it appears only on models whose layers disagree
+        # about KV geometry, which is why a single-geometry model never saw it.
+        #
+        # Overlaying makes the parent the MAX over families instead. Same budget,
+        # 2x the parents on a two-family model.
+        plane_family: dict[str, int] = {}
+        family_of_group: dict[str, int] = {}
+        for field in self.fields:
+            fam = family_of_group.get(field.group_id)
+            if fam is None:
+                fam = plane_family.get(field.plane_id)
+            if fam is None:
+                fam = len(set(plane_family.values()))
+            family_of_group[field.group_id] = fam
+            plane_family[field.plane_id] = fam
         planes = []
-        arena_offset = 0
+        family_offset: dict[int, int] = {}
         for plane_id, bytes_per_lcm_block in self.plane_bytes:
+            fam = plane_family.get(plane_id, 0)
+            arena_offset = family_offset.get(fam, 0)
             planes.append(
                 CachePlaneLayout(
                     plane_id=plane_id,
@@ -262,7 +294,7 @@ class CacheLayout:
                     arena_offset_bytes=arena_offset,
                 )
             )
-            arena_offset += (num_lcm_blocks + 1) * bytes_per_lcm_block
+            family_offset[fam] = arena_offset + (num_lcm_blocks + 1) * bytes_per_lcm_block
 
         return CacheMemoryPlan(
             logical_block_tokens=self.logical_block_tokens,
@@ -652,7 +684,25 @@ def solve_cache_layout(
     parent_alignment = alignment
     for count in packing.values():
         parent_alignment = parent_alignment // math.gcd(parent_alignment, count) * count
-    lcm_block_bytes = _align_up(sum(plane_bytes.values()), parent_alignment)
+    # MAX over geometry families, not SUM over all planes. A parent is bound to
+    # one group while it holds anything, so it only ever touches one family's
+    # planes; `CacheMemoryPlan.layout` overlays the families on the same bytes.
+    # Summing made the parent the union and left 1 - 1/families of the arena
+    # dead -- 13.2 GiB of 26.4 on gemma-4-31B, which the engine was already
+    # reporting as binding_utilization 0.5 on every group.
+    _fam_of_group: dict[str, int] = {}
+    _fam_of_plane: dict[str, int] = {}
+    for _f in ordered_fields:
+        _fam = _fam_of_group.get(_f.group_id, _fam_of_plane.get(_f.plane_id))
+        if _fam is None:
+            _fam = len(set(_fam_of_plane.values()))
+        _fam_of_group[_f.group_id] = _fam
+        _fam_of_plane[_f.plane_id] = _fam
+    _fam_bytes: dict[int, int] = {}
+    for _pid, _b in plane_bytes.items():
+        _fam = _fam_of_plane.get(_pid, 0)
+        _fam_bytes[_fam] = _fam_bytes.get(_fam, 0) + _b
+    lcm_block_bytes = _align_up(max(_fam_bytes.values()), parent_alignment)
     if lcm_block_bytes > _MAX_LCM_BLOCK_BYTES:
         raise ValueError(
             f"LCM block size {lcm_block_bytes} exceeds limit {_MAX_LCM_BLOCK_BYTES}"

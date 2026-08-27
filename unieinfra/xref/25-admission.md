@@ -586,3 +586,64 @@ per-(layer, slot, head, k-channel)、縮減軸取 `d_v`，對齊 `diag(alpha)` �
 
 **這是下一格，而且它跟今天失敗的四個走的是不同的軸** —— 前四個都在既有容量上重新分配
 （checkpoint 密度、host 層、前綴長度、搶佔），這一個是把每請求的佔用直接砍掉。
+
+---
+
+## 附錄 A — LCM parent 的兩個死區(2026-08-26 實測)
+
+引擎自報的 `binding_utilization` 就是這一節的證據,兩個模型上是**不同的**缺陷。
+
+### A.1 gemma-4-31B:parent 被做成幾何家族的「聯集」(已修)
+
+`group->planes` 顯示恰好兩個家族,而且五個 sliding 群組共用同一組 plane:
+
+    full_attention        : 20 planes  unit.N.4x512.{k,v}
+    sliding_attention_0..4: 20 planes  unit.N.{k,v}   ← 五個群組共用
+
+`lcm_block_bytes = sum(所有 plane) = 20,971,520`,`binding_utilization` 六個群組
+全部 **0.5**。arena 26.4 GiB 裡有 **13.2 GiB 從配置起就是死的**:一個 parent 在全部
+40 個 plane 都有 slot,但它綁定到單一群組,只用得到 20 個。
+
+**修法**:`lcm_block_bytes` 從 `sum` 改成 `max over families`,並讓 `layout()` 把
+不同家族的 plane 區段疊放(`arena_offset` 每個家族從 0 重置)。
+
+安全性由既有的不變量提供:`block_pool.h` 的 `FatalCheck("LCM parent binding changed
+while occupied")`,加上 `bound_group.reset()` 只在 `occupied_count == 0` 執行 ——
+連快取中的 block 都不再引用時才解綁,所以兩個家族的資料不可能同時存在於同一個 parent。
+
+**實測**:`parents` 1,354 → **2,709**、`token_capacity` 86,656 → **173,376**、
+`binding_utilization` 全部 0.5 → **1.0**;c=1 輸出正確,c=8 併發 32/32 零損壞。
+
+代價的公式是 `1 - 1/家族數`,所以只有「層與層之間 KV 幾何不同」的模型會踩到 ——
+單一幾何的模型完全無感,這就是它一直沒被發現的原因。
+
+### A.2 Qwen3.5-27B:linear 群組的 0.51 是結構性的,不是進位邊界(實測推翻了第一版)
+
+**第一版的推導是錯的,記在這裡因為錯法本身有用。** 我用「linear 的 block 總位元組
+÷ plane 數」得到每 plane 1,603,692,推論兩塊需要 3,207,384、只差 61,656(2%)放不下,
+於是寫了一個「在 max_padding_fraction 內把 plane 進位到多裝一塊」的修正。**實測完全
+沒有效果**,四個數字一字不變。加一行 trace 印出求解器實際看到的值才發現兩件事:
+
+    [PLANE-PAD] unit.0.a  required=3145728
+      exact=['full_attention','linear_attention_0','linear_attention_1','linear_attention_2']
+      groups={'full_attention': (262144, 12, 12), 'linear_attention_0': (3145728, 1, 1)}
+    [PLANE-PAD] unit.0.b
+      groups={'full_attention': (262144, 12, 12), 'linear_attention_0': (61440, 1, 51)}
+
+1. **四個群組全部是 `exact_page_stride`**,所以任何動 packing 的修正都會(正確地)被跳過。
+   recipe 裡看到的 `exact_page_stride=False` 是別的模型的路徑。
+2. **linear 在兩種 plane 上的佔用完全不同**,平均掉就看不見:
+   `unit.N.a` 放 SSM state,3,145,728 —— **正好填滿,利用率 100%**;
+   `unit.N.b` 放 conv state,只有 61,440 / 3,145,728 = **1.95%**,而 `b` 的尺寸是
+   full_attention 的 12 × 262,144 定的。
+
+所以 linear 的 0.5098 = 16 個 `a` plane 用滿 + 16 個 `b` plane 幾乎空著。它的 packing
+被 `a` plane 釘死在 1(兩塊 SSM state 要 6,291,456,是 plane 的**兩倍**,不是差 2%)。
+
+**Qwen 沒有便宜的 2x。** A.1 的家族疊放對它無效(單一家族,`max == sum`);把 plane 撐大
+到讓 linear packing 2 需要 parent 成長 50%,換來 linear +33% / full −33%,不是淨贏。
+真正的修法是 per-group 的 parent 尺寸(等於分開的池),那是更大的結構改動。
+
+**方法上的教訓**:`binding_utilization` 是每個群組跨所有 plane 的**平均**,而一個群組
+在不同 plane 上的佔用可以差 50 倍。看到 0.5 不要推「差一點就能多裝一塊」——
+要 plane 級的分解才知道那 0.5 是「處處半滿」還是「一半滿、一半空」。

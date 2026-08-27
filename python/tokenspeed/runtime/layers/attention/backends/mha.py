@@ -356,6 +356,39 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     extend_seq_lens_cpu[:bs],
                     self.page_size,
                 )
+                if is_mixed and bs > num_extends:
+                    # MIXED packs prefill rows first, then one-token decode
+                    # rows. The extend vectors describe the PREFILL rows only
+                    # (model_executor slices extend_*_buf[:num_extends]), so
+                    # locations built from them stop at the prefill tokens.
+                    # _save_kv_cache then trims k/v to the loc count and drops
+                    # every decode row's newest token without a word, so the
+                    # next step attends over a stale slot -- a well-formed
+                    # wrong answer, which is why this survived as "mixed
+                    # batching corrupts gemma" rather than as a crash. Append
+                    # the decode tail's own locations in packed row order.
+                    # This is NOT gemma-only. Measured: Qwen3.5-27B reaches
+                    # here too ("appended 2 decode locs to groups
+                    # ['full_attention']") -- its GDN layers are state groups
+                    # and get shed, but its full_attention layers are a paged
+                    # group, so every mixed step was dropping their decode KV
+                    # writes as well. Only models whose block_tables carry no
+                    # paged group at all (group_out_cache_locs stays None) were
+                    # unaffected, because there the caller's whole-batch
+                    # out_cache_loc is used unchanged.
+                    tail_locs = self._compute_decode_group_out_cache_locs(
+                        {
+                            gid: t[num_extends:bs]
+                            for gid, t in group_page_tables.items()
+                        },
+                        seq_lens[num_extends:bs],
+                        self.page_size,
+                        1,
+                    )
+                    group_out_cache_locs = {
+                        gid: torch.cat([locs, tail_locs[gid].to(locs.dtype)])
+                        for gid, locs in group_out_cache_locs.items()
+                    }
             else:
                 # Spec rounds write multi-token windows on BOTH sides: the
                 # target's verify chunk, and a window-mode draft's catch-up
@@ -900,6 +933,21 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # write both segments' KV in one call (see the docstring).
         scrub_padding_tail(total, q, k, v)
         if save_kv_cache:
+            # DIAG: the mixed write must cover prefill tokens AND decode rows.
+            # _trim_kv_to_locs silently drops any k/v rows past the loc count,
+            # which would leave decode rows' newest token out of the cache.
+            _nloc = int(out_cache_loc.shape[0])
+            if _nloc < total and not getattr(self, "_mixed_loc_warned", False):
+                self._mixed_loc_warned = True
+                logger.error(
+                    "MIXED KV write covers only %d of %d rows (prefill=%d "
+                    "decode=%d, k_rows=%d, group=%r): _trim_kv_to_locs will "
+                    "DROP the tail and those tokens never enter the cache. "
+                    "This is a correctness bug, not a warning -- it produces "
+                    "fluent wrong text, never a crash.",
+                    _nloc, total, npt, total - npt, int(k.shape[0]),
+                    getattr(layer, "group_id", None),
+                )
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         # Prefill segment. A fresh chunk (no cached prefix) can still take the

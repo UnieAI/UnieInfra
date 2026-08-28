@@ -27,6 +27,31 @@ import torch.nn.functional as F
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
+import os as _os
+
+# One-shot shape histogram for the dense GEMM path (TOKENSPEED_MM_SHAPES=1).
+# The decode profile says 41% of batch-32 decode time is one
+# cutlass_80_wmma 32x32 split-K kernel, but none of q/k/v/o/gate_up/down at
+# M=32 selects it in isolation under F.linear, torch.mm, or torch.mm(out=).
+# The trace cannot say which op issues it -- correlation ids repeat and
+# record_shapes does not survive the /start_profile proxy -- so count the
+# shapes at the dispatch point instead of inferring them from grid dims.
+_MM_SHAPE_LOG = _os.environ.get("TOKENSPEED_MM_SHAPES") == "1"
+_MM_SHAPES: dict = {}
+
+
+def _mm_note(A, B):
+    k = (tuple(A.shape), tuple(B.shape))
+    n = _MM_SHAPES.get(k, 0) + 1
+    _MM_SHAPES[k] = n
+    if n == 1 and len(_MM_SHAPES) <= 64:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "MM-SHAPE A=%s B=%s dtype=%s", tuple(A.shape), tuple(B.shape), A.dtype
+        )
+
+
 fp8_dtype = torch.float8_e4m3fn
 _FP8_BLOCK_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
@@ -286,6 +311,8 @@ def torch_mm(
     bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if _MM_SHAPE_LOG:
+        _mm_note(A, B)
     if out is not None:
         if out_dtype != A.dtype:
             raise ValueError(

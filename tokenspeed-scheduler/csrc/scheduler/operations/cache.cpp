@@ -35,6 +35,31 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
         chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
     }
     if (chunk_size == unscheduled) {
+        // The last round used to carry the whole remainder, so prefill ended at
+        // `prefill_size` -- page-aligned only by luck. A mamba/state group
+        // publishes nothing when `num_computed_tokens % cache_block_tokens != 0`
+        // (cacheCompletedBlocksForGroup), and SweepThenConverge takes a min
+        // across groups, so one unaligned endpoint drops the whole converged
+        // prefix back to the last aligned publish -- in practice the last
+        // COMPLETE prefill chunk.
+        //
+        // Measured on Qwen3.8-27B with the engine's own per-chunk log: a
+        // prefix's FIRST reuse matched exactly
+        // floor(prefill / chunked_prefill_size) * chunked_prefill_size and
+        // recomputed the rest -- 6,400 / 5,632 / 4,352 / 3,584 tokens at
+        // prompts of 6.5k / 14.0k / 29.0k / 61.0k, i.e. 745-940 ms. In an agent
+        // workload every reuse is a first reuse: turn N+1 resumes turn N's tail
+        // exactly once, so this was paid on every turn.
+        //
+        // End the last full round on the grid and leave the ragged tail -- less
+        // than one page -- to the next round, so the recurrent state
+        // materializes where it can be published. Worst-case reuse loss goes
+        // from one chunk to one page. A prompt that fits inside a single page
+        // keeps its single round: `chunk_size > ragged` is false there.
+        const std::int32_t ragged = (first_pos + chunk_size) % page_size;
+        if (ragged != 0 && chunk_size > ragged) {
+            return chunk_size - ragged;
+        }
         return chunk_size;
     }
 

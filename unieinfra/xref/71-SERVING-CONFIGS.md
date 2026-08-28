@@ -87,3 +87,57 @@ Splitting the plane namespaces to recover it corrupts: the two families then
 have different per-plane sizes and the arena overlay writes into another
 family's parent. `873b731a` now refuses that overlay and falls back to a union
 layout.
+
+### gemma-4-31B: where the remaining decode time goes
+
+Measured 2026-08-28 on a batch-32 pure-decode window (short prompts, so the KV
+is nearly empty and attention is at its cheapest), device kernel time only —
+this box's profiler CPU times run ~3.6x high and cannot be used for this.
+
+| | ms/step | share |
+|---|---|---|
+| GEMM | 45.7 | 87.4% |
+| attention | 5.15 | 9.8% |
+| everything else | 1.4 | 2.8% |
+| **total** | **52.3** | measured step 55.7 ms, vLLM 50.1 ms |
+
+**The GEMM half is already at the weight-streaming floor.** A standalone timing
+of the model's own eight projection shapes sums to 832.5 us per layer at M=16,
+i.e. 49.95 ms across 60 layers — the measured GEMM time is 45.7 ms. There is no
+kernel to swap in: the remaining gap to vLLM lives in the 6.6 ms that is not
+GEMM, and attention is 5.15 ms of it (`kernel_mha`, 77 us per layer per step
+against an almost-empty KV).
+
+Three explanations were tested and refuted; do not re-try them without new
+evidence:
+
+- **"A bad kernel takes 41% of decode."** 41% of decode kernel time is
+  `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128`, and cuBLAS does
+  switch to it at M=16 for every projection except gate_up. But it is the
+  *right* choice there: padding M from 16 to 32 to escape it makes 7 of the 8
+  shapes slower and the per-layer total worse (832.5 -> 857.6 us). It holds 41%
+  because it does most of the projections, not because it is slow.
+- **The `out=` call form.** `torch_mm` uses `torch.mm(A, B.T, out=out)` while a
+  microbench used `F.linear`. Measured: `F.linear`, `torch.mm`, and
+  `torch.mm(out=)` select the same kernel and the same time for every shape.
+- **QKV fusion.** Implemented with `MergedColumnParallelLinear` (vLLM has
+  `QKVParallelLinear`; we issue q/k/v separately). Numerically better — 196/256
+  token-identical replies against vLLM versus 187/256 — and the microbench says
+  the merged GEMM is 15% cheaper at M=32. Integrated it is **worse**: agent
+  c=32 −9.6%, c=14 −5.6%, because `qkv.split()` yields non-contiguous slices and
+  the following `reshape(-1, head_dim)` copies ~410 MB per layer on a
+  12.5k-token prefill. Reverted.
+
+`TOKENSPEED_MM_SHAPES=1` prints the dense-GEMM shape histogram at the dispatch
+point. It exists because the trace could not answer this: correlation ids repeat
+across a long capture, and `record_shapes` does not survive the `/start_profile`
+proxy.
+
+### Operating point
+
+**c=32 on agent, not c=64.** The engine's effective concurrency is 24.6 at both
+c=32 and c=64 (`token_capacity / mean prompt` = 172,928 / ~7,000 = 24.7), so
+c=64 only adds 23.7 queued requests whose prefixes are evicted while they wait:
+in-window prefill tokens go 16,384 -> 53,218 for the same 76% hit rate, and rpm
+drops 76.6 -> 52.6. Holding those prefixes would need twice the arena, which
+does not exist. This is a serving recommendation, not a defect to fix.

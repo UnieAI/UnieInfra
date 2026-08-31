@@ -141,3 +141,73 @@ c=64 only adds 23.7 queued requests whose prefixes are evicted while they wait:
 in-window prefill tokens go 16,384 -> 53,218 for the same 76% hit rate, and rpm
 drops 76.6 -> 52.6. Holding those prefixes would need twice the arena, which
 does not exist. This is a serving recommendation, not a defect to fix.
+
+---
+
+## The A/B parameter record (2026-08-28)
+
+Both engines, every cell, same GPU, back to back. Command lines are
+authoritative; resolved values are read off each server's own startup output.
+
+### Passed on the command line
+
+| | ours (`tokenspeed.cli serve`) | upstream vLLM |
+|---|---|---|
+| `--max-model-len` | 32768 (agent/RAG short) / 73728 (long agent) | same |
+| `--gpu-memory-utilization` | 0.90 | 0.90 |
+| `--max-num-seqs` | 452 | 452 |
+| prefix caching | on by default | `--enable-prefix-caching` |
+| extra | `--enable-metrics --enable-cache-report` (reporting only) | — |
+| env | `TOKENSPEED_ENABLE_FI_PAGED_EXTEND=1`, `sm120_env.sh` | `FLASHINFER_DISABLE_VERSION_CHECK=1` |
+
+No `--disable-mixed-batch` (obsolete after `c277b35c`) and no
+`--chunked-prefill-size` (8192 is already the resolved default; passing it
+restates the default and reads as tuning that is not happening).
+
+### Resolved by each engine
+
+| | ours | vLLM |
+|---|---|---|
+| per-step batched tokens | `chunked_prefill_size=8192` / `max_prefill_tokens=8192` | `max_num_batched_tokens=8192` |
+| chunked prefill | `enable_mixed_batch=True` | `enable_chunked_prefill=True` |
+| prefix caching | `enable_prefix_caching=True` | `enable_prefix_caching=True` |
+| dtype / KV dtype | `auto` / `auto` (bf16) | `torch.bfloat16` / `auto` |
+| quantization | `None` | none |
+| scheduler block size | `block_size=64` (gemma) — the cache recipe derives P=64 for gemma, P=128 for Qwen | — |
+| admission | `admission_reserve='generation-full'` | — |
+| recurrent checkpoints | `state_checkpoint_stride_blocks=0` (derive; `_MAX_STATE_CHECKPOINTS=2`) | — |
+| host KV tier | `kvstore_ratio=2.0` | — |
+| CUDA graph | `max_cudagraph_capture_size=160`, `enforce_eager=False` | default |
+| sampling | `sampling_backend='flashinfer'` | default |
+| **KV capacity, gemma-4-31B** | **token_capacity 172,928** | **85,470 tokens, "Maximum concurrency 2.61x"** |
+| **KV capacity, Qwen3.8-27B** | **token_capacity 531,456, parents 346** | — |
+
+The KV capacity row is not a setting — it is what each engine derives from the
+same 0.90 utilization, and it is the single largest structural difference on
+gemma-4.
+
+### Workload
+
+| corpus | n | input median | input max | output |
+|---|---|---|---|---|
+| `claude_v3_sess14x8` (ours, not citable) | 112 | 7,562 | 15,131 | 128 fixed |
+| `claude_root_sess8x8` (ours, not citable) | 64 | 64,548 | 68,526 | 128 fixed |
+| `swe_smith_agent_sess32x8` (MIT) | 256 | 10,077 | 12,492 | 128 fixed |
+| `swe_agent_nebius_sess16x16` (CC-BY-4.0) | 256 | 8,413 | 12,489 | 128 fixed |
+| `rag_custom` | 1024 | 1,088 | 1,387 | 128 fixed |
+
+Output is pinned at 128 tokens with `ignore_eos` so both engines do identical
+work. That choice has a cost worth stating: at ~48 ms TPOT it makes decode 58%
+of the wall time on the agent shapes, and decode is at parity (both engines sit
+on the weight-streaming floor), which caps the achievable ratio. A shape with
+longer prompts and shorter outputs moves the measurement back onto prefix reuse,
+where the engines actually differ.
+
+### Protocol
+
+Fresh server per cell. Engine warmed with 2xC requests from a corpus that shares
+**0 characters of prefix** with the measured one (verified, not assumed:
+`swe_agent_nebius` against `claude_v3` / `claude_root` / `rag_custom` = 0 chars;
+against `swe_smith` = 9 chars). Target corpus run **once** -- a ladder that
+reruns the same prompts on one server measures replay, not reuse: the hit rate
+climbs 0% -> 95% across three passes and the same cell's wall time moves 51.7%.

@@ -29,4 +29,21 @@ export LIBRARY_PATH=/workspace/roy/.cudart-shim:$(ls -d /usr/local/lib/python3.1
 # them fails to dlopen -- and silently, because the ops fall back or raise only
 # at the first call. `/workspace/roy/.libstdcxx-shim` holds a newer libstdc++
 # for exactly this; it must come before the system one.
-export LD_LIBRARY_PATH=/workspace/roy/.libstdcxx-shim:/workspace/jeff/uniebench/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:$(ls -d /usr/local/lib/python3.12/dist-packages/nvidia/*/lib 2>/dev/null | tr '\n' ':')$LD_LIBRARY_PATH
+# CUDA 13 runtime libs. These used to be pinned to /workspace/jeff/uniebench's
+# venv -- another user's directory. When it went away every launch died with
+# "OSError: libcublas.so.13: cannot open shared object file" from
+# trtllm_kernel's ctypes.CDLL, which reads as a broken tree rather than a
+# missing path. Resolve the first candidate that actually exists instead.
+_ts_cu13=""
+for _c in /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib \
+          /workspace/weiminc/UnieInfra/.container_venv/lib/python3.12/site-packages/nvidia/cu13/lib \
+          /workspace/weiminc/unieai_branch/vllm/.venv/lib/python3.12/site-packages/nvidia/cu13/lib \
+          /workspace/jeff/uniebench/.venv/lib/python3.12/site-packages/nvidia/cu13/lib \
+          /tmp/cu13libs/nvidia/cu13/lib; do
+  if [ -e "$_c/libcublas.so.13" ]; then _ts_cu13="$_c"; break; fi
+done
+if [ -z "$_ts_cu13" ]; then
+  echo "sm120_env.sh: no libcublas.so.13 found; trtllm_kernel will fail to load" >&2
+fi
+export LD_LIBRARY_PATH=/workspace/roy/.libstdcxx-shim${_ts_cu13:+:$_ts_cu13}:$(ls -d /usr/local/lib/python3.12/dist-packages/nvidia/*/lib 2>/dev/null | tr '\n' ':')$LD_LIBRARY_PATH
+unset _ts_cu13 _c

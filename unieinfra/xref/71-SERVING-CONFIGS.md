@@ -55,9 +55,29 @@ default and reads as tuning that is not happening.
 | RAG | 0.95x | 0.94x | 0.96x | 0.97x | 0.87x | 0.80x |
 
 Known bad shape: **c=64 on agent is worse than c=32** (127.8s vs 87.8s, TTFT p50
-3.6s → 13.9s, TPOT p99 706 ms). `token_capacity / max_model_len` is 5.3, so the
-cache holds about five full-length requests; the engine accepts 64 anyway and
-they evict each other. Do not read c=64 as this model's operating point.
+3.6s → 13.9s, TPOT p99 706 ms). Do not read c=64 as this model's operating point.
+
+How many requests actually fit -- and note that `token_capacity / max_model_len`
+is NOT the way to compute it, because `token_capacity = parents * P` assumes
+every parent serves one group while a request needs pages in ALL six
+simultaneously:
+
+    per request, prompt T tokens
+      full_attention   ceil(T / 64) / 2 parents      (packing 2, grows with T)
+      5x sliding       (ceil(1023 / 64) + 1) = 17 parents each = 85 total
+                       (constant -- ReclaimExpired nulls pages that slid out)
+
+At the corpus median of ~7.5k tokens that is 60 + 85 = 145 parents, so
+2,702 / 145 = 18.6 concurrent before sharing. Observed `#running-req` plateaus
+at 24.6 at both c=32 and c=64 -- higher than 18.6 because the full-attention
+pages are shared across sessions by the prefix cache, and flat across the two
+concurrencies because the arena, not `max_num_seqs` (452), is the bound.
+
+The damage at c=64 is not eviction of the reusable prefix -- the hit rate holds
+at 76% -- it is that the 23.7 queued requests lose their pages while they wait
+and re-prefill on admission: in-window prefill tokens go 16,384 -> 53,218 for
+the same hit rate, and rpm drops 76.6 -> 52.6. Holding those prefixes would need
+twice the arena, which does not exist.
 
 ---
 

@@ -275,6 +275,14 @@ class CachePool:
                 dtype=torch.uint8,
                 device=self.device,
             )
+            # The startup memory table and the pool's reported `size` are both
+            # derived, not measured, and they disagree with the arena by a
+            # factor of two on gemma-4. Print what was actually allocated.
+            logger.info(
+                "KV arena allocated: %.2f GB (%d bytes)",
+                self.buffer.numel() / 1e9,
+                self.buffer.numel(),
+            )
         return self.buffer
 
     def _field_block_byte_offset(self, field_id: str, block_id: int) -> int:
@@ -391,13 +399,18 @@ class CachePool:
             try:
                 total = scheduler.paged_cache_group_total_pages(group_id)
                 available = scheduler.paged_cache_group_available_pages(group_id)
+                # `available` is dominated by the arena-wide empty-parent count
+                # scaled by this group's packing, so `total - available` is the
+                # same fraction for every group and says nothing about which
+                # group holds what. The parent count is the real occupancy.
+                parents = scheduler.paged_cache_group_bound_parents(group_id)
             except Exception:  # diagnostics must never take the engine down
                 return
             window = spec.sliding_window_tokens or 0
             parts.append(
                 f"{group_id}[{spec.retention}"
                 + (f",w={window}" if window else "")
-                + f"]: used={total - available}/{total}"
+                + f"]: parents={parents}, used={total - available}/{total}"
             )
         logger.info("Paged-cache group pages. %s", "; ".join(parts))
 

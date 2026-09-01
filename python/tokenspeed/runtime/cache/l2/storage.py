@@ -109,6 +109,12 @@ class HostCacheStorage:
             # transfer stream.
             with open(backing_path, "wb") as fh:
                 os.posix_fallocate(fh.fileno(), 0, self.host_buffer_bytes)
+                # fallocate warms the whole file through the page cache, so a
+                # residency measurement afterwards reads 100% before the engine
+                # has touched anything. Start from cold or the number means
+                # nothing.
+                os.posix_fadvise(fh.fileno(), 0, self.host_buffer_bytes,
+                                 os.POSIX_FADV_DONTNEED)
             self.host_buffer = torch.from_file(
                 backing_path,
                 shared=True,
@@ -135,22 +141,32 @@ class HostCacheStorage:
                 self._libc = ctypes.CDLL(ctypes.util.find_library("c"),
                                          use_errno=True)
                 self._base_addr = self.host_buffer.data_ptr()
+                self._backing_fd = os.open(backing_path, os.O_RDONLY)
                 self._page_size = os.sysconf("SC_PAGESIZE")
                 logger.info("Host L2 will drop page-cache pages after each use")
 
     _drop_after_use = False
 
-    def drop_range(self, offset: int, num_bytes: int) -> None:
+    def drop_range(self, offset: int, num_bytes: int, *, dirty: bool) -> None:
         """Return one byte range to the file, so the next read hits the disk.
 
-        No-op unless TOKENSPEED_KVSTORE_NO_PAGECACHE=1. `msync` first: for a
-        MAP_SHARED mapping MADV_DONTNEED discards the resident pages, and a
-        write that has not reached the file yet would go with them.
+        No-op unless TOKENSPEED_KVSTORE_NO_PAGECACHE=1.
+
+        MADV_DONTNEED alone does not do this. On a MAP_SHARED file mapping it
+        only tears down this process's page-table entries; the page cache keeps
+        the pages, so the next touch is a minor fault and the "disk" tier still
+        serves out of RAM -- measured, residency stayed at 100% of 226 GB and
+        the arm was slower purely from the msync. posix_fadvise is what frees
+        them, and it skips any page still mapped, so it has to come second.
+
+        `dirty` says whether this range was just written. Only then is a
+        writeback needed before the pages can go; a read path that syncs pays a
+        per-range flush for nothing.
         """
 
         if not self._drop_after_use:
             return
-        MS_SYNC, MADV_DONTNEED = 4, 4
+        MS_SYNC, MADV_DONTNEED, POSIX_FADV_DONTNEED = 4, 4, 4
         start = (self._base_addr + offset) & ~(self._page_size - 1)
         end = (self._base_addr + offset + num_bytes + self._page_size - 1) & ~(
             self._page_size - 1
@@ -160,9 +176,14 @@ class HostCacheStorage:
             return
         import ctypes
 
-        self._libc.msync(ctypes.c_void_p(start), ctypes.c_size_t(length), MS_SYNC)
+        if dirty:
+            self._libc.msync(ctypes.c_void_p(start), ctypes.c_size_t(length),
+                             MS_SYNC)
         self._libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length),
                            MADV_DONTNEED)
+        file_offset = start - self._base_addr
+        self._libc.posix_fadvise(self._backing_fd, ctypes.c_long(file_offset),
+                                 ctypes.c_long(length), POSIX_FADV_DONTNEED)
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:
         """Return the packed byte offset for one non-null CacheBlock."""

@@ -410,6 +410,21 @@ std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_i
     return available;
 }
 
+// How many arena parents this group actually holds. `PagedCacheGroupAvailablePages`
+// cannot answer that: its dominant term is the arena-wide empty-parent count
+// scaled by the group's packing, so every group reports the same occupancy
+// fraction and a windowed group looks exactly like a full-history one.
+std::int32_t Scheduler::PagedCacheGroupBoundParents(const std::string& group_id) const {
+    const std::size_t index = groupIndex(group_id);
+    std::int32_t bound = 0;
+    for (std::int32_t id = 1; id <= block_pool_.NumLcmBlocks(); ++id) {
+        if (block_pool_.BoundGroup(id) == static_cast<std::uint32_t>(index)) {
+            ++bound;
+        }
+    }
+    return bound;
+}
+
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     const auto it = requests_.find(id);
     return it == requests_.end() ? -1 : it->second->TokenSize();

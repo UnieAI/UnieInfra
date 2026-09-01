@@ -706,6 +706,15 @@ def _kv_pool_bytes(*pools) -> int:
         if id(underlying) in seen:
             continue
         seen.add(id(underlying))
+        # A pool that owns an LCM arena has one allocation, and the per-layer
+        # k/v views into it overlap -- summing their nbytes reported 52.79 GB
+        # against a 28.34 GB arena on gemma-4, which is what an operator would
+        # size a deployment from. Measure the allocation instead.
+        if getattr(underlying, "_backing_pool", None) is None:
+            arena = getattr(underlying, "buffer", None)
+            if arena is not None and getattr(underlying, "plan", None) is not None:
+                total += arena.numel() * arena.element_size()
+                continue
         getter = getattr(pool, "get_kv_size_bytes", None)
         if getter is None:
             continue

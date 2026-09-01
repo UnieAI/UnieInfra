@@ -231,3 +231,41 @@ Fresh server per cell. Engine warmed with 2xC requests from a corpus that shares
 against `swe_smith` = 9 chars). Target corpus run **once** -- a ladder that
 reruns the same prompts on one server measures replay, not reuse: the hit rate
 climbs 0% -> 95% across three passes and the same cell's wall time moves 51.7%.
+
+## Host DRAM KV tier (L2) — measured
+
+`--kvstore-ratio R` allocates `R × device_lcm_blocks` LCM parents of **pinned**
+host memory. Sizes on this box (gemma-4-31B, GMU 0.90): R=2 → 56.67 GB / 5,404
+blocks; R=8 → 226.66 GB / 21,616 blocks.
+
+**Ceiling is between R=8 and R=12**, not host RAM exhaustion. R=12 (340 GB) and
+R=16 (453 GB) both die in `HostCacheStorage.__init__` at the single
+`torch.empty(..., pin_memory=True)` with `CUDA error: out of memory`, while the
+box shows 703 GB available. It is the pinned/registered-memory path that refuses,
+not the allocator — so the usable knob today is R ≤ 8.
+
+`swe_smith_agent_sess32x8`, c=32, 256 requests, no-replay protocol:
+
+| arm | host GB | dur | rpm | tps | tps/req | TTFT p50 | TTFT p99 | TPOT p50 | hit |
+|---|---|---|---|---|---|---|---|---|---|
+| device only | 0 | 514.8 s | 29.8 | 57.4 | 2.41 | 27,143 | 81,382 | 200 | 40.8% |
+| host ×2 | 56.67 | 470.9 s | 32.6 | 63.6 | 2.68 | 21,217 | 90,747 | 191 | 47.9% |
+| host ×8 | 226.66 | **247.8 s** | 62.0 | 120.1 | 6.27 | **2,995** | 155,774 | 97 | 81.0% |
+| vLLM (no KV offload in this build) | — | 811.6 s | 18.9 | 36.5 | 1.29 | 69,613 | 94,530 | 253 | — |
+
+**Noise floor first.** The device-only c=32 cell was run twice, 9 hours apart,
+with identical flags, corpus, warm-up and no engine commits in between: 467.4 s
+and 514.8 s — a **10.2% spread** on nominally the same cell (this box has two
+other tenants' servers on GPU 0 and GPU 2 sharing host RAM bandwidth, PCIe and
+CPU). So **host ×2's -8.5% is inside the noise and is not a result.** Only host
+×8, at -52%, is far enough outside it to claim. Every arm comparison below is run
+back-to-back in one session for this reason.
+
+**The tier buys the median and sells the tail.** TTFT p50 falls 27.1 s → 3.0 s
+and the mean 36.4 s → 17.0 s, but p99 rises 81.4 s → 155.8 s (max 211.7 s). Most
+requests become hits and start almost at once; the minority that still miss now
+queue behind a much denser admitted stream. An SLO written on **p99 TTFT is worse**
+with the tier on; one written on p50, on TPOT, or on throughput is much better.
+Establish which one the customer has before recommending it.
+
+Ratios against vLLM in the same cell: device-only 1.58x, host ×8 **3.28x**.

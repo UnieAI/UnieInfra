@@ -132,3 +132,33 @@ and past the point where the cache stops holding the working set it lowers both.
 **Reading a row honestly.** `dur` alone can hide a corrupt engine, a shorter
 answer, or a different token count, so always read `ntok` and `bad` from both
 engines in the same cell before comparing anything else.
+
+## Before reading any hit rate: what reuse does the corpus contain?
+
+A hit rate has no meaning without a denominator. `reuse_ceiling.py` computes it
+from the corpus alone, no server involved:
+
+```
+python3 reuse_ceiling.py corpus.jsonl
+```
+
+It reports two numbers:
+
+- **reuse ceiling** — the fraction of prompt tokens that are a page-aligned
+  prefix of an earlier turn in the same session. No cache can beat it.
+- **reuse distance** — how many other requests are issued between a session's
+  consecutive turns. This is what the cache has to survive. If the KV pool holds
+  fewer sessions than the distance spans, the reuse in the corpus is unreachable
+  and the hit rate collapses no matter how good the matching logic is.
+
+The two corpora used here:
+
+| corpus | sessions × turns | prompt tokens | ceiling | reuse distance |
+|---|---|---|---|---|
+| `swe_agent_nebius_sess16x16` | 16 × 16 | 2,066,695 | 91.0% | 16 |
+| `swe_smith_agent_sess32x8` | 32 × 8 | 2,503,295 | 84.8% | 32 |
+
+Both are round-robin interleaved — every session's turn *k* is issued before any
+session's turn *k+1* — which is what a coding-agent provider actually sees, and
+it is the shape that makes the working set, not the individual prompt, the thing
+the cache has to hold.

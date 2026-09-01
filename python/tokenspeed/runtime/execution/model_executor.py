@@ -1152,6 +1152,10 @@ class ModelExecutor:
                 num_queue_reqs,
                 hit_rate,
             )
+            # This workload never logs a pure Decode batch -- gemma fuses
+            # prefill and decode, so 18 of 18 batches were Mix -- and the
+            # per-group report used to hang off the decode branch only.
+            self.token_to_kv_pool.maybe_log_paged_cache_group_pages()
 
         result = self.execute_forward_op(
             forward_op,

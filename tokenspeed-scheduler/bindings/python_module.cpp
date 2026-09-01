@@ -350,6 +350,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
+        .def("paged_cache_group_bound_parents", &tokenspeed::Scheduler::PagedCacheGroupBoundParents,
+             nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
              nb::arg("group_id"));
 }

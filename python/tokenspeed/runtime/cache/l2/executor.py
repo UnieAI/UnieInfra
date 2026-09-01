@@ -337,7 +337,7 @@ class L2CacheExecutor:
                     stage[stage_offset : stage_offset + num_bytes].copy_(
                         host[host_offset : host_offset + num_bytes]
                     )
-                    self.host_storage.drop_range(host_offset, num_bytes)
+                    self.host_storage.drop_range(host_offset, num_bytes, dirty=False)
             transfer_cache_ranges(
                 direction,
                 self.layout.buffers,
@@ -352,7 +352,7 @@ class L2CacheExecutor:
                     host[host_offset : host_offset + num_bytes].copy_(
                         stage[stage_offset : stage_offset + num_bytes]
                     )
-                    self.host_storage.drop_range(host_offset, num_bytes)
+                    self.host_storage.drop_range(host_offset, num_bytes, dirty=True)
             batch, plan, used = [], [], 0
 
         for device_index, device_offset, host_offset, num_bytes in ranges:

@@ -91,9 +91,10 @@ def _num_host_lcm_blocks(
     return count
 
 
-# Ranges arrive per layer consumer, tens of MB at a time, so this only has to
-# exceed one such batch; it is charged once, not per transfer.
-_STAGING_BYTES = 1 << 30
+# One load carries up to a few GB of ranges. Sizing the staging buffer above
+# that keeps the common transfer to a single batch, which is both faster and the
+# case with no staging reuse to wait on. Charged once, not per transfer.
+_STAGING_BYTES = int(os.getenv("TOKENSPEED_L2_STAGING_BYTES", 4 << 30))
 
 
 class L2CacheExecutor:
@@ -339,7 +340,18 @@ class L2CacheExecutor:
         io_plan: list[tuple[int, int, int]] = []  # (file_offset, stage_offset, bytes)
         used = 0
 
-        def flush() -> None:
+        def flush(*, reusing_staging: bool) -> None:
+            """Issue one staging-sized batch.
+
+            `reusing_staging` says another batch will overwrite the staging
+            buffer next. An h2d copy is asynchronous on `stream`, so refilling
+            staging behind it would race the GPU still reading it -- a load of
+            221 blocks is 2.2 GB against a staging buffer of a few GB, so this
+            triggers on real traffic and corrupts restored KV while every
+            latency number stays healthy. The final batch does not wait: its
+            staging is not touched again before the caller's event.
+            """
+
             nonlocal batch, io_plan, used
             if not batch:
                 return
@@ -364,6 +376,8 @@ class L2CacheExecutor:
                         self._stage_view[stage_offset : stage_offset + num_bytes],
                         file_offset,
                     )
+            elif reusing_staging:
+                stream.synchronize()
             batch, io_plan, used = [], [], 0
 
         for device_index, device_offset, host_offset, num_bytes in ordered:
@@ -373,7 +387,7 @@ class L2CacheExecutor:
                     f"{capacity}-byte staging buffer"
                 )
             if used + num_bytes > capacity:
-                flush()
+                flush(reusing_staging=True)
             batch.append((device_index, device_offset, used, num_bytes))
             # Coalesce with the previous I/O when both the file and the staging
             # buffer continue where it stopped.
@@ -389,7 +403,7 @@ class L2CacheExecutor:
             else:
                 io_plan.append((host_offset, used, num_bytes))
             used += num_bytes
-        flush()
+        flush(reusing_staging=False)
 
     def _start_writing(
         self,

@@ -311,6 +311,7 @@ class ServerArgs:
     # arms logged none.
     kvstore_io_backend: str = "direct"
     kvstore_mem_layout: str = "layer_first"
+    kvstore_backing_path: str | None = None
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
 
@@ -878,6 +879,16 @@ class ServerArgs:
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
+        if self.kvstore_backing_path is not None and (
+            self.kvstore_io_backend == "direct"
+        ):
+            # A shared file mapping is pageable; the DMA path requires pinned
+            # memory and would fault or silently fall back.
+            self.kvstore_io_backend = "kernel"
+            logger.info(
+                "--kvstore-backing-path is set, switching kvstore_io_backend "
+                "to kernel"
+            )
         if self.kvstore_storage_backend == "mooncake":
             if self.kvstore_mem_layout == "layer_first":
                 self.kvstore_mem_layout = "page_first"
@@ -1342,6 +1353,17 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kvstore_size,
             help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set.",
+        )
+        parser.add_argument(
+            "--kvstore-backing-path",
+            type=str,
+            default=ServerArgs.kvstore_backing_path,
+            help=(
+                "Back the Host KV tier with a file at this path instead of "
+                "pinned RAM. Use a local NVMe path to buy capacity that host "
+                "memory size does not bound. Forces --kvstore-io-backend "
+                "kernel, because a mapped file cannot be DMA'd from."
+            ),
         )
         parser.add_argument(
             "--kvstore-io-backend",

@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
@@ -90,6 +91,11 @@ def _num_host_lcm_blocks(
     return count
 
 
+# Ranges arrive per layer consumer, tens of MB at a time, so this only has to
+# exceed one such batch; it is charged once, not per transfer.
+_STAGING_BYTES = 1 << 30
+
+
 class L2CacheExecutor:
     """Execute group-aware D2H/H2D operations against one compact Host pool."""
 
@@ -101,6 +107,7 @@ class L2CacheExecutor:
         host_ratio: float,
         host_size_gb: float,
         io_backend: str,
+        backing_path: str | None = None,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -125,26 +132,49 @@ class L2CacheExecutor:
             host_size_gb=host_size_gb,
         )
         requested_host_bytes = host_lcm_blocks * host_lcm_block_bytes
-        available_host_bytes = (
-            psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
-        )
-        if requested_host_bytes > available_host_bytes:
-            raise ValueError(
-                "Not enough Host memory for L2: requesting "
-                f"{requested_host_bytes / 1e9:.2f} GB, available "
-                f"{available_host_bytes / 1e9:.2f} GB"
+        if backing_path is None:
+            available_host_bytes = (
+                psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
             )
+            if requested_host_bytes > available_host_bytes:
+                raise ValueError(
+                    "Not enough Host memory for L2: requesting "
+                    f"{requested_host_bytes / 1e9:.2f} GB, available "
+                    f"{available_host_bytes / 1e9:.2f} GB"
+                )
+        else:
+            free_disk_bytes = shutil.disk_usage(
+                os.path.dirname(backing_path) or "."
+            ).free
+            if requested_host_bytes > free_disk_bytes:
+                raise ValueError(
+                    "Not enough disk for file-backed L2: requesting "
+                    f"{requested_host_bytes / 1e9:.2f} GB, free "
+                    f"{free_disk_bytes / 1e9:.2f} GB at {backing_path}"
+                )
         self.host_storage = HostCacheStorage(
             self.layout,
             num_host_lcm_blocks=host_lcm_blocks,
+            backing_path=backing_path,
+        )
+        # A mapped file is not page-locked and `transfer_cache_ranges` requires
+        # pinned memory, so a file-backed tier hops through a small pinned
+        # staging buffer. That CPU-side copy is where the disk read happens.
+        self._staging = (
+            None
+            if backing_path is None
+            else torch.empty(_STAGING_BYTES, dtype=torch.uint8, pin_memory=True)
         )
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
         logger.info(
-            "Allocated %.2f GB compact Host L2 (%s LCM blocks, %s bytes/block)",
+            "Allocated %.2f GB compact Host L2 on %s (%s LCM blocks, "
+            "%s bytes/block, io_backend=%s)",
             requested_host_bytes / 1e9,
+            "pinned RAM" if backing_path is None else f"file {backing_path}",
             host_lcm_blocks,
             host_lcm_block_bytes,
+            io_backend,
         )
 
         pool_layouts = [(device_pool, target_layout)]
@@ -269,6 +299,75 @@ class L2CacheExecutor:
                 )
         return ranges
 
+    def _transfer(self, direction: str, ranges, stream) -> None:
+        """Move byte ranges between the Device cache and the Host tier.
+
+        With pinned RAM this is one call. With a file-backed tier the bytes go
+        through a pinned staging buffer, so a load reads the file on the CPU
+        thread before the H2D copy and a writeback lands on the file after the
+        D2H copy has been waited on. The writeback therefore blocks where the
+        pinned path overlaps -- a first cut that measures the tier honestly
+        rather than an overlapped implementation that hides its own cost.
+        """
+
+        host = self.host_storage.host_buffer
+        if self._staging is None:
+            transfer_cache_ranges(
+                direction,
+                self.layout.buffers,
+                host,
+                ranges,
+                stream,
+                backend=self.transfer_backend,
+            )
+            return
+
+        stage = self._staging
+        capacity = stage.numel()
+        batch: list[tuple[int, int, int, int]] = []
+        plan: list[tuple[int, int, int]] = []
+        used = 0
+
+        def flush() -> None:
+            nonlocal batch, plan, used
+            if not batch:
+                return
+            if direction == "h2d":
+                for stage_offset, host_offset, num_bytes in plan:
+                    stage[stage_offset : stage_offset + num_bytes].copy_(
+                        host[host_offset : host_offset + num_bytes]
+                    )
+                    self.host_storage.drop_range(host_offset, num_bytes)
+            transfer_cache_ranges(
+                direction,
+                self.layout.buffers,
+                stage,
+                batch,
+                stream,
+                backend=self.transfer_backend,
+            )
+            if direction == "d2h":
+                stream.synchronize()
+                for stage_offset, host_offset, num_bytes in plan:
+                    host[host_offset : host_offset + num_bytes].copy_(
+                        stage[stage_offset : stage_offset + num_bytes]
+                    )
+                    self.host_storage.drop_range(host_offset, num_bytes)
+            batch, plan, used = [], [], 0
+
+        for device_index, device_offset, host_offset, num_bytes in ranges:
+            if num_bytes > capacity:
+                raise RuntimeError(
+                    f"cache transfer range of {num_bytes} bytes exceeds the "
+                    f"{capacity}-byte staging buffer"
+                )
+            if used + num_bytes > capacity:
+                flush()
+            batch.append((device_index, device_offset, used, num_bytes))
+            plan.append((used, host_offset, num_bytes))
+            used += num_bytes
+        flush()
+
     def _start_writing(
         self,
         op_ids: Sequence[int],
@@ -293,14 +392,7 @@ class L2CacheExecutor:
         start.wait(self.write_stream)
         if self._serialize_streams and self._load_acks:
             self._load_acks[-1].finish_event.wait(self.write_stream)
-        transfer_cache_ranges(
-            "d2h",
-            self.layout.buffers,
-            self.host_storage.host_buffer,
-            self._transfer_ranges(transfers),
-            self.write_stream,
-            backend=self.transfer_backend,
-        )
+        self._transfer("d2h", self._transfer_ranges(transfers), self.write_stream)
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
         self._write_acks.append(_Ack(finish, op_ids))
@@ -344,13 +436,10 @@ class L2CacheExecutor:
                 self._write_acks[-1].finish_event.wait(self.load_stream)
             for layer_index in range(consumer_count):
                 consumer = self.layout.consumers[consumer_offset + layer_index]
-                transfer_cache_ranges(
+                self._transfer(
                     "h2d",
-                    self.layout.buffers,
-                    self.host_storage.host_buffer,
                     self._transfer_ranges(transfers, set(consumer)),
                     self.load_stream,
-                    backend=self.transfer_backend,
                 )
                 finish = torch.cuda.Event()
                 finish.record(self.load_stream)

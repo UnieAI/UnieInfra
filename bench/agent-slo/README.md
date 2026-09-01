@@ -105,3 +105,30 @@ exactly once. A median over the hot sends hides this: it is how a defect that
 cost 800 ms on every single turn stayed invisible while the prefix hit rate
 reported 93–95%. Hit rate counts tokens marked as hits; it does not count work
 avoided.
+
+## What each number measures
+
+Every cell drives `N` requests at concurrency `c` against one fresh server and
+records per request: time to first token, time per output token, chunk count,
+end-to-end time, and the generated text.
+
+| column | definition | what it answers |
+|---|---|---|
+| `dur` | wall-clock seconds to finish all `N` requests | **the primary quantity.** Every ratio in this README is `vLLM dur / ours dur`, because it is the only number that cannot be gamed by counting differently |
+| `rpm` | `60 × N_ok / dur` | service rate — how many requests per minute this GPU retires |
+| `tps` | `Σ ntok / dur` | server-side output throughput, summed over all requests in flight |
+| `tps/req` | `mean(ntok / e2e)` | what **one** user feels — a server at 600 tps with 64 users gives each of them ~9 |
+| `TTFT p50 / p99` | ms from request sent to first token | the wait before anything appears. p99 is the one that shows queueing: a server can hold a fine median while a tail waits 60 s |
+| `TPOT p50 / p99` | ms per output token after the first | typing speed. `1000 / TPOT` ≈ `tps/req` once generation dominates |
+| `hit` | cumulative prefix-cache hit rate, `cached_tokens / prompt_tokens` | how much prompt was reused rather than recomputed. **Reports tokens marked as hits, not work avoided** — see the reuse probe below |
+| `ntok` | SSE chunks carrying non-empty text | a proxy for output tokens. Our engine sometimes packs more than one token into a chunk (measured: 506 chars in 114 chunks against vLLM's 429 in 128), so `tps` and `tps/req` are **understated for us**. `dur`, `rpm`, TTFT and TPOT are unaffected |
+| `bad` | character-repetition OR repeated 6-gram within 40 words | a broken engine looks healthy in latency alone. With `ignore_eos` both engines score high here because they are forced past their natural stop — compare the two engines' counts, never the absolute value |
+
+**Which are SLO axes and which are capacity axes.** TTFT and TPOT are what a user
+experiences and what an SLO is written against. `rpm` and `tps` are what the box
+delivers. They trade off: pushing concurrency raises `rpm` and lowers `tps/req`,
+and past the point where the cache stops holding the working set it lowers both.
+
+**Reading a row honestly.** `dur` alone can hide a corrupt engine, a shorter
+answer, or a different token count, so always read `ntok` and `bad` from both
+engines in the same cell before comparing anything else.

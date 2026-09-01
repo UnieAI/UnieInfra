@@ -7,7 +7,9 @@
 """
 import os, sys, torch
 sys.path.insert(0, "/workspace/roy/UnieInfra/tokenspeed-kernel/python")
+sys.path.insert(0, "/workspace/roy/UnieInfra/python")
 from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+from tokenspeed.runtime.cache.l2.storage import HostCacheStorage
 
 PLANE = 524_288
 N_PLANES = int(sys.argv[1]) if len(sys.argv) > 1 else 64
@@ -23,6 +25,9 @@ assert stage.data_ptr() % 4096 == 0
 with open(PATH, "wb") as fh:
     os.posix_fallocate(fh.fileno(), 0, N_PLANES * PLANE)
 fd = os.open(PATH, os.O_RDWR | os.O_DIRECT)
+# 呼叫出貨的實作，不要複製一份會漂移的邏輯
+io = object.__new__(HostCacheStorage)
+io._fd = fd
 
 # 打散順序，模擬真實的 range 分布（_transfer 會依檔案偏移重新排序）
 order = list(range(N_PLANES))
@@ -38,12 +43,12 @@ def run(direction, stream):
         flushes += 1
         if direction == "h2d":
             for fo, so, nb in io_plan:
-                assert os.preadv(fd, [view[so:so+nb]], fo) == nb
+                io.read_into(view[so:so+nb], fo)
         transfer_cache_ranges(direction, [dev], stage, batch, stream, backend="auto")
         if direction == "d2h":
             stream.synchronize()
             for fo, so, nb in io_plan:
-                assert os.pwritev(fd, [view[so:so+nb]], fo) == nb
+                io.write_from(view[so:so+nb], fo)
         elif reusing:
             stream.synchronize()
         batch, io_plan, used = [], [], 0

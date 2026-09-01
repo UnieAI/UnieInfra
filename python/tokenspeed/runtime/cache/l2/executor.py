@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import os
+import queue
 import shutil
+import threading
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
@@ -73,6 +75,11 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
 class _Ack(NamedTuple):
     finish_event: object
     op_ids: list[int]
+    # Set once the bytes have reached the backing file. A CUDA event says the
+    # device finished copying into staging, not that the tier holds the data;
+    # reporting a store complete before that lets the scheduler drop the device
+    # blocks while the only other copy is still in a buffer.
+    io_done: object = None
 
 
 def _num_host_lcm_blocks(
@@ -95,6 +102,11 @@ def _num_host_lcm_blocks(
 # that keeps the common transfer to a single batch, which is both faster and the
 # case with no staging reuse to wait on. Charged once, not per transfer.
 _STAGING_BYTES = int(os.getenv("TOKENSPEED_L2_STAGING_BYTES", 4 << 30))
+
+# Writeback slots. The device-to-staging copy runs at PCIe speed and the file
+# write at disk speed, so the write is what is worth overlapping: a slot is
+# handed to a writer thread and the next transfer proceeds into another one.
+_STAGING_SLOTS = int(os.getenv("TOKENSPEED_L2_STAGING_SLOTS", 4))
 
 
 class L2CacheExecutor:
@@ -172,6 +184,22 @@ class L2CacheExecutor:
         )
         if self._staging is not None and self._staging.data_ptr() % 4096:
             raise RuntimeError("staging buffer is not page-aligned for O_DIRECT")
+        self._slot_bytes = 0
+        self._writer = None
+        self._write_queue = None
+        if self._staging is not None:
+            # Page-align the slot boundary or O_DIRECT rejects the offsets.
+            self._slot_bytes = (self._staging.numel() // _STAGING_SLOTS) & ~4095
+            if self._slot_bytes <= 0:
+                raise RuntimeError("staging buffer too small to slot")
+            self._free_slots = queue.Queue()
+            for index in range(_STAGING_SLOTS):
+                self._free_slots.put(index)
+            self._write_queue = queue.Queue()
+            self._writer = threading.Thread(
+                target=self._writer_loop, name="l2-writeback", daemon=True
+            )
+            self._writer.start()
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
         logger.info(
@@ -306,19 +334,39 @@ class L2CacheExecutor:
                 )
         return ranges
 
-    def _transfer(self, direction: str, ranges, stream) -> None:
+    def _writer_loop(self) -> None:
+        while True:
+            item = self._write_queue.get()
+            if item is None:
+                return
+            slot, io_plan, done = item
+            try:
+                for file_offset, slot_offset, num_bytes in io_plan:
+                    base = slot * self._slot_bytes + slot_offset
+                    self.host_storage.write_from(
+                        self._stage_view[base : base + num_bytes], file_offset
+                    )
+            except Exception:
+                logger.exception("[L2] writeback to the backing file failed")
+            finally:
+                self._free_slots.put(slot)
+                done.set()
+
+    def _transfer(self, direction: str, ranges, stream) -> list:
         """Move byte ranges between the Device cache and the Host tier.
 
-        Pinned RAM is one call. A file-backed tier goes through the pinned
-        staging buffer with explicit O_DIRECT reads and writes.
+        Pinned RAM is one call. A file-backed tier goes through one slot of the
+        pinned staging buffer with explicit O_DIRECT reads and writes.
 
         Ranges are ordered by **file** offset and staging slots handed out in
         that order, so neighbouring ranges land adjacent in staging too and
-        collapse into one large pread/pwrite. That matters more than it sounds:
-        a transfer carries hundreds of 512 KB planes, and issuing them
-        one-by-one made the disk tier cost 582 s over the page-cache-warm case
-        when the bytes themselves only account for about 170 s at the measured
-        NVMe rates.
+        collapse into one large pread/pwrite. That matters: a transfer carries
+        hundreds of 512 KB planes, and issuing them one at a time cost 582 s
+        over the page-cache-warm case when the bytes are worth about 170 s at
+        the measured NVMe rates.
+
+        Returns the events that fire once each writeback has reached the file;
+        empty for loads and for the pinned path.
         """
 
         if self._staging is None:
@@ -330,52 +378,64 @@ class L2CacheExecutor:
                 stream,
                 backend=self.transfer_backend,
             )
-            return
+            return []
 
-        stage = self._staging
-        capacity = stage.numel()
+        capacity = self._slot_bytes
         ordered = sorted(ranges, key=lambda row: row[2])
+        io_events: list = []
+
+        # One slot for the whole call on the load path (it is released as soon
+        # as the copy is waited on); the write path takes a fresh slot per
+        # batch so the writer thread can hold it while the next batch runs.
+        slot = self._free_slots.get()
+        base = slot * capacity
 
         batch: list[tuple[int, int, int, int]] = []
-        io_plan: list[tuple[int, int, int]] = []  # (file_offset, stage_offset, bytes)
+        io_plan: list[tuple[int, int, int]] = []
         used = 0
 
         def flush(*, reusing_staging: bool) -> None:
-            """Issue one staging-sized batch.
+            """Issue one slot-sized batch.
 
-            `reusing_staging` says another batch will overwrite the staging
-            buffer next. An h2d copy is asynchronous on `stream`, so refilling
-            staging behind it would race the GPU still reading it -- a load of
-            221 blocks is 2.2 GB against a staging buffer of a few GB, so this
-            triggers on real traffic and corrupts restored KV while every
-            latency number stays healthy. The final batch does not wait: its
-            staging is not touched again before the caller's event.
+            `reusing_staging` says another batch will overwrite this slot next.
+            An h2d copy is asynchronous on `stream`, so refilling behind it
+            would race the GPU still reading it -- 512 planes through an 8 MB
+            slot mismatched 488,704 bytes without this wait. It corrupts
+            restored KV while every latency number stays healthy.
             """
 
-            nonlocal batch, io_plan, used
+            nonlocal batch, io_plan, used, slot, base
             if not batch:
                 return
             if direction == "h2d":
-                for file_offset, stage_offset, num_bytes in io_plan:
+                for file_offset, slot_offset, num_bytes in io_plan:
                     self.host_storage.read_into(
-                        self._stage_view[stage_offset : stage_offset + num_bytes],
+                        self._stage_view[
+                            base + slot_offset : base + slot_offset + num_bytes
+                        ],
                         file_offset,
                     )
             transfer_cache_ranges(
                 direction,
                 self.layout.buffers,
-                stage,
-                batch,
+                self._staging,
+                [
+                    (device_index, device_offset, base + slot_offset, num_bytes)
+                    for device_index, device_offset, slot_offset, num_bytes in batch
+                ],
                 stream,
                 backend=self.transfer_backend,
             )
             if direction == "d2h":
+                # The device-to-staging copy is PCIe-fast; waiting on it is
+                # cheap. The file write is not, so it goes to the writer thread
+                # and this slot stays out until that write lands.
                 stream.synchronize()
-                for file_offset, stage_offset, num_bytes in io_plan:
-                    self.host_storage.write_from(
-                        self._stage_view[stage_offset : stage_offset + num_bytes],
-                        file_offset,
-                    )
+                done = threading.Event()
+                io_events.append(done)
+                self._write_queue.put((slot, list(io_plan), done))
+                slot = self._free_slots.get()
+                base = slot * capacity
             elif reusing_staging:
                 stream.synchronize()
             batch, io_plan, used = [], [], 0
@@ -384,26 +444,26 @@ class L2CacheExecutor:
             if num_bytes > capacity:
                 raise RuntimeError(
                     f"cache transfer range of {num_bytes} bytes exceeds the "
-                    f"{capacity}-byte staging buffer"
+                    f"{capacity}-byte staging slot"
                 )
             if used + num_bytes > capacity:
                 flush(reusing_staging=True)
             batch.append((device_index, device_offset, used, num_bytes))
-            # Coalesce with the previous I/O when both the file and the staging
-            # buffer continue where it stopped.
             if io_plan:
-                prev_file, prev_stage, prev_bytes = io_plan[-1]
+                prev_file, prev_slot, prev_bytes = io_plan[-1]
                 if (
                     prev_file + prev_bytes == host_offset
-                    and prev_stage + prev_bytes == used
+                    and prev_slot + prev_bytes == used
                 ):
-                    io_plan[-1] = (prev_file, prev_stage, prev_bytes + num_bytes)
+                    io_plan[-1] = (prev_file, prev_slot, prev_bytes + num_bytes)
                 else:
                     io_plan.append((host_offset, used, num_bytes))
             else:
                 io_plan.append((host_offset, used, num_bytes))
             used += num_bytes
         flush(reusing_staging=False)
+        self._free_slots.put(slot)
+        return io_events
 
     def _start_writing(
         self,
@@ -429,10 +489,12 @@ class L2CacheExecutor:
         start.wait(self.write_stream)
         if self._serialize_streams and self._load_acks:
             self._load_acks[-1].finish_event.wait(self.write_stream)
-        self._transfer("d2h", self._transfer_ranges(transfers), self.write_stream)
+        io_events = self._transfer(
+            "d2h", self._transfer_ranges(transfers), self.write_stream
+        )
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
-        self._write_acks.append(_Ack(finish, op_ids))
+        self._write_acks.append(_Ack(finish, op_ids, io_events or None))
 
     def _start_loading(
         self,
@@ -497,10 +559,13 @@ class L2CacheExecutor:
         return results
 
     @staticmethod
-    def _drain(queue, done, results):
+    def _drain(acks, done, results):
         pending = []
-        for ack in queue:
-            if ack.finish_event.query():
+        for ack in acks:
+            # A store is complete only once the bytes are in the tier. With a
+            # file backing that is the writer thread, not the CUDA event.
+            io_ready = ack.io_done is None or all(e.is_set() for e in ack.io_done)
+            if ack.finish_event.query() and io_ready:
                 results.extend(done(op_id) for op_id in ack.op_ids)
             else:
                 pending.append(ack)
@@ -521,6 +586,10 @@ class L2CacheExecutor:
     def shutdown(self) -> None:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
+        if self._writer is not None:
+            self._write_queue.put(None)
+            self._writer.join(timeout=30)
+            self._writer = None
 
     def reset(self) -> None:
         self.shutdown()

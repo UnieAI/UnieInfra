@@ -135,25 +135,44 @@ class HostCacheStorage:
     _fd: int | None = None
     _direct: bool = False
 
+    # Linux caps one read or write syscall at MAX_RW_COUNT, INT_MAX rounded down
+    # to a page: 2 GB - 4096. Coalescing coarse ranges reaches past that, and the
+    # kernel then transfers a prefix and returns -- which without the loop below
+    # is silent corruption, because the rest of the file keeps whatever it held
+    # while every latency number stays healthy. Chunked well under the cap so a
+    # partial transfer stays the exception rather than the rule; the boundary is
+    # page-aligned, which O_DIRECT requires.
+    _IO_CHUNK = 1 << 30
+
     def read_into(self, view: memoryview, file_offset: int) -> None:
         """Fill `view` from the backing file at `file_offset`."""
 
-        got = os.preadv(self._fd, [view], file_offset)
-        if got != len(view):
-            raise OSError(
-                f"short read from cache file: {got} of {len(view)} bytes at "
-                f"offset {file_offset}"
-            )
+        done = 0
+        total = len(view)
+        while done < total:
+            want = min(self._IO_CHUNK, total - done)
+            got = os.preadv(self._fd, [view[done : done + want]], file_offset + done)
+            if got <= 0:
+                raise OSError(
+                    f"read from cache file stalled at {done} of {total} bytes "
+                    f"from offset {file_offset}"
+                )
+            done += got
 
     def write_from(self, view: memoryview, file_offset: int) -> None:
         """Write `view` to the backing file at `file_offset`."""
 
-        put = os.pwritev(self._fd, [view], file_offset)
-        if put != len(view):
-            raise OSError(
-                f"short write to cache file: {put} of {len(view)} bytes at "
-                f"offset {file_offset}"
-            )
+        done = 0
+        total = len(view)
+        while done < total:
+            want = min(self._IO_CHUNK, total - done)
+            put = os.pwritev(self._fd, [view[done : done + want]], file_offset + done)
+            if put <= 0:
+                raise OSError(
+                    f"write to cache file stalled at {done} of {total} bytes "
+                    f"to offset {file_offset}"
+                )
+            done += put
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:
         """Return the packed byte offset for one non-null CacheBlock."""

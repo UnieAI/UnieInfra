@@ -18,11 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compact pinned Host storage for cache transfer entries."""
+"""Compact Host storage for cache transfer entries.
+
+Backed either by pinned RAM or by a file on local NVMe. Both are one flat
+uint8 buffer addressed by the same byte arithmetic, so only the allocation
+differs -- `host_block_offset` is unchanged and the executor cannot tell them
+apart.""" 
 
 from __future__ import annotations
 
+import logging
+import os
+
 from tokenspeed.runtime.cache.transfer.layout import CacheTransferLayout
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_host_layout(
@@ -57,13 +67,21 @@ def compute_host_lcm_block_bytes(layout: CacheTransferLayout) -> int:
 
 
 class HostCacheStorage:
-    """One compact Host allocation indexed by scheduler CacheBlock IDs."""
+    """One compact Host allocation indexed by scheduler CacheBlock IDs.
+
+    `backing_path` swaps pinned RAM for a shared mapping of a file on disk.
+    RAM is the fast tier; a file on NVMe trades bandwidth for capacity that is
+    not bounded by how much memory the box has, which is the tier a deployment
+    buys when DRAM is the expensive part. Copies out of a mapped file are
+    pageable, so the DMA transfer backend cannot be used with it.
+    """
 
     def __init__(
         self,
         layout: CacheTransferLayout,
         *,
         num_host_lcm_blocks: int,
+        backing_path: str | None = None,
     ):
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
@@ -75,13 +93,76 @@ class HostCacheStorage:
         ) = _compute_host_layout(layout)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
+        self.backing_path = backing_path
         import torch
 
-        self.host_buffer = torch.empty(
-            self.host_buffer_bytes,
-            dtype=torch.uint8,
-            pin_memory=True,
+        if backing_path is None:
+            self.host_buffer = torch.empty(
+                self.host_buffer_bytes,
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+        else:
+            os.makedirs(os.path.dirname(backing_path) or ".", exist_ok=True)
+            # Preallocate so the mapping is backed by real extents; a sparse
+            # file turns every first write into an allocating fault under the
+            # transfer stream.
+            with open(backing_path, "wb") as fh:
+                os.posix_fallocate(fh.fileno(), 0, self.host_buffer_bytes)
+            self.host_buffer = torch.from_file(
+                backing_path,
+                shared=True,
+                size=self.host_buffer_bytes,
+                dtype=torch.uint8,
+            )
+            logger.info(
+                "Host L2 backed by file %s (%.2f GB)",
+                backing_path,
+                self.host_buffer_bytes / 1e9,
+            )
+            # A mapped file is served out of the page cache, so on a box with
+            # spare RAM the "disk" tier silently measures DRAM -- residency sat
+            # at 100% of 226 GB. posix_fadvise from another process cannot fix
+            # that: mapped pages are pinned by the mapping. Dropping them has to
+            # come from inside this process, over the range just used.
+            self._drop_after_use = (
+                os.getenv("TOKENSPEED_KVSTORE_NO_PAGECACHE") == "1"
+            )
+            if self._drop_after_use:
+                import ctypes
+                import ctypes.util
+
+                self._libc = ctypes.CDLL(ctypes.util.find_library("c"),
+                                         use_errno=True)
+                self._base_addr = self.host_buffer.data_ptr()
+                self._page_size = os.sysconf("SC_PAGESIZE")
+                logger.info("Host L2 will drop page-cache pages after each use")
+
+    _drop_after_use = False
+
+    def drop_range(self, offset: int, num_bytes: int) -> None:
+        """Return one byte range to the file, so the next read hits the disk.
+
+        No-op unless TOKENSPEED_KVSTORE_NO_PAGECACHE=1. `msync` first: for a
+        MAP_SHARED mapping MADV_DONTNEED discards the resident pages, and a
+        write that has not reached the file yet would go with them.
+        """
+
+        if not self._drop_after_use:
+            return
+        MS_SYNC, MADV_DONTNEED = 4, 4
+        start = (self._base_addr + offset) & ~(self._page_size - 1)
+        end = (self._base_addr + offset + num_bytes + self._page_size - 1) & ~(
+            self._page_size - 1
         )
+        length = end - start
+        if length <= 0:
+            return
+        import ctypes
+
+        self._libc.msync(ctypes.c_void_p(start), ctypes.c_size_t(length), MS_SYNC)
+        self._libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length),
+                           MADV_DONTNEED)
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:
         """Return the packed byte offset for one non-null CacheBlock."""

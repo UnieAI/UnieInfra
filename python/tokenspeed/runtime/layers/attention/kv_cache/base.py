@@ -23,6 +23,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+import os
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 
@@ -313,7 +314,8 @@ class CachePool:
         self.layerwise_load_tracker = layerwise_load_tracker
 
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
-        """Optional hook for model-specific paged-cache diagnostics."""
+        """Keep the scheduler handle for paged-cache diagnostics."""
+        self._paged_cache_scheduler = scheduler
 
     def cache_transfer_layout(self):
         """Return the byte contract used by Host cache transfers."""
@@ -363,7 +365,41 @@ class CachePool:
             self.buffer.zero_()
 
     def maybe_log_paged_cache_group_pages(self) -> None:
-        return None
+        """Report per-group page occupancy when asked for it.
+
+        The aggregate `#pages(active/cached/total)` line cannot answer the
+        question that matters for a windowed model: whether the sliding groups
+        release what has slid out of the window, or hold the whole span like the
+        full-attention group does. Those two cases differ by a large factor in
+        how many concurrent requests fit, and look identical in the aggregate.
+
+        Off unless `TOKENSPEED_LOG_GROUP_PAGES=1`, because it prints once per
+        decode-batch log line.
+        """
+
+        scheduler = getattr(self, "_paged_cache_scheduler", None)
+        if (
+            getattr(self, "rank", 0) != 0
+            or scheduler is None
+            or not self.paged_cache_group_specs
+            or os.getenv("TOKENSPEED_LOG_GROUP_PAGES") != "1"
+        ):
+            return
+        parts = []
+        for spec in self.paged_cache_group_specs:
+            group_id = spec.group_id
+            try:
+                total = scheduler.paged_cache_group_total_pages(group_id)
+                available = scheduler.paged_cache_group_available_pages(group_id)
+            except Exception:  # diagnostics must never take the engine down
+                return
+            window = spec.sliding_window_tokens or 0
+            parts.append(
+                f"{group_id}[{spec.retention}"
+                + (f",w={window}" if window else "")
+                + f"]: used={total - available}/{total}"
+            )
+        logger.info("Paged-cache group pages. %s", "; ".join(parts))
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()

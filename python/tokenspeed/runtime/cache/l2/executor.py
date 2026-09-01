@@ -165,6 +165,12 @@ class L2CacheExecutor:
             if backing_path is None
             else torch.empty(_STAGING_BYTES, dtype=torch.uint8, pin_memory=True)
         )
+        # O_DIRECT needs a page-aligned buffer; a pinned allocation already is.
+        self._stage_view = (
+            None if self._staging is None else memoryview(self._staging.numpy())
+        )
+        if self._staging is not None and self._staging.data_ptr() % 4096:
+            raise RuntimeError("staging buffer is not page-aligned for O_DIRECT")
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
         logger.info(
@@ -302,20 +308,23 @@ class L2CacheExecutor:
     def _transfer(self, direction: str, ranges, stream) -> None:
         """Move byte ranges between the Device cache and the Host tier.
 
-        With pinned RAM this is one call. With a file-backed tier the bytes go
-        through a pinned staging buffer, so a load reads the file on the CPU
-        thread before the H2D copy and a writeback lands on the file after the
-        D2H copy has been waited on. The writeback therefore blocks where the
-        pinned path overlaps -- a first cut that measures the tier honestly
-        rather than an overlapped implementation that hides its own cost.
+        Pinned RAM is one call. A file-backed tier goes through the pinned
+        staging buffer with explicit O_DIRECT reads and writes.
+
+        Ranges are ordered by **file** offset and staging slots handed out in
+        that order, so neighbouring ranges land adjacent in staging too and
+        collapse into one large pread/pwrite. That matters more than it sounds:
+        a transfer carries hundreds of 512 KB planes, and issuing them
+        one-by-one made the disk tier cost 582 s over the page-cache-warm case
+        when the bytes themselves only account for about 170 s at the measured
+        NVMe rates.
         """
 
-        host = self.host_storage.host_buffer
         if self._staging is None:
             transfer_cache_ranges(
                 direction,
                 self.layout.buffers,
-                host,
+                self.host_storage.host_buffer,
                 ranges,
                 stream,
                 backend=self.transfer_backend,
@@ -324,20 +333,22 @@ class L2CacheExecutor:
 
         stage = self._staging
         capacity = stage.numel()
+        ordered = sorted(ranges, key=lambda row: row[2])
+
         batch: list[tuple[int, int, int, int]] = []
-        plan: list[tuple[int, int, int]] = []
+        io_plan: list[tuple[int, int, int]] = []  # (file_offset, stage_offset, bytes)
         used = 0
 
         def flush() -> None:
-            nonlocal batch, plan, used
+            nonlocal batch, io_plan, used
             if not batch:
                 return
             if direction == "h2d":
-                for stage_offset, host_offset, num_bytes in plan:
-                    stage[stage_offset : stage_offset + num_bytes].copy_(
-                        host[host_offset : host_offset + num_bytes]
+                for file_offset, stage_offset, num_bytes in io_plan:
+                    self.host_storage.read_into(
+                        self._stage_view[stage_offset : stage_offset + num_bytes],
+                        file_offset,
                     )
-                    self.host_storage.drop_range(host_offset, num_bytes, dirty=False)
             transfer_cache_ranges(
                 direction,
                 self.layout.buffers,
@@ -348,14 +359,14 @@ class L2CacheExecutor:
             )
             if direction == "d2h":
                 stream.synchronize()
-                for stage_offset, host_offset, num_bytes in plan:
-                    host[host_offset : host_offset + num_bytes].copy_(
-                        stage[stage_offset : stage_offset + num_bytes]
+                for file_offset, stage_offset, num_bytes in io_plan:
+                    self.host_storage.write_from(
+                        self._stage_view[stage_offset : stage_offset + num_bytes],
+                        file_offset,
                     )
-                    self.host_storage.drop_range(host_offset, num_bytes, dirty=True)
-            batch, plan, used = [], [], 0
+            batch, io_plan, used = [], [], 0
 
-        for device_index, device_offset, host_offset, num_bytes in ranges:
+        for device_index, device_offset, host_offset, num_bytes in ordered:
             if num_bytes > capacity:
                 raise RuntimeError(
                     f"cache transfer range of {num_bytes} bytes exceeds the "
@@ -364,7 +375,19 @@ class L2CacheExecutor:
             if used + num_bytes > capacity:
                 flush()
             batch.append((device_index, device_offset, used, num_bytes))
-            plan.append((used, host_offset, num_bytes))
+            # Coalesce with the previous I/O when both the file and the staging
+            # buffer continue where it stopped.
+            if io_plan:
+                prev_file, prev_stage, prev_bytes = io_plan[-1]
+                if (
+                    prev_file + prev_bytes == host_offset
+                    and prev_stage + prev_bytes == used
+                ):
+                    io_plan[-1] = (prev_file, prev_stage, prev_bytes + num_bytes)
+                else:
+                    io_plan.append((host_offset, used, num_bytes))
+            else:
+                io_plan.append((host_offset, used, num_bytes))
             used += num_bytes
         flush()
 

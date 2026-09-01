@@ -104,86 +104,56 @@ class HostCacheStorage:
             )
         else:
             os.makedirs(os.path.dirname(backing_path) or ".", exist_ok=True)
-            # Preallocate so the mapping is backed by real extents; a sparse
-            # file turns every first write into an allocating fault under the
-            # transfer stream.
+            # Preallocate: a sparse file turns every first write into an
+            # allocating fault under the transfer stream.
             with open(backing_path, "wb") as fh:
                 os.posix_fallocate(fh.fileno(), 0, self.host_buffer_bytes)
-                # fallocate warms the whole file through the page cache, so a
-                # residency measurement afterwards reads 100% before the engine
-                # has touched anything. Start from cold or the number means
-                # nothing.
-                os.posix_fadvise(fh.fileno(), 0, self.host_buffer_bytes,
-                                 os.POSIX_FADV_DONTNEED)
-            self.host_buffer = torch.from_file(
-                backing_path,
-                shared=True,
-                size=self.host_buffer_bytes,
-                dtype=torch.uint8,
-            )
+            self.host_buffer = None
+            # O_DIRECT rather than a mapping. Every offset and length here is a
+            # multiple of the 524,288-byte plane, so the alignment O_DIRECT
+            # demands is free -- and it buys the two things the mapped version
+            # could not have: reads and writes that never enter the page cache
+            # (so the tier is genuinely the disk, with no per-range msync,
+            # madvise and fadvise to evict what should never have been cached),
+            # and I/O that can be issued from a worker thread.
+            flags = os.O_RDWR
+            self._direct = hasattr(os, "O_DIRECT")
+            if self._direct:
+                flags |= os.O_DIRECT
+            try:
+                self._fd = os.open(backing_path, flags)
+            except OSError:  # filesystem without O_DIRECT
+                self._direct = False
+                self._fd = os.open(backing_path, os.O_RDWR)
             logger.info(
-                "Host L2 backed by file %s (%.2f GB)",
+                "Host L2 backed by file %s (%.2f GB, O_DIRECT=%s)",
                 backing_path,
                 self.host_buffer_bytes / 1e9,
+                self._direct,
             )
-            # A mapped file is served out of the page cache, so on a box with
-            # spare RAM the "disk" tier silently measures DRAM -- residency sat
-            # at 100% of 226 GB. posix_fadvise from another process cannot fix
-            # that: mapped pages are pinned by the mapping. Dropping them has to
-            # come from inside this process, over the range just used.
-            self._drop_after_use = (
-                os.getenv("TOKENSPEED_KVSTORE_NO_PAGECACHE") == "1"
+
+    _fd: int | None = None
+    _direct: bool = False
+
+    def read_into(self, view: memoryview, file_offset: int) -> None:
+        """Fill `view` from the backing file at `file_offset`."""
+
+        got = os.preadv(self._fd, [view], file_offset)
+        if got != len(view):
+            raise OSError(
+                f"short read from cache file: {got} of {len(view)} bytes at "
+                f"offset {file_offset}"
             )
-            if self._drop_after_use:
-                import ctypes
-                import ctypes.util
 
-                self._libc = ctypes.CDLL(ctypes.util.find_library("c"),
-                                         use_errno=True)
-                self._base_addr = self.host_buffer.data_ptr()
-                self._backing_fd = os.open(backing_path, os.O_RDONLY)
-                self._page_size = os.sysconf("SC_PAGESIZE")
-                logger.info("Host L2 will drop page-cache pages after each use")
+    def write_from(self, view: memoryview, file_offset: int) -> None:
+        """Write `view` to the backing file at `file_offset`."""
 
-    _drop_after_use = False
-
-    def drop_range(self, offset: int, num_bytes: int, *, dirty: bool) -> None:
-        """Return one byte range to the file, so the next read hits the disk.
-
-        No-op unless TOKENSPEED_KVSTORE_NO_PAGECACHE=1.
-
-        MADV_DONTNEED alone does not do this. On a MAP_SHARED file mapping it
-        only tears down this process's page-table entries; the page cache keeps
-        the pages, so the next touch is a minor fault and the "disk" tier still
-        serves out of RAM -- measured, residency stayed at 100% of 226 GB and
-        the arm was slower purely from the msync. posix_fadvise is what frees
-        them, and it skips any page still mapped, so it has to come second.
-
-        `dirty` says whether this range was just written. Only then is a
-        writeback needed before the pages can go; a read path that syncs pays a
-        per-range flush for nothing.
-        """
-
-        if not self._drop_after_use:
-            return
-        MS_SYNC, MADV_DONTNEED, POSIX_FADV_DONTNEED = 4, 4, 4
-        start = (self._base_addr + offset) & ~(self._page_size - 1)
-        end = (self._base_addr + offset + num_bytes + self._page_size - 1) & ~(
-            self._page_size - 1
-        )
-        length = end - start
-        if length <= 0:
-            return
-        import ctypes
-
-        if dirty:
-            self._libc.msync(ctypes.c_void_p(start), ctypes.c_size_t(length),
-                             MS_SYNC)
-        self._libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length),
-                           MADV_DONTNEED)
-        file_offset = start - self._base_addr
-        self._libc.posix_fadvise(self._backing_fd, ctypes.c_long(file_offset),
-                                 ctypes.c_long(length), POSIX_FADV_DONTNEED)
+        put = os.pwritev(self._fd, [view], file_offset)
+        if put != len(view):
+            raise OSError(
+                f"short write to cache file: {put} of {len(view)} bytes at "
+                f"offset {file_offset}"
+            )
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:
         """Return the packed byte offset for one non-null CacheBlock."""

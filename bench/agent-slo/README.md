@@ -132,8 +132,17 @@ and past the point where the cache stops holding the working set it lowers both.
 **Reading a row honestly.** `dur` alone can hide a corrupt engine, a shorter
 answer, or a different token count, so always read `ntok` from both engines in
 the same cell before comparing anything else. `bad` is not usable for that under
-`ignore_eos`; use the tier round-trip check in `tests/l2/` when correctness is
-the question.
+`ignore_eos`; use the byte round-trip in `tests/l2/` when correctness is the
+question.
+
+**Do not use a cold/hot model comparison to clear a transfer path.** This engine
+is not deterministic at `temperature: 0` even with one request in flight and no
+cache at all: gemma-4-31B returned **1.40 distinct outputs per prompt** over 5
+prompts × 4 repeats, and Qwen3.8-27B matched on only 8 of 12 with zero cached
+tokens on the second pass. A cold/hot check therefore has a floor of 30-40%
+disagreement, and a passing score is a draw from that population rather than
+evidence. The byte round-trip does not run the model, and it was shown to fail
+without the fix it guards.
 
 ## Before reading any hit rate: what reuse does the corpus contain?
 

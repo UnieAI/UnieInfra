@@ -121,7 +121,7 @@ end-to-end time, and the generated text.
 | `TTFT p50 / p99` | ms from request sent to first token | the wait before anything appears. p99 is the one that shows queueing: a server can hold a fine median while a tail waits 60 s |
 | `TPOT p50 / p99` | ms per output token after the first | typing speed. `1000 / TPOT` ≈ `tps/req` once generation dominates |
 | `hit` | cumulative prefix-cache hit rate, `cached_tokens / prompt_tokens` | how much prompt was reused rather than recomputed. **Reports tokens marked as hits, not work avoided** — see the reuse probe below |
-| `ntok` | SSE chunks carrying non-empty text | a proxy for output tokens. Our engine sometimes packs more than one token into a chunk (measured: 506 chars in 114 chunks against vLLM's 429 in 128), so `tps` and `tps/req` are **understated for us**. `dur`, `rpm`, TTFT and TPOT are unaffected |
+| `ntok` | SSE chunks carrying non-empty text | a proxy for output tokens. Our engine sometimes packs more than one token into a chunk (measured: 506 chars in 114 chunks against vLLM's 429 in 128), so `tps` and `tps/req` are **understated for us**. `dur`, `rpm`, TTFT and TPOT are unaffected. **This is the column that catches silent corruption**: a KV-transfer defect on gemma-4 held every file-backed arm at 123-126 while every RAM-backed arm sat at 115-117, and nothing else in the run differed |
 | `bad` | character-repetition OR repeated 6-gram within 40 words | a broken engine looks healthy in latency alone. With `ignore_eos` both engines score high here because they are forced past their natural stop — compare the two engines' counts, never the absolute value |
 
 **Which are SLO axes and which are capacity axes.** TTFT and TPOT are what a user

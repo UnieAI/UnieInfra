@@ -122,7 +122,7 @@ end-to-end time, and the generated text.
 | `TPOT p50 / p99` | ms per output token after the first | typing speed. `1000 / TPOT` ≈ `tps/req` once generation dominates |
 | `hit` | cumulative prefix-cache hit rate, `cached_tokens / prompt_tokens` | how much prompt was reused rather than recomputed. **Reports tokens marked as hits, not work avoided** — see the reuse probe below |
 | `ntok` | SSE chunks carrying non-empty text | a proxy for output tokens. Our engine sometimes packs more than one token into a chunk (measured: 506 chars in 114 chunks against vLLM's 429 in 128), so `tps` and `tps/req` are **understated for us**. `dur`, `rpm`, TTFT and TPOT are unaffected. **This is the column that catches silent corruption**: a KV-transfer defect on gemma-4 held every file-backed arm at 123-126 while every RAM-backed arm sat at 115-117, and nothing else in the run differed |
-| `bad` | character-repetition OR repeated 6-gram within 40 words | a broken engine looks healthy in latency alone. With `ignore_eos` both engines score high here because they are forced past their natural stop — compare the two engines' counts, never the absolute value |
+| `bad` | character-repetition OR repeated 6-gram within 40 words | a broken engine looks healthy in latency alone — but **under `ignore_eos` this counter decides nothing, not even between engines**. Both are forced past their natural stop, so both loop, and the counts differ by which one starts first. Measured on Qwen3.8-27B: 101 flagged for us against 88 for vLLM, but **42 of vLLM's flags were requests we did not flag at all**, and one of the 55 we flagged alone had output identical to vLLM's over its first 180 characters. Treat a count difference as noise; only a *split* pattern means anything — see `ntok` |
 
 **Which are SLO axes and which are capacity axes.** TTFT and TPOT are what a user
 experiences and what an SLO is written against. `rpm` and `tps` are what the box
@@ -130,8 +130,10 @@ delivers. They trade off: pushing concurrency raises `rpm` and lowers `tps/req`,
 and past the point where the cache stops holding the working set it lowers both.
 
 **Reading a row honestly.** `dur` alone can hide a corrupt engine, a shorter
-answer, or a different token count, so always read `ntok` and `bad` from both
-engines in the same cell before comparing anything else.
+answer, or a different token count, so always read `ntok` from both engines in
+the same cell before comparing anything else. `bad` is not usable for that under
+`ignore_eos`; use the tier round-trip check in `tests/l2/` when correctness is
+the question.
 
 ## Before reading any hit rate: what reuse does the corpus contain?
 

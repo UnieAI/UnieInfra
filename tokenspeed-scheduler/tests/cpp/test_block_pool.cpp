@@ -201,5 +201,45 @@ TEST(BlockPoolLcmPlacementTest, LastReleaseImmediatelyClearsParentBinding) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
 }
 
+
+// A shrinking arena stops handing out the parents it is giving up, and says
+// when they have drained. The primitive a movable arena boundary needs: the
+// right split between the attention arena and the recurrent-state one depends
+// on the workload, so the boundary has to move after traffic is seen.
+TEST(BlockPoolUsableParents, CapExcludesParentsFromAllocationAndCount) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    EXPECT_EQ(pool.UsableParents(), 8);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8);
+    EXPECT_TRUE(pool.DrainedAboveUsable());
+
+    pool.SetUsableParents(5);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 5);
+    EXPECT_TRUE(pool.DrainedAboveUsable());
+
+    // Every block the pool hands out now sits at or below the cap.
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 5);
+    ASSERT_EQ(blocks.size(), 5u);
+    for (const CacheBlockRef& block : blocks) {
+        EXPECT_LE(block->Location().lcm_block_id, 5);
+    }
+    // And it cannot reach above the cap even though three parents are free.
+    EXPECT_TRUE(pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 1).empty());
+}
+
+TEST(BlockPoolUsableParents, DrainedReportsFalseWhileGivenUpParentsAreStillBound) {
+    BlockPool pool(/*num_lcm_blocks=*/4);
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 4);
+    ASSERT_EQ(blocks.size(), 4u);
+
+    pool.SetUsableParents(2);
+    // Parents 3 and 4 are bound, so the boundary must not move yet.
+    EXPECT_FALSE(pool.DrainedAboveUsable());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+
+    blocks.clear();  // every block released
+    EXPECT_TRUE(pool.DrainedAboveUsable());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

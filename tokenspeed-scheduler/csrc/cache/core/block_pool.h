@@ -41,6 +41,7 @@ public:
         for (std::int32_t id = 1; id <= num_lcm_blocks; ++id) {
             free_parent_ids_.push_back(id);
         }
+        usable_parents_ = num_lcm_blocks;
     }
 
     BlockPool(const BlockPool&) = delete;
@@ -49,7 +50,42 @@ public:
 
     // Number of physical LCM blocks. Kernel page 0 is reserved separately.
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
-    std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
+    std::int32_t NumEmptyLcmBlocks() const noexcept {
+        if (usable_parents_ >= NumLcmBlocks()) {
+            return static_cast<std::int32_t>(free_parent_ids_.size());
+        }
+        std::int32_t n = 0;
+        for (std::int32_t id : free_parent_ids_) {
+            n += (id <= usable_parents_) ? 1 : 0;
+        }
+        return n;
+    }
+
+    // Parents above this id stop being handed out; the pool shrinks to it as
+    // they drain. The whole pool by default, which is the old behaviour.
+    //
+    // This is the primitive a movable arena boundary needs. The right split
+    // between the attention arena and the recurrent-state one is a function of
+    // the workload -- measured on Qwen3.8-27B, the agent shape at c=16 wants
+    // 112 state pages per group and collapses to 0.55x at 180, while RAG at
+    // c=128 wants 180 and sits at 0.69x with 112 -- so the boundary has to be
+    // able to move after the engine has seen traffic. It can only move over
+    // parents that are free, and a shrinking arena has to stop handing out the
+    // ones it is giving up before it can wait for them to come back.
+    void SetUsableParents(std::int32_t n) {
+        FatalCheck(n >= 1 && n <= NumLcmBlocks(), "usable parent count is outside the pool");
+        usable_parents_ = n;
+    }
+    std::int32_t UsableParents() const noexcept { return usable_parents_; }
+    // True once nothing above the cap is still bound: the boundary may move.
+    bool DrainedAboveUsable() const {
+        for (std::int32_t id = usable_parents_ + 1; id <= NumLcmBlocks(); ++id) {
+            if (lcmBlock(id).bound_group) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     CacheBlockRef AcquireBlock(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block) {
         std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, cache_blocks_per_lcm_block, 1);
@@ -72,9 +108,14 @@ public:
                 return {};
             }
             locations.reserve(static_cast<std::size_t>(num));
-            for (std::int32_t i = 0; i < num; ++i) {
-                locations.push_back(
-                    CacheBlockLocation{.lcm_block_id = free_parent_ids_[static_cast<std::size_t>(i)], .slot_index = 0});
+            for (std::int32_t id : free_parent_ids_) {
+                if (id > usable_parents_) {
+                    continue;  // given up to the other arena; do not hand it out
+                }
+                locations.push_back(CacheBlockLocation{.lcm_block_id = id, .slot_index = 0});
+                if (static_cast<std::int32_t>(locations.size()) == num) {
+                    break;
+                }
             }
         } else {
             locations = planLocations(group_id, cache_blocks_per_lcm_block, static_cast<std::size_t>(num));
@@ -142,6 +183,8 @@ public:
     }
 
 private:
+    std::int32_t usable_parents_{0};
+
     struct LcmBlock {
         std::optional<std::uint32_t> bound_group;
         std::vector<bool> occupancy;

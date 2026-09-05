@@ -469,6 +469,49 @@ class CachePool:
             shortages = None
         suffix = f" | arena refusals {list(shortages)}" if shortages else ""
         logger.info("Paged-cache group pages. %s%s", "; ".join(parts), suffix)
+        self._maybe_warn_arena_split(shortages)
+
+    # Refusals have to be this lopsided before the split is called wrong. Below
+    # it the two arenas are both occasionally short, which is what a balanced
+    # split looks like.
+    _ARENA_SPLIT_RATIO = 8.0
+
+    def _maybe_warn_arena_split(self, shortages) -> None:
+        """Say which arena is starving, once, when the split is clearly wrong.
+
+        The right `--state-arena-pages` is a function of the workload and cannot
+        be a constant. Measured on Qwen3.8-27B, device-only: the agent shape at
+        c=16 runs 1.05x of vLLM with 112 pages per group and 0.55x with 180,
+        while RAG at c=128 runs 0.69x with 112 and 1.41x with 180. The engine
+        cannot know which it is serving before requests arrive, but it can see
+        which arena admission could not satisfy, and that is enough to name the
+        direction.
+        """
+        if not shortages or len(shortages) < 2 or getattr(self, "_arena_split_warned", False):
+            return
+        attention, state = shortages[0], max(shortages[1:])
+        total = attention + state
+        if total < 1000:  # too early to read
+            return
+        if attention > state * self._ARENA_SPLIT_RATIO:
+            direction, starving = "lower", "attention"
+        elif state > attention * self._ARENA_SPLIT_RATIO:
+            direction, starving = "raise", "recurrent-state"
+        else:
+            return
+        self._arena_split_warned = True
+        logger.warning(
+            "Cache arena split looks wrong for this workload: the %s arena was "
+            "short on %d admissions against %d for the other. %s "
+            "--state-arena-pages. A state page is far larger than an attention "
+            "page, so the two arenas trade directly: the right split depends on "
+            "the prompt length and the concurrency being served, not on the "
+            "model.",
+            starving,
+            attention if starving == "attention" else state,
+            state if starving == "attention" else attention,
+            direction.capitalize(),
+        )
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()

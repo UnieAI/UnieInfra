@@ -56,13 +56,59 @@ public:
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
     KvCacheCoordinator(std::vector<CacheGroup> groups, std::int32_t cache_block_tokens, BlockPool& pool,
-                       BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                       BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true,
+                       std::vector<BlockPool*> state_pools = {});
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
     bool HasMambaStateGroup() const;
 
+    const BlockPool& DevicePool() const { return pool_; }
+
+    // The device pool a group draws from.
+    //
+    // One arena today, so every group gets the same one and this is an
+    // identity. It exists because the arena's parent is sized by the widest
+    // geometry family and a group whose page is narrower than that wastes the
+    // difference on every parent it binds: on Qwen3.8-27B a GDN state page is
+    // 48.94 MiB against a 96 MiB parent and packs 1, so the three recurrent
+    // groups take 206 of 346 parents -- 60 of every 68 of them retained
+    // snapshots -- and leave full attention 188,928 tokens of prefix cache
+    // against vLLM's 447,146. No packing fixes it: the parent is the sum of the
+    // attention family's planes, which are twice the recurrent family's (k and
+    // v per layer against one state), so the ratio is 16/32 for every packing
+    // and every parent size. A second pool whose parent IS the state page is
+    // the smallest thing that does.
+    BlockPool& PoolForGroup(std::size_t group_index) {
+        const std::optional<std::size_t> slot = statePoolSlot(group_index);
+        return slot ? *state_pools_[*slot] : pool_;
+    }
+    const BlockPool& PoolForGroup(std::size_t group_index) const {
+        const std::optional<std::size_t> slot = statePoolSlot(group_index);
+        return slot ? *state_pools_[*slot] : pool_;
+    }
+    // Distinct device pools this coordinator draws from, in a stable order.
+    // Admission has to fit each one separately: a parent is only ever a page of
+    // its own arena, so a shortage in one says nothing about the other.
+    // Refusals attributed to each arena, index 0 being the shared one.
+    const std::vector<std::int64_t>& ArenaShortages() const { return arena_shortages_; }
+    std::size_t DevicePoolIndexForGroup(std::size_t group_index) const {
+        const std::optional<std::size_t> slot = statePoolSlot(group_index);
+        return slot ? *slot + 1U : 0U;
+    }
+    // The arenas and the group->arena map admission plans against.
+    void devicePoolViews(std::vector<const BlockPool*>& pools, std::vector<std::size_t>& pool_of_group) const {
+        pools.clear();
+        pools.push_back(&pool_);
+        for (const BlockPool* pool : state_pools_) {
+            pools.push_back(pool);
+        }
+        pool_of_group.resize(groups_.size());
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            pool_of_group[i] = DevicePoolIndexForGroup(i);
+        }
+    }
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
     const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
     AttnKind GroupKind(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Spec().kind; }
@@ -164,6 +210,11 @@ private:
 
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
+    // Device tier resolves per group; the Host tier is one pool for all.
+    template <CacheTier Tier>
+    BlockPool& tierPool(std::size_t group_index);
+    template <CacheTier Tier>
+    const BlockPool& tierPool(std::size_t group_index) const;
     template <CacheTier Tier>
     BlockPool& tierPool();
     template <CacheTier Tier>
@@ -189,6 +240,29 @@ private:
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
+    // One arena per recurrent-state group, in group order. Empty keeps every
+    // group on the one arena, which is byte-for-byte the old behaviour.
+    std::vector<BlockPool*> state_pools_;
+    // How often each arena was the one that could not be satisfied. The right
+    // split between them is a function of the workload -- measured, agent c=16
+    // wants 112 state pages per group and collapses to 0.55x at 180, while RAG
+    // c=128 wants 180 and sits at 0.69x with 112 -- so it cannot be a constant,
+    // and this is the signal a rebalance would act on.
+    mutable std::vector<std::int64_t> arena_shortages_;
+    // Which of them this group draws from, if any.
+    std::optional<std::size_t> statePoolSlot(std::size_t group_index) const {
+        if (state_pools_.empty() || groups_[group_index].Spec().kind != AttnKind::kMambaState) {
+            return std::nullopt;
+        }
+        std::size_t slot = 0;
+        for (std::size_t i = 0; i < group_index; ++i) {
+            if (groups_[i].Spec().kind == AttnKind::kMambaState) {
+                ++slot;
+            }
+        }
+        _assert(slot < state_pools_.size(), "more recurrent groups than state arenas");
+        return slot;
+    }
     BlockPool* host_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
     std::int32_t cache_block_tokens_{0};
@@ -200,6 +274,7 @@ private:
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each manager may use a smaller cache-page token count.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,
-                                   BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                                   BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true,
+                                   std::vector<BlockPool*> state_pools = {});
 
 }  // namespace tokenspeed

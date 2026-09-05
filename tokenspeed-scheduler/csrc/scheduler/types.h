@@ -39,6 +39,23 @@ struct SchedulerConfig {
         std::int32_t total_pages{};
     } device_allocator;
 
+    // Second device arena, for the recurrent-state groups only.
+    //
+    // The LCM parent is sized by the widest geometry family, so a group whose
+    // page is narrower strands the difference on every parent it binds. On
+    // Qwen3.8-27B a GDN state page is 48.94 MiB against a 96 MiB parent and
+    // packs 1, so the three recurrent groups take 206 of 346 parents -- 60 of
+    // every 68 of them retained snapshots -- and leave full attention 188,928
+    // tokens of prefix cache against vLLM's 447,146. Splitting them into an
+    // arena whose parent IS the state page takes both utilizations to 1.00.
+    //
+    // 0 keeps every group on `device_allocator`, which is the old behaviour.
+    struct {
+        std::int32_t total_pages{};
+    } state_allocator;
+
+    bool HasStateArena() const { return state_allocator.total_pages > 1; }
+
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }

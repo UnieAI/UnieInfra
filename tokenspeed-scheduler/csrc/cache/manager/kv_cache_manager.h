@@ -226,6 +226,12 @@ public:
     // for a group keeping periodic checkpoints.
     virtual bool BacksEveryPage() const { return true; }
 
+    // The ceiling a group's admission charge may not exceed, whatever path
+    // computed it. Identity here; a windowed group narrows it to the window
+    // plus the step being written, because that is its true high-water mark no
+    // matter how long the prompt is.
+    virtual std::int32_t CapAdmissionPages(std::int32_t pages) const { return pages; }
+
     virtual std::int32_t AdmissionBlocksNeededFor(const BlockTable& table, std::int32_t num_tokens,
                                                  std::int32_t base_index) const {
         const std::int32_t pages = BlocksNeededFor(table, num_tokens);

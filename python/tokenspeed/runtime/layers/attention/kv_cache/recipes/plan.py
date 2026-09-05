@@ -62,6 +62,8 @@ class CacheFieldLayout:
     element_size: int
     field_offset_bytes: int
     page_stride_bytes: int
+    # Bytes live in a standalone tensor. See ``CacheFieldSpec.external``.
+    external: bool = False
 
     @property
     def payload_bytes(self) -> int:
@@ -213,6 +215,28 @@ class CacheFieldSpec:
     # stride to satisfy an alignment constraint (for example, a TMA row
     # stride). The planner applies this in bytes after group packing.
     page_stride_alignment_bytes: int = 1
+    # This field's bytes live in a standalone tensor, not in an arena plane.
+    #
+    # A cache block resolves to a dense kernel page id --
+    # `1 + (lcm_block_id - 1) * cache_blocks_per_lcm_block + slot_index` -- so a
+    # tensor of `pages + 1` rows is addressed by exactly the id the allocator
+    # produces. The page id and the byte location are separable, and separating
+    # them is what lets a group sit in its own arena.
+    #
+    # The LCM parent is sized by the widest geometry family, so a group whose
+    # page is narrower strands the difference on every parent it binds. On
+    # Qwen3.8-27B a GDN state page is 48.94 MiB against a 96 MiB parent and
+    # packs 1, so the three recurrent groups take 206 of 346 parents -- 60 of
+    # every 68 of them retained snapshots -- and full attention is left 188,928
+    # tokens of prefix cache against vLLM's 447,146. No packing fixes it: the
+    # parent is the sum of the attention family's planes, which are twice the
+    # recurrent family's (k and v per layer against one state), so the ratio is
+    # 16/32 for every packing and every parent size.
+    #
+    # An external group must be given both its packing and its page count: it
+    # has no plane footprint for the byte-ratio solve to read, and its pages
+    # come from the scheduler's second BlockPool, not from `num_lcm_blocks`.
+    external: bool = False
 
     @property
     def payload_bytes(self) -> int:
@@ -229,7 +253,9 @@ class CacheLayout:
     plane_bytes: tuple[tuple[str, int], ...]
     fields: tuple[CacheFieldLayout, ...]
 
-    def with_num_lcm_blocks(self, num_lcm_blocks: int) -> CacheMemoryPlan:
+    def with_num_lcm_blocks(
+        self, num_lcm_blocks: int, external_pages: Mapping[str, int] | None = None
+    ) -> CacheMemoryPlan:
         if (
             isinstance(num_lcm_blocks, bool)
             or not isinstance(num_lcm_blocks, int)
@@ -237,9 +263,25 @@ class CacheLayout:
         ):
             raise ValueError("num_lcm_blocks must be a positive integer")
 
+        external_pages = dict(external_pages or {})
+        external_groups = {field.group_id for field in self.fields if field.external}
+        unknown = set(external_pages) - external_groups
+        if unknown:
+            raise ValueError(
+                f"external_pages names groups with no external field: {sorted(unknown)}"
+            )
+        missing = sorted(external_groups - set(external_pages))
+        if missing:
+            raise ValueError(
+                "an external group draws from the scheduler's second block pool "
+                f"and must be given its page count: {missing}"
+            )
         groups = []
         for group_id, count in self.group_packing:
-            if num_lcm_blocks * count > _MAX_KERNEL_PAGE_ID:
+            # An external group's pages come from its own arena, so its page-id
+            # space is that arena's parents times its packing -- not this one's.
+            blocks = external_pages.get(group_id, num_lcm_blocks)
+            if blocks * count > _MAX_KERNEL_PAGE_ID:
                 raise ValueError(
                     f"cache group {group_id!r}: kernel page id exceeds "
                     f"{_MAX_KERNEL_PAGE_ID}"
@@ -248,7 +290,7 @@ class CacheLayout:
                 CacheGroupLayout(
                     group_id=group_id,
                     cache_blocks_per_lcm_block=count,
-                    page_count=1 + num_lcm_blocks * count,
+                    page_count=1 + blocks * count,
                 )
             )
 
@@ -275,6 +317,8 @@ class CacheLayout:
         plane_family: dict[str, int] = {}
         family_of_group: dict[str, int] = {}
         for field in self.fields:
+            if field.external:
+                continue
             fam = family_of_group.get(field.group_id)
             if fam is None:
                 fam = plane_family.get(field.plane_id)
@@ -301,9 +345,7 @@ class CacheLayout:
         # Fall back to consecutive (union) layout rather than refuse to serve:
         # a union parent wastes bytes but reads the right ones.
         distinct_plane_sizes = {size for _, size in self.plane_bytes}
-        overlay = len(set(plane_family.values())) <= 1 or len(
-            distinct_plane_sizes
-        ) == 1
+        overlay = len(set(plane_family.values())) <= 1 or len(distinct_plane_sizes) == 1
         if not overlay and len(set(plane_family.values())) > 1:
             logger.warning(
                 "Cache arena: %d geometry families but %d distinct plane "
@@ -328,7 +370,9 @@ class CacheLayout:
                     arena_offset_bytes=arena_offset,
                 )
             )
-            family_offset[fam] = arena_offset + (num_lcm_blocks + 1) * bytes_per_lcm_block
+            family_offset[fam] = (
+                arena_offset + (num_lcm_blocks + 1) * bytes_per_lcm_block
+            )
 
         return CacheMemoryPlan(
             logical_block_tokens=self.logical_block_tokens,
@@ -552,6 +596,11 @@ def solve_cache_layout(
     if len({field.field_id for field in ordered_fields}) != len(ordered_fields):
         raise ValueError("cache field ids must be unique")
 
+    arena_fields = tuple(field for field in ordered_fields if not field.external)
+    external_only_groups = {f.group_id for f in ordered_fields if f.external} - {
+        f.group_id for f in arena_fields
+    }
+
     raw_by_group: dict[str, int] = {}
     for field in ordered_fields:
         if not field.group_id or not field.field_id or not field.plane_id:
@@ -567,11 +616,15 @@ def solve_cache_layout(
             or field.page_stride_alignment_bytes <= 0
         ):
             raise ValueError(f"cache field {field.field_id!r} has invalid geometry")
+        if field.external:
+            continue
         raw_by_group[field.group_id] = (
             raw_by_group.get(field.group_id, 0) + field.payload_bytes
         )
 
-    ordered_group_ids = tuple(sorted(raw_by_group))
+    if not raw_by_group:
+        raise ValueError("cache layout needs at least one arena-resident field")
+    ordered_group_ids = tuple(sorted(set(raw_by_group) | external_only_groups))
     # One line, once per plan: the per-group block footprint that decides how
     # many cache blocks share an LCM parent. A group with the largest footprint
     # packs 1:1 and then spends a whole parent per 128-token block, which is
@@ -580,7 +633,7 @@ def solve_cache_layout(
     if os.environ.get("TOKENSPEED_LOG_CACHE_PACKING"):
         logger.info(
             "cache packing inputs: %s",
-            {g: raw_by_group[g] for g in ordered_group_ids},
+            {g: raw_by_group.get(g, 0) for g in ordered_group_ids},
         )
     has_explicit_packing = cache_blocks_per_lcm_block is not None
     if has_explicit_packing:
@@ -598,18 +651,24 @@ def solve_cache_layout(
         # Pinned groups take the caller's count; groups the caller leaves
         # unpinned pack by their byte ratio as in the unpinned solve.
         packing = _packing_by_group_ratio(raw_by_group)
-        constrained = _solve_packing(ordered_fields)
+        constrained = _solve_packing(arena_fields)
         if constrained is not None:
             packing.update(constrained)
         packing.update(cache_blocks_per_lcm_block)
     else:
         packing = _packing_by_group_ratio(raw_by_group)
-        constrained = _solve_packing(ordered_fields)
+        constrained = _solve_packing(arena_fields)
         if constrained is not None:
             packing.update(constrained)
+    missing = sorted(external_only_groups - set(packing))
+    if missing:
+        raise ValueError(
+            "groups whose fields are all external must pin "
+            f"cache_blocks_per_lcm_block: {missing}"
+        )
 
     plane_fields: dict[str, dict[str, list[CacheFieldSpec]]] = {}
-    for field in ordered_fields:
+    for field in arena_fields:
         plane_fields.setdefault(field.plane_id, {}).setdefault(
             field.group_id, []
         ).append(field)
@@ -627,9 +686,7 @@ def solve_cache_layout(
 
     # Flexible fields consume explicit strides and can use slack left by exact
     # fields, but their K must divide every plane they occupy.
-    exact_groups = {
-        field.group_id for field in ordered_fields if field.exact_page_stride
-    }
+    exact_groups = {field.group_id for field in arena_fields if field.exact_page_stride}
     flexible_groups = set(ordered_group_ids) - exact_groups
     if flexible_groups and not has_explicit_packing:
         fixed_plane_bytes = {}
@@ -713,7 +770,7 @@ def solve_cache_layout(
                     )
         plane_bytes[plane_id] = _align_up(required_bytes, plane_alignment)
 
-    _check_exact_page_strides(ordered_fields, plane_bytes, packing)
+    _check_exact_page_strides(arena_fields, plane_bytes, packing)
 
     parent_alignment = alignment
     for count in packing.values():
@@ -726,7 +783,7 @@ def solve_cache_layout(
     # reporting as binding_utilization 0.5 on every group.
     _fam_of_group: dict[str, int] = {}
     _fam_of_plane: dict[str, int] = {}
-    for _f in ordered_fields:
+    for _f in arena_fields:
         _fam = _fam_of_group.get(_f.group_id, _fam_of_plane.get(_f.plane_id))
         if _fam is None:
             _fam = len(set(_fam_of_plane.values()))
@@ -743,6 +800,8 @@ def solve_cache_layout(
         )
 
     for group_id in ordered_group_ids:
+        if group_id in external_only_groups:
+            continue
         count = packing[group_id]
         if lcm_block_bytes % count:
             raise ValueError(
@@ -766,9 +825,17 @@ def solve_cache_layout(
                 plane_id=field.plane_id,
                 shape=field.shape,
                 element_size=field.element_size,
-                field_offset_bytes=field_offsets[field.field_id],
-                page_stride_bytes=plane_bytes[field.plane_id]
-                // packing[field.group_id],
+                # A standalone tensor starts at its own row 0 and its pages are
+                # contiguous, so the offset is 0 and the stride is the payload.
+                field_offset_bytes=(
+                    0 if field.external else field_offsets[field.field_id]
+                ),
+                page_stride_bytes=(
+                    field.payload_bytes
+                    if field.external
+                    else plane_bytes[field.plane_id] // packing[field.group_id]
+                ),
+                external=field.external,
             )
         )
 

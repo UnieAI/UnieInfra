@@ -77,6 +77,8 @@ class CachePoolSpec:
     state_field_dtypes: Mapping[str, torch.dtype]
     token_capacity: int
     layer_kv_head_counts: tuple[int, ...] | None = None
+    # Pages in each recurrent group's own arena; 0 keeps them in the LCM arena.
+    state_arena_pages: int = 0
     # Per-layer KV head_dim. Only set for models whose layers disagree about it
     # (gemma-4: 4 x 512 on the ten global layers against 16 x 256 on the
     # sliding half); None keeps the pool on its one-geometry path.
@@ -133,9 +135,7 @@ class CachePoolSpec:
             # a layer would be sized at the ALLOCATION head count against its
             # own head_dim, which is wider than its field, so the row view
             # would run past the buffer.
-            raise ValueError(
-                "cache KV head dims require the matching head counts"
-            )
+            raise ValueError("cache KV head dims require the matching head counts")
         return replace(
             self,
             family=family or self.family,

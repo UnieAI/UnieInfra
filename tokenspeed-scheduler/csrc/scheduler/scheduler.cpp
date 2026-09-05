@@ -53,6 +53,34 @@ std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.total_pages - 1 : 0;
 }
 
+std::int32_t statePoolBlocks(const SchedulerConfig& config) {
+    return config.HasStateArena() ? config.state_allocator.total_pages - 1 : 0;
+}
+
+// One arena per recurrent group. `state_allocator.total_pages` is per group.
+std::deque<BlockPool> makeStatePools(const SchedulerConfig& config) {
+    std::deque<BlockPool> pools;
+    if (!config.HasStateArena()) {
+        return pools;
+    }
+    for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
+        if (group.family == PagedCacheGroupFamily::State &&
+            group.retention == PagedCacheGroupConfig::Retention::FullHistory) {
+            pools.emplace_back(statePoolBlocks(config));
+        }
+    }
+    return pools;
+}
+
+std::vector<BlockPool*> statePoolPointers(std::deque<BlockPool>& pools) {
+    std::vector<BlockPool*> out;
+    out.reserve(pools.size());
+    for (BlockPool& pool : pools) {
+        out.push_back(&pool);
+    }
+    return out;
+}
+
 CacheKey eventKey(const CacheKey& key) {
     // External events describe one scheduler-level boundary. Fold every
     // group/child offset behind that boundary into the same accounting key.
@@ -70,9 +98,10 @@ Scheduler::Scheduler(SchedulerConfig config)
       req_pool_allocator_{config_.max_batch_size},
       block_pool_{config_.device_allocator.total_pages - 1},
       host_pool_{hostPoolBlocks(config_)},
+      state_pools_{makeStatePools(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
                                    host_pool_.NumLcmBlocks() > 0 ? &host_pool_ : nullptr,
-                                   config_.StreamsDeviceCacheToHost())},
+                                   config_.StreamsDeviceCacheToHost(), statePoolPointers(state_pools_))},
       tier_transfers_{coordinator_} {
     if (config_.block_size <= 0) {
         throw std::invalid_argument("Scheduler: block_size must be > 0");
@@ -398,6 +427,14 @@ std::int32_t Scheduler::PagedCacheGroupTotalPages(const std::string& group_id) c
     return config_.paged_cache_groups[groupIndex(group_id)].total_pages;
 }
 
+std::int32_t Scheduler::PagedCacheGroupCachedPages(const std::string& group_id) const {
+    // The group's own arena: a recurrent group draws from its own pool, and
+    // counting it against the main one reports 0 for every state group.
+    const std::size_t index = static_cast<std::size_t>(groupIndex(group_id));
+    return coordinator_.GroupManager(static_cast<std::int32_t>(index))
+        .NumCachedBlocks(coordinator_.PoolForGroup(index));
+}
+
 std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_id) const {
     const std::size_t index = groupIndex(group_id);
     const std::int32_t slots_per_parent = config_.paged_cache_groups[index].cache_blocks_per_lcm_block;
@@ -415,10 +452,12 @@ std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_i
 // scaled by the group's packing, so every group reports the same occupancy
 // fraction and a windowed group looks exactly like a full-history one.
 std::int32_t Scheduler::PagedCacheGroupBoundParents(const std::string& group_id) const {
+    // The group's own arena; a recurrent group is never bound in the main one.
     const std::size_t index = groupIndex(group_id);
+    const BlockPool& pool = coordinator_.PoolForGroup(index);
     std::int32_t bound = 0;
-    for (std::int32_t id = 1; id <= block_pool_.NumLcmBlocks(); ++id) {
-        if (block_pool_.BoundGroup(id) == static_cast<std::uint32_t>(index)) {
+    for (std::int32_t id = 1; id <= pool.NumLcmBlocks(); ++id) {
+        if (pool.BoundGroup(id) == static_cast<std::uint32_t>(index)) {
             ++bound;
         }
     }

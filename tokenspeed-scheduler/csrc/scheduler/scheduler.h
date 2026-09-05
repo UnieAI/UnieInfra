@@ -77,6 +77,16 @@ public:
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupBoundParents(const std::string& group_id) const;
+    // Pages this group holds as CACHE, i.e. retained for a later prefix match
+    // rather than being written by a running request. `BoundParents` minus
+    // this is the live footprint, and on a hybrid model the two answer very
+    // different questions: a recurrent group whose parents are nearly all
+    // live is bounded by concurrency, one whose parents are nearly all
+    // cached is bounded by retention, and the fixes do not overlap.
+    std::int32_t PagedCacheGroupCachedPages(const std::string& group_id) const;
+    // Admission refusals attributed to each device arena, index 0 the shared
+    // one. The signal a split rebalance would act on.
+    std::vector<std::int64_t> ArenaShortages() const { return coordinator_.ArenaShortages(); }
 
     bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
     std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
@@ -165,6 +175,11 @@ private:
     // Pools outlive every CacheBlockRef stored below.
     BlockPool block_pool_;
     BlockPool host_pool_;
+    // One arena per recurrent-state group; empty unless `state_allocator` is
+    // configured. Per group, not shared: a parent is bound exclusively, so
+    // three groups sharing one arena would still need every group's storage to
+    // span the whole page-id range -- 3x the bytes for 1x the live pages.
+    std::deque<BlockPool> state_pools_;
     KvCacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::vector<std::string> cache_group_ids_;

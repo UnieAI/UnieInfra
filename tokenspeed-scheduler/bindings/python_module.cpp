@@ -164,6 +164,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_rw(
             "num_host_pages", [](const tokenspeed::SchedulerConfig& c) { return c.host_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.host_allocator.total_pages = v; })
+        .def_prop_rw(
+            "num_state_pages", [](const tokenspeed::SchedulerConfig& c) { return c.state_allocator.total_pages; },
+            [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.state_allocator.total_pages = v; })
         .def_rw("paged_cache_groups", &tokenspeed::SchedulerConfig::paged_cache_groups)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
@@ -350,6 +353,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
+        .def("paged_cache_group_cached_pages", &tokenspeed::Scheduler::PagedCacheGroupCachedPages,
+             nb::arg("group_id"))
+        .def("arena_shortages", &tokenspeed::Scheduler::ArenaShortages)
         .def("paged_cache_group_bound_parents", &tokenspeed::Scheduler::PagedCacheGroupBoundParents,
              nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,

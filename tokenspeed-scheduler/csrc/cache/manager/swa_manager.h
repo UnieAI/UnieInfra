@@ -68,7 +68,17 @@ public:
     // can only ever reserve LESS than before, never more.
     std::int32_t AdmissionBlocksNeededFor(const BlockTable& table, std::int32_t num_tokens,
                                           std::int32_t base_index) const override {
-        const std::int32_t pages = KvCacheManager::AdmissionBlocksNeededFor(table, num_tokens, base_index);
+        return CapAdmissionPages(KvCacheManager::AdmissionBlocksNeededFor(table, num_tokens, base_index));
+    }
+
+    // The cap itself, so BOTH admission paths get it.
+    //
+    // Only this one used to. The other -- taken whenever the request resumes
+    // from a prefix hit, which on an agent workload is every turn after the
+    // first -- charges `BlocksNeededFor`, the whole prompt span, and a sliding
+    // group never holds that. Same wrong quantity the measurement below was
+    // about, on the branch it did not cover.
+    std::int32_t CapAdmissionPages(std::int32_t pages) const override {
         if (max_scheduled_tokens_ <= 0) {
             return pages;
         }

@@ -43,19 +43,45 @@ struct AdmissionPlan {
 
 class AdmissionPlanner {
 public:
-    AdmissionPlanner(const std::vector<CacheGroup>& groups, const BlockPool& pool, std::span<const GroupDemand> demands,
+    // `pools` are the distinct device arenas, `pool_of_group` maps each group to
+    // one of them. With a single arena both collapse to the old behaviour.
+    //
+    // Two arenas is not a generalization for its own sake: the LCM parent is
+    // sized by the widest geometry family, so a group whose page is narrower
+    // strands the difference on every parent it binds. On Qwen3.8-27B a GDN
+    // state page is 48.94 MiB against a 96 MiB parent, and the recurrent groups
+    // hold 206 of 346 parents -- 60 of every 68 of them retained snapshots.
+    // Giving those groups an arena whose parent IS their page takes both
+    // utilizations to 1.00 and full attention from 188,928 to ~369,024 tokens
+    // of prefix cache.
+    //
+    // Admission has to fit each arena separately: a free parent in one is not
+    // available to a group in the other.
+    AdmissionPlanner(const std::vector<CacheGroup>& groups, std::vector<const BlockPool*> pools,
+                     std::vector<std::size_t> pool_of_group, std::span<const GroupDemand> demands,
                      const KvCacheCoordinator::PrefixProbe& prefix,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
-          pool_{pool},
+          pools_{std::move(pools)},
+          pool_of_group_{std::move(pool_of_group)},
           demands_{demands},
           prefix_{prefix},
           pending_store_releases_{pending_store_releases},
           victims_{victims},
-          remaining_occupied_(static_cast<std::size_t>(pool.NumLcmBlocks()) + 1),
           local_free_slots_(groups.size()),
-          blocks_needed_(groups.size()) {}
+          blocks_needed_(groups.size()) {
+        _assert(!pools_.empty(), "admission needs at least one device pool");
+        _assert(pool_of_group_.size() == groups.size(), "pool map must cover every group");
+        empty_parent_count_.assign(pools_.size(), 0);
+        remaining_occupied_.resize(pools_.size());
+        for (std::size_t p = 0; p < pools_.size(); ++p) {
+            remaining_occupied_[p].assign(static_cast<std::size_t>(pools_[p]->NumLcmBlocks()) + 1, 0);
+        }
+    }
+
+    // Where refusals are tallied; index 0 is the shared arena.
+    void RecordShortagesInto(std::int64_t* counters) { short_arena_ = counters; }
 
     bool Plan() {
         victims_.clear();
@@ -94,7 +120,7 @@ public:
                                      "parents_needed=%lld empty_parents=%d |",
                                      groups_.size(), static_cast<long long>(blocks),
                                      static_cast<long long>(free_slots),
-                                     static_cast<long long>(need), empty_parent_count_);
+                                     static_cast<long long>(need), empty_parent_count_.empty() ? 0 : empty_parent_count_[0]);
                         for (std::size_t i = 0; i < groups_.size(); ++i) {
                             std::fprintf(f, " g%zu(need=%lld free=%lld slots=%d)", i,
                                          static_cast<long long>(blocks_needed_[i]),
@@ -202,42 +228,72 @@ private:
                 demand.materialized_suffix_start < 0
                     ? manager.AdmissionBlocksNeededFor(*demand.table, demand.num_tokens + demand.reserve_tokens,
                                                        host_base + static_cast<std::int32_t>(host_hits.size()))
-                    : manager.BlocksNeededFor(*demand.table, demand);
+                    // The sparse view, same as the branch above. A
+                    // checkpointing group allocates one page per stride plus
+                    // the live tail, so charging the dense span refuses
+                    // requests over capacity it will never occupy: 78 pages on
+                    // a 10k prompt where Acquire takes 2. Invisible while the
+                    // recurrent groups share the 346-parent arena, which
+                    // absorbs it; fatal once they have their own, where the
+                    // first prefix-hit request cannot be admitted and
+                    // #running-req sits at 1. ddefef3a fixed the other branch
+                    // and left this one.
+                    : manager.CapAdmissionPages(static_cast<std::int32_t>(
+                          manager.BackedPagesFor(manager.BlocksNeededFor(*demand.table, demand))));
             blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks;
         }
 
-        for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
-            const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
-            if (!group_id) {
-                ++empty_parent_count_;
-                continue;
-            }
+        for (std::size_t p = 0; p < pools_.size(); ++p) {
+            const BlockPool& pool = *pools_[p];
+            for (std::int32_t parent_id = 1; parent_id <= pool.NumLcmBlocks(); ++parent_id) {
+                const std::optional<std::uint32_t> group_id = pool.BoundGroup(parent_id);
+                if (!group_id) {
+                    ++empty_parent_count_[p];
+                    continue;
+                }
 
-            _assert(*group_id < groups_.size(), "LCM parent has invalid group binding");
-            const std::int32_t occupied = pool_.OccupiedCount(parent_id);
-            const std::int32_t slots = groups_[*group_id].Manager().CacheBlocksPerLcmBlock();
-            _assert(0 < occupied && occupied <= slots, "bound LCM parent has invalid occupancy");
-            remaining_occupied_[static_cast<std::size_t>(parent_id)] = occupied;
-            local_free_slots_[*group_id] += slots - occupied;
+                _assert(*group_id < groups_.size(), "LCM parent has invalid group binding");
+                _assert(poolIndex(*group_id) == p, "a parent is bound to a group from another arena");
+                const std::int32_t occupied = pool.OccupiedCount(parent_id);
+                const std::int32_t slots = groups_[*group_id].Manager().CacheBlocksPerLcmBlock();
+                _assert(0 < occupied && occupied <= slots, "bound LCM parent has invalid occupancy");
+                remaining_occupied_[p][static_cast<std::size_t>(parent_id)] = occupied;
+                local_free_slots_[*group_id] += slots - occupied;
+            }
         }
     }
 
     void collectCandidates() {
-        std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations;
+        // Keyed by (arena, location). A parent id is only unique within its own
+        // arena, so with more than one arena a bare location aliases: the same
+        // (parent, slot) in two state arenas collides, and the second group's
+        // page is dropped as a duplicate -- leaving that group with no eviction
+        // candidates and admission refusing at #running-req 1.
+        using ArenaLocation = std::pair<std::size_t, CacheBlockLocation>;
+        struct ArenaLocationHash {
+            std::size_t operator()(const ArenaLocation& value) const {
+                return CacheBlockLocationHash{}(value.second) * 1000003U + value.first;
+            }
+        };
+        std::unordered_set<ArenaLocation, ArenaLocationHash> protected_locations;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::vector<CacheBlockLocation> hits = groups_[i].Manager().MatchedBlockLocations(
-                pool_, prefix_.group_keys[i], /*begin_blocks=*/0, prefix_.device.per_group[i]);
-            protected_locations.insert(hits.begin(), hits.end());
+                poolFor(static_cast<std::uint32_t>(i)), prefix_.group_keys[i], /*begin_blocks=*/0,
+                prefix_.device.per_group[i]);
+            for (CacheBlockLocation hit : hits) {
+                protected_locations.insert({poolIndex(static_cast<std::uint32_t>(i)), hit});
+            }
         }
 
-        std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> candidates;
+        std::unordered_set<ArenaLocation, ArenaLocationHash> candidates;
         const auto add_candidate = [&](std::uint32_t group_id, CacheBlockLocation location) {
-            if (protected_locations.contains(location) || !candidates.insert(location).second) {
+            const ArenaLocation keyed{poolIndex(group_id), location};
+            if (protected_locations.contains(keyed) || !candidates.insert(keyed).second) {
                 return;
             }
             const KvCacheManager& manager = groups_[group_id].Manager();
             const std::optional<KvCacheManager::CachedBlockMetadata> metadata =
-                manager.CachedBlockMetadataFor(pool_, location);
+                manager.CachedBlockMetadataFor(poolFor(group_id), location);
             const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
             const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
             const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
@@ -282,7 +338,7 @@ private:
                 }
             }
             for (CacheBlockLocation location :
-                 manager.EvictableBlockLocationsAfterReleasing(pool_, group_pending_store_releases)) {
+                 manager.EvictableBlockLocationsAfterReleasing(poolFor(group_id), group_pending_store_releases)) {
                 add_candidate(group_id, location);
             }
             if (demands_[i].num_computed_tokens >= 0) {
@@ -296,15 +352,16 @@ private:
     }
 
     void removeOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        _assert(pool_.BoundGroup(location.lcm_block_id) == group_id,
+        _assert(poolFor(group_id).BoundGroup(location.lcm_block_id) == group_id,
                 "released admission location belongs to another group");
-        std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
+        const std::size_t p = poolIndex(group_id);
+        std::int32_t& occupied = remaining_occupied_[p][static_cast<std::size_t>(location.lcm_block_id)];
         _assert(occupied > 0, "admission released the same location twice");
         const std::int32_t slots = groups_[group_id].Manager().CacheBlocksPerLcmBlock();
         if (occupied == 1) {
             local_free_slots_[group_id] -= slots - 1;
             occupied = 0;
-            ++empty_parent_count_;
+            ++empty_parent_count_[p];
         } else {
             --occupied;
             ++local_free_slots_[group_id];
@@ -312,11 +369,12 @@ private:
     }
 
     void restoreOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
+        const std::size_t p = poolIndex(group_id);
+        std::int32_t& occupied = remaining_occupied_[p][static_cast<std::size_t>(location.lcm_block_id)];
         const std::int32_t slots = groups_[group_id].Manager().CacheBlocksPerLcmBlock();
         if (occupied == 0) {
-            _assert(empty_parent_count_ > 0, "restoring an admission victim underflowed empty parents");
-            --empty_parent_count_;
+            _assert(empty_parent_count_[p] > 0, "restoring an admission victim underflowed empty parents");
+            --empty_parent_count_[p];
             occupied = 1;
             local_free_slots_[group_id] += slots - 1;
         } else {
@@ -327,37 +385,64 @@ private:
     }
 
     bool fits() const {
-        std::int64_t parents_needed = 0;
+        // Per arena: a free parent in one is not available to a group in the
+        // other, so a single sum would admit a request neither arena can hold.
+        std::vector<std::int64_t> parents_needed(pools_.size(), 0);
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::int64_t remaining = std::max<std::int64_t>(blocks_needed_[i] - local_free_slots_[i], 0);
             const std::int64_t slots = groups_[i].Manager().CacheBlocksPerLcmBlock();
-            parents_needed += (remaining + slots - 1) / slots;
+            parents_needed[poolIndex(static_cast<std::uint32_t>(i))] += (remaining + slots - 1) / slots;
         }
-        return parents_needed <= empty_parent_count_;
+        for (std::size_t p = 0; p < pools_.size(); ++p) {
+            if (parents_needed[p] > empty_parent_count_[p]) {
+                // Which arena is short, so the split can be derived instead of
+                // swept. The right split is a function of the workload, not a
+                // constant: on this model a state page is 48.94 MiB and an
+                // attention page 8 MiB, so the state arena has to cover
+                // concurrency x live pages per request while the attention one
+                // covers the working set. Measured, no single value serves
+                // both -- agent c=16 wants 112 state pages per group and gets
+                // 0.55x at 180, RAG c=128 wants 180 and gets 0.69x at 112.
+                if (short_arena_ != nullptr) {
+                    ++short_arena_[p];
+                }
+                return false;
+            }
+        }
+        return true;
     }
 
     const std::vector<CacheGroup>& groups_;
-    const BlockPool& pool_;
+    std::vector<const BlockPool*> pools_;
+    // Optional per-arena refusal counter, owned by the coordinator.
+    std::int64_t* short_arena_{nullptr};
+    std::vector<std::size_t> pool_of_group_;
+    const BlockPool& poolFor(std::uint32_t group_id) const { return *pools_[pool_of_group_[group_id]]; }
+    std::size_t poolIndex(std::uint32_t group_id) const { return pool_of_group_[group_id]; }
     std::span<const GroupDemand> demands_;
     const KvCacheCoordinator::PrefixProbe& prefix_;
     // These locations are still pinned by in-flight Store tickets. The planner only discounts those ticket refs to
     // decide whether waiting for Store ACK makes admission feasible; it never mutates the real pool.
     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
-    std::vector<std::int32_t> remaining_occupied_;
+    std::vector<std::vector<std::int32_t>> remaining_occupied_;
     std::vector<std::int64_t> local_free_slots_;
     std::vector<std::int64_t> blocks_needed_;
-    std::int64_t empty_parent_count_{0};
+    std::vector<std::int64_t> empty_parent_count_;
     std::vector<VictimCandidate> victim_candidates_;
 };
 
-std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups, const BlockPool& pool,
+std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
+                                           std::vector<const BlockPool*> pools,
+                                           std::vector<std::size_t> pool_of_group,
                                            KvCacheCoordinator::PrefixProbe&& prefix,
-                                           std::span<const GroupDemand> demands) {
+                                           std::span<const GroupDemand> demands, std::int64_t* shortages) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups, pool, demands, prefix, {}, victims};
+    const std::vector<const BlockPool*> planner_pools = pools;
+    AdmissionPlanner planner{groups, std::move(pools), std::move(pool_of_group), demands, prefix, {}, victims};
+    planner.RecordShortagesInto(shortages);
     if (!planner.Plan()) {
         // `TOKENSPEED_LOG_ADMISSION=1`: name the group that could not be
         // satisfied. In-flight concurrency stalls well below the client's
@@ -371,7 +456,11 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
                 per_group += (i ? " " : "");
                 per_group += "g" + std::to_string(i) + "=" + std::to_string(demands[i].num_tokens) + "tok";
             }
-            spdlog::info("[ADMIT-REJECT] empty_parents={} demands: {}", pool.NumEmptyLcmBlocks(), per_group);
+            std::string empties;
+            for (std::size_t p = 0; p < planner_pools.size(); ++p) {
+                empties += (p ? "/" : "") + std::to_string(planner_pools[p]->NumEmptyLcmBlocks());
+            }
+            spdlog::info("[ADMIT-REJECT] empty_parents={} demands: {}", empties, per_group);
         }
         return std::nullopt;
     }
@@ -384,7 +473,11 @@ bool KvCacheCoordinator::CanAdmitAfterReleasing(
     const PrefixProbe& prefix, std::span<const GroupDemand> demands,
     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases) const {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups_, pool_, demands, prefix, pending_store_releases, victims};
+    std::vector<const BlockPool*> pools;
+    std::vector<std::size_t> pool_of_group(groups_.size());
+    devicePoolViews(pools, pool_of_group);
+    AdmissionPlanner planner{groups_,  std::move(pools),      std::move(pool_of_group), demands,
+                             prefix,   pending_store_releases, victims};
     return planner.Plan();
 }
 
@@ -409,7 +502,13 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
                 "completed boundary kind must match newly completed page hashes");
     }
 
-    std::optional<AdmissionPlan> candidate = planAdmission(groups_, pool_, std::move(prefix), demands);
+    std::vector<const BlockPool*> plan_pools;
+    std::vector<std::size_t> plan_pool_of_group(groups_.size());
+    devicePoolViews(plan_pools, plan_pool_of_group);
+    arena_shortages_.resize(plan_pools.size(), 0);
+    std::optional<AdmissionPlan> candidate =
+        planAdmission(groups_, std::move(plan_pools), std::move(plan_pool_of_group), std::move(prefix), demands,
+                      arena_shortages_.data());
     if (!candidate) {
         return std::nullopt;
     }
@@ -451,12 +550,12 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
             cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
         }
         if (demand.num_computed_tokens >= 0) {
-            groups_[i].Manager().ReclaimExpired(pool_, *demand.table, demand.num_computed_tokens);
+            groups_[i].Manager().ReclaimExpired(PoolForGroup(i), *demand.table, demand.num_computed_tokens);
         }
     }
     for (const auto& [group_id, location] : prospective_victims) {
         if (!evictCachedBlock(group_id, location)) {
-            FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");
+            FatalCheck(!PoolForGroup(group_id).IsOccupied(location), "admission victim changed before acquisition");
         }
     }
 
@@ -464,10 +563,11 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
         const GroupDemand& demand = demands[i];
         if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
             groups_[i].Manager().AppendHostExtension(
-                pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
+                PoolForGroup(i), *demand.table, std::move(acquired_prefix.host.per_group[i].blocks),
+                result.load_pairs);
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
-        const bool acquired = groups_[i].Manager().Acquire(pool_, *demand.table, demand);
+        const bool acquired = groups_[i].Manager().Acquire(PoolForGroup(i), *demand.table, demand);
         FatalCheck(acquired, "admission plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
         for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {

@@ -294,6 +294,9 @@ class ServerArgs:
     # prompts. Raising it divides that demand and costs recompute from the
     # nearest earlier checkpoint on a partial prefix hit.
     state_checkpoint_stride_blocks: int = 0
+    # Pages in each recurrent group's own cache arena. 0 keeps those groups in
+    # the LCM arena, which is the old behaviour. See CacheFieldSpec.external.
+    state_arena_pages: int = 0
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
     all2all_backend: str = "none"
@@ -1629,6 +1632,19 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--state-arena-pages",
+            type=int,
+            default=ServerArgs.state_arena_pages,
+            help=(
+                "Pages in each recurrent group's own cache arena. 0 (default) "
+                "leaves those groups in the shared LCM arena, where a state "
+                "page is 48.94 MiB against a 96 MiB parent and strands half of "
+                "every parent it binds. A positive value moves them out; the "
+                "arena shrinks by what they take, and full attention keeps the "
+                "rest."
+            ),
         )
         parser.add_argument(
             "--state-checkpoint-stride-blocks",

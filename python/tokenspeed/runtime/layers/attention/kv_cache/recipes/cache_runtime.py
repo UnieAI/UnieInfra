@@ -60,6 +60,8 @@ class PagedCacheRuntimeContract:
     token_capacity: int
     group_specs: tuple[PagedCacheGroupSpec, ...]
     group_page_counts: Mapping[str, int]
+    # Groups that draw from their own arena rather than the LCM one.
+    external_group_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         block_size = require_positive_int("block_size", self.block_size)
@@ -87,6 +89,9 @@ class PagedCacheRuntimeContract:
             )
             for group_id in group_ids
         }
+        # A group with its own arena counts against that arena's parents, not
+        # this one's, so only the shared-arena groups are checked here.
+        own_arena = set(self.external_group_ids or ())
         expected_counts = {
             spec.group_id: num_lcm_blocks
             * require_positive_int(
@@ -95,12 +100,18 @@ class PagedCacheRuntimeContract:
             )
             + 1
             for spec in self.group_specs
+            if spec.group_id not in own_arena
         }
-        if counts != expected_counts:
+        shared_counts = {
+            group_id: count
+            for group_id, count in counts.items()
+            if group_id not in own_arena
+        }
+        if shared_counts != expected_counts:
             raise ValueError(
                 "group page counts must equal num_lcm_blocks * "
                 "cache_blocks_per_lcm_block + 1: "
-                f"expected={expected_counts}, got={counts}"
+                f"expected={expected_counts}, got={shared_counts}"
             )
         max_child_pages = max(counts.values()) - 1
         if token_capacity > max_child_pages * block_size:

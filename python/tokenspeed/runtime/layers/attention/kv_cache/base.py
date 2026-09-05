@@ -20,10 +20,10 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-import os
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 
@@ -176,6 +176,9 @@ class CachePool:
             token_capacity=token_capacity,
             group_specs=self.paged_cache_group_specs,
             group_page_counts=counts,
+            external_group_ids=tuple(
+                sorted({field.group_id for field in self.plan.fields if field.external})
+            ),
         )
 
     def field(self, field_id: str, dtype: torch.dtype) -> torch.Tensor:
@@ -195,6 +198,15 @@ class CachePool:
         if torch.empty((), dtype=dtype).element_size() != field.element_size:
             raise ValueError(f"field {field_id!r}: dtype itemsize does not match plan")
         group = self.plan.group(field.group_id)
+        if field.external:
+            # Its own dense tensor, one contiguous row per kernel page id. The
+            # id comes from the scheduler's second block pool; see
+            # ``CacheFieldSpec.external``.
+            view = torch.zeros(
+                (group.page_count, *field.shape), dtype=dtype, device=self.device
+            )
+            self._fields[field_id] = view
+            return view
         element_strides = []
         stride = 1
         for extent in reversed(field.shape):
@@ -221,6 +233,21 @@ class CachePool:
         ]
         if segments:
             zero_byte_ranges(buffer, segments)
+        for group_id, block_ids in block_ids_by_group.items():
+            if not block_ids:
+                continue
+            rows = None
+            for field in self.plan.fields:
+                if not field.external or field.group_id != group_id:
+                    continue
+                view = self._fields.get(field.field_id)
+                if view is None:
+                    continue
+                if rows is None:
+                    rows = torch.tensor(
+                        block_ids, dtype=torch.int64, device=view.device
+                    )
+                view.index_fill_(0, rows, 0)
 
     @property
     def supports_disaggregation(self) -> bool:
@@ -287,6 +314,10 @@ class CachePool:
 
     def _field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         field = self.plan.field(field_id)
+        if field.external:
+            raise ValueError(
+                f"cache field {field_id!r} is external and has no arena offset"
+            )
         group = self.plan.group(field.group_id)
         if block_id < 0 or block_id >= group.page_count:
             raise IndexError(
@@ -306,7 +337,13 @@ class CachePool:
         self, group_id: str, block_ids: list[int]
     ) -> list[tuple[int, int]]:
         self.plan.group(group_id)
-        fields = [field for field in self.plan.fields if field.group_id == group_id]
+        # External fields are not in the arena buffer; zero_blocks clears them
+        # on their own tensors.
+        fields = [
+            field
+            for field in self.plan.fields
+            if field.group_id == group_id and not field.external
+        ]
         return [
             (
                 self._field_block_byte_offset(field.field_id, block_id),
@@ -402,17 +439,36 @@ class CachePool:
                 # `available` is dominated by the arena-wide empty-parent count
                 # scaled by this group's packing, so `total - available` is the
                 # same fraction for every group and says nothing about which
-                # group holds what. The parent count is the real occupancy.
+                # group holds what -- do not subtract anything from it. Read
+                # `parents` for occupancy and `cached` for how much of that is
+                # retention: on Qwen3.8-27B c=16 the three recurrent groups
+                # report parents=68/69 with cached=60/61, so a state group's
+                # parents are retained snapshots, not the pages running
+                # requests are writing.
                 parents = scheduler.paged_cache_group_bound_parents(group_id)
+                # Pages held as cache. `used - cached` is the live footprint,
+                # and the two need different fixes: a group whose parents are
+                # nearly all live is bounded by concurrency, one whose parents
+                # are nearly all cached is bounded by retention.
+                cached = scheduler.paged_cache_group_cached_pages(group_id)
             except Exception:  # diagnostics must never take the engine down
                 return
             window = spec.sliding_window_tokens or 0
             parts.append(
                 f"{group_id}[{spec.retention}"
                 + (f",w={window}" if window else "")
-                + f"]: parents={parents}, used={total - available}/{total}"
+                + f"]: parents={parents}, cached={cached}, used={total - available}/{total}"
             )
-        logger.info("Paged-cache group pages. %s", "; ".join(parts))
+        # Which arena admission could not satisfy. The split between them is a
+        # function of the workload -- measured, agent c=16 wants 112 state
+        # pages per group and collapses to 0.55x at 180, while RAG c=128 wants
+        # 180 and sits at 0.69x with 112 -- so this is what a rebalance reads.
+        try:
+            shortages = scheduler.arena_shortages()
+        except Exception:
+            shortages = None
+        suffix = f" | arena refusals {list(shortages)}" if shortages else ""
+        logger.info("Paged-cache group pages. %s%s", "; ".join(parts), suffix)
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()

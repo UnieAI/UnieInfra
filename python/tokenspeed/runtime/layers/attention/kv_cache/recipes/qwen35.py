@@ -98,6 +98,7 @@ def qwen_gdn_cache_fields(
     conv_element_size,
     ssm_shape,
     ssm_element_size,
+    state_external: bool = False,
 ) -> tuple[CacheFieldSpec, ...]:
     """Describe Qwen3.5 full-attention KV and recurrent checkpoints."""
     if len(layer_types) != len(layer_group_ids):
@@ -116,12 +117,24 @@ def qwen_gdn_cache_fields(
         if label == "linear_attention":
             fields.extend(
                 (
+                    # External: the recurrent state leaves the LCM arena.
+                    #
+                    # Its page is 48.94 MiB against a 96 MiB parent and packs 1,
+                    # so every page it binds strands half a parent -- 206 of 346
+                    # parents on this model, 60 of every 68 of them retained
+                    # snapshots, leaving full attention 188,928 tokens of prefix
+                    # cache against vLLM's 447,146. No packing fixes that: the
+                    # parent is the attention family's plane sum, which is twice
+                    # the recurrent family's (k and v per layer against one
+                    # state). Giving these groups their own arena, whose parent
+                    # IS their page, takes both utilizations to 1.00.
                     CacheFieldSpec(
                         group_id,
                         f"layer.{layer_id}.ssm",
                         f"unit.{unit}.a",
                         tuple(ssm_shape),
                         ssm_element_size,
+                        external=state_external,
                     ),
                     CacheFieldSpec(
                         group_id,
@@ -130,6 +143,7 @@ def qwen_gdn_cache_fields(
                         tuple(conv_shape),
                         conv_element_size,
                         exact_page_stride=False,
+                        external=state_external,
                     ),
                 )
             )
@@ -197,6 +211,7 @@ def prepare_qwen35_cache(
         conv_element_size=conv_dtype.itemsize,
         ssm_shape=ssm_shape,
         ssm_element_size=ssm_dtype.itemsize,
+        state_external=int(getattr(server_args, "state_arena_pages", 0) or 0) > 0,
     )
     state_dtypes = {
         f"layer.{layer_id}.conv": conv_dtype
@@ -282,6 +297,7 @@ def prepare_qwen35_cache(
         layer_kv_head_counts=None,
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
+        state_arena_pages=int(getattr(server_args, "state_arena_pages", 0) or 0),
         fixed_workspace_bytes=fixed_workspace_bytes,
         logical_block_tokens=logical_block_tokens,
         max_padding_fraction=qwen_gdn_max_padding_fraction(

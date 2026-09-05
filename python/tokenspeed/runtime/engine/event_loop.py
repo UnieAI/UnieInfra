@@ -564,6 +564,14 @@ class EventLoop:
             context_chunk_unit=server_args.context_chunk_unit,
             max_cold_prefills=server_args.max_cold_prefills,
         )
+        # Pages in each recurrent group's own arena; 0 leaves them in the LCM
+        # arena. The pool's spec is authoritative: it is what actually sized
+        # the standalone tensors.
+        scheduler_cfg.num_state_pages = (
+            int(getattr(server_args, "state_arena_pages", 0) or 0) + 1
+            if int(getattr(server_args, "state_arena_pages", 0) or 0) > 0
+            else 0
+        )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(
             "Scheduler config: block_size=%s num_device_pages=%s "

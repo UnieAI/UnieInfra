@@ -82,9 +82,7 @@ def mha_cache_fields(
         raise ValueError("head_dim must be divisible by kv_scale_block_size")
 
     if (layer_kv_heads is None) != (layer_kv_head_dims is None):
-        raise ValueError(
-            "layer_kv_heads and layer_kv_head_dims must be given together"
-        )
+        raise ValueError("layer_kv_heads and layer_kv_head_dims must be given together")
     if layer_kv_heads is not None and (
         len(layer_kv_heads) != len(layer_group_ids)
         or len(layer_kv_head_dims) != len(layer_group_ids)
@@ -116,7 +114,9 @@ def mha_cache_fields(
         # not the allocation's gets its own plane rather than a wrong stride on
         # a shared one. Same-geometry groups keep sharing, and every model with
         # one geometry keeps byte-identical plane ids.
-        suffix = "" if (heads_l, dim_l) == (kv_heads, head_dim) else f".{heads_l}x{dim_l}"
+        suffix = (
+            "" if (heads_l, dim_l) == (kv_heads, head_dim) else f".{heads_l}x{dim_l}"
+        )
         plane_k = f"unit.{unit}{suffix}.k"
         plane_v = f"unit.{unit}{suffix}.v"
         fields.extend(
@@ -279,6 +279,7 @@ def build_hybrid_cache_setup(
     fixed_workspace_bytes: int,
     logical_block_tokens: int,
     max_padding_fraction: float,
+    state_arena_pages: int = 0,
 ):
     """Bind one hybrid cache layout to a capacity.
 
@@ -300,15 +301,57 @@ def build_hybrid_cache_setup(
     merged_specs = tuple(group_specs)
     merged_head_counts = layer_kv_head_counts
 
+    # An external group has no plane footprint for the byte-ratio solve to
+    # read, so its packing is pinned: one page per parent of its own arena,
+    # which is what makes that arena's parent equal to its page.
+    external_group_ids = sorted(
+        {field.group_id for field in merged_fields if field.external}
+    )
     merged_layout = solve_cache_layout(
         merged_fields,
         logical_block_tokens=logical_block_tokens,
         alignment=256,
         max_padding_fraction=max_padding_fraction,
+        cache_blocks_per_lcm_block=(
+            {group_id: 1 for group_id in external_group_ids}
+            if external_group_ids
+            else None
+        ),
     )
     packing = dict(merged_layout.group_packing)
 
-    usable_cache_bytes = cache_budget_bytes - fixed_workspace_bytes
+    # Retained recurrent snapshots can live outside the arena, one dense row
+    # each, instead of costing a whole LCM parent apiece. On Qwen3.8-27B a GDN
+    # state page is 48.94 MiB against a 96 MiB parent, so the three state
+    # groups drift to 223 of 346 parents -- at c=16 AND at c=4, where only ~30
+    # of those are live -- and leave full attention 188,928 tokens of prefix
+    # cache against vLLM's 447,146. See `state_checkpoints.py`.
+    #
+    # The balanced slot count is `attention_tokens / mean_prompt_tokens`: one
+    # resume point per prefix the attention cache can still hold. The runtime
+    # cannot know the mean prompt at startup, so this stays an explicit
+    # argument and defaults to 0 -- off, byte-for-byte the old behaviour, and
+    # inert for every model without a recurrent group.
+    # Each recurrent group's own arena, if it has one. Its parent IS its page,
+    # so there is no binding hole to pay for: `state_arena_pages` pages cost
+    # exactly that many page-bytes. One arena per group, never shared -- a
+    # parent is bound exclusively, so groups sharing an arena would each still
+    # need storage spanning the whole page-id range.
+    external_groups = external_group_ids
+    state_page_bytes = {
+        group_id: sum(
+            field.payload_bytes
+            for field in merged_fields
+            if field.external and field.group_id == group_id
+        )
+        for group_id in external_groups
+    }
+    state_arena_bytes = sum(
+        (state_arena_pages + 1) * page_bytes for page_bytes in state_page_bytes.values()
+    )
+    external_pages = {group_id: state_arena_pages for group_id in external_groups}
+
+    usable_cache_bytes = cache_budget_bytes - fixed_workspace_bytes - state_arena_bytes
     num_lcm_blocks = usable_cache_bytes // merged_layout.lcm_block_bytes - 1
     if num_lcm_blocks < 1:
         raise ValueError(
@@ -329,12 +372,15 @@ def build_hybrid_cache_setup(
     return CacheSetup(
         spec=CachePoolSpec(
             family=family,
-            memory_plan=merged_layout.with_num_lcm_blocks(num_lcm_blocks),
+            memory_plan=merged_layout.with_num_lcm_blocks(
+                num_lcm_blocks, external_pages=external_pages
+            ),
             layer_types=merged_layer_types,
             layer_group_ids=merged_group_ids,
             paged_cache_group_specs=merged_specs,
             state_field_dtypes=state_dtypes,
             token_capacity=(num_lcm_blocks * max_packing * logical_block_tokens),
+            state_arena_pages=state_arena_pages,
             layer_kv_head_counts=merged_head_counts,
         ),
         num_draft_layers=num_draft_layers,
@@ -399,6 +445,7 @@ def _storage_layers(config, num_layers: int) -> int:
 # `cache_blocks_per_lcm_block` -- and `solve_cache_layout` derives it from the
 # per-group field bytes on its own. So the fields have to carry the layer's own
 # geometry; see `_mha_fields`.
+
 
 def _ordinary_setup(
     *,
@@ -478,9 +525,9 @@ def _ordinary_setup(
     # again under a different name.
     _dims = tuple(getattr(attn_config, "layer_kv_head_dims", None) or ())
     _heads = tuple(getattr(attn_config, "layer_kv_head_counts", None) or ())
-    uniform_widths = not _dims or len(
-        {int(h) * int(d) for h, d in zip(_heads, _dims)}
-    ) <= 1
+    uniform_widths = (
+        not _dims or len({int(h) * int(d) for h, d in zip(_heads, _dims)}) <= 1
+    )
     merged_layout = solve_cache_layout(
         merged_fields,
         logical_block_tokens=page_size,
@@ -515,19 +562,18 @@ def _ordinary_setup(
     # Per-layer KV geometry, for a model whose layers disagree about head_dim
     # (gemma-4). Target-only: a draft stack is a different model and its layers
     # continue the numbering, so an unaligned tuple is dropped whole.
-    merged_kv_head_counts = tuple(
-        getattr(attn_config, "layer_kv_head_counts", None) or ()
-    ) or None
-    merged_kv_head_dims = tuple(
-        getattr(attn_config, "layer_kv_head_dims", None) or ()
-    ) or None
+    merged_kv_head_counts = (
+        tuple(getattr(attn_config, "layer_kv_head_counts", None) or ()) or None
+    )
+    merged_kv_head_dims = (
+        tuple(getattr(attn_config, "layer_kv_head_dims", None) or ()) or None
+    )
     if merged_kv_head_dims is not None and (
         len(merged_kv_head_dims) != len(merged_group_ids)
         or merged_kv_head_counts is None
         or len(merged_kv_head_counts) != len(merged_group_ids)
     ):
         merged_kv_head_counts = merged_kv_head_dims = None
-
 
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         build_paged_cache_group_specs,

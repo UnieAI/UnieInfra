@@ -44,7 +44,7 @@ def rotate_half(x):
 def ref_apply(x, positions, inv_freq):
     """x [T, H, D]; HF's neox rotation with cos/sin = cat(freqs, freqs)."""
     freqs = positions.float()[:, None] * inv_freq[None, :].float()  # [T, D/2]
-    emb = torch.cat((freqs, freqs), dim=-1)                          # [T, D]
+    emb = torch.cat((freqs, freqs), dim=-1)  # [T, D]
     cos = emb.cos()[:, None, :]
     sin = emb.sin()[:, None, :]
     xf = x.float()
@@ -61,8 +61,10 @@ def main():
         d = layer_head_dim(tcfg, layer_type)
         inv = build_rope_inv_freq(layer_type, tcfg)
         nz = int((inv != 0).sum())
-        print(f"\n## {layer_type}: head_dim {d}, {inv.numel()} angles, "
-              f"{nz} non-zero ({'partial' if nz < inv.numel() else 'full'} rotary)")
+        print(
+            f"\n## {layer_type}: head_dim {d}, {inv.numel()} angles, "
+            f"{nz} non-zero ({'partial' if nz < inv.numel() else 'full'} rotary)"
+        )
 
         rope = Gemma4RotaryEmbedding(tcfg, layer_type, 4096, torch.bfloat16).to(dev)
         nq = tcfg.num_attention_heads
@@ -81,8 +83,10 @@ def main():
             rk = ref_apply(k.view(T, nkv, d), pos, inv.to(dev)).view(T, nkv * d)
             dq = (qo.float() - rq).abs().max().item() / rq.abs().max().item()
             dk = (ko.float() - rk).abs().max().item() / rk.abs().max().item()
-            print(f"  T={T:5d}  q rel={dq:9.2e}  k rel={dk:9.2e}  "
-                  f"{'OK' if max(dq, dk) < 5e-2 else '<-- WRONG'}")
+            print(
+                f"  T={T:5d}  q rel={dq:9.2e}  k rel={dk:9.2e}  "
+                f"{'OK' if max(dq, dk) < 5e-2 else '<-- WRONG'}"
+            )
 
 
 if __name__ == "__main__":

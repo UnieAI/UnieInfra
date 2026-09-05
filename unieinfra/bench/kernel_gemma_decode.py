@@ -45,7 +45,9 @@ def build(nq, nkv, d, batch, ctx, device="cuda"):
     pages_per_seq = (ctx + PAGE - 1) // PAGE
     total_pages = pages_per_seq * batch + 2
     q = torch.randn(batch, nq, d, dtype=torch.bfloat16, device=device)
-    k_cache = torch.randn(total_pages, PAGE, nkv, d, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(
+        total_pages, PAGE, nkv, d, dtype=torch.bfloat16, device=device
+    )
     page_table = torch.arange(
         pages_per_seq * batch, dtype=torch.int32, device=device
     ).view(batch, pages_per_seq)
@@ -85,11 +87,15 @@ def unwrap(r):
 def main():
     torch.manual_seed(0)
     props = torch.cuda.get_device_properties(0)
-    print(f"# {props.name}, {props.multi_processor_count} SM, "
-          f"read roofline {HBM_READ_GBS} GB/s, L2 {L2_BYTES >> 20} MB")
-    print(f"{'geom':>8} {'batch':>6} {'ctx':>6} {'eff_kv':>7} {'us':>9} "
-          f"{'GB/s':>8} {'%peak':>6} {'set MB':>8} {'L2?':>4} "
-          f"{'step ms/60L':>12}")
+    print(
+        f"# {props.name}, {props.multi_processor_count} SM, "
+        f"read roofline {HBM_READ_GBS} GB/s, L2 {L2_BYTES >> 20} MB"
+    )
+    print(
+        f"{'geom':>8} {'batch':>6} {'ctx':>6} {'eff_kv':>7} {'us':>9} "
+        f"{'GB/s':>8} {'%peak':>6} {'set MB':>8} {'L2?':>4} "
+        f"{'step ms/60L':>12}"
+    )
 
     # Split sweep. The registry's Triton decode reads
     # TS_TRITON_DECODE_KV_SPLITS on every call, so setting it here selects the
@@ -123,8 +129,10 @@ def main():
                             # Say what failed. Swallowing it printed
                             # "'NoneType' object is not subscriptable" from the
                             # summary line instead of the actual error.
-                            print(f"{name:>8} {batch:6d} {ctx:6d} split {sp:3d}: "
-                                  f"{type(exc).__name__}: {str(exc)[:90]}")
+                            print(
+                                f"{name:>8} {batch:6d} {ctx:6d} split {sp:3d}: "
+                                f"{type(exc).__name__}: {str(exc)[:90]}"
+                            )
                             row.append((sp, float("inf"), float("nan")))
                             continue
                         row.append((sp, t, dev))
@@ -132,7 +140,9 @@ def main():
                             best = (sp, t, dev)
                     os.environ.pop("TS_TRITON_DECODE_KV_SPLITS", None)
                     if best is None:
-                        print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d}  every split failed")
+                        print(
+                            f"{name:>8} {batch:6d} {ctx:6d} {eff:7d}  every split failed"
+                        )
                         del a
                         torch.cuda.empty_cache()
                         continue
@@ -142,20 +152,24 @@ def main():
                     # deliver, so its GB/s is not a bandwidth number. Say so on
                     # the row rather than leaving a >100% figure to be quoted.
                     l2 = " L2!" if kv_bytes < L2_BYTES else "    "
-                    print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d} "
-                          + "  ".join(f"s{sp}={t:7.1f}" for sp, t, _ in row)
-                          + f"   best=s{best[0]} "
-                          f"{gbs:6.0f} GB/s ({100 * gbs / HBM_READ_GBS:3.0f}%)"
-                          f"{l2} set={kv_bytes / 1e6:6.1f}MB"
-                          f"  max|d|={max(d for _, _, d in row if d == d):.2e}")
+                    print(
+                        f"{name:>8} {batch:6d} {ctx:6d} {eff:7d} "
+                        + "  ".join(f"s{sp}={t:7.1f}" for sp, t, _ in row)
+                        + f"   best=s{best[0]} "
+                        f"{gbs:6.0f} GB/s ({100 * gbs / HBM_READ_GBS:3.0f}%)"
+                        f"{l2} set={kv_bytes / 1e6:6.1f}MB"
+                        f"  max|d|={max(d for _, _, d in row if d == d):.2e}"
+                    )
                     del a
                     torch.cuda.empty_cache()
                     continue
                 try:
                     us = device_us(fn)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d}  "
-                          f"failed: {type(exc).__name__}: {str(exc)[:60]}")
+                    print(
+                        f"{name:>8} {batch:6d} {ctx:6d} {eff:7d}  "
+                        f"failed: {type(exc).__name__}: {str(exc)[:60]}"
+                    )
                     continue
                 # K and V, bf16, over the effective window only.
                 kv_bytes = 2 * eff * nkv * d * 2 * batch
@@ -163,10 +177,12 @@ def main():
                 fits_l2 = kv_bytes < L2_BYTES
                 # What one layer's cost implies for a whole step of this model.
                 step_ms = us * layers / 1000.0
-                print(f"{name:>8} {batch:6d} {ctx:6d} {eff:7d} {us:9.1f} "
-                      f"{gbs:8.1f} {100 * gbs / HBM_READ_GBS:5.0f}% "
-                      f"{kv_bytes / 1e6:8.1f} {'yes' if fits_l2 else '':>4} "
-                      f"{step_ms:12.2f}")
+                print(
+                    f"{name:>8} {batch:6d} {ctx:6d} {eff:7d} {us:9.1f} "
+                    f"{gbs:8.1f} {100 * gbs / HBM_READ_GBS:5.0f}% "
+                    f"{kv_bytes / 1e6:8.1f} {'yes' if fits_l2 else '':>4} "
+                    f"{step_ms:12.2f}"
+                )
                 del a
                 torch.cuda.empty_cache()
 

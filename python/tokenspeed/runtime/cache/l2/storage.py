@@ -23,7 +23,7 @@
 Backed either by pinned RAM or by a file on local NVMe. Both are one flat
 uint8 buffer addressed by the same byte arithmetic, so only the allocation
 differs -- `host_block_offset` is unchanged and the executor cannot tell them
-apart.""" 
+apart."""
 
 from __future__ import annotations
 

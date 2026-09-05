@@ -30,14 +30,20 @@ gemma-4-31B-it across the fix:
     layer 0 (32q x 16kv x 256)   1.42e-03 before and after
     layer 5 (32q x  4kv x 512)   1.13 before,  1.48e-03 after
 """
-import argparse, json, os, struct
+
+import argparse
+import json
+import os
+import struct
 
 import torch
 import torch.nn.functional as F
 
 
 def load_layer_weights(root, layer_id, names):
-    idx = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
+    idx = json.load(open(os.path.join(root, "model.safetensors.index.json")))[
+        "weight_map"
+    ]
     out = {}
     for n in names:
         key = f"model.language_model.layers.{layer_id}.self_attn.{n}"
@@ -51,7 +57,9 @@ def load_layer_weights(root, layer_id, names):
             start, end = meta["data_offsets"]
             fh.seek(8 + hlen + start)
             raw = fh.read(end - start)
-        t = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).reshape(meta["shape"])
+        t = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).reshape(
+            meta["shape"]
+        )
         out[n] = t.float()
     return out
 
@@ -75,8 +83,10 @@ def main():
     lid, hd = int(d["layer_id"]), int(d["head_dim"])
     nq, nkv = int(d["num_heads"]), int(d["num_kv_heads"])
     T = d["hidden_in"].shape[0]
-    print(f"layer {lid} ({d['layer_type']}), {nq}q x {nkv}kv x {hd}, "
-          f"k_eq_v={d['k_eq_v']}, {T} tokens")
+    print(
+        f"layer {lid} ({d['layer_type']}), {nq}q x {nkv}kv x {hd}, "
+        f"k_eq_v={d['k_eq_v']}, {T} tokens"
+    )
 
     # --- 1. does the attention output match SDPA on the dumped q/k/v? ---
     q = d["q"].view(T, nq, hd)
@@ -89,21 +99,33 @@ def main():
     ref = F.scaled_dot_product_attention(qq, kk, vv, is_causal=True, scale=1.0)
     ref = ref.squeeze(0).permute(1, 0, 2).reshape(T, nq * hd)
     r1 = rel(d["attn_out"], ref)
-    print(f"  attn_out vs SDPA(dumped q,k,v)   rel={r1:9.3e}  "
-          f"{'OK -- the kernel saw these tensors' if r1 < 5e-2 else '<-- WRONG: the cache round trip'}")
+    print(
+        f"  attn_out vs SDPA(dumped q,k,v)   rel={r1:9.3e}  "
+        f"{'OK -- the kernel saw these tensors' if r1 < 5e-2 else '<-- WRONG: the cache round trip'}"
+    )
 
     # --- 2. do q/k/v match a recomputation from hidden_in? ---
-    w = load_layer_weights(args.model, lid,
-                           ["q_proj.weight", "k_proj.weight", "v_proj.weight",
-                            "q_norm.weight", "k_norm.weight"])
+    w = load_layer_weights(
+        args.model,
+        lid,
+        [
+            "q_proj.weight",
+            "k_proj.weight",
+            "v_proj.weight",
+            "q_norm.weight",
+            "k_norm.weight",
+        ],
+    )
     h = d["hidden_in"]
     q_raw = h @ w["q_proj.weight"].T
     k_raw = h @ w["k_proj.weight"].T
     print(f"  k_raw vs h @ k_proj.T            rel={rel(d['k_raw'], k_raw):9.3e}")
     qn = rms(q_raw.reshape(-1, hd), w["q_norm.weight"]).reshape(T, nq * hd)
     kn = rms(k_raw.reshape(-1, hd), w["k_norm.weight"]).reshape(T, nkv * hd)
-    print(f"  (q,k after norm are compared BEFORE rope, so a nonzero rel here "
-          f"is rope, not the norms)")
+    print(
+        f"  (q,k after norm are compared BEFORE rope, so a nonzero rel here "
+        f"is rope, not the norms)"
+    )
     print(f"  q vs qnorm(q_proj)  [rope not applied to ref] rel={rel(d['q'], qn):9.3e}")
     print(f"  k vs knorm(k_proj)  [rope not applied to ref] rel={rel(d['k'], kn):9.3e}")
     if d["k_eq_v"]:
@@ -114,8 +136,9 @@ def main():
         vref = rms(v_raw.reshape(-1, hd)).reshape(T, nkv * hd)
         src = "v_norm(v_proj)"
     r2 = rel(d["v"], vref)
-    print(f"  v vs {src:22s}      rel={r2:9.3e}  "
-          f"{'OK' if r2 < 5e-2 else '<-- WRONG'}")
+    print(
+        f"  v vs {src:22s}      rel={r2:9.3e}  " f"{'OK' if r2 < 5e-2 else '<-- WRONG'}"
+    )
 
 
 if __name__ == "__main__":

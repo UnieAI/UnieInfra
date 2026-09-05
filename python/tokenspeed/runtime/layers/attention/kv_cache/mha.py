@@ -145,7 +145,8 @@ class MHATokenToKVPool(CachePool):
         # and on gemma-4 the difference is fluent nonsense.
         if self._layer_kv_head_dims is not None:
             widths = {
-                (h, d) for h, d in zip(self._layer_kv_head_counts, self._layer_kv_head_dims)
+                (h, d)
+                for h, d in zip(self._layer_kv_head_counts, self._layer_kv_head_dims)
             }
             logger.info(
                 "KV geometry: allocation %d heads x %d, per-layer widths %s",

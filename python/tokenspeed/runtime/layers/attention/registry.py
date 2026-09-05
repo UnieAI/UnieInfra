@@ -969,8 +969,13 @@ def create_attn_components(
         logger.info(
             "Cache layout: lcm_block_bytes=%d planes=%s group_block_bytes=%s packing=%s",
             _plan.lcm_block_bytes,
-            [(getattr(pl, "plane_id", "?"), getattr(pl, "bytes_per_lcm_block", getattr(pl, "block_bytes", -1)))
-             for pl in _plan.planes],
+            [
+                (
+                    getattr(pl, "plane_id", "?"),
+                    getattr(pl, "bytes_per_lcm_block", getattr(pl, "block_bytes", -1)),
+                )
+                for pl in _plan.planes
+            ],
             _gb,
             {g.group_id: g.cache_blocks_per_lcm_block for g in _plan.groups},
         )

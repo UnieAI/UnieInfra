@@ -113,3 +113,63 @@ def test_host_fields_are_packed_without_padding():
     assert storage.host_cache_block_bytes == (80, 1200)
     assert storage.host_field_offsets == ((0, 40), (0, 1000))
     assert storage.host_lcm_block_bytes == 1280
+
+
+class _FakePinned:
+    """Stands in for the pre-pinned uint8 buffer under the fake torch module."""
+
+    def __init__(self, size, *, pinned=True, dtype=None):
+        self._size = size
+        self._pinned = pinned
+        self.dtype = dtype if dtype is not None else sys.modules["torch"].uint8
+        self.sliced_to = None
+
+    def numel(self):
+        return self._size
+
+    def is_pinned(self):
+        return self._pinned
+
+    def __getitem__(self, key):
+        self.sliced_to = key.stop
+        return bytearray(key.stop)
+
+
+def test_a_pre_pinned_buffer_is_sliced_not_reallocated(monkeypatch):
+    """The device budget already paid for these bytes; a second pin double-charges."""
+    layout = _layout()
+    torch = sys.modules["torch"]
+    monkeypatch.setattr(
+        torch, "empty", lambda *a, **k: pytest.fail("allocated a second buffer")
+    )
+    buffer = _FakePinned(4096)
+    storage = HostCacheStorage(layout, num_host_lcm_blocks=2, prepinned=buffer)
+    assert buffer.sliced_to == storage.host_buffer_bytes
+    assert storage.host_buffer_bytes == 2 * storage.host_lcm_block_bytes
+
+
+def test_a_pre_pinned_buffer_too_small_is_refused():
+    """A short buffer would slice past the end and no view op would say so."""
+    layout = _layout()
+    with pytest.raises(ValueError, match="need"):
+        HostCacheStorage(layout, num_host_lcm_blocks=2, prepinned=_FakePinned(8))
+
+
+def test_a_pageable_buffer_is_refused():
+    """transfer_cache_ranges requires page-locked memory."""
+    layout = _layout()
+    with pytest.raises(ValueError, match="page-locked"):
+        HostCacheStorage(
+            layout, num_host_lcm_blocks=2, prepinned=_FakePinned(4096, pinned=False)
+        )
+
+
+def test_a_buffer_of_the_wrong_dtype_is_refused():
+    """Offsets are byte offsets; any wider element silently rescales them."""
+    layout = _layout()
+    with pytest.raises(ValueError, match="uint8"):
+        HostCacheStorage(
+            layout,
+            num_host_lcm_blocks=2,
+            prepinned=_FakePinned(4096, dtype=object()),
+        )

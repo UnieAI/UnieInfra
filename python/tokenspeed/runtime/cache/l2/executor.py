@@ -98,6 +98,58 @@ def _num_host_lcm_blocks(
     return count
 
 
+def prepin_host_tier(
+    *,
+    enable_kvstore: bool,
+    host_size_gb: float,
+    backing_path: str | None,
+) -> "torch.Tensor | None":
+    """Pin the host tier BEFORE the device cache budget is profiled.
+
+    Pinning host memory is not free on the device, and the budget is fixed
+    before the tier exists, so nothing charges for it. gemma-4-31B dies on it:
+    the engine prints `Device free 1.70 GB`, allocates 227 GB of pinned RAM,
+    and then the first full 8192-token prefill chunk asks for 334.00 MiB and
+    finds ~310 MiB. Five of ten tiered attempts failed that way; `--kvstore-
+    size 227` on swe_smith at c=1 and c=16 never produced a cell at all.
+
+    Charging for it in the budget would need the device cost of a 227 GB pin,
+    which nobody has measured -- and a linear extrapolation from a small probe
+    is only valid if the marginal cost per GB is constant, which is itself
+    unmeasured. Allocating first needs no number: `get_available_gpu_memory`
+    then sees whatever the pin actually took, and the cache budget comes out
+    smaller by exactly that much. It is self-calibrating.
+
+    Only for an explicit `--kvstore-size`. Ratio mode sizes the tier from the
+    device pool's LCM block count, so it cannot be known before the pool
+    exists, and file-backed mode pins only its staging buffer. Returns the
+    buffer to hand to `L2CacheExecutor(prepinned=...)`, or None.
+    """
+    if not enable_kvstore or backing_path is not None or host_size_gb <= 0:
+        return None
+    want = int(host_size_gb * 1e9)
+    available = psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
+    if want > available:
+        raise ValueError(
+            f"Not enough Host memory for L2: requesting {want / 1e9:.2f} GB, "
+            f"available {available / 1e9:.2f} GB"
+        )
+    free_before = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
+    buffer = torch.empty(want, dtype=torch.uint8, pin_memory=True)
+    if free_before is not None:
+        free_after = torch.cuda.mem_get_info()[0]
+        logger.info(
+            "Pre-pinned %.2f GB for the Host L2 tier before profiling; it cost "
+            "%.1f MiB on the device (free %.1f -> %.1f MiB), which the cache "
+            "budget now sees instead of overrunning it later",
+            want / 1e9,
+            (free_before - free_after) / (1 << 20),
+            free_before / (1 << 20),
+            free_after / (1 << 20),
+        )
+    return buffer
+
+
 # One load carries up to a few GB of ranges. Sizing the staging buffer above
 # that keeps the common transfer to a single batch, which is both faster and the
 # case with no staging reuse to wait on. Charged once, not per transfer.
@@ -121,6 +173,7 @@ class L2CacheExecutor:
         host_size_gb: float,
         io_backend: str,
         backing_path: str | None = None,
+        prepinned=None,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -144,17 +197,30 @@ class L2CacheExecutor:
             host_ratio=host_ratio,
             host_size_gb=host_size_gb,
         )
+        if prepinned is not None:
+            # The buffer was pinned before profiling, so the byte count is
+            # already fixed. Round the block count down into it rather than
+            # allocating a second time -- an off-by-one block here would slice
+            # past the end and `as_strided` would not say so.
+            fits = prepinned.numel() // host_lcm_block_bytes
+            if fits <= 0:
+                raise ValueError(
+                    f"pre-pinned {prepinned.numel()} bytes hold no whole "
+                    f"{host_lcm_block_bytes}-byte LCM block"
+                )
+            host_lcm_blocks = min(host_lcm_blocks, fits)
         requested_host_bytes = host_lcm_blocks * host_lcm_block_bytes
         if backing_path is None:
-            available_host_bytes = (
-                psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
-            )
-            if requested_host_bytes > available_host_bytes:
-                raise ValueError(
-                    "Not enough Host memory for L2: requesting "
-                    f"{requested_host_bytes / 1e9:.2f} GB, available "
-                    f"{available_host_bytes / 1e9:.2f} GB"
+            if prepinned is None:
+                available_host_bytes = (
+                    psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
                 )
+                if requested_host_bytes > available_host_bytes:
+                    raise ValueError(
+                        "Not enough Host memory for L2: requesting "
+                        f"{requested_host_bytes / 1e9:.2f} GB, available "
+                        f"{available_host_bytes / 1e9:.2f} GB"
+                    )
         else:
             free_disk_bytes = shutil.disk_usage(
                 os.path.dirname(backing_path) or "."
@@ -169,6 +235,7 @@ class L2CacheExecutor:
             self.layout,
             num_host_lcm_blocks=host_lcm_blocks,
             backing_path=backing_path,
+            prepinned=prepinned,
         )
         # A mapped file is not page-locked and `transfer_cache_ranges` requires
         # pinned memory, so a file-backed tier hops through a small pinned
@@ -206,7 +273,11 @@ class L2CacheExecutor:
             "Allocated %.2f GB compact Host L2 on %s (%s LCM blocks, "
             "%s bytes/block, io_backend=%s)",
             requested_host_bytes / 1e9,
-            "pinned RAM" if backing_path is None else f"file {backing_path}",
+            (
+                "pre-pinned RAM"
+                if prepinned is not None
+                else "pinned RAM" if backing_path is None else f"file {backing_path}"
+            ),
             host_lcm_blocks,
             host_lcm_block_bytes,
             io_backend,

@@ -82,6 +82,7 @@ class HostCacheStorage:
         *,
         num_host_lcm_blocks: int,
         backing_path: str | None = None,
+        prepinned=None,
     ):
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
@@ -97,11 +98,31 @@ class HostCacheStorage:
         import torch
 
         if backing_path is None:
-            self.host_buffer = torch.empty(
-                self.host_buffer_bytes,
-                dtype=torch.uint8,
-                pin_memory=True,
-            )
+            if prepinned is None:
+                self.host_buffer = torch.empty(
+                    self.host_buffer_bytes,
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                )
+            else:
+                # Pinned before the device cache budget was profiled, so the
+                # budget already accounts for whatever the pin cost on the
+                # device. Take a prefix view rather than a second allocation:
+                # a view of pinned storage is still pinned, which
+                # `transfer_cache_ranges` requires, and it starts at offset 0
+                # so the O_DIRECT-grade alignment of the base pointer holds.
+                if prepinned.numel() < self.host_buffer_bytes:
+                    raise ValueError(
+                        f"pre-pinned buffer holds {prepinned.numel()} bytes, "
+                        f"need {self.host_buffer_bytes}"
+                    )
+                if not prepinned.is_pinned():
+                    raise ValueError("pre-pinned buffer is not page-locked")
+                if prepinned.dtype is not torch.uint8:
+                    raise ValueError(
+                        f"pre-pinned buffer must be uint8, got {prepinned.dtype}"
+                    )
+                self.host_buffer = prepinned[: self.host_buffer_bytes]
         else:
             os.makedirs(os.path.dirname(backing_path) or ".", exist_ok=True)
             # Preallocate: a sparse file turns every first write into an

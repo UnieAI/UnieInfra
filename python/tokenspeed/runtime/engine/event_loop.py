@@ -33,7 +33,10 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
-from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+from tokenspeed.runtime.cache.l2.executor import (
+    L2CacheExecutor,
+    prepin_host_tier,
+)
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -355,6 +358,15 @@ class EventLoop:
             else 1
         )
 
+        # BEFORE create_attn_components profiles memory for the KV budget.
+        # A pin taken after profiling is spent out of headroom the budget
+        # already gave away; taken here it lands inside the profile.
+        self._prepinned_host_tier = prepin_host_tier(
+            enable_kvstore=server_args.enable_kvstore,
+            host_size_gb=server_args.kvstore_size,
+            backing_path=server_args.kvstore_backing_path,
+        )
+
         (
             attn_backend,
             token_to_kv_pool,
@@ -499,14 +511,21 @@ class EventLoop:
             free_before = (
                 torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
             )
-            self.l2_cache_executor = L2CacheExecutor(
-                device_pool=token_to_kv_pool,
-                draft_pool=draft_token_to_kv_pool,
-                host_ratio=server_args.kvstore_ratio,
-                host_size_gb=server_args.kvstore_size,
-                io_backend=server_args.kvstore_io_backend,
-                backing_path=server_args.kvstore_backing_path,
-            )
+            try:
+                self.l2_cache_executor = L2CacheExecutor(
+                    device_pool=token_to_kv_pool,
+                    draft_pool=draft_token_to_kv_pool,
+                    host_ratio=server_args.kvstore_ratio,
+                    host_size_gb=server_args.kvstore_size,
+                    io_backend=server_args.kvstore_io_backend,
+                    backing_path=server_args.kvstore_backing_path,
+                    prepinned=self._prepinned_host_tier,
+                )
+            except Exception:
+                # 227 GB of pinned RAM does not go back on its own if the
+                # executor raises after it was taken.
+                self._prepinned_host_tier = None
+                raise
             if free_before is not None:
                 free_after = torch.cuda.mem_get_info()[0]
                 logger.info(

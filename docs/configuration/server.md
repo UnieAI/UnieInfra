@@ -251,3 +251,26 @@ features directly:
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`
+
+### Host KV tier sizing (`--kvstore-size` vs `--kvstore-ratio`)
+
+The host tier can be sized two ways, and they differ in more than units:
+
+- `--kvstore-size <GB>` names the bytes outright. Because that number does not
+  depend on the device cache pool, the pinned allocation is taken **before**
+  the KV budget is profiled, so the device-side cost of page-locking that much
+  host RAM lands inside the profile and the cache pool comes out smaller by
+  exactly that much.
+- `--kvstore-ratio <r>` sizes the tier as a multiple of the device pool's LCM
+  block count, which only exists after the pool is allocated. The pin therefore
+  has to be taken afterwards, out of headroom the budget has already handed to
+  the cache.
+
+That ordering is not cosmetic. Pinning host memory is not free on the device
+and nothing charges for it, so under `--kvstore-ratio` a large tier can leave
+the engine short at the first full prefill chunk: gemma-4-31B with a 227 GB
+tier failed 5 of 10 attempts, asking for 334.00 MiB and finding ~310 MiB,
+against 1.70 GB of nominal headroom. Prefer `--kvstore-size` for a large tier.
+
+`--kvstore-backing-path` (file-backed) pins only a small staging buffer and is
+unaffected either way.

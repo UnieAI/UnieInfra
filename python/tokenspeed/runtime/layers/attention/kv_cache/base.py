@@ -487,7 +487,11 @@ class CachePool:
         which arena admission could not satisfy, and that is enough to name the
         direction.
         """
-        if not shortages or len(shortages) < 2 or getattr(self, "_arena_split_warned", False):
+        if (
+            not shortages
+            or len(shortages) < 2
+            or getattr(self, "_arena_split_warned", False)
+        ):
             return
         attention, state = shortages[0], max(shortages[1:])
         total = attention + state

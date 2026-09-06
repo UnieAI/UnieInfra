@@ -116,7 +116,12 @@ def _plan(max_state_slots=6):
         logical_block_tokens=64,
         lcm_block_bytes=LCM,
         num_lcm_blocks=NUM_PARENTS,
-        groups=(),
+        groups=tuple(
+            plan_mod.CacheGroupLayout(
+                group_id=g, cache_blocks_per_lcm_block=1, page_count=max_state_slots
+            )
+            for g in GROUPS
+        ),
         planes=(),
         fields=tuple(fields),
         max_state_slots=max_state_slots,
@@ -225,6 +230,29 @@ class ExternalViewTest(unittest.TestCase):
             external_field_view(
                 self.buffer, self.plan, f"{GROUPS[0]}.ssm", torch.float16
             )
+
+    def test_a_group_sized_differently_from_the_region_is_refused(self):
+        """Page ids index these rows; a size disagreement is silent otherwise."""
+        plan = _plan()
+        mismatched = plan_mod.CacheMemoryPlan(
+            logical_block_tokens=plan.logical_block_tokens,
+            lcm_block_bytes=plan.lcm_block_bytes,
+            num_lcm_blocks=plan.num_lcm_blocks,
+            groups=(
+                plan_mod.CacheGroupLayout(
+                    group_id=GROUPS[0],
+                    cache_blocks_per_lcm_block=1,
+                    page_count=plan.max_state_slots + 1,
+                ),
+            ),
+            planes=plan.planes,
+            fields=plan.fields,
+            max_state_slots=plan.max_state_slots,
+            buffer_bytes=plan.buffer_bytes,
+        )
+        buffer = torch.zeros(mismatched.unified_buffer_bytes, dtype=torch.uint8)
+        with self.assertRaises(ValueError):
+            external_field_view(buffer, mismatched, f"{GROUPS[0]}.ssm", torch.float32)
 
     def test_a_short_buffer_is_refused(self):
         small = torch.zeros(self.plan.unified_buffer_bytes - 1, dtype=torch.uint8)

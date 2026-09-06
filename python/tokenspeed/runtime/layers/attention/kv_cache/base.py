@@ -66,8 +66,9 @@ def external_field_view(
         A ``(max_state_slots, *field.shape)`` view. No copy.
 
     Raises:
-        ValueError: If the plan has no state region, the field is not external,
-            the dtype disagrees with the plan, or the buffer is too small.
+        ValueError: If the plan has no state region, the field is not
+            external, the dtype disagrees with the plan, the group's page count
+            disagrees with the slot count, or the buffer is too small.
     """
     if plan.max_state_slots <= 0:
         raise ValueError("plan has no state region; max_state_slots is 0")
@@ -76,6 +77,16 @@ def external_field_view(
         raise ValueError(f"{field_id} is not an external field")
     if torch.empty((), dtype=dtype).element_size() != field.element_size:
         raise ValueError(f"field {field_id!r}: dtype itemsize does not match plan")
+    pages = plan.group(field.group_id).page_count
+    if pages != plan.max_state_slots:
+        # The scheduler addresses these rows by page id. If the group is sized
+        # for a different number of pages than the region has slots, every id
+        # past the shorter of the two lands somewhere it was not meant to, and
+        # a wrong recurrent state is silent.
+        raise ValueError(
+            f"group {field.group_id!r} has {pages} pages but the state region "
+            f"has {plan.max_state_slots} slots"
+        )
     if buffer.numel() < plan.unified_buffer_bytes:
         raise ValueError(
             f"buffer holds {buffer.numel()} bytes, the plan needs "
@@ -254,12 +265,20 @@ class CachePool:
             raise ValueError(f"field {field_id!r}: dtype itemsize does not match plan")
         group = self.plan.group(field.group_id)
         if field.external:
-            # Its own dense tensor, one contiguous row per kernel page id. The
-            # id comes from the scheduler's second block pool; see
-            # ``CacheFieldSpec.external``.
-            view = torch.zeros(
-                (group.page_count, *field.shape), dtype=dtype, device=self.device
-            )
+            if self.plan.max_state_slots > 0:
+                # One buffer, two ends: the parents grow up from offset 0 and
+                # these rows down from the end, so the boundary between them is
+                # a pair of quotas rather than a reallocation. Addresses never
+                # move, which a CUDA graph requires -- it bakes `data_ptr()`
+                # into its kernel arguments at capture and never re-reads them.
+                view = external_field_view(buffer, self.plan, field_id, dtype)
+            else:
+                # No state region declared: its own dense tensor, one
+                # contiguous row per kernel page id. The id comes from the
+                # scheduler's second block pool; see ``CacheFieldSpec.external``.
+                view = torch.zeros(
+                    (group.page_count, *field.shape), dtype=dtype, device=self.device
+                )
             self._fields[field_id] = view
             return view
         element_strides = []
@@ -353,7 +372,9 @@ class CachePool:
             return buffer
         if self.buffer is None:
             self.buffer = torch.zeros(
-                self.plan.arena_bytes,
+                # Equals `arena_bytes` until a plan declares a state region, so
+                # a model without one allocates exactly what it always did.
+                self.plan.unified_buffer_bytes,
                 dtype=torch.uint8,
                 device=self.device,
             )

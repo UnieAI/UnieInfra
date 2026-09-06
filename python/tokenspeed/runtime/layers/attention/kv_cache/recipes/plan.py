@@ -83,10 +83,101 @@ class CacheMemoryPlan:
     groups: tuple[CacheGroupLayout, ...]
     planes: tuple[CachePlaneLayout, ...] = ()
     fields: tuple[CacheFieldLayout, ...] = ()
+    # Slots the recurrent-state region is *addressable* for. 0 keeps the old
+    # geometry: the external fields live in standalone tensors and there is no
+    # unified buffer.
+    max_state_slots: int = 0
+    # The single physical allocation both regions are cut from. It is
+    # deliberately SMALLER than the two maxima added together -- that overlap
+    # is the point. Parents can fill it alone and so can slots; what stops them
+    # doing it at the same time is the quota pair, not the geometry. Sizing the
+    # buffer for both maxima would make the boundary unmovable, because neither
+    # side would ever have anything the other could take. 0 means "no unified
+    # buffer", and the plan falls back to ``arena_bytes``.
+    buffer_bytes: int = 0
 
     @property
     def arena_bytes(self) -> int:
         return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
+
+    @property
+    def state_slot_bytes(self) -> int:
+        """Bytes one snapshot slot takes across every external group.
+
+        A snapshot occupies one page in each recurrent group at once, so the
+        groups move in lockstep and a *slot* -- one page from each -- is the
+        unit the boundary steps in. Interleaving by slot (rather than stacking
+        whole groups) is what keeps the unused bytes in ONE contiguous gap next
+        to the attention parents; stacked groups would strand a gap inside the
+        stack where the parents cannot reach it.
+        """
+        return sum(f.payload_bytes for f in self.fields if f.external)
+
+    @property
+    def unified_buffer_bytes(self) -> int:
+        """One physical allocation holding both regions.
+
+        Parents grow up from offset 0; state slots grow *down* from the end.
+        Neither ever relocates, which is the whole point: a CUDA graph bakes a
+        tensor's ``data_ptr()`` into its kernel arguments at capture time and
+        never re-reads it, so a layout that moved a page on a boundary change
+        would leave every replay reading freed memory -- and a wrong recurrent
+        state produces no latency signal at all.
+        """
+        return self.buffer_bytes or self.arena_bytes
+
+    def state_field_offset_bytes(self, field_id: str, slot: int) -> int:
+        """Byte offset of one external field's row for ``slot``.
+
+        Slot 0 sits hard against the end of the buffer and slot ``n`` sits
+        ``n`` slots below it, so adding slots never moves the ones already
+        written -- growth eats into the gap, it does not shuffle the region.
+        """
+        if self.max_state_slots <= 0:
+            raise ValueError("plan has no state region; max_state_slots is 0")
+        if not 0 <= slot < self.max_state_slots:
+            raise ValueError(
+                f"slot {slot} is outside the sized region "
+                f"[0, {self.max_state_slots})"
+            )
+        within = 0
+        for field in self.fields:
+            if not field.external:
+                continue
+            if field.field_id == field_id:
+                break
+            within += field.payload_bytes
+        else:
+            raise KeyError(f"{field_id} is not an external field")
+        slot_base = self.unified_buffer_bytes - (slot + 1) * self.state_slot_bytes
+        return slot_base + within
+
+    def check_boundary(self, usable_parents: int, state_slots: int) -> None:
+        """Reject a boundary where the two regions would overlap.
+
+        This one inequality is the only thing standing between a moved
+        boundary and silent corruption, so it is a check at the single place
+        the quotas change rather than a property the callers are trusted to
+        keep.
+        """
+        if usable_parents < 0 or usable_parents > self.num_lcm_blocks:
+            raise ValueError(
+                f"usable parents {usable_parents} is outside "
+                f"[0, {self.num_lcm_blocks}]"
+            )
+        if state_slots < 0 or state_slots > self.max_state_slots:
+            raise ValueError(
+                f"state slots {state_slots} is outside [0, {self.max_state_slots}]"
+            )
+        # +1 for the null parent, which is always addressable.
+        parent_end = (usable_parents + 1) * self.lcm_block_bytes
+        state_start = self.unified_buffer_bytes - state_slots * self.state_slot_bytes
+        if parent_end > state_start:
+            raise ValueError(
+                f"boundary overlaps: {usable_parents} parents end at "
+                f"{parent_end} but {state_slots} state slots start at "
+                f"{state_start} ({parent_end - state_start} bytes over)"
+            )
 
     def group(self, group_id: str) -> CacheGroupLayout:
         for group in self.groups:

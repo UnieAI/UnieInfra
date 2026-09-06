@@ -241,5 +241,86 @@ TEST(BlockPoolUsableParents, DrainedReportsFalseWhileGivenUpParentsAreStillBound
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
 }
 
+// The mirror. The recurrent-state pool keeps its HIGHEST parents, so its free
+// rows fall next to the attention parents where a moved boundary can reach
+// them. Both regions reach the kernels as strided tensor views and torch has
+// no negative stride, so the layout cannot count down from the far end -- the
+// allocator is what runs backwards instead.
+TEST(BlockPoolUsableTopParents, KeepsTheHighParentsAndGivesUpTheLowOnes) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    pool.SetUsableTopParents(3);
+    EXPECT_EQ(pool.UsableParents(), 3);
+    EXPECT_EQ(pool.UsableFrom(), 6);
+    EXPECT_EQ(pool.UsableTo(), 8);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 3);
+    ASSERT_EQ(blocks.size(), 3u);
+    for (const CacheBlockRef& block : blocks) {
+        EXPECT_GE(block->Location().lcm_block_id, 6);
+    }
+    // Five parents are free and none of them may be handed out.
+    EXPECT_TRUE(pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 1).empty());
+}
+
+TEST(BlockPoolUsableTopParents, DrainWaitsForTheGivenUpLowParents) {
+    BlockPool pool(/*num_lcm_blocks=*/4);
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 4);
+    ASSERT_EQ(blocks.size(), 4u);
+
+    pool.SetUsableTopParents(2);
+    // Parents 1 and 2 are the ones given up, and they are still bound. A cap
+    // that only ever looked above itself would call this drained and let the
+    // boundary move over live pages.
+    EXPECT_FALSE(pool.DrainedOutsideUsable());
+
+    blocks.clear();
+    EXPECT_TRUE(pool.DrainedOutsideUsable());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+}
+
+// The packed path plans locations separately, and it used to reach straight
+// into the free list without consulting the cap at all -- so a group with more
+// than one block per parent could take a parent the pool had already given to
+// the other arena.
+TEST(BlockPoolUsableParents, APackedGroupCannotTakeAGivenUpParent) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    pool.SetUsableParents(2);
+
+    // Two parents usable, four blocks each: eight blocks is everything there
+    // is, and a ninth must fail rather than reaching past the cap.
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/4, 8);
+    ASSERT_EQ(blocks.size(), 8u);
+    for (const CacheBlockRef& block : blocks) {
+        EXPECT_LE(block->Location().lcm_block_id, 2);
+    }
+    EXPECT_TRUE(pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/4, 1).empty());
+}
+
+// The free list is a deque that release appends to, so the parent a capped
+// pool picks is not always its front. Releasing 7 then 3 leaves [7, 3]; under
+// a cap of 5 the pool must hand out 3. `occupy` used to assert the front and
+// turned that placement into a crash -- and no existing test reached it,
+// because a cap applied to a fresh pool always picks the front.
+TEST(BlockPoolUsableParents, PlacesAFreeParentThatIsNotTheFrontOfTheList) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    std::vector<CacheBlockRef> all = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 8);
+    ASSERT_EQ(all.size(), 8u);
+
+    std::vector<CacheBlockRef> keep;
+    for (CacheBlockRef& block : all) {
+        const std::int32_t id = block->Location().lcm_block_id;
+        if (id != 7 && id != 3) {
+            keep.push_back(std::move(block));
+        }
+    }
+    all.clear();  // 7 released first, then 3
+
+    pool.SetUsableParents(5);
+    std::vector<CacheBlockRef> got = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 1);
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got.front()->Location().lcm_block_id, 3);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

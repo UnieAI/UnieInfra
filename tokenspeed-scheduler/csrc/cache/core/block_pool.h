@@ -51,12 +51,12 @@ public:
     // Number of physical LCM blocks. Kernel page 0 is reserved separately.
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
     std::int32_t NumEmptyLcmBlocks() const noexcept {
-        if (usable_parents_ >= NumLcmBlocks()) {
+        if (usable_from_ <= 1 && usable_parents_ >= NumLcmBlocks()) {
             return static_cast<std::int32_t>(free_parent_ids_.size());
         }
         std::int32_t n = 0;
         for (std::int32_t id : free_parent_ids_) {
-            n += (id <= usable_parents_) ? 1 : 0;
+            n += usableParent(id) ? 1 : 0;
         }
         return n;
     }
@@ -74,18 +74,39 @@ public:
     // ones it is giving up before it can wait for them to come back.
     void SetUsableParents(std::int32_t n) {
         FatalCheck(n >= 1 && n <= NumLcmBlocks(), "usable parent count is outside the pool");
+        usable_from_ = 1;
         usable_parents_ = n;
     }
-    std::int32_t UsableParents() const noexcept { return usable_parents_; }
-    // True once nothing above the cap is still bound: the boundary may move.
-    bool DrainedAboveUsable() const {
-        for (std::int32_t id = usable_parents_ + 1; id <= NumLcmBlocks(); ++id) {
-            if (lcmBlock(id).bound_group) {
+    // The mirror: keep the HIGHEST n parents and give up the low ones.
+    //
+    // Which end a pool keeps is not cosmetic. The two arenas share one buffer,
+    // and both reach the kernels as strided tensor views -- torch has no
+    // negative stride, so neither region can be laid out counting down from
+    // its far end. With both laid out ascending, the only way the free bytes
+    // land where the *other* arena can reach them is for one pool to allocate
+    // from the top. The recurrent-state pool is the one that does: its free
+    // rows then sit immediately above the attention parents, which is exactly
+    // the gap a moved boundary hands over.
+    void SetUsableTopParents(std::int32_t n) {
+        FatalCheck(n >= 1 && n <= NumLcmBlocks(), "usable parent count is outside the pool");
+        usable_from_ = NumLcmBlocks() - n + 1;
+        usable_parents_ = NumLcmBlocks();
+    }
+    std::int32_t UsableParents() const noexcept { return usable_parents_ - usable_from_ + 1; }
+    std::int32_t UsableFrom() const noexcept { return usable_from_; }
+    std::int32_t UsableTo() const noexcept { return usable_parents_; }
+    // True once nothing outside the usable range is still bound: the boundary
+    // may move. Both ends matter -- a pool that gave up its low parents has to
+    // wait for those, not for the ones above its cap.
+    bool DrainedOutsideUsable() const {
+        for (std::int32_t id = 1; id <= NumLcmBlocks(); ++id) {
+            if (!usableParent(id) && lcmBlock(id).bound_group) {
                 return false;
             }
         }
         return true;
     }
+    bool DrainedAboveUsable() const { return DrainedOutsideUsable(); }
 
     CacheBlockRef AcquireBlock(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block) {
         std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, cache_blocks_per_lcm_block, 1);
@@ -109,7 +130,7 @@ public:
             }
             locations.reserve(static_cast<std::size_t>(num));
             for (std::int32_t id : free_parent_ids_) {
-                if (id > usable_parents_) {
+                if (!usableParent(id)) {
                     continue;  // given up to the other arena; do not hand it out
                 }
                 locations.push_back(CacheBlockLocation{.lcm_block_id = id, .slot_index = 0});
@@ -183,6 +204,11 @@ public:
     }
 
 private:
+    bool usableParent(std::int32_t id) const noexcept {
+        return id >= usable_from_ && id <= usable_parents_;
+    }
+
+    std::int32_t usable_from_{1};
     std::int32_t usable_parents_{0};
 
     struct LcmBlock {
@@ -214,11 +240,19 @@ private:
     void occupy(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
         if (parent.occupied_count == 0) {
-            FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
-                       "empty LCM placement must consume the next free parent");
+            // Usually the front, and that stays O(1). But a pool with a usable
+            // range skips the ids it has given up, so the parent it picked can
+            // sit anywhere in the deque -- release appends, so a free list of
+            // [7, 3] under a cap of 5 hands out 3, which is not the front.
+            // Asserting "front" here made that a crash rather than a placement.
+            auto it = free_parent_ids_.begin();
+            if (it == free_parent_ids_.end() || *it != location.lcm_block_id) {
+                it = std::find(free_parent_ids_.begin(), free_parent_ids_.end(), location.lcm_block_id);
+            }
+            FatalCheck(it != free_parent_ids_.end(), "empty LCM placement must consume a free parent");
             FatalCheck(parent.occupancy.empty(), "empty LCM parent must not retain child slots");
             parent.occupancy.assign(static_cast<std::size_t>(slots_per_parent), false);
-            free_parent_ids_.pop_front();
+            free_parent_ids_.erase(it);
             parent.bound_group = group_id;
         }
         FatalCheck(
@@ -276,6 +310,9 @@ private:
 
         // Allocate free lcmBlock if partially-filled block is not enough.
         for (std::int32_t lcm_block_id : free_parent_ids_) {
+            if (!usableParent(lcm_block_id)) {
+                continue;  // given up to the other arena; a packed group may not take it either
+            }
             for (std::int32_t slot = 0; slot < slots_per_parent && locations.size() < count; ++slot) {
                 locations.push_back(CacheBlockLocation{
                     .lcm_block_id = lcm_block_id,

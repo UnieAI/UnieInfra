@@ -129,9 +129,16 @@ class CacheMemoryPlan:
     def state_field_offset_bytes(self, field_id: str, slot: int) -> int:
         """Byte offset of one external field's row for ``slot``.
 
-        Slot 0 sits hard against the end of the buffer and slot ``n`` sits
-        ``n`` slots below it, so adding slots never moves the ones already
-        written -- growth eats into the gap, it does not shuffle the region.
+        Row index ascends with the address, because both regions are handed to
+        the kernels as ``as_strided`` views and torch has no negative stride --
+        a region that grew downward could not be expressed as a tensor at all.
+        So the *layout* is ordinary and the *allocator* is what runs backwards:
+        the state pool hands out its highest ids first, which puts the occupied
+        rows against the end of the buffer and leaves the free ones next to the
+        attention parents, where a moved boundary can actually reach them.
+
+        Row ``max_state_slots - 1`` is the last slot in the buffer and row 0 is
+        the first one after the gap. Neither moves when the boundary does.
         """
         if self.max_state_slots <= 0:
             raise ValueError("plan has no state region; max_state_slots is 0")
@@ -149,7 +156,10 @@ class CacheMemoryPlan:
             within += field.payload_bytes
         else:
             raise KeyError(f"{field_id} is not an external field")
-        slot_base = self.unified_buffer_bytes - (slot + 1) * self.state_slot_bytes
+        slot_base = (
+            self.unified_buffer_bytes
+            - (self.max_state_slots - slot) * self.state_slot_bytes
+        )
         return slot_base + within
 
     def check_boundary(self, usable_parents: int, state_slots: int) -> None:

@@ -166,17 +166,51 @@ class StateSlotGeometryTest(unittest.TestCase):
             p.unified_buffer_bytes,
         )
 
-    def test_slot_zero_sits_against_the_end(self):
+    def test_the_last_row_sits_against_the_end(self):
+        """Rows ascend with the address; the pool is what runs backwards.
+
+        torch has no negative stride, so a region indexed downward could not be
+        expressed as an ``as_strided`` view at all. The occupied rows end up at
+        the buffer's end because the state pool hands out its highest ids
+        first, not because the layout is reversed.
+        """
+        p = _plan()
+        last = p.state_field_offset_bytes(f"{_GROUPS[0]}.conv", p.max_state_slots - 1)
+        self.assertEqual(last, p.unified_buffer_bytes - p.state_slot_bytes)
+
+    def test_row_zero_is_the_first_row_after_the_gap(self):
         p = _plan()
         first = p.state_field_offset_bytes(f"{_GROUPS[0]}.conv", 0)
-        self.assertEqual(first, p.unified_buffer_bytes - p.state_slot_bytes)
+        self.assertEqual(
+            first,
+            p.unified_buffer_bytes - p.max_state_slots * p.state_slot_bytes,
+        )
 
-    def test_slots_grow_downward_by_exactly_one_slot(self):
+    def test_rows_ascend_by_exactly_one_slot(self):
         p = _plan()
         for slot in range(p.max_state_slots - 1):
             here = p.state_field_offset_bytes(f"{_GROUPS[0]}.conv", slot)
-            below = p.state_field_offset_bytes(f"{_GROUPS[0]}.conv", slot + 1)
-            self.assertEqual(here - below, p.state_slot_bytes)
+            above = p.state_field_offset_bytes(f"{_GROUPS[0]}.conv", slot + 1)
+            self.assertEqual(above - here, p.state_slot_bytes)
+
+    def test_the_free_rows_are_the_ones_next_to_the_parents(self):
+        """The gap a moved boundary reaches has to be the LOW rows.
+
+        With S slots in use the pool holds the top S, so rows 0..max-S-1 are
+        free and they sit immediately above the parents. If the free rows were
+        at the buffer end instead, the attention region could never reach them
+        and the boundary would be decorative.
+        """
+        p = _plan()
+        in_use = 4
+        lowest_used = p.state_field_offset_bytes(
+            f"{_GROUPS[0]}.conv", p.max_state_slots - in_use
+        )
+        self.assertEqual(
+            lowest_used,
+            p.unified_buffer_bytes - in_use * p.state_slot_bytes,
+        )
+        p.check_boundary((lowest_used // p.lcm_block_bytes) - 1, in_use)
 
     def test_one_slot_is_contiguous_across_its_fields(self):
         """Every group's page for a slot sits together, with no hole.

@@ -489,6 +489,16 @@ class EventLoop:
                     "the cache-group scheduler has no L3 storage tier; unset "
                     "--kvstore-storage-backend"
                 )
+            # The device budget was fixed before this point -- the cache pool
+            # is already allocated and the startup memory table already printed
+            # `Device free`. Pinning host memory is not free on the device, and
+            # nothing charges for it, so measure the delta rather than assume
+            # it is zero: gemma-4-31B dies here on 3 of 6 tiered cells, asking
+            # for the 334.00 MiB of a full 8192-token prefill chunk and finding
+            # ~310 MiB, reproducibly, against 1.70 GB of nominal headroom.
+            free_before = (
+                torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
+            )
             self.l2_cache_executor = L2CacheExecutor(
                 device_pool=token_to_kv_pool,
                 draft_pool=draft_token_to_kv_pool,
@@ -497,6 +507,15 @@ class EventLoop:
                 io_backend=server_args.kvstore_io_backend,
                 backing_path=server_args.kvstore_backing_path,
             )
+            if free_before is not None:
+                free_after = torch.cuda.mem_get_info()[0]
+                logger.info(
+                    "Host L2 device cost: %.1f MiB (device free %.1f -> %.1f MiB); "
+                    "this is not in the cache budget",
+                    (free_before - free_after) / (1 << 20),
+                    free_before / (1 << 20),
+                    free_after / (1 << 20),
+                )
             num_host_pages = self.l2_cache_executor.num_host_pages
         else:
             self.l2_cache_executor = None

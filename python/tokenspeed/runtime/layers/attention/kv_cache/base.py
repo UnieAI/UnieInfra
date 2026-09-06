@@ -43,6 +43,61 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
+def external_field_view(
+    buffer: torch.Tensor, plan: CacheMemoryPlan, field_id: str, dtype: torch.dtype
+) -> torch.Tensor:
+    """One recurrent-state field as a view into the shared buffer's tail.
+
+    Row ``r`` of the returned tensor is slot ``r``: rows ascend with the
+    address, and the state pool hands out its highest ids first so the occupied
+    rows stay against the end of the buffer and the free ones stay next to the
+    attention parents. The stride between rows is the whole slot -- every
+    recurrent group's page for one slot sits together -- so a group's rows are
+    strided, not contiguous, while each row itself is contiguous, which is what
+    the GDN kernels' page ABI requires.
+
+    Args:
+        buffer: The unified ``uint8`` arena, ``plan.unified_buffer_bytes`` long.
+        plan: Layout whose ``max_state_slots`` is greater than zero.
+        field_id: An external field.
+        dtype: Element type, which must match the plan's element size.
+
+    Returns:
+        A ``(max_state_slots, *field.shape)`` view. No copy.
+
+    Raises:
+        ValueError: If the plan has no state region, the field is not external,
+            the dtype disagrees with the plan, or the buffer is too small.
+    """
+    if plan.max_state_slots <= 0:
+        raise ValueError("plan has no state region; max_state_slots is 0")
+    field = plan.field(field_id)
+    if not field.external:
+        raise ValueError(f"{field_id} is not an external field")
+    if torch.empty((), dtype=dtype).element_size() != field.element_size:
+        raise ValueError(f"field {field_id!r}: dtype itemsize does not match plan")
+    if buffer.numel() < plan.unified_buffer_bytes:
+        raise ValueError(
+            f"buffer holds {buffer.numel()} bytes, the plan needs "
+            f"{plan.unified_buffer_bytes}"
+        )
+    element_strides = []
+    stride = 1
+    for extent in reversed(field.shape):
+        element_strides.append(stride)
+        stride *= extent
+    offset = plan.state_field_offset_bytes(field_id, 0)
+    if offset % field.element_size:
+        raise ValueError(
+            f"field {field_id!r}: slot base {offset} is not aligned to its element"
+        )
+    return buffer.view(dtype).as_strided(
+        (plan.max_state_slots, *field.shape),
+        (plan.state_slot_bytes // field.element_size, *reversed(element_strides)),
+        offset // field.element_size,
+    )
+
+
 class CachePool:
     """Own page-backed cache memory and expose backend-specific views."""
 

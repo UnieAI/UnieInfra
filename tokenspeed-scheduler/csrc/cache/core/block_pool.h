@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -92,6 +93,17 @@ public:
         usable_from_ = NumLcmBlocks() - n + 1;
         usable_parents_ = NumLcmBlocks();
     }
+    // Allocate the highest usable parent first instead of the lowest.
+    //
+    // The range alone is not enough. While the whole pool is usable the
+    // acquire loop takes the front of the free list, so a state pool would
+    // fill from its LOW end -- and then shrinking it to the top S would have
+    // to wait for pages scattered across the low ids to drain, which may never
+    // happen under steady traffic. Filling from the top keeps the free bytes
+    // contiguous at the low end, next to the attention parents, where the
+    // boundary hands them over.
+    void PreferHighParents(bool enable) noexcept { prefer_high_ = enable; }
+    bool PrefersHighParents() const noexcept { return prefer_high_; }
     std::int32_t UsableParents() const noexcept { return usable_parents_ - usable_from_ + 1; }
     std::int32_t UsableFrom() const noexcept { return usable_from_; }
     std::int32_t UsableTo() const noexcept { return usable_parents_; }
@@ -129,10 +141,17 @@ public:
                 return {};
             }
             locations.reserve(static_cast<std::size_t>(num));
+            std::vector<std::int32_t> usable;
+            usable.reserve(free_parent_ids_.size());
             for (std::int32_t id : free_parent_ids_) {
-                if (!usableParent(id)) {
-                    continue;  // given up to the other arena; do not hand it out
+                if (usableParent(id)) {  // outside the range: given up to the other arena
+                    usable.push_back(id);
                 }
+            }
+            if (prefer_high_) {
+                std::ranges::sort(usable, std::greater<>{});
+            }
+            for (std::int32_t id : usable) {
                 locations.push_back(CacheBlockLocation{.lcm_block_id = id, .slot_index = 0});
                 if (static_cast<std::int32_t>(locations.size()) == num) {
                     break;
@@ -208,6 +227,7 @@ private:
         return id >= usable_from_ && id <= usable_parents_;
     }
 
+    bool prefer_high_{false};
     std::int32_t usable_from_{1};
     std::int32_t usable_parents_{0};
 

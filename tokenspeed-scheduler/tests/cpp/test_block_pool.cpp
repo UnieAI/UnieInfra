@@ -322,5 +322,34 @@ TEST(BlockPoolUsableParents, PlacesAFreeParentThatIsNotTheFrontOfTheList) {
     EXPECT_EQ(got.front()->Location().lcm_block_id, 3);
 }
 
+// Capping the range is not enough on its own. While the whole pool is usable
+// the acquire loop takes the front of the free list, so a state pool fills
+// from its LOW end -- and a later shrink to the top S then has to wait for
+// pages scattered across the low ids to drain, which under steady traffic may
+// never happen. Filling from the top makes the shrink immediate.
+TEST(BlockPoolPreferHighParents, FillsFromTheTopSoAShrinkCanHappenAtOnce) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    pool.PreferHighParents(true);
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 3);
+    ASSERT_EQ(blocks.size(), 3u);
+    for (const CacheBlockRef& block : blocks) {
+        EXPECT_GE(block->Location().lcm_block_id, 6);
+    }
+    pool.SetUsableTopParents(3);
+    EXPECT_TRUE(pool.DrainedOutsideUsable());
+}
+
+TEST(BlockPoolPreferHighParents, WithoutItTheSameShrinkIsBlocked) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, 3);
+    ASSERT_EQ(blocks.size(), 3u);
+    for (const CacheBlockRef& block : blocks) {
+        EXPECT_LE(block->Location().lcm_block_id, 3);
+    }
+    pool.SetUsableTopParents(3);
+    // 1..3 are bound and now outside the range: the boundary cannot move.
+    EXPECT_FALSE(pool.DrainedOutsideUsable());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

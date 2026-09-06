@@ -66,7 +66,12 @@ std::deque<BlockPool> makeStatePools(const SchedulerConfig& config) {
     for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
         if (group.family == PagedCacheGroupFamily::State &&
             group.retention == PagedCacheGroupConfig::Retention::FullHistory) {
-            pools.emplace_back(statePoolBlocks(config));
+            // Fill from the top. The two arenas share one buffer, and the
+            // free bytes only land where the attention parents can reach them
+            // if the state side keeps its high rows and gives up its low ones.
+            // Capping the range alone would leave pages scattered across the
+            // low ids and the boundary stuck; see BlockPool::PreferHighParents.
+            pools.emplace_back(statePoolBlocks(config)).PreferHighParents(true);
         }
     }
     return pools;

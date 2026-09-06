@@ -90,9 +90,7 @@ def env():
 
 
 def test_an_explicit_size_is_pinned_up_front(env):
-    buffer = _load(vars(env))(
-        enable_kvstore=True, host_size_gb=227, backing_path=None
-    )
+    buffer = _load(vars(env))(enable_kvstore=True, host_size_gb=227, backing_path=None)
     assert buffer is not None
     assert env.taken == [int(227 * 1e9)]
 
@@ -100,8 +98,7 @@ def test_an_explicit_size_is_pinned_up_front(env):
 def test_ratio_mode_is_left_alone(env):
     """Ratio sizes off the device pool's block count, which does not exist yet."""
     assert (
-        _load(vars(env))(enable_kvstore=True, host_size_gb=0, backing_path=None)
-        is None
+        _load(vars(env))(enable_kvstore=True, host_size_gb=0, backing_path=None) is None
     )
     assert env.taken == []
 
@@ -119,9 +116,7 @@ def test_a_file_backed_tier_is_left_alone(env):
 
 def test_a_disabled_tier_is_left_alone(env):
     assert (
-        _load(vars(env))(
-            enable_kvstore=False, host_size_gb=227, backing_path=None
-        )
+        _load(vars(env))(enable_kvstore=False, host_size_gb=227, backing_path=None)
         is None
     )
     assert env.taken == []
@@ -132,6 +127,4 @@ def test_a_host_shortage_is_refused_before_anything_is_pinned():
     env = _Recorder(available=1 << 30)
     env.torch.empty = lambda *a, **k: pytest.fail("pinned despite the shortage")
     with pytest.raises(ValueError, match="Not enough Host memory"):
-        _load(vars(env))(
-            enable_kvstore=True, host_size_gb=227, backing_path=None
-        )
+        _load(vars(env))(enable_kvstore=True, host_size_gb=227, backing_path=None)

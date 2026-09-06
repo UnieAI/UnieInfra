@@ -180,6 +180,39 @@ private:
         std::int64_t position_rank;
     };
 
+    // Depth-before-recency, opt-in, default off.
+    //
+    // The default below is LRU, and LRU has a worst case this workload sits in.
+    // The agent corpora interleave N sessions round-robin, so a session's next
+    // turn arrives after N-1 other requests. Measured on gemma-4-31B swe_smith
+    // (32 sessions, 10,084 tokens each): surviving one reuse distance needs
+    // 312,912 tokens against a 172,928-token pool. LRU keeps the most recent
+    // ~16 sequences WHOLE and drops the rest WHOLE, and the reuse distance is
+    // 32, so every reuse misses by construction. The engine's own probe agrees:
+    // 87% of matches converge at exactly 1024 tokens -- the cross-session
+    // system prompt and nothing else. 1024/10,084 = 10.2% against a measured
+    // hit rate of 9-11%. Reordering the same corpus so a session's turns are
+    // adjacent, with no engine change at all, takes it to 74.0%.
+    //
+    // Ordering depth first inverts the failure: under pressure the deep suffix
+    // of every sequence is reclaimed before the shallow prefix of any of them,
+    // so all N sessions keep a prefix instead of 16 keeping everything. The
+    // equilibrium depth is capacity/N and needs no tuning parameter.
+    //
+    // It is off by default because it is a POLICY change, not a fix. Recency
+    // wins when there is temporal locality; depth wins when access is cyclic
+    // and the working set exceeds capacity. Six tests in
+    // test_kv_cache_coordinator.cpp assert the recency contract by name
+    // (`FullEvictionPrefersOlderRequestBeforePosition`,
+    // `StateEvictionUsesAccessEpochBeforePosition`, ...) and they keep passing:
+    // they do not set the variable. Flipping the default is a decision that
+    // needs both workload shapes measured, which this switch is what makes
+    // possible.
+    static bool depthFirstEviction() {
+        static const bool on = std::getenv("TOKENSPEED_EVICT_DEPTH_FIRST") != nullptr;
+        return on;
+    }
+
     static auto evictionKey(const VictimCandidate& candidate) {
         // Recency first, tier second. Tried the reverse on 2026-08-21 to keep
         // resumable SWA boundaries alive: gemma-4-31B agent-26k c=1, median
@@ -194,8 +227,24 @@ private:
         // needs a mechanism that does not also reorder the live set: refresh
         // the epoch of a boundary when a match lands on it, or exclude
         // kUncached from candidacy, not a global re-sort.
-        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier,         candidate.position_rank,
-                          candidate.group_id,          candidate.location.lcm_block_id, candidate.location.slot_index};
+        //
+        // `last_access_epoch == 0` is an uncached block -- a page an in-flight
+        // request is writing into. Under the depth-first policy those are
+        // partitioned out FIRST and keep their existing order among themselves,
+        // so the live set is not reordered. That is the distinction the
+        // 2026-08-21 attempt missed: it re-sorted everything and paid +50.4%
+        // median TTFT for it.
+        const std::int64_t live = candidate.last_access_epoch == 0 ? 0 : 1;
+        const std::int64_t depth =
+            (depthFirstEviction() && live == 1) ? candidate.position_rank : std::int64_t{0};
+        return std::tuple{live,
+                          depth,
+                          candidate.last_access_epoch,
+                          candidate.eviction_tier,
+                          candidate.position_rank,
+                          candidate.group_id,
+                          candidate.location.lcm_block_id,
+                          candidate.location.slot_index};
     }
     static bool evictedAfter(const VictimCandidate& lhs, const VictimCandidate& rhs) {
         return evictionKey(rhs) < evictionKey(lhs);

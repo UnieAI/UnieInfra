@@ -168,12 +168,20 @@ class InputBuffers:
             non_blocking=True,
         )
 
+        # Bind once. Every `forward_op.<vector>` access crosses nanobind and
+        # rebuilds a whole Python list (nanobind/stl/vector.h is a list_caster,
+        # not a view), so reading them inside the generator made this
+        # O(3 * num_extends) list constructions -- and the all() does not
+        # short-circuit in the case it exists to detect, where every term is
+        # True.
+        extend_prefix_lens = forward_op.extend_prefix_lens
+        input_lengths_all = forward_op.input_lengths
+        prefill_lengths_all = forward_op.prefill_lengths
         self.all_extends_mid_chunk = (
             num_extends > 0
             and num_extends == batch_size
             and all(
-                forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
-                < forward_op.prefill_lengths[i]
+                extend_prefix_lens[i] + input_lengths_all[i] < prefill_lengths_all[i]
                 for i in range(num_extends)
             )
         )
@@ -181,10 +189,10 @@ class InputBuffers:
         if num_extends > 0:
             # Fresh bulk pinned per step (see _bulk_pinned: persistent staging races overlap scheduling).
             self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.extend_prefix_lens, dtype=torch.int32
+                extend_prefix_lens, dtype=torch.int32
             )
             self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.input_lengths[:num_extends], dtype=torch.int32
+                input_lengths_all[:num_extends], dtype=torch.int32
             )
             ext_prefix_cpu, ext_seq_cpu = self._bulk_pinned(
                 (num_extends, torch.int32), (num_extends, torch.int32)

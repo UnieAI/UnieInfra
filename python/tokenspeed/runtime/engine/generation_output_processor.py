@@ -229,11 +229,17 @@ class RequestState:
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        all_ids = self.prompt_input_ids_unpadded + self.output_ids
-        return (
-            all_ids[self._surr_offset :],
-            self._read_offset - self._surr_offset,
-        )
+        # Only the tail from _surr_offset is ever read, and _surr_offset sits a
+        # few tokens behind the prompt end (INIT_INCREMENTAL_DETOKENIZATION_
+        # OFFSET). Concatenating the two lists first copied the entire prompt on
+        # every streamed frame -- 127k elements per token on a long-context
+        # request, in the scheduler process.
+        prompt = self.prompt_input_ids_unpadded
+        if self._surr_offset >= len(prompt):
+            tail = self.output_ids[self._surr_offset - len(prompt) :]
+        else:
+            tail = prompt[self._surr_offset :] + self.output_ids
+        return (tail, self._read_offset - self._surr_offset)
 
     def check_finished(self, skip_grammar_termination: bool = False):
 
@@ -740,12 +746,16 @@ class OutputProcesser:
         # prefill window (RebasePrefill), so this can exceed the original prompt
         # length that RequestState.prefill_finished compares against.
         prefill_lengths = forward_op.prefill_lengths
+        # Hoisted for the same reason output_logprobs_list and nan_flags_list
+        # above already are: this converts the whole batch tensor, so calling it
+        # inside the per-request loop is O(bs^2) work and O(bs) list allocations
+        # per step, on the scheduler's critical path. Each iteration only ever
+        # reads its own [pt, pt+output_length) slice of it.
+        output_tokens_list = model_execution_results.output_tokens.tolist()
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
-            model_output_ids = model_execution_results.output_tokens.tolist()[
-                pt : pt + output_length
-            ]
+            model_output_ids = output_tokens_list[pt : pt + output_length]
             model_output_logprobs = (
                 output_logprobs_list[pt : pt + output_length]
                 if output_logprobs_list is not None

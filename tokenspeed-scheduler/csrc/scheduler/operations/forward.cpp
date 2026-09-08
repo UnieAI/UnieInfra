@@ -185,9 +185,11 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t max_cacheable_tokens = std::max(request->PrefillSize() - replay_tokens, 0);
     const std::int32_t probe_pages = max_cacheable_tokens / cache_block_tokens;
     const std::int32_t candidate_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
-    std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
-    paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(candidate_pages)));
-    std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "");
+    // Cached on the request and extended, not recomputed: a request that keeps
+    // failing admission is probed every step, and the chain over its prompt does
+    // not change between those steps. See Request::PagedHashes (request.h).
+    const std::span<const std::string> cached_hashes = request->PagedHashes(candidate_pages);
+    std::vector<std::string> hashes(cached_hashes.begin(), cached_hashes.end());
     const auto probe_hashes =
         std::span<const std::string>(hashes).first(std::min(hashes.size(), static_cast<std::size_t>(probe_pages)));
 

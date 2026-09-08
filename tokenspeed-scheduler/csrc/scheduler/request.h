@@ -61,6 +61,23 @@ public:
         return token_container_.FullPagedTokens(page_size_, except_last);
     }
 
+    // Hash chain over the request's complete pages, computed once and extended.
+    //
+    // `matchPrefixAtAdmission` used to call ComputePagedHashes over the whole
+    // prompt on every admission attempt (forward.cpp). A request that cannot be
+    // admitted is retried every step, and HashPage feeds each token to
+    // SHA256_Update individually plus a hex conversion and a 64-char string per
+    // page (page_hasher.h) -- so a 10k-token prompt blocked for ten steps paid
+    // 100k SHA256_Update calls and 3,120 allocations for an answer that had not
+    // changed. vLLM keeps the chain on the request and only extends it
+    // (v1/request.py:237-240).
+    //
+    // Safe because TokenContainer::Extend only appends (token_container.cpp:27):
+    // the token values under any already-hashed page never change, so a prefix
+    // of the chain stays valid. RebasePrefill moves the prefill boundary, which
+    // changes how many pages are wanted, not what the earlier ones contain.
+    std::span<const std::string> PagedHashes(std::int32_t pages) const;
+
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
@@ -136,6 +153,8 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t page_size_{};
     fsm::State state_;
+    // Filled lazily by PagedHashes(); mutable so the accessor stays const.
+    mutable std::vector<std::string> paged_hashes_;
 };
 
 }  // namespace tokenspeed

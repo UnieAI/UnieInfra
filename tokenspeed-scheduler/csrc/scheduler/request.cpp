@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include "scheduler/page_hasher.h"
 #include "scheduler/request.h"
 
 #include <stdexcept>
@@ -75,6 +76,30 @@ const fsm::ForwardState& Request::forwardState(const char* operation) const {
         throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " + StateName());
     }
     return *result;
+}
+
+std::span<const std::string> Request::PagedHashes(std::int32_t pages) const {
+    if (pages <= 0) {
+        return {};
+    }
+    const auto want = static_cast<std::size_t>(pages);
+    if (paged_hashes_.size() < want) {
+        std::vector<std::span<const std::int32_t>> paged = FullPagedTokens(false);
+        if (paged.size() > want) {
+            paged.resize(want);
+        }
+        // Continue from where the chain already ends. `prior` is the last hash
+        // held, or "" for a cold start -- the same seed ComputePagedHashes uses.
+        const std::size_t have = std::min(paged_hashes_.size(), paged.size());
+        if (have < paged.size()) {
+            const std::string prior = have == 0 ? std::string{} : paged_hashes_[have - 1];
+            std::vector<std::string> tail = ComputePagedHashes(
+                std::span<const std::span<const std::int32_t>>(paged).subspan(have), prior);
+            paged_hashes_.insert(paged_hashes_.end(), tail.begin(), tail.end());
+        }
+    }
+    const auto have = std::min(paged_hashes_.size(), want);
+    return std::span<const std::string>(paged_hashes_).first(have);
 }
 
 }  // namespace tokenspeed

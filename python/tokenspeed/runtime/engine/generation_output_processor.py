@@ -263,12 +263,21 @@ class RequestState:
 
         last_token_id = self.output_ids[-1]
 
+        # Caller-supplied stop tokens are not the model's EOS: `ignore_eos` says
+        # "do not stop at the model's end-of-sequence", not "ignore what I asked
+        # you to stop at". vLLM checks stop_token_ids unconditionally
+        # (v1/core/sched/utils.py:108) and lets ignore_eos clear only the EOS id.
+        # Keeping this check inside the guard meant every benchmark run -- which
+        # sets ignore_eos to match `vllm bench serve` -- silently disabled it.
+        if self.sampling_params.stop_token_ids and (
+            last_token_id in self.sampling_params.stop_token_ids
+        ):
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+            return
+
         if not self.sampling_params.ignore_eos:
             matched_eos = False
 
-            # Check stop token ids
-            if self.sampling_params.stop_token_ids:
-                matched_eos = last_token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 matched_eos |= last_token_id in self.eos_token_ids
             if self._eos_token_id_cached is None:
@@ -288,7 +297,13 @@ class RequestState:
             )
 
             for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str or stop_str in self.decoded_text:
+                # `self.decoded_text` is initialised to "" at :126 and never
+                # assigned anywhere in this process -- the incremental text lives
+                # in the AsyncLLM process (detokenizer.py:233). The disjunct was
+                # therefore always false, so the tail window below is the only
+                # thing that has ever matched a stop string. Widened in
+                # sampling_params.normalize() accordingly.
+                if stop_str in tail_str:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
 

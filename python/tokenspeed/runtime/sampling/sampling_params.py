@@ -233,9 +233,18 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
 
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
+                # The window is in TOKENS, and the canonical encoding is only a
+                # lower bound on how many tokens the model actually spends on
+                # the same characters -- "```" encodes to one token but a model
+                # may emit three backtick tokens. A k-character string needs at
+                # most k tokens (every token is at least one character), so take
+                # the character count as the bound. The canonical length is kept
+                # in the max only to document that it is never the larger one.
                 if tokenizer is not None:
                     stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                    stop_str_max_len = max(
+                        stop_str_max_len, len(stop_str_ids), len(stop_str)
+                    )
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len

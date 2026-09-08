@@ -490,7 +490,17 @@ class Gemma4Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=(config.sliding_window if self.is_sliding else -1),
+            # HF counts the window inclusive of the current token
+            # (`kv_idx > q_idx - sliding_window`), TokenSpeed's `window_left` is
+            # exclusive (kernel docstring, tokenspeed_kernel/ops/attention/__init__.py).
+            # Passing the config value straight through attends to 1025 keys where
+            # HF attends to 1024. The cache side already uses the HF semantics --
+            # `pagesNeededToResume()` is `ceil((W-1)/P)` (swa_manager.h) -- so only
+            # the mask was off. gpt_oss.py and inkling.py both do this conversion;
+            # gemma was the one model that did not.
+            sliding_window_size=(
+                config.sliding_window - 1 if self.is_sliding else -1
+            ),
             group_id=self.group_id,
         )
 

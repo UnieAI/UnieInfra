@@ -165,7 +165,35 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len, BLOCK_N):
+    # Narrow the loop to the tiles this query block can actually see rather than
+    # walking every tile and masking. Both bounds come from conditions that are
+    # ANDed into `final_mask` below, so narrowing cannot admit a key the mask
+    # would have dropped.
+    #
+    # Query block m covers absolute KV positions [q_lo, q_hi]:
+    #   causal   q >= k       ->  k <= q_hi
+    #   window   q <= k + W   ->  k >= q_lo - W
+    #
+    # Masking alone left the iteration, the position arithmetic and the two
+    # tl.max reductions of SKIP_TILE on every tile. At 26k of context with a
+    # 1024 window that is ~96% of iterations doing nothing but proving they have
+    # nothing to do.
+    q_lo = cur_q_start + cur_block_m * BLOCK_M
+    q_hi = q_lo + BLOCK_M - 1
+    loop_lo = 0
+    loop_hi = cur_seq_len
+    if SLIDING_WINDOW_SIZE > 0:
+        first_visible = q_lo - SLIDING_WINDOW_SIZE
+        if first_visible > 0:
+            loop_lo = (first_visible // BLOCK_N) * BLOCK_N
+    # The causal term is in an `elif` under USE_CUSTOM_MASK, so it is only
+    # applied -- and may only be used to prune -- when there is no custom mask.
+    if IS_CAUSAL and not USE_CUSTOM_MASK:
+        past_last_visible = q_hi + 1
+        if past_last_visible < loop_hi:
+            loop_hi = past_last_visible
+
+    for start_n in range(loop_lo, loop_hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len
 

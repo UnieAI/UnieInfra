@@ -107,7 +107,16 @@ Scheduler::Scheduler(SchedulerConfig config)
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
                                    host_pool_.NumLcmBlocks() > 0 ? &host_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost(), statePoolPointers(state_pools_))},
-      tier_transfers_{coordinator_} {
+      tier_transfers_{coordinator_},
+      // Without this the member initialiser (scheduler.h) wins and the ratio is
+      // pinned at 1.0, which makes `admission_reserve=generation-adaptive`
+      // (new_token_ratio_init = 0.7, scheduler_utils.py:284) behave exactly like
+      // `generation-full`: the decay step is
+      //   floor = init * min_factor;  step = (init - floor) / decay_steps
+      // and min_factor defaults to 1.0, so floor == init and step == 0 -- the ratio
+      // never moves off whatever it starts at. Starting it at the configured value
+      // is what makes the option mean anything.
+      new_token_ratio_{config_.new_token_ratio_init} {
     if (config_.block_size <= 0) {
         throw std::invalid_argument("Scheduler: block_size must be > 0");
     }

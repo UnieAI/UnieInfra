@@ -354,6 +354,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_cached_pages", &tokenspeed::Scheduler::PagedCacheGroupCachedPages,
+        .def("paged_cache_group_run_profile", &tokenspeed::Scheduler::PagedCacheGroupRunProfile,
+             "Cached blocks a probe cannot reach: {cached, indexed, distinct, runs, stranded, max_index}")
              nb::arg("group_id"))
         .def("arena_shortages", &tokenspeed::Scheduler::ArenaShortages)
         .def("paged_cache_group_bound_parents", &tokenspeed::Scheduler::PagedCacheGroupBoundParents,

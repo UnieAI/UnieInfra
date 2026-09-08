@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -84,6 +85,10 @@ public:
     // live is bounded by concurrency, one whose parents are nearly all
     // cached is bounded by retention, and the fixes do not overlap.
     std::int32_t PagedCacheGroupCachedPages(const std::string& group_id) const;
+    // Cached blocks a probe can never reach, because their contiguous run is
+    // shorter than the lookback a hit needs and does not reach block 0.
+    // Returns {cached, indexed, distinct, runs, stranded, max_index}.
+    std::array<std::int32_t, 6> PagedCacheGroupRunProfile(const std::string& group_id) const;
     // Admission refusals attributed to each device arena, index 0 the shared
     // one. The signal a split rebalance would act on.
     std::vector<std::int64_t> ArenaShortages() const { return coordinator_.ArenaShortages(); }

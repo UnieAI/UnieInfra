@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -447,6 +448,13 @@ std::int32_t Scheduler::PagedCacheGroupCachedPages(const std::string& group_id) 
     const std::size_t index = static_cast<std::size_t>(groupIndex(group_id));
     return coordinator_.GroupManager(static_cast<std::int32_t>(index))
         .NumCachedBlocks(coordinator_.PoolForGroup(index));
+}
+
+std::array<std::int32_t, 6> Scheduler::PagedCacheGroupRunProfile(const std::string& group_id) const {
+    const std::size_t index = static_cast<std::size_t>(groupIndex(group_id));
+    const auto p = coordinator_.GroupManager(static_cast<std::int32_t>(index))
+                       .CachedRunProfileFor(coordinator_.PoolForGroup(index));
+    return {p.cached, p.indexed, p.distinct, p.runs, p.stranded, p.max_index};
 }
 
 std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_id) const {

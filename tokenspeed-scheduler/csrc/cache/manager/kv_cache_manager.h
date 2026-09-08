@@ -402,6 +402,82 @@ public:
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index == nullptr ? 0 : static_cast<std::int32_t>(cache_index->entries.size());
     }
+    // D1/D3 diagnostic: how much of the cached set can no probe ever reach.
+    //
+    // A sliding group's boundary run is published at exactly
+    // BoundaryLookbackBlocks() pages and a hit needs exactly that many
+    // contiguous pages, so the design has zero margin: evict one page out of a
+    // run and the remainder is held but unreachable, unless the run reaches
+    // block 0 (SwaManager::findResumableBoundary's bottom rule).
+    //
+    // The chain is not reconstructible from CacheKey -- it carries a content
+    // hash but no parent link -- so this treats the cached logical indices as a
+    // set. Two chains at the same depth collapse into one index, which
+    // under-counts fragmentation; it is a lower bound, which is the safe
+    // direction for deciding whether the defect is worth fixing.
+    struct CachedRunProfile {
+        std::int32_t cached{0};        // cached blocks in this pool
+        std::int32_t indexed{0};       // of those, ones carrying a logical index
+        std::int32_t distinct{0};      // distinct logical indices
+        std::int32_t runs{0};          // maximal contiguous index runs
+        std::int32_t stranded{0};      // distinct indices in runs shorter than the
+                                       // lookback that do not start at 0
+        std::int32_t max_index{-1};
+    };
+
+    CachedRunProfile CachedRunProfileFor(const BlockPool& pool) const {
+        CachedRunProfile out;
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return out;
+        }
+        out.cached = static_cast<std::int32_t>(cache_index->entries.size());
+        std::vector<std::int32_t> idx;
+        idx.reserve(cache_index->entries.size());
+        for (const CacheEntry& entry : cache_index->entries) {
+            if (entry.logical_block_index >= 0) {
+                idx.push_back(entry.logical_block_index);
+            }
+        }
+        out.indexed = static_cast<std::int32_t>(idx.size());
+        if (idx.empty()) {
+            return out;
+        }
+        std::ranges::sort(idx);
+        idx.erase(std::ranges::unique(idx).begin(), idx.end());
+        out.distinct = static_cast<std::int32_t>(idx.size());
+        out.max_index = idx.back();
+        const auto [runs, stranded] = AnalyseIndexRuns(idx, BoundaryLookbackBlocks());
+        out.runs = runs;
+        out.stranded = stranded;
+        return out;
+    }
+
+    // Split as a free function so the run arithmetic is testable without a
+    // BlockPool and a populated CacheEntries behind it.
+    // `idx` must be sorted and unique. Returns {runs, stranded}.
+    static std::pair<std::int32_t, std::int32_t> AnalyseIndexRuns(const std::vector<std::int32_t>& idx,
+                                                                 std::int32_t lookback) {
+        std::int32_t runs = 0;
+        std::int32_t stranded = 0;
+        const std::int32_t need = std::max(lookback, 1);
+        std::size_t run_begin = 0;
+        for (std::size_t i = 1; i <= idx.size(); ++i) {
+            if (i != idx.size() && idx[i] == idx[i - 1] + 1) {
+                continue;
+            }
+            ++runs;
+            const auto len = static_cast<std::int32_t>(i - run_begin);
+            // A run that reaches block 0 resumes even when short --
+            // SwaManager::findResumableBoundary's bottom rule.
+            if (len < need && idx[run_begin] != 0) {
+                stranded += len;
+            }
+            run_begin = i;
+        }
+        return {runs, stranded};
+    }
+
     std::int32_t NumPinnedCachedBlocks(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {

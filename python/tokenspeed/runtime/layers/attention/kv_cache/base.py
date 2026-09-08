@@ -530,10 +530,21 @@ class CachePool:
             except Exception:  # diagnostics must never take the engine down
                 return
             window = spec.sliding_window_tokens or 0
+            # Cached-but-unreachable. A sliding group publishes its boundary run
+            # at exactly BoundaryLookbackBlocks() pages and a hit needs exactly
+            # that many contiguous ones, so evicting a single page out of a run
+            # strands the rest unless the run reaches block 0. `cached` alone
+            # cannot show that: a fragmented group and an intact one report the
+            # same number.
+            try:
+                prof = scheduler.paged_cache_group_run_profile(group_id)
+                frag = f", runs={prof[3]}, stranded={prof[4]}/{prof[2]}, depth={prof[5]}"
+            except Exception:
+                frag = ""
             parts.append(
                 f"{group_id}[{spec.retention}"
                 + (f",w={window}" if window else "")
-                + f"]: parents={parents}, cached={cached}, used={total - available}/{total}"
+                + f"]: parents={parents}, cached={cached}, used={total - available}/{total}{frag}"
             )
         # Which arena admission could not satisfy. The split between them is a
         # function of the workload -- measured, agent c=16 wants 112 state

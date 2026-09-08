@@ -302,6 +302,14 @@ class RMSNormWithoutScale(torch.nn.Module):
         key = (x.device, x.dtype, x.shape[-1])
         cached = self._ones_cache.get(key)
         if cached is None:
+            # Allocating during graph capture would put this tensor in the
+            # graph's private pool, where it is only valid during a replay --
+            # a later eager call would read freed memory. Capture is always
+            # preceded by warmup forwards, so in practice the cache is warm by
+            # then; if it somehow is not, take the eager path for this call and
+            # let the next non-capturing one populate it.
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                return None
             cached = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
             self._ones_cache[key] = cached
         return cached

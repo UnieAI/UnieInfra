@@ -25,6 +25,7 @@ import os
 from collections.abc import Sequence
 
 import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
+import re as _re
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -220,6 +221,34 @@ if platform.is_nvidia and platform.is_hopper_plus:
             causal=is_causal,
         )
 
+    def _xqa_head_dims() -> frozenset:
+        """XQA 接受的 head_dim 集合,從安裝的 flashinfer 推導而不是抄死。
+
+        為什麼不寫常數:這個上限跟著 flashinfer 版本走。0.6.15 是 [16,256],
+        較新的 checkout 已放寬到 512(head_dim>256 另需 q_seq_len==1 且
+        head_group_ratio<=16)。抄死 256 的後果是 gemma-4 那 10 層 512 寬的
+        full-attention 永遠拿不到 XQA —— 本檔的量測是 50 層 sliding 走 XQA
+        共 1.0 ms,那 10 層落到 Triton 共 20.7 ms,佔 decode attention 的 95%。
+        抄死 512 的後果更糟:舊版 flashinfer 會在 JIT 期丟
+        `Invalid head_dim: 512`,而那發生在 CUDA graph capture,整個伺服器掛掉。
+
+        所以讀它自己的檢查式。解析失敗時退回 256 —— 保守但不會炸。
+        """
+        limit = 256
+        try:
+            import inspect as _inspect
+
+            from flashinfer.jit import xqa as _xqa
+
+            m = _re.search(
+                r"head_dim\s*>\s*(\d+)", _inspect.getsource(_xqa.gen_xqa_module)
+            )
+            if m:
+                limit = int(m.group(1))
+        except Exception:  # 版本佈局變了就用保守值,絕不讓選路在這裡拋例外
+            pass
+        return frozenset(range(16, limit + 1, 16))
+
     @register_kernel(
         "attention",
         "mha_decode_with_kvcache",
@@ -261,7 +290,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             # decides once per model and forces every layer onto Triton
             # (`Gemma4 model has heterogeneous head dimensions ... forcing
             # TRITON_ATTN`).
-            "head_dim": frozenset(range(16, 257, 16)),
+            "head_dim": _xqa_head_dims(),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),

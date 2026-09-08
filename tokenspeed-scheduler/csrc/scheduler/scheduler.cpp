@@ -118,6 +118,7 @@ Scheduler::Scheduler(SchedulerConfig config)
       // never moves off whatever it starts at. Starting it at the configured value
       // is what makes the option mean anything.
       new_token_ratio_{config_.new_token_ratio_init} {
+    coordinator_.SetBoundaryStrideBlocks(config_.boundary_stride_blocks);
     if (config_.block_size <= 0) {
         throw std::invalid_argument("Scheduler: block_size must be > 0");
     }

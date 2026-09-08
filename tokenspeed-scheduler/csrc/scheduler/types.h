@@ -156,6 +156,18 @@ struct SchedulerConfig {
     // Reserving the prompt at admission (above) is only half of vLLM's design:
     // it charges the prompt, not the output, so its preemption path stays live
     // and is a normal mechanism rather than a last resort.
+    // Extra resume points inside a chunk, in cache blocks. 0 keeps the shipped
+    // behaviour: one lookback run per scheduling step, so a prompt gets
+    // ceil(prompt / chunk) resume points -- two for a 10k prompt at chunk 8192.
+    //
+    // That is byte-efficient (a run is BoundaryLookbackBlocks() pages, not the
+    // whole span) but it only resumes where a boundary happens to land. Real
+    // agent traffic diverges mid-prompt: on the cc corpus half of consecutive
+    // turns share no prefix at all and the tier reaches 39.1% against a 65.3%
+    // oracle. Publishing at a finer stride trades retained bytes for resume
+    // points; which way that trade goes is a measurement, so it is a knob and
+    // not a new default.
+    std::int32_t boundary_stride_blocks{0};
     bool preempt_on_blocked_request{false};
     // Admission reserves `prompt + max_new_tokens * new_token_ratio`, ported
     // from SGLang (srt/managers/schedule_policy.py, new_token_ratio_tracker).

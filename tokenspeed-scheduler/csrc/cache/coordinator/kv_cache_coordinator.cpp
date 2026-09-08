@@ -656,11 +656,36 @@ void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, c
     if (lookback == 0) {
         return;
     }
-    const std::int32_t first_cache_block = boundary_cache_block - lookback;
     std::vector<CacheKey> keys = keysForGroup(demand.page_hashes, groups_[group_index].Id());
-    cacheFullBlocksForGroup<Tier>(group_index, *demand.table,
-                                  std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)),
-                                  first_cache_block, access_epoch, *demand.completed_boundary_kind);
+    // Publish the run ending at the boundary, plus optional intermediate ones so
+    // a probe can resume between chunk ends. Runs overlap by lookback-stride
+    // pages and RegisterCachedBlock is idempotent per location, so the extra
+    // cost is the pages a coarser stride would not have kept, not a full
+    // re-publish per point.
+    const std::int32_t stride = boundary_stride_blocks_;
+    std::int32_t end = boundary_cache_block;
+    for (;;) {
+        const std::int32_t run = std::min(lookback, end);
+        if (run <= 0) {
+            break;
+        }
+        const std::int32_t first_cache_block = end - run;
+        cacheFullBlocksForGroup<Tier>(
+            group_index, *demand.table,
+            std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block),
+                                                    static_cast<std::size_t>(run)),
+            first_cache_block, access_epoch, *demand.completed_boundary_kind);
+        if (stride <= 0 || end <= stride) {
+            break;
+        }
+        end -= stride;
+        // Only go back as far as the pages this step completed; earlier
+        // positions were already published by the step that completed them.
+        // Earlier positions were published by the step that completed them.
+        if (end <= demand.new_page_hash_begin * cache_blocks_per_hash) {
+            break;
+        }
+    }
 }
 
 void KvCacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,

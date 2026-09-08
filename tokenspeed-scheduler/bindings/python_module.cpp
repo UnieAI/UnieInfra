@@ -175,6 +175,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_cold_prefills", &tokenspeed::SchedulerConfig::max_cold_prefills)
         .def_rw("reserve_full_prefill_at_admission",
                 &tokenspeed::SchedulerConfig::reserve_full_prefill_at_admission)
+        .def_rw("boundary_stride_blocks", &tokenspeed::SchedulerConfig::boundary_stride_blocks)
         .def_rw("preempt_on_blocked_request", &tokenspeed::SchedulerConfig::preempt_on_blocked_request)
         .def_rw("reserve_generation_at_admission",
                 &tokenspeed::SchedulerConfig::reserve_generation_at_admission)

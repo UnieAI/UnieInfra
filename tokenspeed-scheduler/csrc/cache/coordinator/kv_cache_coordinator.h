@@ -62,6 +62,10 @@ public:
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
+    // Extra resume points inside a step's newly completed range, in cache
+    // blocks. 0 publishes only the run ending at the boundary. See
+    // SchedulerConfig::boundary_stride_blocks for why this is a knob.
+    void SetBoundaryStrideBlocks(std::int32_t blocks) noexcept { boundary_stride_blocks_ = blocks; }
     bool HasMambaStateGroup() const;
 
     const BlockPool& DevicePool() const { return pool_; }
@@ -266,6 +270,7 @@ private:
     BlockPool* host_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
     std::int32_t cache_block_tokens_{0};
+    std::int32_t boundary_stride_blocks_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;

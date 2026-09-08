@@ -202,6 +202,11 @@ class ServerArgs:
     # which hybrid models require).
     context_chunk_unit: int = 0
     admission_reserve: str = "generation-full"
+    # Extra prefix-cache resume points inside a chunk, in cache blocks.
+    # 0 (default) publishes one lookback run per scheduling step, so a
+    # prompt resumes only at chunk ends. A finer stride buys resume points
+    # with retained bytes; measure before changing it.
+    boundary_stride_blocks: int = 0
     # Cap on requests admitted in one step whose prefix matched nothing in the
     # cache; 0 is unlimited. Requests admitted together all probe the cache
     # before any of them writes to it, so on a shared-prefix corpus the first
@@ -1320,6 +1325,13 @@ class ServerArgs:
                 "generation-full: plus max_new_tokens in full (TRT-LLM), which "
                 "makes preemption structurally unnecessary."
             ),
+        )
+        parser.add_argument(
+            "--boundary-stride-blocks",
+            type=int,
+            default=ServerArgs.boundary_stride_blocks,
+            help="Extra prefix-cache resume points inside a chunk, in cache blocks. "
+            "0 publishes one lookback run per scheduling step (chunk ends only).",
         )
         parser.add_argument(
             "--disable-mixed-batch",

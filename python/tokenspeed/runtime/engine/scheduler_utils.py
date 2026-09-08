@@ -214,6 +214,7 @@ def make_config(
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
     admission_reserve: str = "generation-full",
+    boundary_stride_blocks: int = 0,
     context_chunk_policy: str = "fcfs",
     context_chunk_unit: int = 0,
     prefix_replay_tokens: int = 0,
@@ -272,6 +273,10 @@ def make_config(
     # One policy name, translated to the two switches and the ratio the C++
     # side reads. Keeping the translation here means the scheduler config stays
     # a mechanism and the choice stays a documented, measured option.
+    # Resume-point density inside a chunk. 0 keeps one run per scheduling step.
+    if boundary_stride_blocks < 0:
+        raise ValueError("boundary_stride_blocks must be >= 0")
+    cfg.boundary_stride_blocks = boundary_stride_blocks
     if admission_reserve == "chunk":
         cfg.reserve_full_prefill_at_admission = False
         cfg.reserve_generation_at_admission = False

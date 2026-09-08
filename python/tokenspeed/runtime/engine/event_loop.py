@@ -598,6 +598,7 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             admission_reserve=server_args.admission_reserve,
+            boundary_stride_blocks=server_args.boundary_stride_blocks,
             context_chunk_policy=server_args.context_chunk_policy,
             context_chunk_unit=server_args.context_chunk_unit,
             max_cold_prefills=server_args.max_cold_prefills,

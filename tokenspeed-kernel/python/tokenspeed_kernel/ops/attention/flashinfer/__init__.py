@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import os
 from collections.abc import Sequence
 
@@ -755,12 +756,36 @@ def _resolve_paged_run():
 _paged_run = _resolve_paged_run()
 
 
+logger = logging.getLogger(__name__)
+
+_paged_prefill_logged = False
+
+
 def _paged_prefill_available() -> bool:
-    """Off by default until an end-to-end run backs the kernel-level numbers."""
-    return (
-        BatchPrefillWithPagedKVCacheWrapper is not ErrorClass
-        and os.getenv("TOKENSPEED_ENABLE_FI_PAGED_EXTEND") == "1"
-    )
+    """Off by default until an end-to-end run backs the kernel-level numbers.
+
+    The decision is logged once. A silent env-var gate is exactly how a launcher
+    bug hid for a whole campaign: the flag was written in the runner, never
+    reached the server, and nothing in any log said which kernel actually ran.
+    """
+    global _paged_prefill_logged
+    raw = os.getenv("TOKENSPEED_ENABLE_FI_PAGED_EXTEND")
+    ok = BatchPrefillWithPagedKVCacheWrapper is not ErrorClass and raw == "1"
+    # The first caller is a module-level gate, which runs before the server
+    # configures logging -- an INFO record there goes nowhere. Hold the message
+    # until a handler exists, so it lands in the run's log rather than being
+    # emitted into the void and marked as done.
+    if not _paged_prefill_logged and logging.getLogger().hasHandlers():
+        _paged_prefill_logged = True
+        logger.info(
+            "FI paged extend: %s (TOKENSPEED_ENABLE_FI_PAGED_EXTEND=%r, wrapper=%s)",
+            "ENABLED" if ok else "disabled",
+            raw,
+            "available"
+            if BatchPrefillWithPagedKVCacheWrapper is not ErrorClass
+            else "missing",
+        )
+    return ok
 
 
 def _paged_plan_key(

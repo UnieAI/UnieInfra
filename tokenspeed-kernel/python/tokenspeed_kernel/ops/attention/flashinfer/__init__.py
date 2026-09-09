@@ -762,7 +762,25 @@ _paged_prefill_logged = False
 
 
 def _paged_prefill_available() -> bool:
-    """Off by default until an end-to-end run backs the kernel-level numbers.
+    """On by default; set TOKENSPEED_ENABLE_FI_PAGED_EXTEND=0 to fall back.
+
+    It was off pending an end-to-end run to back the kernel-level numbers. That
+    run exists now. On gemma-4-31B-it over a 32-session Claude Code corpus at
+    concurrency 8, a 2x2 of {loop-pruned Triton} x {this kernel}, measured as the
+    marginal cost per prefill token regressed from the engine's own batch log
+    (repeatable to 0.4%, where end-to-end duration on this box scatters 10%):
+
+        baseline (Triton, unpruned)   0.2609 ms/token
+        + this kernel                 0.2218   -15.0%
+        + loop-pruned Triton          0.2220   -14.9%
+        + both                        0.2046   -21.6%
+
+    The two are complementary rather than competing: this kernel declares
+    head_dim {64,128,256}, so gemma's 50 sliding layers (256) take it while the
+    10 global layers (512) stay on Triton and keep the pruning. Sessions meeting
+    the full SLO went 6/32 -> 16/32, goodput 23.4 -> 27.6 req/min. Output was
+    checked against the Triton arm: no character loops in either, phrase loops
+    2 vs 3 of 256.
 
     The decision is logged once. A silent env-var gate is exactly how a launcher
     bug hid for a whole campaign: the flag was written in the runner, never
@@ -770,7 +788,7 @@ def _paged_prefill_available() -> bool:
     """
     global _paged_prefill_logged
     raw = os.getenv("TOKENSPEED_ENABLE_FI_PAGED_EXTEND")
-    ok = BatchPrefillWithPagedKVCacheWrapper is not ErrorClass and raw == "1"
+    ok = BatchPrefillWithPagedKVCacheWrapper is not ErrorClass and raw != "0"
     # The first caller is a module-level gate, which runs before the server
     # configures logging -- an INFO record there goes nowhere. Hold the message
     # until a handler exists, so it lands in the run's log rather than being

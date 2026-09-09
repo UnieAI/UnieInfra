@@ -1001,6 +1001,58 @@ def nvidia_rsag_all_gather_kernel(
     blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="acq_rel")
 
 
+_MULTICAST_SUPPORTED: bool | None = None
+
+
+def multicast_supported(device_index: int | None = None) -> bool:
+    """Whether this device can execute the ``multimem.*`` instructions.
+
+    The RSAG kernels reduce and broadcast through ``multimem.ld_reduce`` /
+    ``multimem.st``, which need a CUDA multicast object -- NVLink/NVSwitch
+    hardware. On H200 and other NVLink parts this is available and the path is
+    worth having; on a PCIe box it is not.
+
+    Callers used to treat a successful ``symm_mem.rendezvous`` as proof, with a
+    try/except around state creation as the fallback. That test is not
+    sufficient: on an RTX PRO 6000 Blackwell box (four cards, PCIe only, driver
+    reporting MULTICAST_SUPPORTED=0) the rendezvous succeeds and the *kernel*
+    then dies with an illegal memory access. An illegal access poisons the CUDA
+    context, so it cannot be caught and degraded from -- every tensor-parallel
+    launch on that machine aborted during startup, in whichever synchronize
+    happened to come first (autotune, graph capture, or sampling), which reads
+    as three unrelated faults instead of one.
+
+    Ask the driver instead, and let creation fail cleanly so the existing
+    fallbacks take over.
+    """
+    global _MULTICAST_SUPPORTED
+    if _MULTICAST_SUPPORTED is not None:
+        return _MULTICAST_SUPPORTED
+    try:
+        from cuda.bindings import driver as _cud
+
+        (rc,) = _cud.cuInit(0)
+        idx = device_index if device_index is not None else torch.cuda.current_device()
+        rc, dev = _cud.cuDeviceGet(idx)
+        rc, value = _cud.cuDeviceGetAttribute(
+            _cud.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, dev
+        )
+        _MULTICAST_SUPPORTED = bool(value)
+    except Exception as exc:  # no cuda-python, old driver, ...
+        logger.warning(
+            "Could not query CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED (%s: %s); "
+            "assuming multimem is unavailable and using the plain collectives.",
+            type(exc).__name__,
+            exc,
+        )
+        _MULTICAST_SUPPORTED = False
+    return _MULTICAST_SUPPORTED
+
+
+class MulticastUnsupported(RuntimeError):
+    """Raised instead of letting a multimem kernel fault at runtime."""
+
+
 def nvidia_create_rsag_state(
     group: dist.ProcessGroup,
     rank_in_group: int,
@@ -1011,6 +1063,12 @@ def nvidia_create_rsag_state(
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
+    if not multicast_supported():
+        raise MulticastUnsupported(
+            "CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED is 0 on this device, so the "
+            "multimem RSAG kernels cannot run. Callers fall back to the plain "
+            "collectives; nothing further is needed on a PCIe box."
+        )
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
     # Reserve the symmetric-memory signal pad for the largest grid the
     # reduce-scatter launcher can pick. blockwise_barrier indexes the pad at

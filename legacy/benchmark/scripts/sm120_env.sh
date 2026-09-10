@@ -9,7 +9,21 @@ export FLASHINFER_DISABLE_VERSION_CHECK=1
 # `_LIBCUDACXX_HAS_SPACESHIP_OPERATOR` is undefined where it is used and every
 # DeepGEMM JIT compile fails with "missing binary operator before token" --
 # which reads like a source bug and is an include-path bug.
-export CPATH=$(ls -d /usr/local/lib/python3.12/dist-packages/nvidia/*/include 2>/dev/null | grep -v '/cuda_cccl/' | tr '\n' ':')$CPATH
+# `nvidia/cuda_runtime` is excluded for a second, separate reason. It is the
+# CUDA 12 wheel; `nvidia/cu13` is the CUDA 13 one, and both ship a top-level
+# `vector_types.h`. CUDA 13 added the 32-byte-aligned vector types
+# (`double4_32a`, `longlong4_32a`) and flashinfer's bundled CCCL uses them in
+# `cuda/__ptx/ptx_helper_functions.h`. With both wheels on CPATH, CUDA 12's
+# `cuda_runtime.h` pulls in its own sibling `vector_types.h` by relative path --
+# which beats CPATH order, so putting cu13 first does not help (measured: 19
+# errors either way, 0 with cuda_runtime removed). Only head_dim 512 kernels
+# instantiate the code that needs those wide types, so this stayed invisible
+# until gemma-4's ten global-attention layers were routed to flashinfer: the
+# server died at capture with `the global scope has no "double4_32a"`, which
+# reads like a flashinfer bug and is an include-path bug.
+# cu13 carries every header cuda_runtime does except four texture/surface ones,
+# which no GEMM or attention kernel here includes.
+export CPATH=$(ls -d /usr/local/lib/python3.12/dist-packages/nvidia/*/include 2>/dev/null | grep -v '/cuda_cccl/' | grep -v '/cuda_runtime/' | tr '\n' ':')$CPATH
 # The cu13 wheel ships nvcc 13.2 against CUDART 13.3 headers, and CCCL refuses
 # the pair outright ("CUDA compiler and CUDA toolkit headers are
 # incompatible"). The header names this flag for exactly that case -- a CTK

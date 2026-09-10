@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Sequence
@@ -38,6 +39,7 @@ from tokenspeed_kernel.signature import (
     format_signatures,
 )
 
+logger = logging.getLogger(__name__)
 platform = current_platform()
 
 BatchDecodeWithPagedKVCacheWrapper = ErrorClass
@@ -777,6 +779,7 @@ def _plan_paged_extend(
     logit_cap: float,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
+    head_dim_vo: int | None = None,
 ) -> None:
     """Plan `wrapper` for one page table at one layer geometry.
 
@@ -814,6 +817,7 @@ def _plan_paged_extend(
             num_kv_heads,
             head_dim,
             page_size,
+            head_dim_vo=head_dim if head_dim_vo is None else head_dim_vo,
             causal=is_causal,
             sm_scale=softmax_scale,
             window_left=window_left,
@@ -821,6 +825,163 @@ def _plan_paged_extend(
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
         )
+
+
+# ------------------------------------------------------------------------------
+# Output-dimension split for wide heads
+# ------------------------------------------------------------------------------
+#
+# gemma-4's ten global layers are head_dim 512, where this kernel reaches only
+# 145 TFLOP/s against 313 at head_dim 256 -- the same kernel and the same head
+# count, so head_dim is what costs it. The measured limit is the fp32
+# accumulator: at [BLOCK_M, 512] it is 128 KB of registers per block, which
+# collapses occupancy, and sm_120 has 101,376 bytes of shared memory so the
+# tiles cannot grow to compensate (every tile above (32, 32) raises
+# OutOfResources).
+#
+# softmax cannot be split along the QK contraction. The OUTPUT dimension can:
+# O = P V, and V's column space partitions freely while both halves share the
+# same P, because each pass still contracts QK over the full head_dim. The cost
+# is computing QK twice (1.5x the FLOPs); the gain is halving the accumulator.
+# It wins anyway -- measured on an idle card at the production shape (M=8192
+# against 35,326 cached tokens, 32 q heads / 4 kv):
+#
+#     one pass  vo=512   115.42 ms   (three rounds within 0.03%)
+#     two passes vo=256   90.08 ms   -> 1.28x, 186 TFLOP/s, 45% of roofline
+#
+# Numerics are the same to bf16 rounding at M/KV of 256/1024, 1024/4096,
+# 2048/8192 and 8192/35326 (max abs 1.5e-5 to 6.1e-5). Not bit-identical: the
+# two passes accumulate their own softmax, so the reduction order differs.
+#
+# The halves are VIEWS of the same v_cache, so the strides still match k_cache
+# and no cache layout changes. `TOKENSPEED_FI_EXTEND_SPLIT_VO=0` restores the
+# single pass.
+#
+# The 512 floor is measured, not assumed. Below it the extra QK does not pay
+# for itself, because the accumulator was not the binding constraint there
+# (same shape as above, idle card):
+#
+#     head_dim   one pass   two passes
+#        512     115.99 ms    90.46 ms   1.28x   split wins
+#        256      26.83 ms    38.58 ms   0.70x   split loses
+#        128      11.76 ms    18.14 ms   0.65x   split loses
+#
+# So gemma-4's fifty sliding layers and both Qwen models (all head_dim 256)
+# keep the single pass, and their output is bit-identical with this enabled.
+_SPLIT_VO_MIN_HEAD_DIM = 512
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+# Below three query rows in the whole batch, the asymmetric kernel does not
+# exist on this GPU: flashinfer falls back to `cta_tile_q=16` and raises
+#
+#   Even the smallest KV tile for head_dim_qk=512, head_dim_vo=256,
+#   cta_tile_q=16 exceeds this GPU's 101376 bytes of shared memory per block
+#
+# while the symmetric head_dim_vo=512 runs fine at every size. This is a hard
+# capability boundary, not a tuning choice, and it is sharp and independent of
+# KV length (1 and 2 rows raise, 3 upward run, at both 2,048 and 35,326):
+#
+#     query rows   1  2  3  4  5  8  16
+#     vo=256       X  X  O  O  O  O  O
+#
+# The engine hits it constantly -- a `#new-token: 1` batch inside the prefill
+# graph at bucket 16 is what took the server down at startup. One tiny request
+# inside a large batch is fine (1+8192 and 1+1+8192 both run), so the guard is
+# on the batch total, which the caller already has host-side. At two rows there
+# is no work to win back anyway.
+_SPLIT_VO_MIN_TOTAL_Q = 3
+_split_logged = False
+
+
+def _log_split_once(head_dim: int, half: int) -> None:
+    """Say once that the split is live, the first time it actually fires.
+
+    A gate that silently does nothing is indistinguishable from a gate that
+    works, and this one already shipped a version that fired everywhere and
+    took the server down. Deferred until logging has handlers, like the
+    paged-extend gate above.
+    """
+    global _split_logged
+    if _split_logged or not logging.getLogger().hasHandlers():
+        return
+    _split_logged = True
+    logger.info(
+        "FI paged extend: splitting head_dim %d into two vo=%d passes "
+        "(min total_q %d)",
+        head_dim,
+        half,
+        _SPLIT_VO_MIN_TOTAL_Q,
+    )
+
+
+def _split_vo_width(head_dim: int, k_cache, v_cache, total_q: int) -> int | None:
+    """Half-width to split the output dimension into, or None to run one pass."""
+    if os.getenv("TOKENSPEED_FI_EXTEND_SPLIT_VO", "1") != "1":
+        return None
+    if head_dim < _SPLIT_VO_MIN_HEAD_DIM or head_dim % 2:
+        return None
+    if total_q < _SPLIT_VO_MIN_TOTAL_Q:
+        return None
+    _log_split_once(head_dim, head_dim // 2)
+    # The split slices v_cache's last dim, so it has to BE the head dim.
+    if v_cache.shape[-1] != head_dim or k_cache.shape[-1] != head_dim:
+        return None
+    # fp8 KV carries per-tensor scales that have not been checked against a
+    # split; leave those on the single pass rather than guess.
+    if k_cache.dtype in _FP8_DTYPES or v_cache.dtype in _FP8_DTYPES:
+        return None
+    return head_dim // 2
+
+
+def _run_paged_extend_split(
+    wrapper,
+    q: torch.Tensor,
+    total_q: int,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    half: int,
+    return_lse: bool,
+    k_scale,
+    v_scale,
+):
+    """Two passes over the output dimension into one preallocated output.
+
+    `wrapper` must already be planned with `head_dim_vo=half`. Each pass writes
+    straight into its slice of `out`, so there is no concatenation. The LSE is a
+    property of the softmax, which both passes compute identically, so the first
+    pass's is returned.
+    """
+    qq = q[:total_q] if total_q != q.shape[0] else q
+    lse = None
+    parts = []
+    for i in range(2):
+        sl = slice(i * half, (i + 1) * half)
+        # Two constraints pull opposite ways, and only one combination
+        # satisfies both. V must stay a VIEW: the kernel checks that k and v
+        # share strides, and a `.contiguous()` half is packed to 16384 against
+        # k's 32768, so it raises. The OUTPUT must be its own contiguous
+        # buffer: writing into `out[:total_q, :, sl]` is non-contiguous in the
+        # last dim and the kernel packs it, which gave a relative error of
+        # 2.6e3 against the single pass -- garbage, not rounding.
+        r = _paged_run(
+            wrapper,
+            qq,
+            (k_cache, v_cache[..., sl]),
+            out=torch.empty(
+                (qq.shape[0], qq.shape[1], half), dtype=q.dtype, device=q.device
+            ),
+            return_lse=return_lse and i == 0,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        part = r[0] if isinstance(r, tuple) else r
+        parts.append(part)
+        if return_lse and i == 0:
+            lse = r[1] if isinstance(r, tuple) else None
+    out = torch.empty_like(q)
+    out[:total_q] = torch.cat(parts, dim=-1)
+    return (out, lse) if return_lse else out
 
 
 def _run_paged_extend(
@@ -967,7 +1128,27 @@ if _paged_prefill_available():
         priority=Priority.PERFORMANT,
         traits={
             "is_causal": frozenset({False, True}),
-            "head_dim": frozenset({64, 128, 256}),
+            # 512 is here for gemma-4's ten global layers (`global_head_dim: 512`
+            # with `num_global_key_value_heads: 4`). It was absent, so those ten
+            # layers fell to the Triton fallback while the fifty sliding layers
+            # (head_dim 256) took this kernel -- silently, because a closed
+            # allowlist declines rather than fails. On the production shape
+            # (8192-token chunk against 35,326 cached tokens) that cost
+            # 137.24 ms per layer at 122.2 TFLOP/s against this kernel's
+            # 115.48 ms at 145.2, i.e. 218 ms of a 2,761 ms prefill forward.
+            #
+            # Checked before widening the set, because a trait set is a promise
+            # to serve every combination in it: all 16 combinations of
+            # causal x sliding_window x logit_cap x return_lse run at 512, as do
+            # both fp8 KV dtypes in the signature list. Accuracy against an fp32
+            # reference is identical to the Triton kernel's on four of five
+            # shapes and within bf16 epsilon on the fifth.
+            #
+            # Both numbers are still far off the 414 TFLOP/s roofline that
+            # head_dim 256 reaches (312.7). head_dim is what costs it, not
+            # context length -- the same kernel and head count at 256 is 2.2x
+            # faster. This entry banks the free half; the rest needs a kernel.
+            "head_dim": frozenset({64, 128, 256, 512}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False}),
             "support_logit_cap": frozenset({False, True}),
@@ -1034,6 +1215,9 @@ if _paged_prefill_available():
             ):
                 continue
             want = (shape_key, float(softmax_scale), float(logit_cap))
+            # Both halves of a split share one plan: they differ only in which
+            # columns of V they read, and head_dim_vo is the same for each.
+            half = _split_vo_width(head_dim, k_cache, v_cache, installed["total_q"])
             if installed["planned"] != want:
                 _plan_paged_extend(
                     installed["wrapper"],
@@ -1050,8 +1234,21 @@ if _paged_prefill_available():
                     logit_cap=logit_cap,
                     q_dtype=q.dtype,
                     kv_dtype=k_cache.dtype,
+                    head_dim_vo=half,
                 )
                 installed["planned"] = want
+            if half is not None:
+                return _run_paged_extend_split(
+                    installed["wrapper"],
+                    q,
+                    installed["total_q"],
+                    k_cache,
+                    v_cache,
+                    half,
+                    return_lse,
+                    k_scale,
+                    v_scale,
+                )
             return _run_paged_extend(
                 installed["wrapper"],
                 q,
@@ -1092,6 +1289,7 @@ if _paged_prefill_available():
         # borrowing an installed group's slot would re-point that group at this
         # call's pages.
         wrapper = _paged_prefill_wrapper(q.device, _PAGED_FALLBACK_SLOT)
+        half = _split_vo_width(head_dim, k_cache, v_cache, total_q)
         _plan_paged_extend(
             wrapper,
             cu_seqlens_q=cu_seqlens_q,
@@ -1107,7 +1305,20 @@ if _paged_prefill_available():
             logit_cap=logit_cap,
             q_dtype=q.dtype,
             kv_dtype=k_cache.dtype,
+            head_dim_vo=half,
         )
+        if half is not None:
+            return _run_paged_extend_split(
+                wrapper,
+                q,
+                total_q,
+                k_cache,
+                v_cache,
+                half,
+                return_lse,
+                k_scale,
+                v_scale,
+            )
         return _run_paged_extend(
             wrapper, q, total_q, k_cache, v_cache, return_lse, k_scale, v_scale
         )

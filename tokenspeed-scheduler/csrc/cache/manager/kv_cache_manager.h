@@ -138,6 +138,7 @@ public:
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         table.blocks_ = std::move(hit.blocks);
+        table.reclaimed_prefix_blocks_ = 0;
     }
 
     // Virtual so a group that keeps only periodic checkpoints can leave the
@@ -165,14 +166,12 @@ public:
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
                              std::vector<BlockTransfer>& load_pairs) {
         _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
-        // A sparse group backs only checkpoint positions, and admission
-        // reserved exactly that many; materialising every host hit here would
-        // ask the pool for blocks nobody charged for, which is what the check
-        // below then reports as a plan that no longer fits.
-        const std::int32_t first_index = static_cast<std::int32_t>(table.blocks_.size());
+        // A matched host snapshot is required for the chosen resume boundary.
+        // Publication stride governs NEW checkpoints, not restoration of an
+        // existing chunk/endpoint snapshot. Admission reserves every host hit.
         std::int32_t num_pages = 0;
         for (std::size_t i = 0; i < host_block_refs.size(); ++i) {
-            if (host_block_refs[i] && IsBackedIndex(first_index + static_cast<std::int32_t>(i))) {
+            if (host_block_refs[i]) {
                 ++num_pages;
             }
         }
@@ -184,7 +183,7 @@ public:
         auto destination_it = destination_refs.begin();
         for (std::size_t i = 0; i < host_block_refs.size(); ++i) {
             CacheBlockRef& host_block_ref = host_block_refs[i];
-            if (!host_block_ref || !IsBackedIndex(first_index + static_cast<std::int32_t>(i))) {
+            if (!host_block_ref) {
                 table.blocks_.emplace_back();
                 continue;
             }
@@ -251,10 +250,10 @@ public:
 
     // Positions the host extension occupies are hits.size(); how many of them
     // AppendHostExtension will actually back is this.
-    std::int32_t BackedHostExtensionPages(std::int32_t base_index, std::span<const std::uint8_t> hits) const {
+    std::int32_t BackedHostExtensionPages(std::int32_t /*base_index*/, std::span<const std::uint8_t> hits) const {
         std::int32_t backed = 0;
         for (std::size_t i = 0; i < hits.size(); ++i) {
-            if (hits[i] != 0 && IsBackedIndex(base_index + static_cast<std::int32_t>(i))) {
+            if (hits[i] != 0) {
                 ++backed;
             }
         }
@@ -570,6 +569,7 @@ public:
         }
         table.blocks_.clear();
         table.available_tokens_ = 0;
+        table.reclaimed_prefix_blocks_ = 0;
     }
 
 protected:

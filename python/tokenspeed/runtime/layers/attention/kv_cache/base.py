@@ -538,7 +538,9 @@ class CachePool:
             # same number.
             try:
                 prof = scheduler.paged_cache_group_run_profile(group_id)
-                frag = f", runs={prof[3]}, stranded={prof[4]}/{prof[2]}, depth={prof[5]}"
+                frag = (
+                    f", runs={prof[3]}, stranded={prof[4]}/{prof[2]}, depth={prof[5]}"
+                )
             except Exception:
                 frag = ""
             parts.append(

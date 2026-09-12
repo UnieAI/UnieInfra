@@ -5,11 +5,11 @@ test_prefill_window_prune.py 走的是 triton_mha_prefill(無快取,q 就是整�
 `cur_q_start = cur_seq_len - cur_seq_len_extend` 非零,而剪枝的下界
 `q_lo - W` 正是由它算出來的。那條路徑沒被前一支測到。
 """
+
 import math
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.attention.triton.mha_prefill import (
     triton_mha_extend_with_kvcache,
 )
@@ -23,7 +23,9 @@ def _build_paged(kv_lens, device, dtype):
     pages_per = [(L + PAGE - 1) // PAGE for L in kv_lens]
     k_cache = torch.zeros(sum(pages_per), PAGE, H, D, device=device, dtype=dtype)
     v_cache = torch.zeros_like(k_cache)
-    page_table = torch.zeros(len(kv_lens), max(pages_per), device=device, dtype=torch.int32)
+    page_table = torch.zeros(
+        len(kv_lens), max(pages_per), device=device, dtype=torch.int32
+    )
     ks, vs, nxt = [], [], 0
     for i, L in enumerate(kv_lens):
         ki = torch.randn(L, H, D, device=device, dtype=dtype) * 0.5
@@ -58,13 +60,13 @@ def reference(qs, ks, vs, q_lens, kv_lens, window_left, scale):
 @pytest.mark.parametrize(
     "q_lens,kv_lens,window_left",
     [
-        ([64], [64], 16),          # 第一個 chunk:q_start = 0
-        ([64], [512], 16),         # 後續 chunk:q_start = 448,窗遠在左邊
-        ([64], [512], 1023),       # 窗大於整段
-        ([128], [1024], 255),      # 窗在 BLOCK 邊界
-        ([128], [1024], -1),       # 無窗,純因果 —— 剪的是上界
+        ([64], [64], 16),  # 第一個 chunk:q_start = 0
+        ([64], [512], 16),  # 後續 chunk:q_start = 448,窗遠在左邊
+        ([64], [512], 1023),  # 窗大於整段
+        ([128], [1024], 255),  # 窗在 BLOCK 邊界
+        ([128], [1024], -1),  # 無窗,純因果 —— 剪的是上界
         ([37, 96], [300, 512], 64),  # 多序列、非對齊
-        ([256], [4096], 1023),     # gemma 的窗、長脈絡
+        ([256], [4096], 1023),  # gemma 的窗、長脈絡
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -76,14 +78,27 @@ def test_paged_extend_matches_reference(q_lens, kv_lens, window_left, dtype):
     k_cache, v_cache, page_table, ks, vs = _build_paged(kv_lens, dev, dtype)
     qs = [torch.randn(n, H, D, device=dev, dtype=dtype) * 0.5 for n in q_lens]
     q = torch.cat(qs, 0)
-    cu_q = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32, device=dev)
-    cu_kv = torch.tensor([0, *torch.tensor(kv_lens).cumsum(0).tolist()], dtype=torch.int32, device=dev)
+    cu_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32, device=dev
+    )
+    cu_kv = torch.tensor(
+        [0, *torch.tensor(kv_lens).cumsum(0).tolist()], dtype=torch.int32, device=dev
+    )
     cache_seqlens = torch.tensor(kv_lens, dtype=torch.int32, device=dev)
     scale = 1.0 / math.sqrt(D)
     got = triton_mha_extend_with_kvcache(
-        q, cu_q, cu_kv, k_cache, v_cache, page_table, cache_seqlens,
-        max(q_lens), max(kv_lens), is_causal=True,
-        window_left=window_left, softmax_scale=scale,
+        q,
+        cu_q,
+        cu_kv,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        max(q_lens),
+        max(kv_lens),
+        is_causal=True,
+        window_left=window_left,
+        softmax_scale=scale,
     )
     want = reference(qs, ks, vs, q_lens, kv_lens, window_left, scale)
     torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)

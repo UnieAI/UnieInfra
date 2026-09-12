@@ -367,6 +367,9 @@ protected:
 TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) {
     Submit(MakeHybridRequest("seed", 100));
     PlanOnce();
+    // The aligned publication chunk ends at 10; schedule the one-token tail
+    // before delivering a final ExtendResult (intermediate chunks emit none).
+    PlanOnce();
     SendForwardDone("seed", {900});
     PlanOnce();
     SendFinish("seed");
@@ -378,6 +381,9 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     ASSERT_NE(promotion, nullptr);
     ASSERT_EQ(promotion->request_ids, std::vector<std::string>{"promote"});
     EXPECT_EQ(promotion->input_lengths, std::vector<std::int32_t>{8});
+    PlanOnce();
+    // Publication at 8 is followed by an aligned two-token chunk and a
+    // one-token tail, not one three-token chunk.
     PlanOnce();
     SendForwardDone("promote", {901});
     PlanOnce();

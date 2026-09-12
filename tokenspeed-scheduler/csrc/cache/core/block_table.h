@@ -45,6 +45,21 @@ public:
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t AvailableTokens() const { return available_tokens_; }
 
+    // Every slot before this boundary has been released, including sparse
+    // holes. Unlike a null slot, this is evidence that the whole prefix is free.
+    std::int32_t ReclaimedPrefixBlocks() const { return reclaimed_prefix_blocks_; }
+
+    void ReclaimPrefix(std::int32_t end) {
+        _assert(0 <= end && end <= NumBlocks(), "reclaim prefix out of range");
+        // Preserve reverse release order for deterministic pool reuse.
+        for (std::int32_t i = end; i > reclaimed_prefix_blocks_; --i) {
+            blocks_[static_cast<std::size_t>(i - 1)].reset();
+        }
+        if (end > reclaimed_prefix_blocks_) {
+            reclaimed_prefix_blocks_ = end;
+        }
+    }
+
     CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
         return std::exchange(blocks_[static_cast<std::size_t>(index)], {});
@@ -57,6 +72,7 @@ private:
     // Unconsumed capacity at the logical tail. This may span multiple blocks
     // when admission preallocates a later decode/MTP step.
     std::int32_t available_tokens_{0};
+    std::int32_t reclaimed_prefix_blocks_{0};
 };
 
 // LCM ownership ids for scheduler accounting/debugging. Kernel-facing page

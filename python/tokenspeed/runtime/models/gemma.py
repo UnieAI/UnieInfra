@@ -498,9 +498,7 @@ class Gemma4Attention(nn.Module):
             # `pagesNeededToResume()` is `ceil((W-1)/P)` (swa_manager.h) -- so only
             # the mask was off. gpt_oss.py and inkling.py both do this conversion;
             # gemma was the one model that did not.
-            sliding_window_size=(
-                config.sliding_window - 1 if self.is_sliding else -1
-            ),
+            sliding_window_size=(config.sliding_window - 1 if self.is_sliding else -1),
             group_id=self.group_id,
         )
 

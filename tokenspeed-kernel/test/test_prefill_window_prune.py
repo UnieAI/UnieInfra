@@ -8,11 +8,11 @@ AND 進 final_mask 的條件,所以理論上不可能放進本來會被遮掉的
   - W 恰好落在 BLOCK_N 邊界上、以及差一格
   - 多序列、非對齊長度
 """
+
 import math
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.attention.triton.mha_prefill import triton_mha_prefill
 
 
@@ -54,16 +54,20 @@ def test_matches_reference(seqlens, window_left, dtype):
     torch.manual_seed(0)
     h, d = 4, 64
     total = sum(seqlens)
-    q, k, v = (
-        torch.randn(total, h, d, device="cuda", dtype=dtype) for _ in range(3)
-    )
+    q, k, v = (torch.randn(total, h, d, device="cuda", dtype=dtype) for _ in range(3))
     cu = torch.tensor(
         [0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
     )
     scale = 1.0 / math.sqrt(d)
     got = triton_mha_prefill(
-        q, k, v, cu, cu.tolist(), max(seqlens),
-        window_left=window_left, softmax_scale=scale,
+        q,
+        k,
+        v,
+        cu,
+        cu.tolist(),
+        max(seqlens),
+        window_left=window_left,
+        softmax_scale=scale,
     )
     want = reference(q, k, v, seqlens, window_left, scale)
     torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)

@@ -223,13 +223,7 @@ public:
 
     // Punches null holes so the table never shrinks and slot alignment stays stable.
     void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_computed_tokens) override {
-        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            CacheBlockRef old = table.EvictToNull(i);
-            if (!old) {
-                break;  // already null -> earlier slots are null too
-            }
-        }
+        table.ReclaimPrefix(fullySlidOutBlocks(table, num_computed_tokens));
     }
 
     // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
@@ -237,10 +231,10 @@ public:
                                      bool count_uncached) const override {
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::int32_t freed = 0;
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+        for (std::int32_t i = skipped_blocks - 1; i >= table.ReclaimedPrefixBlocks(); --i) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
             if (!block) {
-                break;  // already null -> earlier slots are null too
+                continue;
             }
             const bool cached = ContainsCachedBlock(block);
             const bool only_table_and_cache_owners = cached && block.use_count() == 2;
@@ -256,10 +250,10 @@ public:
         std::span<const CacheBlockLocation> released_locations) const override {
         const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<CacheBlockLocation> locations;
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+        for (std::int32_t i = skipped_blocks - 1; i >= table.ReclaimedPrefixBlocks(); --i) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
             if (!block) {
-                break;
+                continue;
             }
             const bool cached = ContainsCachedBlock(block);
             const std::uint32_t released_owners =

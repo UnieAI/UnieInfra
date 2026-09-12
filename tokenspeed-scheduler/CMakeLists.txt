@@ -109,6 +109,10 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_eviction_stress.cpp
         tests/cpp/test_swa_checkpoint_stride.cpp
+        tests/cpp/test_sparse_reclamation.cpp
+        tests/cpp/test_sparse_host_restore.cpp
+        tests/cpp/test_sparse_cursor_lifecycle.cpp
+        tests/cpp/test_sparse_host_admission.cpp
         tests/cpp/test_checkpoint_slot_allocator.cpp
         tests/cpp/test_forward_checkpoint_channel.cpp
         tests/cpp/test_cache_block_ref.cpp

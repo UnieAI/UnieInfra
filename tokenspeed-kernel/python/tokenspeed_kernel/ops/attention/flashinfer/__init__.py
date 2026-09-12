@@ -20,13 +20,13 @@
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 import os
+import re as _re
 from collections.abc import Sequence
 
 import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
-import re as _re
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -799,9 +799,11 @@ def _paged_prefill_available() -> bool:
             "FI paged extend: %s (TOKENSPEED_ENABLE_FI_PAGED_EXTEND=%r, wrapper=%s)",
             "ENABLED" if ok else "disabled",
             raw,
-            "available"
-            if BatchPrefillWithPagedKVCacheWrapper is not ErrorClass
-            else "missing",
+            (
+                "available"
+                if BatchPrefillWithPagedKVCacheWrapper is not ErrorClass
+                else "missing"
+            ),
         )
     return ok
 

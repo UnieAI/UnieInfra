@@ -557,7 +557,13 @@ CacheBlockRef KvCacheCoordinator::AcquireHostBlock(std::uint32_t group_id) {
     const auto value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
         const auto metadata = groups_[candidate_group].Manager().CachedBlockMetadataFor(*host_pool_, location);
         _assert(metadata.has_value(), "evictable Host block has no cache metadata");
-        return std::tuple{metadata->was_acquired, metadata->last_access_epoch, candidate_group, location.lcm_block_id,
+        // Compare token depths, not physical page IDs or group-specific indices.
+        // Unknown legacy metadata retains its recency tie-break at depth zero.
+        const std::int64_t depth = host_prefix_retention_ && metadata->logical_block_index >= 0
+            ? -(static_cast<std::int64_t>(metadata->logical_block_index) + 1) *
+                  groups_[candidate_group].Manager().CacheBlockTokens()
+            : 0;
+        return std::tuple{depth, metadata->was_acquired, metadata->last_access_epoch, candidate_group, location.lcm_block_id,
                           location.slot_index};
     };
     using HostCacheValue = decltype(value(group_id, CacheBlockLocation{}));
@@ -752,10 +758,12 @@ std::int32_t KvCacheCoordinator::NumPinnedHostCachedBlocks() const {
     return count;
 }
 
-void KvCacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
+void KvCacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
+                                       std::int32_t logical_block_index, CacheBoundaryKind boundary_kind) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
-    groups_[key.group_id].Manager().RegisterCachedBlock(*host_pool_, block_ref, key, ++next_access_epoch_);
+    groups_[key.group_id].Manager().RegisterCachedBlock(*host_pool_, block_ref, key, ++next_access_epoch_,
+                                                     logical_block_index, boundary_kind);
 }
 
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,

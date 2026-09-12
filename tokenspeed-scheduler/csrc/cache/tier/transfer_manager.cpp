@@ -52,6 +52,9 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
             continue;
         }
         const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
+        const auto metadata = manager.CachedBlockMetadataFor(
+            coordinator_.PoolForGroup(candidate.key.group_id), device_block_ref->Location());
+        _assert(metadata.has_value(), "pinned store source must have cache metadata");
         CacheBlockRef host_block_ref = coordinator_.AcquireHostBlock(candidate.key.group_id);
         if (!host_block_ref) {
             continue;
@@ -65,6 +68,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
             std::move(candidate.key),
             std::move(device_block_ref),
             std::move(host_block_ref),
+            metadata->logical_block_index,
+            metadata->boundary_kind,
         });
     }
 
@@ -110,7 +115,8 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
         store_keys_.erase(ticket.key);
     }
     for (StoreTicket& ticket : stores) {
-        coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
+        coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key, ticket.logical_block_index,
+                                    ticket.boundary_kind);
     }
 }
 

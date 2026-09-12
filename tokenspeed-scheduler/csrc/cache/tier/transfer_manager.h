@@ -55,6 +55,8 @@ private:
         CacheKey key;
         CacheBlockRef device_block_ref;
         CacheBlockRef host_block_ref;
+        std::int32_t logical_block_index;
+        CacheBoundaryKind boundary_kind;
     };
 
     std::uint32_t nextOpId() { return next_op_id_++; }

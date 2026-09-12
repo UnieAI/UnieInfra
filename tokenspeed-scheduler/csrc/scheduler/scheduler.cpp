@@ -119,6 +119,7 @@ Scheduler::Scheduler(SchedulerConfig config)
       // is what makes the option mean anything.
       new_token_ratio_{config_.new_token_ratio_init} {
     coordinator_.SetBoundaryStrideBlocks(config_.boundary_stride_blocks);
+    coordinator_.SetHostPrefixRetention(std::getenv("TOKENSPEED_HOST_PREFIX_RETENTION") != nullptr);
     if (config_.block_size <= 0) {
         throw std::invalid_argument("Scheduler: block_size must be > 0");
     }

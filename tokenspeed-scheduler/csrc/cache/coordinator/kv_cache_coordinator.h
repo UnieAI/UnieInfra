@@ -192,13 +192,17 @@ public:
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
+    // Experimental retention policy; preserve shallow Host prefixes under churn.
+    void SetHostPrefixRetention(bool enabled) { host_prefix_retention_ = enabled; }
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
-    void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
+                        std::int32_t logical_block_index = -1,
+                        CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
 
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
@@ -269,6 +273,7 @@ private:
     }
     BlockPool* host_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
+    bool host_prefix_retention_{false};
     std::int32_t cache_block_tokens_{0};
     std::int32_t boundary_stride_blocks_{0};
     std::uint64_t next_access_epoch_{0};

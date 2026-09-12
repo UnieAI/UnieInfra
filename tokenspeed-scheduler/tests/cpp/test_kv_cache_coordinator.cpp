@@ -36,6 +36,7 @@
 #include "cache/manager/cache_group.h"
 #include "cache/coordinator/kv_cache_coordinator.h"
 #include "cache/core/cache_types.h"
+#include "cache/tier/transfer_manager.h"
 #include "cache/manager/full_attn_manager.h"
 #include "cache/manager/swa_manager.h"
 #include "cache_test_access.h"
@@ -2455,6 +2456,32 @@ TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenColle
     on.Free(tables2);
 }
 
+TEST(KvCacheCoordinatorHostReplacement, WritebackPreservesPositionAndBoundaryOnlyAfterAck) {
+    BlockPool device(4), host(4);
+    std::vector<KvCacheSpec> specs{{.kind = AttnKind::kFull}};
+    auto coordinator = MakeCoordinator(specs, 2, device, &host);
+    auto& manager = coordinator.GroupManager(0);
+    auto ref = device.AcquireBlock(0, 1);
+    const auto key = Key("snapshot", 0);
+    manager.RegisterCachedBlock(device, ref, key, 1, 7, CacheBoundaryKind::kEndpoint);
+    ref.reset();
+    std::vector<std::string> hashes{"snapshot"};
+    coordinator.QueueCachedBlocksForStore(hashes);
+    TierTransferManager transfers(coordinator);
+    auto op = transfers.StartPendingStores();
+    ASSERT_TRUE(op);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key));
+    EXPECT_TRUE(transfers.HasStoresInFlight());
+    transfers.CompleteWriteBack(op->op_id);
+    auto host_ref = manager.AcquireCachedBlock(host, key);
+    ASSERT_TRUE(host_ref);
+    auto metadata = manager.CachedBlockMetadataFor(host, host_ref->Location());
+    ASSERT_TRUE(metadata);
+    EXPECT_EQ(metadata->logical_block_index, 7);
+    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kEndpoint);
+    EXPECT_FALSE(transfers.HasStoresInFlight());
+}
+
 TEST(KvCacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent) {
     BlockPool device_pool(2);
     BlockPool host_pool(1);
@@ -2479,6 +2506,38 @@ TEST(KvCacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent
     EXPECT_EQ(coordinator.NumHostCachedBlocks(), 1);
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(first));
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(second));
+}
+
+TEST(KvCacheCoordinatorHostReplacement, PrefixRetentionKeepsShallowBlocksAndHonorsPins) {
+    for (bool enabled : {false, true}) {
+        BlockPool device(4), host(2);
+        std::vector<KvCacheSpec> specs{{.kind = AttnKind::kFull}};
+        auto coordinator = MakeCoordinator(specs, 2, device, &host);
+        coordinator.SetHostPrefixRetention(enabled);
+        auto shallow = host.AcquireBlock(0, 1);
+        coordinator.CacheHostBlock(shallow, Key("shallow", 0), 0);
+        shallow.reset();
+        auto deep = host.AcquireBlock(0, 1);
+        coordinator.CacheHostBlock(deep, Key("deep", 0), 99);
+        deep.reset();
+        auto replacement = coordinator.AcquireHostBlock(0);
+        ASSERT_TRUE(replacement);
+        EXPECT_EQ(coordinator.ContainsHostCachedBlock(Key("shallow", 0)), enabled);
+        EXPECT_EQ(coordinator.ContainsHostCachedBlock(Key("deep", 0)), !enabled);
+    }
+    BlockPool device(4), host(2);
+    std::vector<KvCacheSpec> specs{{.kind = AttnKind::kFull}};
+    auto coordinator = MakeCoordinator(specs, 2, device, &host);
+    coordinator.SetHostPrefixRetention(true);
+    auto shallow = host.AcquireBlock(0, 1);
+    coordinator.CacheHostBlock(shallow, Key("shallow", 0), 0);
+    shallow.reset();
+    auto pinned = host.AcquireBlock(0, 1);
+    coordinator.CacheHostBlock(pinned, Key("pinned", 0), 99);
+    auto replacement = coordinator.AcquireHostBlock(0);
+    ASSERT_TRUE(replacement);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("pinned", 0)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("shallow", 0)));
 }
 
 TEST(KvCacheCoordinatorHostReplacement, RebindsACompleteEvictableParentAcrossGroups) {

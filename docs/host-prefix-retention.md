@@ -32,3 +32,20 @@ attention, and no future request is guaranteed a resumable boundary. Full
 CPU tests of the policy, fixed churn replay, quality and loaded AgentX curves
 remain required. Its switch exists for controlled validation, not as the
 requested deliverable.
+
+## Reuse-class ordering candidate
+
+The initial depth-first candidate improved a selected churn replay but its
+first loaded C32 result was only 13.15 RPM; the same-input baseline control
+is pending. An actual-core CPU counterexample showed successful recent reuse
+could never protect a deep block from an unused shallow block.
+
+This follow-up orders successful reuse before depth, preserving the previous
+depth rule only within the same reuse class. The default-off ordering is
+unchanged because its depth is always zero. Tests cover both one-child and
+packed parents and verify successful acquisition metadata before pressure;
+existing shallow-retention and pin-safety tests still apply. No tensor or
+ownership handling changes. This fixes one explicit counterexample, not all
+temporal-locality or hybrid-prefix dependency problems. A reused old shallow
+block can still outrank a reused recent deep block. GPU churn, quality and
+loaded-frontier validation are required before adopting this candidate.

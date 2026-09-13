@@ -563,7 +563,9 @@ CacheBlockRef KvCacheCoordinator::AcquireHostBlock(std::uint32_t group_id) {
             ? -(static_cast<std::int64_t>(metadata->logical_block_index) + 1) *
                   groups_[candidate_group].Manager().CacheBlockTokens()
             : 0;
-        return std::tuple{depth, metadata->was_acquired, metadata->last_access_epoch, candidate_group, location.lcm_block_id,
+        // Successful reuse outranks position: stale shallow history must not
+        // displace a deeper boundary that has already served a cache hit.
+        return std::tuple{metadata->was_acquired, depth, metadata->last_access_epoch, candidate_group, location.lcm_block_id,
                           location.slot_index};
     };
     using HostCacheValue = decltype(value(group_id, CacheBlockLocation{}));

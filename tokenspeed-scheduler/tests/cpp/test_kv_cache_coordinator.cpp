@@ -2508,6 +2508,38 @@ TEST(KvCacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(second));
 }
 
+TEST(KvCacheCoordinatorHostReplacement, SuccessfulReuseOutranksShallowPosition) {
+    for (int packing : {1, 2}) {
+        BlockPool device(4), host(2 / packing);
+        std::vector<KvCacheSpec> specs{{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = packing}};
+        auto coordinator = MakeCoordinator(specs, 2, device, &host);
+        coordinator.SetHostPrefixRetention(true);
+        auto shallow = host.AcquireBlock(0, packing);
+        coordinator.CacheHostBlock(shallow, Key("old-shallow", 0), 0);
+        shallow.reset();
+        auto deep = host.AcquireBlock(0, packing);
+        coordinator.CacheHostBlock(deep, Key("reused-deep", 0), 99);
+        const auto location = deep->Location();
+        deep.reset();
+        auto& manager = coordinator.GroupManager(0);
+        const std::array<CacheKey, 1> keys{Key("reused-deep", 0)};
+        {
+            const auto probe = manager.Probe(host, keys, 0, 1);
+            const auto match = manager.AcquireMatchedBlocks(host, keys, 0, probe, 1000);
+            ASSERT_EQ(match.blocks.size(), 1);
+            ASSERT_TRUE(match.blocks[0]);
+        }
+        const auto metadata = manager.CachedBlockMetadataFor(host, location);
+        ASSERT_TRUE(metadata);
+        ASSERT_TRUE(metadata->was_acquired);
+        ASSERT_EQ(metadata->last_access_epoch, 1000);
+        auto replacement = coordinator.AcquireHostBlock(0);
+        ASSERT_TRUE(replacement);
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("reused-deep", 0)));
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-shallow", 0)));
+    }
+}
+
 TEST(KvCacheCoordinatorHostReplacement, PrefixRetentionKeepsShallowBlocksAndHonorsPins) {
     for (bool enabled : {false, true}) {
         BlockPool device(4), host(2);

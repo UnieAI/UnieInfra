@@ -1035,7 +1035,27 @@ def nvidia_create_rsag_state(
     logger.info(
         f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
-    symm_mem.rendezvous(comm_buff, group=group)
+    symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
+    # Every kernel this state feeds -- nvidia_rsag_multimem_all_gather and
+    # nvidia_rsag_multimem_reduce_scatter -- addresses the buffer through
+    # multimem.st / multimem.ld_reduce, which need an NVLS multicast mapping.
+    # The rendezvous succeeds without one: torch prints "Gracefully skipping
+    # multicast initialization" and leaves multicast_ptr at 0, so the
+    # rendezvous is not the capability test the callers assume it is. The
+    # kernel then stores through a null multicast pointer, which is an illegal
+    # access reported asynchronously at whatever synchronizes next -- on this
+    # 8xH200 box that was the first Triton launch inside the sampler, several
+    # call frames away from the fault, and it took down startup for every
+    # tensor-parallel launch of every model. Refuse here instead: the runtime
+    # callers already treat an exception from state creation as "unavailable"
+    # and fall back to the plain NCCL all-gather.
+    multicast_ptr = getattr(symm_mem_hdl, "multicast_ptr", 0)
+    if not multicast_ptr:
+        raise RuntimeError(
+            "symmetric-memory rendezvous produced no NVLS multicast mapping "
+            f"(multicast_ptr={multicast_ptr}); the Triton RSAG kernels are "
+            "multimem-only and cannot run over this interconnect"
+        )
     return TritonCommState(
         group=group,
         rank_in_group=rank_in_group,
@@ -1044,6 +1064,7 @@ def nvidia_create_rsag_state(
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
+        symm_mem_hdl=symm_mem_hdl,
     )
 
 

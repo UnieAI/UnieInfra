@@ -301,9 +301,7 @@ class CacheLayout:
         # Fall back to consecutive (union) layout rather than refuse to serve:
         # a union parent wastes bytes but reads the right ones.
         distinct_plane_sizes = {size for _, size in self.plane_bytes}
-        overlay = len(set(plane_family.values())) <= 1 or len(
-            distinct_plane_sizes
-        ) == 1
+        overlay = len(set(plane_family.values())) <= 1 or len(distinct_plane_sizes) == 1
         if not overlay and len(set(plane_family.values())) > 1:
             logger.warning(
                 "Cache arena: %d geometry families but %d distinct plane "
@@ -328,7 +326,9 @@ class CacheLayout:
                     arena_offset_bytes=arena_offset,
                 )
             )
-            family_offset[fam] = arena_offset + (num_lcm_blocks + 1) * bytes_per_lcm_block
+            family_offset[fam] = (
+                arena_offset + (num_lcm_blocks + 1) * bytes_per_lcm_block
+            )
 
         return CacheMemoryPlan(
             logical_block_tokens=self.logical_block_tokens,

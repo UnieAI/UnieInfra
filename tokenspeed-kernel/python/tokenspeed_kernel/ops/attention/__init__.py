@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -33,7 +34,6 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
-import os
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
@@ -1733,9 +1733,13 @@ def mha_decode_with_kvcache(
     # Print them rather than reconstruct them again.
     if os.environ.get("TOKENSPEED_LOG_KERNEL_PICK") == "1":
         import sys as _sys
-        print(f"[pick] mha_decode -> {kernel.name} q={tuple(q.shape)} "
-              f"kcache={tuple(k_cache.shape)} traits={traits}",
-              file=_sys.stderr, flush=True)
+
+        print(
+            f"[pick] mha_decode -> {kernel.name} q={tuple(q.shape)} "
+            f"kcache={tuple(k_cache.shape)} traits={traits}",
+            file=_sys.stderr,
+            flush=True,
+        )
 
     # Record shapes
     shape_params = {

@@ -9,7 +9,11 @@ same string is not the same experiment: gemma is very sensitive to a missing
 BOS, and the two sides disagreeing about one special token looks exactly like a
 broken layer.
 """
-import argparse, torch
+
+import argparse
+
+import torch
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -34,8 +38,10 @@ def main():
             ids = [int(x) for x in ids.flatten().tolist()]
             print("input_ids taken from", args.ids_from, ids)
         except Exception as exc:  # noqa: BLE001
-            print(f"  could not read ids from {args.ids_from}: "
-                  f"{type(exc).__name__}: {str(exc)[:70]}")
+            print(
+                f"  could not read ids from {args.ids_from}: "
+                f"{type(exc).__name__}: {str(exc)[:70]}"
+            )
     if ids is None:
         ids = tok(args.prompt, add_special_tokens=False)["input_ids"]
         print("input_ids (retokenized)", ids)
@@ -44,14 +50,19 @@ def main():
     # class may refuse it; try the image-text-to-text class before falling back
     # to the plain one. Whichever loads, only the text stack is exercised below.
     model = None
-    for cls_name in ("AutoModelForImageTextToText", "AutoModelForCausalLM",
-                     "AutoModel"):
+    for cls_name in (
+        "AutoModelForImageTextToText",
+        "AutoModelForCausalLM",
+        "AutoModel",
+    ):
         cls = getattr(transformers, cls_name, None)
         if cls is None:
             continue
         try:
             model = cls.from_pretrained(
-                args.model, dtype=torch.bfloat16, device_map={"": 0},
+                args.model,
+                dtype=torch.bfloat16,
+                device_map={"": 0},
                 attn_implementation="eager",
             )
             print("loaded via", cls_name)
@@ -88,11 +99,16 @@ def main():
     top = logits[0, -1].topk(5)
     rec["top5_ids"] = top.indices.cpu()
     rec["top5_vals"] = top.values.float().cpu()
-    print("HF top-5 next tokens:",
-          [(tok.decode([i]), round(float(v), 3))
-           for i, v in zip(top.indices.tolist(), top.values.tolist())])
+    print(
+        "HF top-5 next tokens:",
+        [
+            (tok.decode([i]), round(float(v), 3))
+            for i, v in zip(top.indices.tolist(), top.values.tolist())
+        ],
+    )
     torch.save(rec, args.out)
     print("saved", args.out)
+
 
 if __name__ == "__main__":
     main()

@@ -19,14 +19,21 @@ which is what a real agent client does.
 Length is capped by CHOOSING AN EARLIER TURN -- never by truncating text. Truncation
 would make different sessions collide on identical strings and hand the cache free hits.
 """
-import pyarrow.parquet as pq, json, sys, hashlib
+
+import hashlib
+import json
+import sys
+
+import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 TOKN = "/workspace/models/Qwen/Qwen3.5-27B"
 tok = AutoTokenizer.from_pretrained(TOKN)
 
+
 def norm_nebius(path, limit):
-    f = pq.ParquetFile(path); out = []
+    f = pq.ParquetFile(path)
+    out = []
     for b in f.iter_batches(batch_size=256):
         for r in b.to_pylist():
             msgs = []
@@ -35,53 +42,84 @@ def norm_nebius(path, limit):
                 txt = m["system_prompt"] if role == "system" else m["text"]
                 msgs.append((role, txt or ""))
             out.append((r["instance_id"], r["instance_id"].split("-")[0], msgs))
-            if len(out) >= limit: return out
+            if len(out) >= limit:
+                return out
     return out
 
+
 def norm_swesmith(path, limit):
-    f = pq.ParquetFile(path); out = []
+    f = pq.ParquetFile(path)
+    out = []
     for b in f.iter_batches(batch_size=256):
         for r in b.to_pylist():
-            out.append((r["traj_id"], r["instance_id"].split(".")[0],
-                        [(m["role"], m["content"] or "") for m in r["messages"]]))
-            if len(out) >= limit: return out
+            out.append(
+                (
+                    r["traj_id"],
+                    r["instance_id"].split(".")[0],
+                    [(m["role"], m["content"] or "") for m in r["messages"]],
+                )
+            )
+            if len(out) >= limit:
+                return out
     return out
+
 
 def boundaries(msgs, cap):
     """Cumulative token length at each user-message boundary; keep those under cap."""
     parts = [f"[{r}]\n{t}\n\n" for r, t in msgs]
     lens = [len(x) for x in tok(parts, add_special_tokens=False)["input_ids"]]
-    cum = 0; out = []
+    cum = 0
+    out = []
     for i, (role, _) in enumerate(msgs):
         cum += lens[i]
-        if role == "user" and cum <= cap: out.append((i, cum))
+        if role == "user" and cum <= cap:
+            out.append((i, cum))
     return parts, out
+
 
 def build(kind, src, nsess, nturn, cap, outpath):
     trajs = norm_swesmith(src, 1200) if kind == "swesmith" else norm_nebius(src, 1200)
     picked, seen_repo = [], set()
     for tid, repo, msgs in trajs:
-        if repo in seen_repo: continue            # one session per repo -> real diversity
+        if repo in seen_repo:
+            continue  # one session per repo -> real diversity
         parts, bnd = boundaries(msgs, cap)
-        if len(bnd) < nturn: continue
+        if len(bnd) < nturn:
+            continue
         seen_repo.add(repo)
-        picked.append((tid, parts, bnd[-nturn:]))  # LAST nturn consecutive turns under cap
-        if len(picked) >= nsess: break
+        picked.append(
+            (tid, parts, bnd[-nturn:])
+        )  # LAST nturn consecutive turns under cap
+        if len(picked) >= nsess:
+            break
     assert len(picked) == nsess, f"only found {len(picked)} sessions"
 
     sessions = []
     for tid, parts, bnd in picked:
         sessions.append([(tid, "".join(parts[: i + 1]).rstrip(), n) for i, n in bnd])
 
-    rows = []                                      # round-robin interleave across sessions
+    rows = []  # round-robin interleave across sessions
     for k in range(nturn):
         for s in range(nsess):
             tid, prompt, ntok = sessions[s][k]
-            rows.append({"prompt": prompt, "session": tid, "turn": k, "n_prompt_tokens": ntok})
+            rows.append(
+                {"prompt": prompt, "session": tid, "turn": k, "n_prompt_tokens": ntok}
+            )
     with open(outpath, "w") as fh:
-        for r in rows: fh.write(json.dumps(r) + "\n")
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
     h = {hashlib.sha256(r["prompt"].encode()).hexdigest() for r in rows}
-    print(f"wrote {outpath}: {len(rows)} requests, {len(h)} unique prompts, {nsess} sessions x {nturn} turns")
+    print(
+        f"wrote {outpath}: {len(rows)} requests, {len(h)} unique prompts, {nsess} sessions x {nturn} turns"
+    )
+
 
 if __name__ == "__main__":
-    build(sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
+    build(
+        sys.argv[1],
+        sys.argv[2],
+        int(sys.argv[3]),
+        int(sys.argv[4]),
+        int(sys.argv[5]),
+        sys.argv[6],
+    )

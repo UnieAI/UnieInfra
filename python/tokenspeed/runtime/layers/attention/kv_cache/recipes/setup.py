@@ -133,9 +133,7 @@ class CachePoolSpec:
             # a layer would be sized at the ALLOCATION head count against its
             # own head_dim, which is wider than its field, so the row view
             # would run past the buffer.
-            raise ValueError(
-                "cache KV head dims require the matching head counts"
-            )
+            raise ValueError("cache KV head dims require the matching head counts")
         return replace(
             self,
             family=family or self.family,

@@ -21,13 +21,12 @@
 from __future__ import annotations
 
 import math
+import os as _os
 
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
-
-import os as _os
 
 # One-shot shape histogram for the dense GEMM path (TOKENSPEED_MM_SHAPES=1).
 # The decode profile says 41% of batch-32 decode time is one

@@ -5,10 +5,16 @@
 產生通順但不同的文字。這個測試不經過模型：把已知資料從裝置寫進檔案再讀回來，
 逐位元組比對。staging 故意設得很小，強制走多批路徑。
 """
-import os, sys, torch
+
+import os
+import sys
+
+import torch
+
 sys.path.insert(0, "/workspace/roy/UnieInfra/tokenspeed-kernel/python")
 sys.path.insert(0, "/workspace/roy/UnieInfra/python")
 from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+
 from tokenspeed.runtime.cache.l2.storage import HostCacheStorage
 
 PLANE = 524_288
@@ -34,28 +40,37 @@ order = list(range(N_PLANES))
 order = order[1::2] + order[0::2]
 ranges = [(0, i * PLANE, i * PLANE, PLANE) for i in order]
 
+
 def run(direction, stream):
     ordered = sorted(ranges, key=lambda r: r[2])
     batch, io_plan, used, flushes = [], [], 0, 0
+
     def flush(reusing):
         nonlocal batch, io_plan, used, flushes
-        if not batch: return
+        if not batch:
+            return
         flushes += 1
         if direction == "h2d":
             for fo, so, nb in io_plan:
-                io.read_into(view[so:so+nb], fo)
+                io.read_into(view[so : so + nb], fo)
         transfer_cache_ranges(direction, [dev], stage, batch, stream, backend="auto")
         if direction == "d2h":
             stream.synchronize()
             for fo, so, nb in io_plan:
-                io.write_from(view[so:so+nb], fo)
+                io.write_from(view[so : so + nb], fo)
         elif reusing:
             stream.synchronize()
         batch, io_plan, used = [], [], 0
+
     for di, do, ho, nb in ordered:
-        if used + nb > STAGE: flush(True)
+        if used + nb > STAGE:
+            flush(True)
         batch.append((di, do, used, nb))
-        if io_plan and io_plan[-1][0] + io_plan[-1][2] == ho and io_plan[-1][1] + io_plan[-1][2] == used:
+        if (
+            io_plan
+            and io_plan[-1][0] + io_plan[-1][2] == ho
+            and io_plan[-1][1] + io_plan[-1][2] == used
+        ):
             io_plan[-1] = (io_plan[-1][0], io_plan[-1][1], io_plan[-1][2] + nb)
         else:
             io_plan.append((ho, used, nb))
@@ -63,15 +78,22 @@ def run(direction, stream):
     flush(False)
     return flushes
 
+
 s = torch.cuda.Stream()
-n1 = run("d2h", s); s.synchronize()
+n1 = run("d2h", s)
+s.synchronize()
 expect = dev.clone()
-dev.zero_(); torch.cuda.synchronize()
-n2 = run("h2d", s); s.synchronize()
+dev.zero_()
+torch.cuda.synchronize()
+n2 = run("h2d", s)
+s.synchronize()
 
 bad = int((dev != expect).sum().item())
-print(f"{N_PLANES} planes ({N_PLANES*PLANE/1e6:.0f} MB), staging {STAGE/1e6:.0f} MB, "
-      f"d2h {n1} 批 / h2d {n2} 批")
+print(
+    f"{N_PLANES} planes ({N_PLANES*PLANE/1e6:.0f} MB), staging {STAGE/1e6:.0f} MB, "
+    f"d2h {n1} 批 / h2d {n2} 批"
+)
 print(f"不相符的位元組: {bad}  →  {'通過' if bad == 0 else '失敗'}")
-os.close(fd); os.unlink(PATH)
+os.close(fd)
+os.unlink(PATH)
 sys.exit(1 if bad else 0)

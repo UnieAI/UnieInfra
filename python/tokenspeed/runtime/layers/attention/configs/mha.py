@@ -34,7 +34,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-
 def _per_layer_kv_geometry(
     text_config,
     raw_layer_types: tuple[str, ...],
@@ -99,6 +98,7 @@ def _per_layer_kv_geometry(
             per_heads.append(heads)
             per_dims.append(dim)
     return tuple(per_heads), tuple(per_dims)
+
 
 @dataclass
 class MHAConfig(BaseAttnConfig):

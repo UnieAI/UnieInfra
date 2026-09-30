@@ -16,12 +16,17 @@ through `model.norm` while the engine's `layer59` has not, so that one row is
 expected to disagree and `final_norm` is the row that matters. The two norms
 (23.96 against 723.6) say which is which.
 """
-import argparse, torch
+
+import argparse
+
+import torch
+
 
 def rel(a, b):
     n = (a - b).norm().item()
     d = max(b.norm().item(), 1e-12)
     return n / d
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -33,8 +38,10 @@ def main():
 
     ia = a["input_ids"].flatten().tolist()
     ib = b["input_ids"].flatten().tolist()
-    print(f"input_ids ours={ia} hf={ib}"
-          f"{'' if ia == ib else '   <-- DIFFERENT INPUT, nothing below is comparable'}")
+    print(
+        f"input_ids ours={ia} hf={ib}"
+        f"{'' if ia == ib else '   <-- DIFFERENT INPUT, nothing below is comparable'}"
+    )
 
     keys = ["embed"] + [f"layer{i}" for i in range(200)] + ["final_norm"]
     prev = None
@@ -49,9 +56,12 @@ def main():
         flag = ""
         if prev is not None and r > 10 * max(prev, 1e-3) and r > 0.05:
             flag = "  <-- first big jump"
-        print(f"{k:12s} rel_l2={r:10.4e}   ours|.|={x.norm():10.3e} "
-              f"hf|.|={y.norm():10.3e}{flag}")
+        print(
+            f"{k:12s} rel_l2={r:10.4e}   ours|.|={x.norm():10.3e} "
+            f"hf|.|={y.norm():10.3e}{flag}"
+        )
         prev = r
+
 
 if __name__ == "__main__":
     main()

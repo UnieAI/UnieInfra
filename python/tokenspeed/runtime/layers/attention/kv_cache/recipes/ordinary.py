@@ -82,9 +82,7 @@ def mha_cache_fields(
         raise ValueError("head_dim must be divisible by kv_scale_block_size")
 
     if (layer_kv_heads is None) != (layer_kv_head_dims is None):
-        raise ValueError(
-            "layer_kv_heads and layer_kv_head_dims must be given together"
-        )
+        raise ValueError("layer_kv_heads and layer_kv_head_dims must be given together")
     if layer_kv_heads is not None and (
         len(layer_kv_heads) != len(layer_group_ids)
         or len(layer_kv_head_dims) != len(layer_group_ids)
@@ -116,7 +114,9 @@ def mha_cache_fields(
         # not the allocation's gets its own plane rather than a wrong stride on
         # a shared one. Same-geometry groups keep sharing, and every model with
         # one geometry keeps byte-identical plane ids.
-        suffix = "" if (heads_l, dim_l) == (kv_heads, head_dim) else f".{heads_l}x{dim_l}"
+        suffix = (
+            "" if (heads_l, dim_l) == (kv_heads, head_dim) else f".{heads_l}x{dim_l}"
+        )
         plane_k = f"unit.{unit}{suffix}.k"
         plane_v = f"unit.{unit}{suffix}.v"
         fields.extend(
@@ -400,6 +400,7 @@ def _storage_layers(config, num_layers: int) -> int:
 # per-group field bytes on its own. So the fields have to carry the layer's own
 # geometry; see `_mha_fields`.
 
+
 def _ordinary_setup(
     *,
     family: str,
@@ -478,9 +479,9 @@ def _ordinary_setup(
     # again under a different name.
     _dims = tuple(getattr(attn_config, "layer_kv_head_dims", None) or ())
     _heads = tuple(getattr(attn_config, "layer_kv_head_counts", None) or ())
-    uniform_widths = not _dims or len(
-        {int(h) * int(d) for h, d in zip(_heads, _dims)}
-    ) <= 1
+    uniform_widths = (
+        not _dims or len({int(h) * int(d) for h, d in zip(_heads, _dims)}) <= 1
+    )
     merged_layout = solve_cache_layout(
         merged_fields,
         logical_block_tokens=page_size,
@@ -515,19 +516,18 @@ def _ordinary_setup(
     # Per-layer KV geometry, for a model whose layers disagree about head_dim
     # (gemma-4). Target-only: a draft stack is a different model and its layers
     # continue the numbering, so an unaligned tuple is dropped whole.
-    merged_kv_head_counts = tuple(
-        getattr(attn_config, "layer_kv_head_counts", None) or ()
-    ) or None
-    merged_kv_head_dims = tuple(
-        getattr(attn_config, "layer_kv_head_dims", None) or ()
-    ) or None
+    merged_kv_head_counts = (
+        tuple(getattr(attn_config, "layer_kv_head_counts", None) or ()) or None
+    )
+    merged_kv_head_dims = (
+        tuple(getattr(attn_config, "layer_kv_head_dims", None) or ()) or None
+    )
     if merged_kv_head_dims is not None and (
         len(merged_kv_head_dims) != len(merged_group_ids)
         or merged_kv_head_counts is None
         or len(merged_kv_head_counts) != len(merged_group_ids)
     ):
         merged_kv_head_counts = merged_kv_head_dims = None
-
 
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         build_paged_cache_group_specs,

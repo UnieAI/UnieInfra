@@ -100,42 +100,78 @@ def run(name, nq, nkv, d, window, ctx, m):
     r = ref_decode(q1, k, v, window)
     for sol in DECODE_SOLUTIONS:
         try:
-            o = unwrap(
-                mha_decode_with_kvcache(
-                    q=q1, k_cache=k_cache, v_cache=v_cache, page_table=page_table,
-                    cache_seqlens=torch.tensor([ctx], dtype=torch.int32, device=dev),
-                    max_seqlen_k=ctx, max_seqlen_q=1, window_left=window,
-                    softmax_scale=SCALE, solution=sol,
+            o = (
+                unwrap(
+                    mha_decode_with_kvcache(
+                        q=q1,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        page_table=page_table,
+                        cache_seqlens=torch.tensor(
+                            [ctx], dtype=torch.int32, device=dev
+                        ),
+                        max_seqlen_k=ctx,
+                        max_seqlen_q=1,
+                        window_left=window,
+                        softmax_scale=SCALE,
+                        solution=sol,
+                    )
                 )
-            ).float().view(1, nq, d)
+                .float()
+                .view(1, nq, d)
+            )
             diff = (o - r).abs().max().item()
             rel = diff / r.abs().max().item()
-            print(f"  decode  solution={str(sol):18s} max|d|={diff:9.3e}  rel={rel:8.2e}"
-                  f"  {'OK' if rel < 5e-2 else '<-- WRONG'}")
+            print(
+                f"  decode  solution={str(sol):18s} max|d|={diff:9.3e}  rel={rel:8.2e}"
+                f"  {'OK' if rel < 5e-2 else '<-- WRONG'}"
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"  decode  solution={str(sol):18s} {type(exc).__name__}: {str(exc)[:60]}")
+            print(
+                f"  decode  solution={str(sol):18s} {type(exc).__name__}: {str(exc)[:60]}"
+            )
 
     qm = torch.randn(m, nq, d, dtype=torch.bfloat16, device=dev)
     rm = ref_extend(qm, k, v, window)
     for sol in EXTEND_SOLUTIONS:
         try:
-            o = unwrap(
-                mha_extend_with_kvcache(
-                    q=qm,
-                    cu_seqlens_q=torch.tensor([0, m], dtype=torch.int32, device=dev),
-                    cu_seqlens_kv=torch.tensor([0, ctx], dtype=torch.int32, device=dev),
-                    k_cache=k_cache, v_cache=v_cache, page_table=page_table,
-                    cache_seqlens=torch.tensor([ctx], dtype=torch.int32, device=dev),
-                    max_seqlen_q=m, max_seqlen_k=ctx, is_causal=True,
-                    window_left=window, softmax_scale=SCALE, solution=sol,
+            o = (
+                unwrap(
+                    mha_extend_with_kvcache(
+                        q=qm,
+                        cu_seqlens_q=torch.tensor(
+                            [0, m], dtype=torch.int32, device=dev
+                        ),
+                        cu_seqlens_kv=torch.tensor(
+                            [0, ctx], dtype=torch.int32, device=dev
+                        ),
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        page_table=page_table,
+                        cache_seqlens=torch.tensor(
+                            [ctx], dtype=torch.int32, device=dev
+                        ),
+                        max_seqlen_q=m,
+                        max_seqlen_k=ctx,
+                        is_causal=True,
+                        window_left=window,
+                        softmax_scale=SCALE,
+                        solution=sol,
+                    )
                 )
-            ).float().view(m, nq, d)
+                .float()
+                .view(m, nq, d)
+            )
             diff = (o - rm).abs().max().item()
             rel = diff / rm.abs().max().item()
-            print(f"  extend  solution={str(sol):18s} max|d|={diff:9.3e}  rel={rel:8.2e}"
-                  f"  {'OK' if rel < 5e-2 else '<-- WRONG'}")
+            print(
+                f"  extend  solution={str(sol):18s} max|d|={diff:9.3e}  rel={rel:8.2e}"
+                f"  {'OK' if rel < 5e-2 else '<-- WRONG'}"
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"  extend  solution={str(sol):18s} {type(exc).__name__}: {str(exc)[:60]}")
+            print(
+                f"  extend  solution={str(sol):18s} {type(exc).__name__}: {str(exc)[:60]}"
+            )
 
 
 def main():

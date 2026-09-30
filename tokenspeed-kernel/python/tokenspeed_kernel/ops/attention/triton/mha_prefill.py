@@ -495,6 +495,7 @@ def prefill_attention_fwd(
     # and those 10 layers are 41.3% of prefill device time (137 ms per
     # 1024-token chunk against 6.88 ms for all 50 sliding layers).
     import os as _os
+
     _bm = _os.environ.get("TS_TRITON_PREFILL_BLOCK_M")
     _bn = _os.environ.get("TS_TRITON_PREFILL_BLOCK_N")
     _nw = _os.environ.get("TS_TRITON_PREFILL_NUM_WARPS")

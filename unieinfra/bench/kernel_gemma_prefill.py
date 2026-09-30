@@ -61,16 +61,24 @@ def device_us(fn, reps=20):
         for _ in range(reps):
             fn()
         torch.cuda.synchronize()
-    return sum(e.device_time_total for e in prof.key_averages()
-               if e.device_time_total > 0 and e.count) / reps
+    return (
+        sum(
+            e.device_time_total
+            for e in prof.key_averages()
+            if e.device_time_total > 0 and e.count
+        )
+        / reps
+    )
 
 
 def unwrap(r):
     return r[0] if isinstance(r, tuple) else r
 
 
-print(f"{'geom':>8} {'M':>6} {'kv':>7} {'triton us':>10} {'fi us':>9} "
-      f"{'tri/fi':>7} {'TFLOP/s':>9} {'max|d|':>8}")
+print(
+    f"{'geom':>8} {'M':>6} {'kv':>7} {'triton us':>10} {'fi us':>9} "
+    f"{'tri/fi':>7} {'TFLOP/s':>9} {'max|d|':>8}"
+)
 for name, (nq, nkv, d, win) in GEOM.items():
     for m in MS:
         kv_len = m if win < 0 else min(m, win)
@@ -84,11 +92,15 @@ for name, (nq, nkv, d, win) in GEOM.items():
             d_f = device_us(fi)
         except Exception as exc:
             diff, d_f = float("nan"), float("nan")
-            print(f"  (flashinfer unavailable at {name} M={m}: "
-                  f"{type(exc).__name__}: {str(exc)[:50]})")
+            print(
+                f"  (flashinfer unavailable at {name} M={m}: "
+                f"{type(exc).__name__}: {str(exc)[:50]})"
+            )
         d_t = device_us(tri)
         # causal attention over the effective KV window
         flop = 2 * 2 * m * kv_len * nq * d / 2
-        print(f"{name:>8} {m:6d} {kv_len:7d} {d_t:10.1f} {d_f:9.1f} "
-              f"{d_t / d_f if d_f == d_f else float('nan'):6.2f}x "
-              f"{flop / (d_t * 1e-6) / 1e12:8.1f} {diff:8.2e}")
+        print(
+            f"{name:>8} {m:6d} {kv_len:7d} {d_t:10.1f} {d_f:9.1f} "
+            f"{d_t / d_f if d_f == d_f else float('nan'):6.2f}x "
+            f"{flop / (d_t * 1e-6) / 1e12:8.1f} {diff:8.2e}"
+        )

@@ -20,12 +20,11 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
-
-import os
 
 import torch
 from tokenspeed_kernel import (
@@ -939,15 +938,23 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             _dm = self.forward_decode_metadata
             _dlocs = None if _dm is None else getattr(_dm, "out_cache_locs", None)
             _elocs = getattr(metadata, "out_cache_locs", None)
+
             def _n(d):
                 if d is None:
                     return None
                 return {g: int(t.shape[0]) for g, t in d.items()}
+
             logger.info(
                 "mixed layer=%s rows=%d (prefill=%d decode=%d) q=%d "
                 "save_kv=%s extend_locs=%s decode_locs=%s caller_locs=%s",
-                layer.layer_id, total, npt, total - npt, int(q.shape[0]),
-                save_kv_cache, _n(_elocs), _n(_dlocs),
+                layer.layer_id,
+                total,
+                npt,
+                total - npt,
+                int(q.shape[0]),
+                save_kv_cache,
+                _n(_elocs),
+                _n(_dlocs),
                 None if out_cache_loc is None else int(out_cache_loc.shape[0]),
             )
 
@@ -967,7 +974,11 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     "DROP the tail and those tokens never enter the cache. "
                     "This is a correctness bug, not a warning -- it produces "
                     "fluent wrong text, never a crash.",
-                    _nloc, total, npt, total - npt, int(k.shape[0]),
+                    _nloc,
+                    total,
+                    npt,
+                    total - npt,
+                    int(k.shape[0]),
                     getattr(layer, "group_id", None),
                 )
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)

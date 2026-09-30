@@ -20,7 +20,7 @@ of the `roy` host, through the token-speed / UnieInfra engine.
 | MTP / NextN layers (`num_nextn_predict_layers=3`) | done (DSPARK, `Accept_num_tokens_avg` 1.6–3.5) |
 | Text benchmark vs vLLM (`vllm bench serve`) | done — see below |
 | Vision benchmark vs vLLM | done — see below |
-| AgentX (TPGS / P90 / DEP) evaluation | pending |
+| AgentX (TPGS / P90 / DEP) evaluation | done — see below (correctness gate FAILED) |
 
 The text backbone, the vision path, and the MTP/NextN draft path are all
 working: `vision.*` and `aligner.*` are loaded and the LM runs with image
@@ -57,6 +57,42 @@ the vision axes are only comparable on output throughput / TPOT:
 
 Full command lines and per-request dumps are in `bench/agent-slo/`
 (`results_*_dsv4_{text,vision}.txt`).
+
+### AgentX-style benchmark (concurrency 16, 256 requests, 128 output tokens, temperature 0)
+
+SWE-agent conversation strands from the Nebius session corpus
+(`bench/agent-slo/corpora/swe_agent_nebius_sess16x16_b.jsonl`), one user
+message per request, driven by `bench/agent-slo/drive.py` (streaming
+`/v1/chat/completions`, `max_tokens=128`, `ignore_eos=True`). Each engine was
+started fresh, warmed on a *different* corpus (swesmith), and served the
+target corpus exactly once so the measurement could not ride a warmed prefix
+cache. Both got 256/256 successful requests.
+
+| Axis (AgentX, c=16, n=256) | Engine (DSPARK) | vLLM |
+| --- | --- | --- |
+| Duration (s) | 239.9 | 620.4 |
+| Requests/s (rps) | 1.07 | 0.41 |
+| Output throughput (tok/s, 128 tok/req) | 136.6 | 52.8 |
+| TTFT mean / p50 / p90 / p99 (ms) | 2017 / 1274 / 1954 / 14457 | 7910 / 559 / 25378 / 56090 |
+| TPOT mean / p50 / p90 / p99 (ms) | 339 / 337 / 376 / 404 | 243 / 150 / 546 / 867 |
+| E2E mean / p50 / p99 (ms) | 14709 / 13902 / 27587 | 38752 / 20581 / 146568 |
+
+> **Correctness gate FAILED — do not take the 2.6x speedup at face value.**
+> Per AGENTS.md, every A/B is gated on output length and on token-for-token
+> agreement with a reference engine at temperature 0. Both engines produce
+> coherent, on-topic, non-repetitive SWE-agent text, but the two do **not**
+> agree token-for-token (exact-substring overlap 0/256), and — critically —
+> the engine is **not self-consistent** at temperature 0: re-sending the same
+> prompt to the same engine three times gave LCP 0/236 and 236/236 across
+> runs, whereas vLLM reproduced its own output exactly (LCP 481/481). The
+> engine maps `temperature=0` to greedy (`top_k=1`) in `sampling_params.py`,
+> so a correct greedy solver must be deterministic; the engine's intermittent
+> divergence is a genuine numerical/correctness defect, not a config choice.
+> The engine here is genuinely faster in wall-clock (it also has a much
+> larger KV budget: 0.87 vs 0.70 GPU util) but the result is **not a
+> validated, correctness-preserving speedup**. The throughput numbers above
+> are recorded as an observed measurement only, and the nondeterminism should
+> be root-caused before this engine is treated as production-correct.
 
 ## Why the two-GPU quantization is not a no-op on Hopper
 
@@ -189,12 +225,13 @@ fit at the current `gpu_memory_utilization=0.87` without one of:
 
 ## Remaining integration
 
-- **AgentX.** Run `SemiAnalysis/agentx-conversation-explorer` with HF traces
-  (`semianalysisai/cc-traces-*`) on both engines to compare TPGS, P90
-  interactivity and DEP disaggregation. The OpenAI-compat driver
-  (`bench/agent-slo/drive.py`) and corpus (`ts64.jsonl`) are in place; the
-  engine gateway accepts the multimodal-free AgentX data over
-  `/v1/chat/completions` for text requests.
+- **AgentX.** The OpenAI-compat driver (`bench/agent-slo/drive.py`) and the
+  Nebius SWE-agent corpus drive the same conversation strands at temperature 0
+  on both engines (see the AgentX-style benchmark above). The engine gateway
+  accepts the multimodal-free AgentX data over `/v1/chat/completions` for text
+  requests. **Open item:** the engine is not temperature-0 self-consistent, so
+  the engine-vs-vLLM AgentX result is a timing observation only and must be
+  re-gated on token agreement once the nondeterminism is fixed.
 - **Vision through the OpenAI gateway.** `/v1/chat/completions` rejects
   multimodal requests for this model (`invalid_multimodal_request: multimodal
   not supported for model: dsv4`) because the smg Rust registry has no

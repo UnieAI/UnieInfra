@@ -27,7 +27,7 @@ import sys
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
-TOKN = "/workspace/models/Qwen/Qwen3.5-27B"
+TOKN = "/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
 tok = AutoTokenizer.from_pretrained(TOKN)
 
 
@@ -77,21 +77,27 @@ def boundaries(msgs, cap):
     return parts, out
 
 
-def build(kind, src, nsess, nturn, cap, outpath):
-    trajs = norm_swesmith(src, 1200) if kind == "swesmith" else norm_nebius(src, 1200)
+def build(kind, src, nsess, nturn, cap, outpath, offset=0):
+    trajs = norm_swesmith(src, 2400) if kind == "swesmith" else norm_nebius(src, 2400)
     picked, seen_repo = [], set()
     for tid, repo, msgs in trajs:
         if repo in seen_repo:
             continue  # one session per repo -> real diversity
+        seen_repo.add(repo)
         parts, bnd = boundaries(msgs, cap)
         if len(bnd) < nturn:
             continue
-        seen_repo.add(repo)
+        if len(picked) < offset:
+            picked.append(
+                (tid, parts, bnd[-nturn:])
+            )  # skip already-used sessions (fresh-corpus builds)
+            continue
         picked.append(
             (tid, parts, bnd[-nturn:])
         )  # LAST nturn consecutive turns under cap
-        if len(picked) >= nsess:
+        if len(picked) >= nsess + offset:
             break
+    picked = picked[offset:]
     assert len(picked) == nsess, f"only found {len(picked)} sessions"
 
     sessions = []
@@ -122,4 +128,5 @@ if __name__ == "__main__":
         int(sys.argv[4]),
         int(sys.argv[5]),
         sys.argv[6],
+        int(sys.argv[7]) if len(sys.argv) > 7 else 0,
     )

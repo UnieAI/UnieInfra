@@ -60,7 +60,9 @@ def _span_arrays(num_tokens: int, lo: int, hi: int):
     return span_lo, span_hi
 
 
-def _expected_swa(pos: int, lo: int, hi: int, window: int = WINDOW) -> tuple[int, int, list[int]]:
+def _expected_swa(
+    pos: int, lo: int, hi: int, window: int = WINDOW
+) -> tuple[int, int, list[int]]:
     """Reference window (topk_len, cur_len, swa_source_positions) for a token."""
     topk_len = min(pos + 1, TOPK)
     if lo <= pos <= hi:
@@ -74,9 +76,7 @@ def _expected_swa(pos: int, lo: int, hi: int, window: int = WINDOW) -> tuple[int
     return topk_len, cur_len, list(range(start, start + cur_len))
 
 
-def _assert_token_row(
-    row: torch.Tensor, topk_len: int, cur_len: int, swa: list[int]
-):
+def _assert_token_row(row: torch.Tensor, topk_len: int, cur_len: int, swa: list[int]):
     total_len = topk_len + cur_len
     assert row[topk_len : topk_len + cur_len].cpu().tolist() == swa
     assert bool((row[total_len:] == -1).all().item())
@@ -102,9 +102,12 @@ def test_combine_topk_swa_image_span_bidirectional_narrow():
     seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=dev)
     gather_lens = torch.tensor([seq_len], dtype=torch.int32, device=dev)
     query_start_loc = torch.tensor([0, seq_len], dtype=torch.int32, device=dev)
-    topk_indices = (torch.arange(seq_len * TOPK, device=dev) % 1000).reshape(
-        seq_len, TOPK
-    ).to(torch.int32).contiguous()
+    topk_indices = (
+        (torch.arange(seq_len * TOPK, device=dev) % 1000)
+        .reshape(seq_len, TOPK)
+        .to(torch.int32)
+        .contiguous()
+    )
     span_lo, span_hi = _span_arrays(seq_len, NARROW_LO, NARROW_HI)
 
     combined, lens = ops.deepseek_v4_combine_topk_swa_indices(
@@ -126,7 +129,9 @@ def test_combine_topk_swa_image_span_bidirectional_narrow():
     for pos in range(seq_len):
         topk_len, cur_len, swa = _expected_swa(pos, NARROW_LO, NARROW_HI)
         row = combined[pos]
-        assert row[:topk_len].cpu().tolist() == topk_indices[pos, :topk_len].cpu().tolist()
+        assert (
+            row[:topk_len].cpu().tolist() == topk_indices[pos, :topk_len].cpu().tolist()
+        )
         _assert_token_row(row, topk_len, cur_len, swa)
         assert int(lens[pos]) == topk_len + cur_len
 

@@ -22,7 +22,12 @@ def lcp(a, b):
     return i
 
 
-def main(path, nsess, tokname="/workspace/models/Qwen/Qwen3.5-27B", sess_key=None):
+def main(
+    path,
+    nsess,
+    tokname="/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    sess_key=None,
+):
     rows = [json.loads(l) for l in open(path)]
     prompts = [r["prompt"] for r in rows]
     n = len(prompts)
@@ -32,7 +37,7 @@ def main(path, nsess, tokname="/workspace/models/Qwen/Qwen3.5-27B", sess_key=Non
     print(
         f"unique prompts  : {uniq}   ({'OK all unique' if uniq==n else '!! DUPLICATES: %d'%(n-uniq)})"
     )
-    tok = AutoTokenizer.from_pretrained(tokname)
+    tok = AutoTokenizer.from_pretrained(tokname, use_fast=True, local_files_only=True)
     ids = tok(prompts, add_special_tokens=False)["input_ids"]
     tl = sorted(len(x) for x in ids)
     cl = sorted(len(p) for p in prompts)
@@ -100,6 +105,10 @@ if __name__ == "__main__":
     main(
         sys.argv[1],
         int(sys.argv[2]) if len(sys.argv) > 2 else 1,
-        sys.argv[3] if len(sys.argv) > 3 else "/workspace/models/Qwen/Qwen3.5-27B",
+        (
+            sys.argv[3]
+            if len(sys.argv) > 3
+            else "/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+        ),
         sys.argv[4] if len(sys.argv) > 4 else None,
     )

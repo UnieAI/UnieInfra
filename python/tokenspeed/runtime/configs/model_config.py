@@ -1107,6 +1107,9 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "KimiK3ForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV4ForCausalLMNextN",
         # Audio in, tokens out: the request carries its audio the same way a
         # multimodal request carries an image, even though Whisper is an
         # encoder-decoder rather than an audio-prefix model.

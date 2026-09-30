@@ -45,8 +45,10 @@ except ImportError:
 
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
+    has_indexer_topk_prefill,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,
+    indexer_topk_prefill,
     persistent_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -122,6 +124,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -139,7 +142,24 @@ from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.deepseek_v4_vision import (
+    IMAGE,
+    DeepseekV4VisionAligner,
+    DeepseekV4VisionTower,
+    build_image_block,
+    llm_grid,
+)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    VisionEmbedder,
+    pad_input_tokens,
+)
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from tokenspeed.runtime.utils import (
     add_prefix,
     get_colorful_logger,
@@ -727,8 +747,16 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
 
     if not logits.is_cuda or logits.dtype != torch.float32:
         raise RuntimeError("DeepSeek V4 prefill indexer requires CUDA float32 logits")
-    trtllm_ops = getattr(torch.ops, "trtllm", None)
-    if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
+    # TRT-LLM's indexerTopK kernel is compiled for Blackwell (SM100+); on
+    # Hopper it raises `no kernel image is available`. The workspace
+    # deepseek_v4_attention op is compiled with SM90 support, so use it as the
+    # Hopper/portable fallback.
+    use_trtllm = (
+        _platform.is_blackwell
+        and (trtllm_ops := getattr(torch.ops, "trtllm", None)) is not None
+        and hasattr(trtllm_ops, "indexer_topk_prefill")
+    )
+    if not use_trtllm and not has_indexer_topk_prefill():
         raise RuntimeError(
             "DeepSeek V4 prefill indexer requires the CUDA prefill top-k op"
         )
@@ -769,13 +797,22 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
 
     topk = out[:num_rows]
     topk.fill_(-1)
-    trtllm_ops.indexer_topk_prefill(
-        logits,
-        row_starts_for_kernel,
-        row_ends_for_kernel,
-        topk,
-        topk_tokens,
-    )
+    if use_trtllm:
+        trtllm_ops.indexer_topk_prefill(
+            logits,
+            row_starts_for_kernel,
+            row_ends_for_kernel,
+            topk,
+            topk_tokens,
+        )
+    else:
+        indexer_topk_prefill(
+            logits,
+            row_starts_for_kernel,
+            row_ends_for_kernel,
+            topk,
+            topk_tokens,
+        )
     return topk
 
 
@@ -2260,6 +2297,24 @@ class DeepseekV4MoEGate(nn.Module):
         return _deepseek_v4_router_gemm(hidden_states, self.weight)
 
 
+def _routed_experts_are_fp4(config) -> bool:
+    """Whether the routed experts are serialized in a 4-bit format.
+
+    A DeepSeek-V4 checkpoint advertises the scheme of its *dense* weights in
+    ``quantization_config`` and the scheme of its *routed expert* weights in
+    the top-level ``expert_dtype`` field. All three published V4-Flash
+    checkpoints (deepseek-ai/DeepSeek-V4-Flash, -0731 and
+    nvidia/DeepSeek-V4-Flash-NVFP4) set ``expert_dtype="fp4"`` while
+    ``quantization_config.quant_method`` stays ``"fp8"``, because the
+    attention projections and the shared experts really are block-FP8.
+    """
+    return str(getattr(config, "expert_dtype", "")).lower() in (
+        "fp4",
+        "mxfp4",
+        "nvfp4",
+    )
+
+
 class DeepseekV4MegaMoEExperts(nn.Module):
     _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
 
@@ -2581,19 +2636,40 @@ class DeepseekV4MoE(nn.Module):
             )
             self.topk = None
         else:
-            # A block-FP8 checkpoint (quant_method=fp8, ue8m0 block scales, e.g.
-            # DeepSeek-V4-Flash) keeps its own Fp8Config and runs weight-only
-            # through the DeepGEMM block-FP8 grouped MoE (SM90 / Hopper via
-            # DeepEP). Its routed experts carry no GEMM bias -- the noaux_tc
-            # correction bias is a routing-only term applied in TopK. Only the
-            # MXFP4-serialized variant needs the Mxfp4 repack + expert bias.
-            is_block_fp8 = isinstance(quant_config, Fp8Config)
+            # The routed experts are not serialized in the same scheme as the
+            # rest of the checkpoint. DeepSeek-V4-Flash declares
+            # quantization_config.quant_method="fp8" -- block-scaled e4m3 with
+            # 128x128 ue8m0 scales -- and that holds for its attention
+            # projections and its *shared* experts, but its routed experts are
+            # MXFP4: int8-packed e2m1 pairs (w1 is [2048, 2048] for a logical
+            # [2048, 4096]) with one e8m0 scale per 32 input elements
+            # (w1.scale is [2048, 128]). config.expert_dtype == "fp4" is what
+            # announces that. Reading only the top-level quant_method builds
+            # (2*ispp/128, hidden/128) fp32 block scales against a checkpoint
+            # that ships (2*ispp, hidden/32) e8m0 ones -- 128x off in the last
+            # dim, and a different dtype -- which is the load_w13 shape
+            # mismatch this branch used to raise on Hopper.
+            # No DeepSeek-V4 checkpoint carries a routed-expert GEMM bias (the
+            # noaux_tc correction bias is a routing-only term applied in TopK),
+            # so with_bias stays False on both branches below.
+            routed_experts_fp4 = _routed_experts_are_fp4(config)
+            is_block_fp8 = (
+                isinstance(quant_config, Fp8Config) and not routed_experts_fp4
+            )
             if is_block_fp8:
                 routed_quant_config = quant_config
             else:
                 routed_quant_config = Mxfp4Config(
                     ignored_layers=quant_config.ignored_layers,
                     is_checkpoint_mxfp4_serialized=True,
+                )
+            if layer_index == 0:
+                logger.info(
+                    "DeepSeek V4 routed experts: scheme=%s expert_dtype=%s "
+                    "checkpoint_quant=%s with_bias=False",
+                    "block_fp8" if is_block_fp8 else "mxfp4",
+                    getattr(config, "expert_dtype", None),
+                    type(quant_config).__name__,
                 )
             self.experts = MoELayer(
                 top_k=config.num_experts_per_tok,
@@ -2610,7 +2686,7 @@ class DeepseekV4MoE(nn.Module):
                 ep_size=mapping.moe.ep_size,
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
-                with_bias=not is_block_fp8,
+                with_bias=False,
                 routing_config={
                     "routed_scaling_factor": self.routed_scaling_factor,
                     "normalize_topk_weights": config.norm_topk_prob,
@@ -4251,6 +4327,199 @@ class DeepseekV4Model(nn.Module):
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
 
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            encoder_only=getattr(config, "encoder_only", False),
+        )
+        self.is_multimodal_active = is_multimodal_active
+        self.mm_attention_backend = mm_attention_backend
+        has_vision = getattr(config, "vision_n_layers", 0) > 0
+        if not (self.is_multimodal_active and has_vision):
+            self.vision = None  # type: ignore[assignment]
+            self.aligner = None  # type: ignore[assignment]
+            self.vision_embedder = None
+            self.image_encoder = None
+            self._image_params = None
+        else:
+            self.vision = DeepseekV4VisionTower(config, mapping=mapping)
+            self.aligner = DeepseekV4VisionAligner(config)
+            dtype = torch.get_default_dtype()
+            self.image_start = nn.Parameter(
+                torch.empty(config.hidden_size, dtype=dtype, requires_grad=False)
+            )
+            self.image_pad = nn.Parameter(
+                torch.empty(config.hidden_size, dtype=dtype, requires_grad=False)
+            )
+            self.image_newline = nn.Parameter(
+                torch.empty(config.hidden_size, dtype=dtype, requires_grad=False)
+            )
+            self.image_end = nn.Parameter(
+                torch.empty(config.hidden_size, dtype=dtype, requires_grad=False)
+            )
+            self._image_params = None
+            # Encoder callables may be swapped to cudagraph wrappers during
+            # runtime startup; the eager path uses the same entry point.
+            self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
+            self.image_encoder = self.get_image_feature
+
+    @property
+    def _block_params(self) -> torch.Tensor:
+        """The 5 learnable scaffold parameters, indexed by sentinel kind.
+
+        Built lazily (rather than cached) so it always reflects the weights the
+        checkpoint loader wrote into ``self.image_*``.
+        """
+        return torch.stack(
+            [
+                self.image_start,
+                self.image_pad,
+                self.image_pad,
+                self.image_newline,
+                self.image_end,
+            ],
+            dim=0,
+        )
+
+    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+        return pad_input_tokens(input_ids, mm_inputs)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if getattr(self, "vision_embedder", None) is None:
+            return {}
+        return {Modality.IMAGE: EncoderSpec(self.image_encoder)}
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    def _block_metadata(
+        self, item: MultimodalDataItem, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Return ``(types, perm, n_vit_h, n_vit_w)`` for one image item.
+
+        Prefers the gateway-provided ``model_specific_data`` tensors; otherwise
+        rebuilds ``types``/``perm`` from the grid dimensions and the block's
+        start position (the same deterministic layout the checkpoint's own
+        preprocessor emits). ``n_vit_h``/``n_vit_w`` are required for the ViT.
+        """
+        msd = item.model_specific_data or {}
+        types = msd.get("types")
+        perm = msd.get("perm")
+        n_vit_h = msd.get("n_vit_h")
+        n_vit_w = msd.get("n_vit_w")
+        if types is None or perm is None:
+            ratio = int(self.config.vision_downsample_ratio)
+            if n_vit_h is None or n_vit_w is None:
+                n_llm_h = msd.get("n_llm_h")
+                n_llm_w = msd.get("n_llm_w")
+                if n_llm_h is not None and n_llm_w is not None:
+                    # n_llm = ceil(n_vit / ratio) is not invertible, so a pure
+                    # LLM-grid spec still needs the ViT grid to run the tower.
+                    raise ValueError(
+                        "DeepSeek-V4 image item provides n_llm_h/n_llm_w but not "
+                        "n_vit_h/n_vit_w; the vision tower needs the patch grid."
+                    )
+                raise ValueError(
+                    "DeepSeek-V4 image item must provide n_vit_h/n_vit_w "
+                    "(and types/perm) in model_specific_data."
+                )
+            n_llm_h, n_llm_w = llm_grid(
+                int(n_vit_h), int(n_vit_w), int(self.config.vision_downsample_ratio)
+            )
+            start_pos = min(rng[0] for rng in item.offsets)
+            types, perm = build_image_block(n_llm_h, n_llm_w, start_pos)
+        if types is None or perm is None or n_vit_h is None or n_vit_w is None:
+            raise ValueError(
+                "DeepSeek-V4 image item is missing types/perm/n_vit_h/n_vit_w "
+                "in model_specific_data."
+            )
+        return (
+            torch.as_tensor(types, device=device, dtype=torch.int64),
+            torch.as_tensor(perm, device=device, dtype=torch.int64),
+            int(n_vit_h),
+            int(n_vit_w),
+        )
+
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        """Encode one or more images into full text-width block embeddings.
+
+        Each item's ``feature`` is the ``(n_vit_h*n_vit_w, 3, p, p)`` patch
+        tensor (or already-flattened ``(N, 3*p*p)``). The returned rows are the
+        final sentinel blocks in the item order the embedder expects, so the
+        generic scatter places them at the placeholder offsets unchanged.
+        """
+        device = self.image_start.device
+        dtype = self.image_start.dtype
+        blocks: list[torch.Tensor] = []
+        for item in items:
+            types, perm, n_vit_h, n_vit_w = self._block_metadata(item, device)
+            features = item.feature.to(device, non_blocking=True)
+            x = self.vision.encode_image(features, n_vit_h, n_vit_w)
+            embeds = self.aligner(x, n_vit_h, n_vit_w)[perm].to(dtype)
+            block = self._block_params[types]
+            block[types == IMAGE] = embeds
+            blocks.append(block)
+        return torch.cat(blocks, dim=0)
+
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        multimodal_context = kwargs.pop("multimodal_context", None)
+        if (
+            multimodal_context is None
+            or not multimodal_context.has_extend_inputs()
+            or ctx.forward_mode.is_decode_or_idle()
+            or getattr(self, "vision_embedder", None) is None
+        ):
+            return super().forward(
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                **kwargs,
+            )
+
+        input_embeds, model_kwargs = self.vision_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self.model.embed_tokens,
+            ctx=multimodal_context,
+            encoders=self.get_multimodal_encoder_specs(),
+            multimodal_model=self,
+        )
+        hidden_states, aux_hidden_states = self.model(
+            input_ids,
+            positions,
+            ctx,
+            out_cache_loc,
+            input_embeds=input_embeds,
+            **model_kwargs,
+        )
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states,
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.capture_aux_hidden_states = True
         self.model.set_dspark_layers_to_capture(layer_ids)
@@ -4265,8 +4534,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
         ]
 
-    @staticmethod
-    def _map_weight_name(name: str) -> str:
+    def _map_weight_name(self, name: str) -> str:
         if name.startswith("layers."):
             name = "model." + name
         elif name.startswith("embed."):
@@ -4285,7 +4553,10 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             # MegaMoE experts register block scales as ``w{13,2}_weight_scale``;
             # the generic block-FP8 MoELayer (non-mega, Hopper DeepEP path)
             # registers ``..._weight_scale_inv`` via create_fp8_block_scale_inverses.
-            if get_moe_backend().is_mega_moe():
+            # An MXFP4 routed-expert MoELayer registers its group scales as
+            # ``w{13,2}_weight_scale`` too (create_mxfp4_weight_pair), so it
+            # follows the MegaMoE spelling rather than the block-FP8 one.
+            if get_moe_backend().is_mega_moe() or _routed_experts_are_fp4(self.config):
                 name = name.replace(".scale", ".weight_scale")
             else:
                 name = name.replace(".scale", ".weight_scale_inv")
@@ -4330,6 +4601,18 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         for raw_name, loaded_weight in weights:
             name = self._map_weight_name(raw_name)
             if name.startswith("mtp."):
+                continue
+            # Vision encoder / aligner / image-scaffold tensors live outside the
+            # LM and must not run through the stacked-params or MoE mapping
+            # (whose bare "w1"/"w3" substrings would rewrite vision.*.mlp.w1 and
+            # aligner.w1 and then silently drop them).
+            if name.startswith(("vision.", "aligner.", "image_")):
+                param = params_dict.get(name)
+                if param is not None:
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
                 continue
             if (
                 name.endswith("attn.wo_a.weight")

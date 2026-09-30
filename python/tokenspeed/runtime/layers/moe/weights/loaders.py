@@ -83,7 +83,16 @@ def load_w13(
             )
 
     expert_data = expert_data.narrow(shard_dim, start, shard_size)
-    dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+    try:
+        dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+    except Exception as exc:
+        raise RuntimeError(
+            f"load_w13 mismatch: shard_id={shard_id} shard_dim={shard_dim} "
+            f"is_bias={is_bias} tp_size={tp_size} tp_rank={tp_rank} "
+            f"expert_data={tuple(expert_data.shape)}/{expert_data.dtype} "
+            f"loaded_weight={tuple(loaded_weight.shape)}/{loaded_weight.dtype} "
+            f"shard_size={shard_size} start={start}"
+        ) from exc
     loaded_weight = preserve_e8m0_bytes_for_uint8_param(dst, loaded_weight)
     dst.copy_(loaded_weight)
 

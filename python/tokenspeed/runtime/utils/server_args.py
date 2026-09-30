@@ -814,6 +814,19 @@ class ServerArgs:
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()
+        # Escape hatch: the fused path goes through the AOT trtllm_comm module,
+        # and when that module is unusable on a given box there is otherwise no
+        # supported way to run TP>1 -- the auto-enable below has no CLI
+        # counterpart. Keep it explicit and logged so a silent switch and a
+        # broken switch do not look alike.
+        if os.environ.get("TOKENSPEED_DISABLE_ALLREDUCE_FUSION") == "1":
+            self.enable_allreduce_fusion = False
+            self.comm_fusion_max_num_tokens = -1
+            logger.info(
+                "Allreduce fusion force-disabled by "
+                "TOKENSPEED_DISABLE_ALLREDUCE_FUSION=1"
+            )
+            return
         if (
             not self.enable_allreduce_fusion
             and (current_platform().is_hopper_plus or platform.is_amd)

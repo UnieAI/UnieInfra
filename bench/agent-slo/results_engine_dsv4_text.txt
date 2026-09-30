@@ -1,0 +1,25 @@
+UnieInfra engine (ts serve) baseline — text-only, DeepSeek-V4-Flash-Vision-Exp, TP2, physically 6/7
+Command (same as vLLM):
+  vllm bench serve --backend openai-chat --model dsv4 --tokenizer /models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+    --dataset-name random --num-prompts 64 --request-rate 4 --random-input-len 256 --random-output-len 128 \
+    --ignore-eos --temperature 0 --endpoint /v1/chat/completions
+Client from container vllm-dsv4 -> base_url http://172.17.0.3:30101 (engine gateway, host 0.0.0.0).
+Engine flags: --speculative-algorithm DSPARK --speculative-config '{"method":"DSPARK","num_speculative_tokens":5}'
+  --disable-kvstore --max-cudagraph-capture-size 40
+Result:
+  Successful requests: 64    Failed: 0
+  Total generated tokens: 8192   (all responses reached max_tokens=128; ok)
+  Benchmark duration (s): 63.57
+  Output token throughput (tok/s): 128.87
+  Peak output token throughput (tok/s): 223.00
+  Total token throughput (tok/s): 390.65
+  Mean TTFT (ms): 28586.37
+  Median TTFT (ms): 28354.53
+  P99 TTFT (ms): 37344.21
+  Mean TPOT (ms): 150.63
+  Median TPOT (ms): 145.90
+  P99 TPOT (ms): 318.67
+  Mean ITL (ms): 390.78
+  Median ITL (ms): 347.54
+  P99 ITL (ms): 1255.24
+  Accept_num_tokens_avg (from engine log): ~1.76-2.05, i.e. DSPARK MTP draft accepted ~1.8-2.0 tokens/draft

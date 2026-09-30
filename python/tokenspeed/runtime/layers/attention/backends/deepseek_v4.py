@@ -847,6 +847,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         positions = kwargs.get("positions")
         num_extends_arg = kwargs.pop("num_extends", None)
         num_extends = bs if num_extends_arg is None else int(num_extends_arg)
+        multimodal_context = kwargs.pop("multimodal_context", None)
         if num_tokens_arg is not None:
             num_tokens = int(num_tokens_arg)
         elif isinstance(positions, torch.Tensor):
@@ -1064,6 +1065,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
         elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             self.forward_prefill_metadata = self.forward_metadata
+        if (
+            multimodal_context is not None
+            and self.forward_prefill_metadata is not None
+            and self.forward_prefill_metadata.num_prefill_tokens > 0
+            and self.forward_prefill_metadata.image_span_lo is None
+        ):
+            from tokenspeed.runtime.models.deepseek_v4 import (
+                build_image_spans_from_context,
+            )
+
+            span_lo, span_hi = build_image_spans_from_context(
+                multimodal_context,
+                self.forward_prefill_metadata.num_prefill_tokens,
+                seq_lens.device,
+            )
+            self.forward_prefill_metadata.image_span_lo = span_lo
+            self.forward_prefill_metadata.image_span_hi = span_hi
         self._decode_tile_metadata = {}
 
     def _update_decode_swa_metadata(
@@ -1542,6 +1560,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
+        span_lo = metadata.image_span_lo
+        span_hi = metadata.image_span_hi
+        max_image_tokens = metadata.image_span_max_tokens
         cache_metadata = metadata.cache
         num_reqs = metadata.seq_lens.numel()
         prefix_lens = metadata.seq_lens - metadata.query_lens
@@ -1607,6 +1628,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk=topk_indices.shape[-1],
                 workspace_width=workspace_width,
                 compressed_base=compressed_base,
+                span_lo=span_lo,
+                span_hi=span_hi,
+                max_image_tokens=max_image_tokens,
             )
             return kv_workspace, indices, lens
 
@@ -1663,6 +1687,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk=dense_compressed_indices.shape[-1],
                 workspace_width=workspace_width,
                 compressed_base=compressed_base,
+                span_lo=span_lo,
+                span_hi=span_hi,
+                max_image_tokens=max_image_tokens,
             )
             return kv_workspace, indices, lens
 
@@ -1676,6 +1703,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compress_ratio=compress_ratio,
             workspace_width=workspace_width,
             compressed_base=compressed_base,
+            span_lo=(span_lo[: positions.numel()] if span_lo is not None else None),
+            span_hi=(span_hi[: positions.numel()] if span_hi is not None else None),
+            max_image_tokens=max_image_tokens,
         )
         return kv_workspace, indices, lens
 
@@ -1775,6 +1805,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=forward_mode,
+            image_span_lo=(
+                metadata.image_span_lo[token_start:token_end]
+                if metadata.image_span_lo is not None
+                else None
+            ),
+            image_span_hi=(
+                metadata.image_span_hi[token_start:token_end]
+                if metadata.image_span_hi is not None
+                else None
+            ),
+            image_span_max_tokens=metadata.image_span_max_tokens,
         )
 
     def _forward_deepseek_v4_prefill_chunk(

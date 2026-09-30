@@ -1,0 +1,24 @@
+vLLM baseline (reference) — text-only, DeepSeek-V4-Flash-Vision-Exp, TP2, physically 4/5
+Same command as engine run:
+  vllm bench serve --backend openai-chat --model dsv4 --tokenizer /models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+    --dataset-name random --num-prompts 64 --request-rate 4 --random-input-len 256 --random-output-len 128 \
+    --ignore-eos --temperature 0 --endpoint /v1/chat/completions
+Client from container vllm-dsv4 -> base_url http://127.0.0.1:8889 (vLLM server).
+vLLM server flags: --tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.70 --enforce-eager
+  env: NCCL_NVLS_ENABLE=0 VLLM_USE_BREAKABLE_CUDAGRAPH=0
+Result:
+  Successful requests: 64    Failed: 0
+  Total generated tokens: 8192   (all responses reached max_tokens=128; ok)
+  Benchmark duration (s): 37.53
+  Output token throughput (tok/s): 218.26
+  Peak output token throughput (tok/s): 448.00
+  Total token throughput (tok/s): 796.32
+  Mean TTFT (ms): 7881.82
+  Median TTFT (ms): 7661.34
+  P99 TTFT (ms): 16467.38
+  Mean TPOT (ms): 160.45
+  Median TPOT (ms): 150.37
+  P99 TPOT (ms): 278.97
+  Mean ITL (ms): 159.20
+  Median ITL (ms): 149.22
+  P99 ITL (ms): 164.56

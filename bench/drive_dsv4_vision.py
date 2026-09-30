@@ -33,7 +33,7 @@ import smg_grpc_proto.generated.tokenspeed_scheduler_pb2 as pb  # noqa: E402
 import smg_grpc_proto.generated.tokenspeed_scheduler_pb2_grpc as pbg  # noqa: E402
 
 CKPT = "/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
-HOST = "127.0.0.1:56749"
+HOST = os.environ.get("IMG_GRPC_HOST", "127.0.0.1:56749")
 IMG_START_POS = 3  # block start position inside the expanded stream (arbitrary)
 
 
@@ -134,7 +134,7 @@ def main() -> int:
     req = pb.GenerateRequest()
     req.request_id = "vision-test-" + uuid.uuid4().hex[:8]
     req.tokenized.input_ids.extend(input_ids)
-    req.sampling_params.max_new_tokens = 16
+    req.sampling_params.max_new_tokens = int(os.environ.get("IMG_MAX_TOKENS", "16"))
     req.sampling_params.temperature = 0.0
     req.sampling_params.skip_special_tokens = True
     req.stream = False

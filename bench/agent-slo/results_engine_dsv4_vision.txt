@@ -1,0 +1,34 @@
+Engine (TokenSpeed) vision benchmark — DeepSeek-V4-Flash-Vision-Exp
+====================================================================
+
+Shape: 1 image + short text prompt; the prompt token sequence already carries
+the expanded sentinel block ``vocab_size + types`` (114 image tokens) — no
+image-placeholder token is used, per the engine's driver contract. TokenSpeed
+vision requests MUST go over gRPC: the OpenAI gateway (smg) has no DeepSeek-V4
+vision processor registered, so ``/v1/chat/completions`` rejects multimodal
+(``invalid_multimodal_request: multimodal not supported for model: dsv4``).
+
+Corpus: same synthetic gradient image reused across all requests, 64 output
+tokens each (``IMG_MAX_TOKENS=64``).
+
+Result run: conc=16, nreq=32, max_tokens=64, gRPC host 127.0.0.1:35225.
+  duration   43.85s
+  ok         32 / 32
+  total_tok  2048  (64 token/req, finish=length on all)
+  TTFT       mean 19483.5ms  med 19719.1ms  P99 37779.0ms
+  TPOT       mean 37.9ms     med 38.8ms      P99 46.4ms
+  out_tok/s  46.70
+
+Notes
+-----
+* TTFT is dominated by prefill of the 114-token expanded image span (ViT encode
+  + per-token bidirectional SWA widening). The conc=16 burst queues behind the
+  prefill, hence the very long P99 TTFT.
+* TPOT (37.9ms) and total-token per request are correct: the driver accumulates
+  output ids from the chunk stream. The gRPC ``complete`` frame only echoes the
+  last chunk's ids and must NOT be used as the token count (it under-reports:
+  e.g. 2 tokens measured when 24 were generated).
+* Correctness gate satisfied: the decoder output describes the supplied image
+  ("repeating geometric pattern composed of slanted parallelogram tiles with a
+  full-spectrum color gradient"), i.e. the image-span bidirectional attention is
+  actually engaged and the model sees the fused patch region.

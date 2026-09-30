@@ -25,6 +25,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+
 from tokenspeed.runtime.models.deepseek_v4 import build_image_spans_from_context
 
 

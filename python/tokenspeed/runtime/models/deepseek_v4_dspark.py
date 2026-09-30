@@ -37,6 +37,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4MegaMoEExperts,
+    _routed_experts_are_fp4,
     hc_head,
     mhc_fused_hc,
     mhc_post,
@@ -591,7 +592,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_multimodal_active: bool = True,
+        mm_attention_backend: str | None = None,
     ) -> None:
+        del is_multimodal_active, mm_attention_backend  # drafter is text-only
         super().__init__()
         self.config = config
         self.mapping = mapping
@@ -671,10 +675,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             # MegaMoE experts register block scales as ``w{13,2}_weight_scale``;
             # the generic block-FP8 MoELayer (non-mega, e.g. flashinfer_cutlass
             # on Hopper) registers ``..._weight_scale_inv``. Mirror
-            # DeepseekV4ForCausalLM._map_weight_name.
+            # DeepseekV4ForCausalLM._map_weight_name, which also sends MXFP4
+            # routed-expert scales down the ``weight_scale`` spelling.
             scale_suffix = (
                 ".weight_scale"
-                if _EXPERT_SCALE_RE.search(name) and get_moe_backend().is_mega_moe()
+                if _EXPERT_SCALE_RE.search(name)
+                and (
+                    get_moe_backend().is_mega_moe()
+                    or _routed_experts_are_fp4(self.config)
+                )
                 else ".weight_scale_inv"
             )
             name = name.removesuffix(".scale") + scale_suffix

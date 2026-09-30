@@ -148,6 +148,14 @@ class DeepseekV4ForwardMetadata:
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
+    # Per-flat-prefill-token request-absolute inclusive bounds of the image
+    # sentinel span the token is inside (-1 means the token is not in an image
+    # span). Prefill-only: decode rows are not indexed into these tensors.
+    image_span_lo: torch.Tensor | None = None
+    image_span_hi: torch.Tensor | None = None
+    # ``vision_max_n_token`` from the checkpoint config; caps the bidirectional
+    # image-span window so its max width is window_size + this value.
+    image_span_max_tokens: int = 0
 
     def decode_req_count(self) -> int:
         return max(0, int(self.req_pool_indices.shape[0]) - int(self.num_prefill_reqs))

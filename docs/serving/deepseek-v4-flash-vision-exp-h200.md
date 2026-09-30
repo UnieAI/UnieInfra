@@ -16,12 +16,47 @@ of the `roy` host, through the token-speed / UnieInfra engine.
 | GPU footprint (text-only backbone) | ~129 GiB/GPU, ~13.7 GiB free |
 | Vision-language input path (image -> tokens, no placeholder token) | done |
 | Vision correctness vs reference tower | layout identical, embeddings match (<1e-2) |
-| MTP / NextN layers (`num_nextn_predict_layers=3`) | **not wired yet** |
-| Benchmark vs vLLM + agentX | **not done yet** |
+| Image-span bidirectional attention (sparse prefill SWA window) | done, GPU-kernel tested |
+| MTP / NextN layers (`num_nextn_predict_layers=3`) | done (DSPARK, `Accept_num_tokens_avg` 1.6–3.5) |
+| Text benchmark vs vLLM (`vllm bench serve`) | done — see below |
+| Vision benchmark vs vLLM | done — see below |
+| AgentX (TPGS / P90 / DEP) evaluation | pending |
 
-The text backbone and the vision path are both working: `vision.*` and
-`aligner.*` weights are loaded and the LM runs with image embeddings injected;
-`mtp.*` layers still load but are not driven.
+The text backbone, the vision path, and the MTP/NextN draft path are all
+working: `vision.*` and `aligner.*` are loaded and the LM runs with image
+embeddings injected; `mtp.*` is driven as the DSPARK speculative draft (the
+engine's `Accept_num_tokens_avg` per-step log shows ~1.6–3.5 accepted draft
+tokens per decode step, so it is not a degraded text-only path).
+
+### Benchmarks (H200, 64 requests, 128 output tokens, temperature 0)
+
+Measured with `vllm bench serve` (it reads `usage.completion_tokens`, so token
+counts are exact; the engine stream honours `stream_options.include_usage`).
+Engine on GPUs 6,7 (`roy-h200g`); vLLM `v0.30.1rc1.dev396` on GPUs 4,5.
+
+| Axis (text, `--ignore-eos`, 64 req) | Engine (DSPARK) | vLLM |
+| --- | --- | --- |
+| Duration (s) | 63.57 | 37.53 |
+| Output throughput (tok/s) | 128.87 | 218.26 |
+| Peak output (tok/s) | 223 | 448 |
+| Total throughput (tok/s) | 390.65 | 796.32 |
+| TTFT mean / med / P99 (ms) | 28586 / 28354 / 37344 | 7882 / 7661 / 16467 |
+| TPOT mean / med / P99 (ms) | 150.63 / 145.90 / 318.67 | 160.45 / 150.37 / 278.97 |
+| ITL mean / P99 (ms) | 390.78 / 1255.24 | 159.20 / 164.56 |
+
+Both got 64/64 successful requests and 8192 generated tokens. The two engines
+use different input representations for vision (the engine expands the image to
+a 114-token sentinel block; vLLM uses the `<|deepseek_image|>` placeholder), so
+the vision axes are only comparable on output throughput / TPOT:
+
+| Axis (vision, 32 req @ conc 16, 64 output tokens) | Engine (gRPC) | vLLM (64 req, rate 4) |
+| --- | --- | --- |
+| Output throughput (tok/s) | 46.70 | 147.85 |
+| TTFT mean / med / P99 (ms) | 19483 / 19719 / 37779 | 5722 / 5189 / 13151 |
+| TPOT mean / med / P99 (ms) | 37.9 / 38.8 / 46.4 | 193.9 / 152.0 / 358.8 |
+
+Full command lines and per-request dumps are in `bench/agent-slo/`
+(`results_*_dsv4_{text,vision}.txt`).
 
 ## Why the two-GPU quantization is not a no-op on Hopper
 
@@ -82,6 +117,28 @@ All are uncommitted on branch `unieai`.
      through a null multicast pointer and the failure surfaces asynchronously
      inside an unrelated later Triton launch, taking down every TP launch.
 
+5. Image-span bidirectional attention (prefill)
+
+   - `tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/triton/deepseek_v4.py`:
+     both swap-index combiners gained optional `span_lo`/`span_hi` (per-token
+     image-span bounds) and `max_image_tokens`; a token inside a span widens its
+     SWA left/right window to the reference `get_image_visible` window.
+   - `python/tokenspeed/runtime/layers/attention/deepseek_v4/metadata.py` +
+     `.../attention/backends/deepseek_v4.py`: `DeepseekV4ForwardMetadata` carries
+     `image_span_lo/hi` + `image_span_max_tokens`, sliced per chunk and passed to
+     all three combine call sites.
+   - `python/tokenspeed/runtime/models/deepseek_v4.py`:
+     `build_image_spans_from_context` mirrors the multimodal embedder's
+     request/prefix/base walk and attaches the spans during the model forward.
+
+6. MTP / NextN (DSPARK) wiring
+
+   - `python/tokenspeed/runtime/models/deepseek_v4_dspark.py` now threads the
+     multimodal-active flag and the DSV4 attention backend through the draft
+     path, and `_map_checkpoint_name` spells `weight_scale` vs
+     `weight_scale_inv` based on the MTP positions / FP4 scheme so the draft
+     weights load at the right dtype.
+
 ## How to launch
 
 Container `roy-h200g` was committed from the GPU-enabled `ts-env:gpu` image
@@ -100,6 +157,14 @@ bash /workspace/roy/launch_vision.sh v4vision
 Watch the log: `Kernel tuning finished`, `Capturing batches ... 23/23`,
 `TokenSpeed gRPC server is ready`, `Starting TokenSpeed HTTP server`. Engine
 gRPC on port 56749, OpenAI HTTP on 30102 (also accepted on 30101).
+
+When serving with the DSPARK speculative draft (`--speculative-algorithm
+DSPARK --speculative-config '{"method":"DSPARK","num_speculative_tokens":5}'`)
+on this checkpoint, pass `--disable-kvstore` (the same-checkpoint KV store is
+not wired for the DSV4 vision path) and lower `--max-cudagraph-capture-size`
+to 40 — the DSPARK draft capture otherwise attempts a batch-80 graph that
+OOMs the ~13.7 GiB/GPU headroom. `Accept_num_tokens_avg` in the per-step log
+is the evidence the draft is actually engaged (1.6–3.5 on this run).
 
 ```bash
 docker exec roy-h200g curl -s -m 120 http://127.0.0.1:30102/v1/completions \
@@ -122,26 +187,21 @@ fit at the current `gpu_memory_utilization=0.87` without one of:
 - running the vision tower at TP1 in the encode role (EPD
   `--disaggregation-mode encode`).
 
-## Remaining integration (not yet done)
+## Remaining integration
 
-- **Bidirectional image attention.** The reference decoder gives image-span
-  tokens (between `IMAGE_START` and `IMAGE_END`) bidirectional attention via
-  `get_image_visible` / `get_window_topk_idxs_visible` (see
-  `inference/model.py`). The engine's sparse-indexer + CSA attention kernels do
-  not yet extend the SWA window for the image span, so the image embeddings are
-  visible through the compressed-prefix / dense path only. Solid-color probes
-  still answer correctly (red -> "Red", blue -> "Blue"), so this is a quality /
-  full-fidelity enhancement, not a correctness blocker.
-- **MTP / NextN.** `models/deepseek_v4_mtp.py` already exists (inference-only
-  draft). The checkpoint has `num_nextn_predict_layers=3`; the log showed
-  `drafter=False`, so the layers are loaded but never driven. Confirm the
-  draft path is invoked with the 3-stage depth count and wire it as
-  speculative decoding.
-- **Benchmark.** Compare against latest vLLM (`lmcache/vllm-openai:nightly-...`)
-  with `vllm bench` on GPUs 4,5, and the engine's own bench harness on 6,7;
-  then exercise `SemiAnalysis/agentX` (TPGS, P90 interactivity, DEP
-  disaggregation). vLLM needs to recognize the DeepSeek-V4-Flash-Vision-Exp
-  architecture first.
+- **AgentX.** Run `SemiAnalysis/agentx-conversation-explorer` with HF traces
+  (`semianalysisai/cc-traces-*`) on both engines to compare TPGS, P90
+  interactivity and DEP disaggregation. The OpenAI-compat driver
+  (`bench/agent-slo/drive.py`) and corpus (`ts64.jsonl`) are in place; the
+  engine gateway accepts the multimodal-free AgentX data over
+  `/v1/chat/completions` for text requests.
+- **Vision through the OpenAI gateway.** `/v1/chat/completions` rejects
+  multimodal requests for this model (`invalid_multimodal_request: multimodal
+  not supported for model: dsv4`) because the smg Rust registry has no
+  DeepSeek-V4 vision processor. Vision requests must use the gRPC scheduler
+  (`bench/drive_dsv4_vision.py`, `bench/bench_dsv4_vision_grpc.py`). Registering
+  the processor in smg would let the HTTP path forward the precomputed
+  multimodal inputs that `async_llm.py` already expects.
 
 ## Vision integration (done)
 
@@ -184,6 +244,28 @@ green image -> empty output (model emitted EOS); `verify_dsv4_vision` reports
 identical block layout and embeddings matching the reference to < 1e-2. The
 image span must fit inside a single prefill block (prompts here are ~130
 tokens, well under the 256-token block size).
+
+### Image-span bidirectional attention (prefill, done)
+
+The sparse-prefill index combiners
+(`deepseek_v4_combine_topk_swa_indices` /
+`deepseek_v4_combine_dense_swa_indices`) now widen a token's SWA window from the
+causal `[pos - window_size + 1, pos]` slice to the reference visible window
+(`get_image_visible` / `get_window_topk_idxs_visible`) when the token is inside
+an image sentinel span: up to `window_size - 1` tokens to the left and
+`vision_max_n_token` tokens to the right (so the widest window is
+`window_size + vision_max_n_token`, here 128+384=512). It is **not** the whole
+span when the span is longer than that fixed window. The spans are built by
+`build_image_spans_from_context` in `models/deepseek_v4.py` (mirroring the
+multimodal embedder's request/prefix/base walk) and attached to
+`DeepseekV4ForwardMetadata.image_span_lo/hi` plus the
+`image_span_max_tokens` cap; `_prefill_workspace` passes them to all three
+combine call sites. Decode is untouched (still causal), and prefill tokens
+**not** in a span are byte-identical to the previous causal window.
+Kernel-level GPU tests live at
+`tokenspeed-kernel/test/test_deepseek_v4_image_span_swa_gpu.py` (including a
+span wider than the window to exercise the cap) and the span builder at
+`test/runtime/models/test_deepseek_v4_image_span.py`.
 
 ## Vision integration contract (verified by reading the engine)
 
@@ -231,20 +313,3 @@ sub-dict is needed; the fields are top-level (`vision_n_layers`=32,
 `vision_patch_size`=14, `vision_rope_theta`=10000,
 `vision_downsample_ratio`=3, `vision_max_n_token`=384,
 `vision_min_pixels`=147456, `vision_max_wh_ratio`=8).
-
-## Remaining integration (not yet done)
-
-- **Vision-language path.** Port `inference/vision.py` as the model's
-  `self.vision`, register multimodal, wire `get_multimodal_encoder_specs` +
-  `pad_input_ids`, and run one image prompt against the reference sglang
-  server (GPU 0-3) to confirm token-for-token agreement at temperature 0.
-- **MTP / NextN.** `models/deepseek_v4_mtp.py` already exists (inference-only
-  draft). The checkpoint has `num_nextn_predict_layers=3`; the log showed
-  `drafter=False`, so the layers are loaded but never driven. Confirm the
-  draft path is invoked with the 3-stage depth count and wire it as
-  speculative decoding.
-- **Benchmark.** Compare against latest vLLM (`lmcache/vllm-openai:nightly-...`)
-  with `vllm bench` on GPUs 4,5, and the engine's own bench harness on 6,7;
-  then exercise `SemiAnalysis/agentX` (TPGS, P90 interactivity, DEP
-  disaggregation). vLLM needs to recognize the DeepSeek-V4-Flash-Vision-Exp
-  architecture first.

@@ -1294,10 +1294,14 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     workspace_width,
     compressed_base,
+    span_lo_ptr,
+    span_hi_ptr,
     topk: tl.constexpr,
     compress_ratio: tl.constexpr,
     window_size: tl.constexpr,
     padded_topk: tl.constexpr,
+    swa_capacity: tl.constexpr,
+    max_image_tokens: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -1318,6 +1322,19 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
         topk_len = tl.minimum((pos + 1) // compress_ratio, topk)
         swa_len = tl.minimum(pos + 1, window_size)
 
+        span_lo = tl.load(span_lo_ptr + token_idx).to(tl.int32)
+        span_hi = tl.load(span_hi_ptr + token_idx).to(tl.int32)
+        in_span = span_lo >= 0
+        # Visible bidirectional window: up to window_size-1 tokens to the left
+        # and max_image_tokens to the right, matched against the reference
+        # get_window_topk_idxs_visible. Non-span tokens stay causal.
+        left = tl.minimum(pos - span_lo, max_image_tokens - 1)
+        right = tl.minimum(span_hi - pos, max_image_tokens)
+        span_start = tl.maximum(tl.maximum(pos - window_size + 1, pos - left), 0)
+        span_len = pos + right - span_start + 1
+        cur_len = tl.where(in_span, span_len, swa_len)
+        cur_start_global = tl.where(in_span, span_start, pos - swa_len + 1)
+
         topk_offsets = tl.arange(0, padded_topk)
         topk_mask = topk_offsets < topk_len
         topk_values = tl.load(
@@ -1331,7 +1348,7 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
             mask=topk_mask,
         )
 
-        swa_offsets = tl.arange(0, window_size)
+        swa_offsets = tl.arange(0, swa_capacity)
         tl.store(
             combined_indices_ptr
             + token_idx * combined_indices_stride
@@ -1339,15 +1356,13 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
             + swa_offsets,
             workspace_width * batch_idx
             + compressed_base
-            + swa_offsets
-            + pos
-            - swa_len
-            + 1
-            - gather_start,
-            mask=swa_offsets < swa_len,
+            + cur_start_global
+            - gather_start
+            + swa_offsets,
+            mask=swa_offsets < cur_len,
         )
 
-        tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
+        tl.store(combined_lens_ptr + token_idx, topk_len + cur_len)
 
 
 def deepseek_v4_combine_topk_swa_indices(
@@ -1361,13 +1376,36 @@ def deepseek_v4_combine_topk_swa_indices(
     topk: int,
     workspace_width: int,
     compressed_base: int,
+    span_lo: torch.Tensor | None = None,
+    span_hi: torch.Tensor | None = None,
+    max_image_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build FlashMLA sparse prefill indices from compressed prefix and SWA."""
+    """Build FlashMLA sparse prefill indices from compressed prefix and SWA.
+
+    ``span_lo``/``span_hi`` hold the request-absolute inclusive bounds of the
+    image sentinel span that each prefill token is inside (``-1`` when the token
+    is not in an image span). When a token is inside a span its SWA window is
+    widened to a bidirectional window of at most ``window_size + max_image_tokens``
+    tokens (``window_size - 1`` to the left, ``max_image_tokens`` to the right),
+    matching the reference ``get_window_topk_idxs_visible``. Any token without a
+    span (``span_lo < 0``) keeps the exact causal window.
+    """
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
+    if span_lo is None or span_hi is None:
+        span_lo = torch.full(
+            (num_tokens,), -1, dtype=torch.int32, device=topk_indices.device
+        )
+        span_hi = torch.full(
+            (num_tokens,), -1, dtype=torch.int32, device=topk_indices.device
+        )
+    span_lo = span_lo[:num_tokens].to(torch.int32).contiguous()
+    span_hi = span_hi[:num_tokens].to(torch.int32).contiguous()
+
+    swa_capacity = triton.next_power_of_2(window_size + max_image_tokens)
     combined_topk = (
-        (topk + window_size + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        (topk + swa_capacity + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
         // DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
         * DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
     )
@@ -1394,10 +1432,14 @@ def deepseek_v4_combine_topk_swa_indices(
         gather_lens.to(torch.int32),
         workspace_width,
         compressed_base,
+        span_lo,
+        span_hi,
         topk=topk,
         compress_ratio=compress_ratio,
         window_size=window_size,
         padded_topk=triton.next_power_of_2(topk_indices.shape[-1]),
+        swa_capacity=swa_capacity,
+        max_image_tokens=max_image_tokens,
     )
     return combined_indices, combined_lens
 
@@ -1474,9 +1516,13 @@ def _deepseek_v4_combine_dense_swa_indices_kernel(
     gather_lens_ptr,
     workspace_width,
     compressed_base,
+    span_lo_ptr,
+    span_hi_ptr,
     combined_topk: tl.constexpr,
     compress_ratio: tl.constexpr,
     window_size: tl.constexpr,
+    swa_capacity: tl.constexpr,
+    max_image_tokens: tl.constexpr,
     candidate_block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -1497,7 +1543,17 @@ def _deepseek_v4_combine_dense_swa_indices_kernel(
     else:
         compressed_len = tl.full((), 0, tl.int32)
     swa_len = tl.minimum(pos + 1, window_size)
-    total_len = compressed_len + swa_len
+
+    span_lo = tl.load(span_lo_ptr + token_idx).to(tl.int32)
+    span_hi = tl.load(span_hi_ptr + token_idx).to(tl.int32)
+    in_span = span_lo >= 0
+    left = tl.minimum(pos - span_lo, max_image_tokens - 1)
+    right = tl.minimum(span_hi - pos, max_image_tokens)
+    span_start = tl.maximum(tl.maximum(pos - window_size + 1, pos - left), 0)
+    span_len = pos + right - span_start + 1
+    cur_len = tl.where(in_span, span_len, swa_len)
+    cur_start_global = tl.where(in_span, span_start, pos - swa_len + 1)
+    total_len = compressed_len + cur_len
 
     request_base = workspace_width * req_idx
     values = tl.full((candidate_block,), -1, tl.int32)
@@ -1507,7 +1563,7 @@ def _deepseek_v4_combine_dense_swa_indices_kernel(
     swa_offsets = offsets - compressed_len
     is_swa = (offsets >= compressed_len) & (offsets < total_len)
     swa_values = (
-        request_base + compressed_base + swa_offsets + pos - swa_len + 1 - gather_start
+        request_base + compressed_base + cur_start_global - gather_start + swa_offsets
     )
     values = tl.where(is_swa, swa_values, values)
 
@@ -1530,13 +1586,35 @@ def deepseek_v4_combine_dense_swa_indices(
     compress_ratio: int,
     workspace_width: int,
     compressed_base: int,
+    span_lo: torch.Tensor | None = None,
+    span_hi: torch.Tensor | None = None,
+    max_image_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build dense-compressed plus SWA sparse prefill indices."""
+    """Build dense-compressed plus SWA sparse prefill indices.
+
+    ``span_lo``/``span_hi`` hold the request-absolute inclusive bounds of the
+    image sentinel span that each prefill token is inside (``-1`` when the token
+    is not in an image span). When a token is inside a span its SWA window is
+    widened to a bidirectional window of at most ``window_size + max_image_tokens``
+    tokens; tokens without a span keep the exact causal
+    ``[pos - window_size + 1, pos]`` slice.
+    """
 
     num_tokens = positions.numel()
+    if span_lo is None or span_hi is None:
+        span_lo = torch.full(
+            (num_tokens,), -1, dtype=torch.int32, device=positions.device
+        )
+        span_hi = torch.full(
+            (num_tokens,), -1, dtype=torch.int32, device=positions.device
+        )
+    span_lo = span_lo[:num_tokens].to(torch.int32).contiguous()
+    span_hi = span_hi[:num_tokens].to(torch.int32).contiguous()
+
+    swa_capacity = triton.next_power_of_2(window_size + max_image_tokens)
     combined_topk = (
         (
-            max(compressed_base + window_size, 1)
+            max(compressed_base + swa_capacity, 1)
             + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
             - 1
         )
@@ -1567,9 +1645,13 @@ def deepseek_v4_combine_dense_swa_indices(
         gather_lens.to(torch.int32),
         workspace_width,
         compressed_base,
+        span_lo,
+        span_hi,
         combined_topk=combined_topk,
         compress_ratio=compress_ratio,
         window_size=window_size,
+        swa_capacity=swa_capacity,
+        max_image_tokens=max_image_tokens,
         candidate_block=candidate_block,
     )
     return combined_indices, combined_lens

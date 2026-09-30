@@ -4324,6 +4324,63 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, aux_hidden_states
 
 
+def build_image_spans_from_context(
+    mm_ctx,
+    num_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-flat-prefill-token image span bounds.
+
+    Mirrors the multimodal embedder's request/prefix/base walk over the full
+    batch so the returned flat indices line up with the flat prefill token slice
+    that the sparse prefill combine kernels index. Returns ``(image_span_lo,
+    image_span_hi)`` int32 tensors of length ``num_tokens``; ``-1`` marks a token
+    that is not inside any image sentinel span. Prefill-only: text/decode rows
+    keep ``-1`` and never carry a span.
+    """
+
+    span_lo = torch.full((num_tokens,), -1, dtype=torch.int32, device=device)
+    span_hi = torch.full((num_tokens,), -1, dtype=torch.int32, device=device)
+    if num_tokens <= 0:
+        return span_lo, span_hi
+    extend_seq_lens = getattr(mm_ctx, "extend_seq_lens", None)
+    extend_prefix_lens = getattr(mm_ctx, "extend_prefix_lens", None)
+    mm_inputs = getattr(mm_ctx, "mm_inputs", None)
+    if extend_seq_lens is None or mm_inputs is None:
+        return span_lo, span_hi
+
+    base = 0
+    for req_idx, req_mm in enumerate(mm_inputs):
+        if req_idx >= len(extend_seq_lens):
+            break
+        seq = int(extend_seq_lens[req_idx])
+        if req_mm is None or seq <= 0:
+            base += max(seq, 0)
+            continue
+        prefix = (
+            int(extend_prefix_lens[req_idx]) if extend_prefix_lens is not None else 0
+        )
+        for item in getattr(req_mm, "mm_items", ()) or ():
+            if item is None or not item.offsets:
+                continue
+            for offset_start, offset_end in item.offsets:
+                # Flat indices covered by this span's portion of the extend
+                # chunk; clamped to the prefill token slice.
+                start_flat = min(
+                    max(base + (int(offset_start) - prefix), 0), num_tokens - 1
+                )
+                end_flat = min(
+                    max(base + (int(offset_end) - prefix), 0), num_tokens - 1
+                )
+                if start_flat <= end_flat:
+                    lo_abs = min(max(int(offset_start), 0), num_tokens - 1)
+                    hi_abs = min(max(int(offset_end), 0), num_tokens - 1)
+                    span_lo[start_flat : end_flat + 1] = lo_abs
+                    span_hi[start_flat : end_flat + 1] = hi_abs
+        base += seq
+    return span_lo, span_hi
+
+
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
 
@@ -4503,6 +4560,18 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
+        prefill_metadata = getattr(ctx.attn_backend, "forward_prefill_metadata", None)
+        if prefill_metadata is not None and prefill_metadata.num_prefill_tokens:
+            span_lo, span_hi = build_image_spans_from_context(
+                multimodal_context,
+                prefill_metadata.num_prefill_tokens,
+                input_ids.device,
+            )
+            prefill_metadata.image_span_lo = span_lo
+            prefill_metadata.image_span_hi = span_hi
+            prefill_metadata.image_span_max_tokens = int(
+                getattr(self.config, "vision_max_n_token", 384)
+            )
         hidden_states, aux_hidden_states = self.model(
             input_ids,
             positions,

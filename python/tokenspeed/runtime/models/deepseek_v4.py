@@ -619,6 +619,61 @@ def _deepseek_v4_gather_paged_indexer_mxfp4_cache(
     return values.view(torch.int8), scales.view(torch.int32).squeeze(-1)
 
 
+def _deepseek_v4_decode_topk_reorder_logits(
+    logits: torch.Tensor,
+    topk: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministically reorder decode top-k indices to score-desc/index-asc.
+
+    The CUDA top-k kernels write the selected set into output slots via
+    ``atomicAdd``, so the array order is nondeterministic thread-arrival order
+    even though the set is deterministic. The flash-MLA consumer walks the
+    indices in array order and softmax accumulation is FP-order-sensitive, so
+    identical sets in different orders produce different bits and diverge. The
+    reference (``torch.topk``, used by the HF model) returns score-descending,
+    index-ascending on ties; reorder to that convention here so every run is
+    self-consistent and agrees with the reference.
+
+    ``topk`` is reordered in place (the decode caller supplies a preallocated
+    ``out`` buffer and ignores the return value) and returned.
+    """
+    if topk.numel() == 0:
+        return topk
+    # Squeeze to a fixed 2-D view: logits is [num_rows, max_len], topk is
+    # [num_rows, topk_tokens] (or a [num_rows*topk_tokens] row view of it).
+    indices = topk.reshape(logits.shape[0], -1)
+    idx64 = indices.to(torch.int64).clamp(min=0)
+    # Gather the logit of each selected position; use -inf for the -1 sentinel
+    # slots so they sort to the end.
+    selected = logits.reshape(logits.shape[0], -1).gather(1, idx64)
+    selected = torch.where(
+        topk.reshape(logits.shape[0], -1) < 0,
+        torch.full_like(selected, float("-inf")),
+        selected,
+    )
+    # Monotone float->uint32 transform mirroring convert_to_uint32_v2 so a
+    # larger key always means a larger score.
+    bits = selected.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    score_bits = torch.where(
+        selected >= 0,
+        bits ^ 0x80000000,
+        (~bits) & 0xFFFFFFFF,
+    )
+    # Composite (score desc, index asc) key. Ascending torch.sort is
+    # deterministic on CUDA, so we pack a score term that DESCENDS with score
+    # into the high 32 bits plus the index into the low 32 bits, which makes
+    # the key unique (index asc) on exact-score ties. Re-bias the high half
+    # into the signed int64 range so positive scores come first instead of
+    # colliding with the int64 sign bit.
+    rank = 0xFFFFFFFF - score_bits
+    high = rank - 0x80000000
+    logical = topk.reshape(logits.shape[0], -1)
+    key = (high << 32) | idx64
+    order = torch.sort(key, dim=1).indices
+    logical.copy_(logical.gather(1, order))
+    return topk
+
+
 def _deepseek_v4_indexer_topk_from_logits(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -722,7 +777,7 @@ def _deepseek_v4_indexer_topk_from_logits(
             topk_tokens,
             max_len,
         )
-        return topk
+        return _deepseek_v4_decode_topk_reorder_logits(logits, topk)
 
     fast_topk_v2(
         logits.contiguous(),
@@ -731,7 +786,7 @@ def _deepseek_v4_indexer_topk_from_logits(
         topk_tokens,
         next_n,
     )
-    return topk
+    return _deepseek_v4_decode_topk_reorder_logits(logits, topk)
 
 
 def _deepseek_v4_indexer_topk_from_logits_prefill_op(

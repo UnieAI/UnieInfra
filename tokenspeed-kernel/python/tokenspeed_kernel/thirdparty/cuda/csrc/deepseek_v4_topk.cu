@@ -112,7 +112,8 @@ __device__ bool process_histogram_step(
     int& threshold_bin_idx, SmemOutputType& smem_output,
     int* smem_threshold_bin_idx, int* smem_final_dst_idx,
     int* smem_final_bin_size, int* smem_found_topk_values,
-    SmemFinalType& smem_final, int top_k) {
+    SmemFinalType& smem_final, int top_k, float* prefix_logits,
+    int* prefix_indices) {
 #pragma unroll
   for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
     smem_final.histo.data[idx] = 0;
@@ -185,7 +186,15 @@ __device__ bool process_histogram_step(
           (step >= 1);
       if (bin_idx < threshold_bin_idx && should_write_directly) {
         int dst_idx = atomicAdd(&smem_found_topk_values[0], 1);
+        // The prefix (bins strictly above the threshold) is guaranteed to be
+        // in the top-k set. atomicAdd picks the storage slot in nondeterministic
+        // thread-arrival order, so record (score, index) in a side pool and let
+        // the finalization pass re-sort it with the same composite key used for
+        // the threshold bin. Writing smem_output here as well keeps the >top_k
+        // near-identical fallback (which never runs finalization) functional.
         smem_output[dst_idx] = idx;
+        prefix_logits[dst_idx] = logit;
+        prefix_indices[dst_idx] = idx;
       }
       if constexpr (step < 3) {
         if (bin_idx == threshold_bin_idx &&
@@ -196,9 +205,23 @@ __device__ bool process_histogram_step(
         }
       } else {
         if (bin_idx == threshold_bin_idx) {
-          int dst_idx = atomicAdd(&smem_final.histo.data[bin_idx], 1);
-          if (dst_idx < top_k) {
-            smem_output[dst_idx] = idx;
+          if (smem_final_bin_size[0] <= kNumFinalItems) {
+            // Deterministic path: pool the whole threshold bin into
+            // smem_final.items so the final (rank-desc, index-asc) sort SELECTS
+            // which items make the cut. Writing here via histogram atomics would
+            // pick an arbitrary subset of near-tie items in nondeterministic
+            // thread order.
+            int dst_idx = atomicAdd(&smem_final_dst_idx[0], 1);
+            smem_final.items.logits[dst_idx] = logit;
+            smem_final.items.indices[dst_idx] = idx;
+          } else {
+            // More than kNumFinalItems near-identical values in one bin cannot
+            // be sorted; fall back to filling up to top_k (the ties are exact
+            // by construction, so the order does not change the softmax set).
+            int dst_idx = atomicAdd(&smem_final.histo.data[bin_idx], 1);
+            if (dst_idx < top_k) {
+              smem_output[dst_idx] = idx;
+            }
           }
         }
       }
@@ -218,7 +241,7 @@ static __device__ void topk_per_row_job(const float* logits, int row_start,
   static constexpr int kNumFinalItems = 2048;
   static constexpr int kNumFinalItemsPerThread =
       kNumFinalItems / kNumThreadsPerBlock;
-  using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock,
+  using FinalSort = cub::BlockRadixSort<uint64_t, kNumThreadsPerBlock,
                                         kNumFinalItemsPerThread, int>;
   using FinalSortTempStorage =
       std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
@@ -244,6 +267,12 @@ static __device__ void topk_per_row_job(const float* logits, int row_start,
   __shared__ int smem_final_dst_idx[1];
   __shared__ int smem_final_bin_size[1];
   __shared__ int smem_found_topk_values[1];
+
+  // Side pool for the below-threshold prefix (the guaranteed top-k set). The
+  // slot picked by atomicAdd is nondeterministic, so we keep (score, index) and
+  // re-rank the whole pool deterministically during finalization.
+  float* prefix_logits = reinterpret_cast<float*>(smem_output + top_k);
+  int* prefix_indices = smem_output + 2 * top_k;
 
   int row_len = row_end - row_start;
   if (row_len <= top_k) {
@@ -273,14 +302,16 @@ static __device__ void topk_per_row_job(const float* logits, int row_start,
                              kNumFinalItems>(
           row_logits, row_len, logit_pattern, threshold_bin_idx, smem_output,
           smem_threshold_bin_idx, smem_final_dst_idx, smem_final_bin_size,
-          smem_found_topk_values, smem_final, top_k);
+          smem_found_topk_values, smem_final, top_k, prefix_logits,
+          prefix_indices);
   if (continue_to_next_step) {
     continue_to_next_step =
         process_histogram_step<1, kNumThreadsPerBlock, kNumBins,
                                kNumFinalItems>(
             row_logits, row_len, logit_pattern, threshold_bin_idx, smem_output,
             smem_threshold_bin_idx, smem_final_dst_idx, smem_final_bin_size,
-            smem_found_topk_values, smem_final, top_k);
+            smem_found_topk_values, smem_final, top_k, prefix_logits,
+            prefix_indices);
   }
   if (continue_to_next_step) {
     continue_to_next_step =
@@ -288,34 +319,64 @@ static __device__ void topk_per_row_job(const float* logits, int row_start,
                                kNumFinalItems>(
             row_logits, row_len, logit_pattern, threshold_bin_idx, smem_output,
             smem_threshold_bin_idx, smem_final_dst_idx, smem_final_bin_size,
-            smem_found_topk_values, smem_final, top_k);
+            smem_found_topk_values, smem_final, top_k, prefix_logits,
+            prefix_indices);
   }
   if (continue_to_next_step) {
     process_histogram_step<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
         row_logits, row_len, logit_pattern, threshold_bin_idx, smem_output,
         smem_threshold_bin_idx, smem_final_dst_idx, smem_final_bin_size,
-        smem_found_topk_values, smem_final, top_k);
+        smem_found_topk_values, smem_final, top_k, prefix_logits,
+        prefix_indices);
   }
 
   if (!continue_to_next_step) {
-    if constexpr (useRadixSort) {
-      float final_logits[kNumFinalItemsPerThread];
-      int final_indices[kNumFinalItemsPerThread];
-#pragma unroll
-      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
-        final_logits[ii] = -FLT_MAX;
+    // Deterministically order the prefix pool (score desc, index asc). The
+    // prefix is at most top_k long and each thread re-ranks every candidate
+    // over the whole pool, so the result is invariant to the atomicAdd storage
+    // order used while filling the pool.
+    int prefix_count = smem_found_topk_values[0];
+    for (int i = threadIdx.x; i < prefix_count; i += kNumThreadsPerBlock) {
+      int out_index = 0;
+      float logit_i = prefix_logits[i];
+      int idx_i = prefix_indices[i];
+      for (int j = 0; j < prefix_count; j++) {
+        float logit_j = prefix_logits[j];
+        int idx_j = prefix_indices[j];
+        if (logit_j > logit_i || (logit_j == logit_i && idx_j < idx_i)) {
+          out_index++;
+        }
       }
+      smem_output[out_index] = idx_i;
+    }
+    __syncthreads();
+    if constexpr (useRadixSort) {
+      uint64_t final_keys[kNumFinalItemsPerThread];
+      int final_indices[kNumFinalItemsPerThread];
 #pragma unroll
       for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
         int src_idx = ii * kNumThreadsPerBlock + threadIdx.x;
         if (src_idx < smem_final_dst_idx[0]) {
-          final_logits[ii] = smem_final.items.logits[src_idx];
-          final_indices[ii] = smem_final.items.indices[src_idx];
+          float logit = smem_final.items.logits[src_idx];
+          int idx = smem_final.items.indices[src_idx];
+          // Monotone float->uint32 transform so larger key == larger score.
+          uint32_t score_bits =
+              (logit >= 0.0f) ? (__float_as_uint(logit) ^ 0x80000000u)
+                              : ~__float_as_uint(logit);
+          // Composite (score desc, index asc) key; the index term makes the key
+          // unique so the sort is deterministic even on exact-score ties.
+          final_keys[ii] =
+              (static_cast<uint64_t>(score_bits) << 32) |
+              (0xFFFFFFFFu - static_cast<uint32_t>(idx));
+          final_indices[ii] = idx;
+        } else {
+          final_keys[ii] = 0;
+          final_indices[ii] = -1;
         }
       }
       __syncthreads();
       FinalSort(smem_final.finalSort)
-          .SortDescendingBlockedToStriped(final_logits, final_indices);
+          .SortDescendingBlockedToStriped(final_keys, final_indices);
       int base_idx = smem_found_topk_values[0];
 #pragma unroll
       for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
@@ -331,9 +392,11 @@ static __device__ void topk_per_row_job(const float* logits, int row_start,
            i += kNumThreadsPerBlock) {
         int out_index = 0;
         auto logit = smem_final.items.logits[i];
+        auto idx_i = smem_final.items.indices[i];
         for (int j = 0; j < smem_final_dst_idx[0]; j++) {
           auto other_logit = smem_final.items.logits[j];
-          if (logit < other_logit || (logit == other_logit && i < j)) {
+          auto idx_j = smem_final.items.indices[j];
+          if (logit < other_logit || (logit == other_logit && idx_i < idx_j)) {
             out_index++;
           }
         }
@@ -378,7 +441,7 @@ void launch_indexer_topk_prefill(const TensorView& logits,
   if (num_insertion_blocks > 0) {
     topk_per_row_prefill_kernel<kNumThreadsPerBlock, false>
         <<<num_insertion_blocks, kNumThreadsPerBlock,
-           static_cast<size_t>(k) * sizeof(int32_t), stream>>>(
+           static_cast<size_t>(k) * 3 * sizeof(int32_t), stream>>>(
             static_cast<float*>(logits.data_ptr()),
             static_cast<int*>(row_starts.data_ptr()),
             static_cast<int*>(row_ends.data_ptr()),
@@ -389,7 +452,7 @@ void launch_indexer_topk_prefill(const TensorView& logits,
     int num_radix_blocks = num_rows - kSortingAlgorithmThreshold;
     topk_per_row_prefill_kernel<kNumThreadsPerBlock, true>
         <<<num_radix_blocks, kNumThreadsPerBlock,
-           static_cast<size_t>(k) * sizeof(int32_t), stream>>>(
+           static_cast<size_t>(k) * 3 * sizeof(int32_t), stream>>>(
             static_cast<float*>(logits.data_ptr()),
             static_cast<int*>(row_starts.data_ptr()),
             static_cast<int*>(row_ends.data_ptr()),

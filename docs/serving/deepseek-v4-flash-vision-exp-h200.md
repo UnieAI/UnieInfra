@@ -101,18 +101,59 @@ cache. Both got 256/256 successful requests.
 > `test/ops/test_dsa_topk.py::test_persistent_topk_saturated_tie_is_deterministic`
 > asserts 12 launches return the same full top-k set.
 >
-> **Re-verified.** Kernel-level: 12/12 launches identical (`{0..topk-1}`) on
-> the decode, medium and filtered paths, plus a control set. Engine-level
-> (live gRPC, temperature 0): 8/8 identical 64-token continuations, LCP 64/64
-> — before the fix the same probe reported LCP 0/236.
+> **Kernel-level re-verified.** 12/12 launches identical (`{0..topk-1}`) on
+> the decode, medium and filtered paths, plus a control set.
 >
-> **Still not a validated speedup.** The engine-vs-vLLM token-agreement A/B
-> has **not** been re-run yet (the reference vLLM and the engine OpenAI
-> gateway were down at re-verification time), so the 2.6x speedup and the
-> throughput numbers above remain an observed measurement until that
-> agreement gate passes. The engine is genuinely faster in wall-clock (it also
-> has a much larger KV budget: 0.87 vs 0.70 GPU util), but it is not yet
-> re-gated as a correctness-preserving speedup.
+> **Root cause of the residual temperature-0 nondeterminism was the top-k
+> index *order*, not the attention reduction.** Both the prefill and the
+> decode top-k kernels emit a deterministic **set** but a nondeterministic
+> **array order**: the above-threshold/prefix slots are filled through
+> `atomicAdd`, so the storage slot is thread-arrival order. The CSA / FlashMLA
+> consumer
+> (`deepseek_v4_combine_topk_swa_indices`, `flash_mla_sparse_fwd`) walks the
+> `indices` array in order, and softmax accumulation is FP-order-sensitive, so
+> the same set in a different order produces different bits and diverges. The
+> earlier probe hashed only the *sorted set* (`sorted_set_diff=0`), so it
+> mistook a bit-identical set for a bit-identical input and pinned the blame
+> on FlashMLA's reduction upstream; the input actually differed in index
+> order, which the set hash could not see.
+> Fixes, both landing with this commit:
+>   - prefill (`tokenspeed-kernel/.../cuda/csrc/deepseek_v4_topk.cu`): run
+>     the above-threshold prefix through a side pool and re-rank it to
+>     `(score desc, index asc)` using the same composite `uint64` key as the
+>     threshold-bin final pass, so the emitted order no longer depends on
+>     `atomicAdd` arrival;
+>   - decode (`python/tokenspeed/runtime/models/deepseek_v4.py`,
+>     `_deepseek_v4_decode_topk_reorder_logits`): reorder the returned decode
+>     top-k to the same convention (score-desc, index-asc on ties, the
+>     `torch.topk` convention the HF reference uses) on both decode return
+>     paths (`persistent_topk` and `fast_topk_v2`). The reorder is in-place on
+>     the preallocated `out` buffer and is deterministic (the composite int64
+>     sort key is unique per element).
+> Engine-level determinism is now confirmed: on the long SWE-agent prompt used
+> by the A/B (9552 tokens, chunked prefill, `--enforce-eager`, speculation
+> off), 4 re-sends give the same 64-token continuation on the three clean
+> reps (`iso_trace.py 4 0`, rep1=rep2=rep3 token-identical); the per-`(rank,
+> layer)` bucket hashes compare equal on raw order and sorted set. Only the
+> warmup-polluted rep0 differs.
+>
+> **Still not a validated speedup.** Determinism (self-consistency) passes,
+> but the engine-vs-vLLM token-for-token agreement gate does **not**: at
+> temperature 0 the engine agrees exactly with the vLLM reference on 2/16
+> prompts (and on output length on 13/16). The match set is the same before
+> and after the fix, so this divergence is a separate, pre-existing issue, not
+> a regression from the reorder: some prompts agree for 100–380 characters
+> then diverge (natural mid-stream FP cascade), and a few diverge at the first
+> token, where the two servers were launched with different reasoning/stop
+> handling (engine `--reasoning-parser deepseek_v31`, vLLM default), and the
+> vLLM `logprobs.tokens`/text-re-encode comparison cannot reconstruct special
+> tokens such as the engine's leading assistant marker. Because token-for-token
+> agreement is not established, the 2.6x speedup and the throughput numbers
+> above remain an **observed** measurement and the correctness gate stays
+> **blocked**. The engine is genuinely deterministic now and genuinely faster
+> in wall-clock (it also has a much larger KV budget: 0.87 vs 0.70 GPU util),
+> but it is not re-gated as a correctness-preserving speedup until the
+> engine-vs-vLLM temperature-0 agreement is resolved.
 
 ## Why the two-GPU quantization is not a no-op on Hopper
 

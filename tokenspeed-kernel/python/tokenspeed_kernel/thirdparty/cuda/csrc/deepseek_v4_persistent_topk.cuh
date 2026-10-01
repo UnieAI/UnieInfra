@@ -405,8 +405,28 @@ __device__ __noinline__ void histogram_2048_topk(
     if (tx < RADIX + 1) refine[0][tx] = 0;
     __syncthreads();
 
+    if (pass == 3) {
+      // Deterministic tie-break. At the final byte all candidates that share
+      // ref_thr are bit-exact; when `bin > ref_thr` does not fill the remaining
+      // k slots the `sFIN` chosen from them must be a stable set. Mark those
+      // exact-equal candidates in the sign bit of their buffered element index
+      // so each thread can rank them by element index below without re-reading
+      // 32-bit logits per candidate. Element indices are non-negative, so the
+      // high bit is free here.
+      for (int i = tx; i < num_buffered; i += kThreadsPerBlock) {
+        const int idx = bufs[src][i];
+        const uint32_t fp32 = convert_to_uint32_v2(logits[idx]);
+        if ((fp32 & 0xFFu) == static_cast<uint32_t>(ref_thr)) {
+          bufs[src][i] = idx | 0x80000000;
+        }
+      }
+      __syncthreads();
+    }
+
+    const int sfin = decode_smem[SBASE + sFIN];
     for (int i = tx; i < num_buffered; i += kThreadsPerBlock) {
-      const int idx = bufs[src][i];
+      const int idx_raw = bufs[src][i];
+      const int idx = idx_raw & 0x7FFFFFFF;
       const float logit_val = logits[idx];
       const uint32_t fp32 = convert_to_uint32_v2(logit_val);
       const int bin = (fp32 >> bit_offset) & 0xFF;
@@ -416,8 +436,19 @@ __device__ __noinline__ void histogram_2048_topk(
         output_indices[pos] = idx;
       } else if (bin == ref_thr) {
         if (pass == 3) {
-          const int slot = atomicAdd(&decode_smem[SBASE + sFIN], -1);
-          if (slot > 0) output_indices[TopK - slot] = idx;
+          // Keep the sFIN exact-equal candidates with the smallest element
+          // index. rank counts tied candidates with a strictly smaller index
+          // across the WHOLE buffer, so the kept candidates write to distinct
+          // output slots [TopK - sFIN, TopK) in ascending index order --
+          // invariant to the atomicAdd arrival order that used to pick them.
+          int rank = 0;
+          for (int q = 0; q < num_buffered; ++q) {
+            const int other = bufs[src][q];
+            if (other < 0 && (other & 0x7FFFFFFF) < idx) ++rank;
+          }
+          if (rank < sfin) {
+            output_indices[TopK - sfin + rank] = idx;
+          }
         } else {
           const int bp = atomicAdd(&decode_smem[SBASE + sBUF0 + dst], 1);
           if (__builtin_expect(bp < DBUF, 1)) {
@@ -579,8 +610,25 @@ __device__ __noinline__ void histogram_256_topk(
     }
     __syncthreads();
 
+    if (pass == 3) {
+      // Deterministic tie-break at the final byte (see the decode kernel):
+      // mark the exact-equal candidates so they can be ranked by element
+      // index instead of chosen by atomicAdd arrival order.
+      for (int i = thread_id; i < num_buffered; i += kThreadsPerBlock) {
+        const int idx = buffered_indices[src_buffer][i];
+        const uint32_t fp32_bits =
+            convert_to_uint32_v2(logits[idx + logits_offset]);
+        if ((fp32_bits & 0xFFu) == static_cast<uint32_t>(threshold_bin)) {
+          buffered_indices[src_buffer][i] = idx | 0x80000000;
+        }
+      }
+      __syncthreads();
+    }
+
+    const int final_k = shared_final_k;
     for (int i = thread_id; i < num_buffered; i += kThreadsPerBlock) {
-      const int idx = buffered_indices[src_buffer][i];
+      const int idx_raw = buffered_indices[src_buffer][i];
+      const int idx = idx_raw & 0x7FFFFFFF;
       const float logit_value = logits[idx + logits_offset];
       const uint32_t fp32_bits = convert_to_uint32_v2(logit_value);
       const int bin = (fp32_bits >> bit_offset) & 0xFF;
@@ -589,9 +637,15 @@ __device__ __noinline__ void histogram_256_topk(
         output_indices[output_pos] = idx;
       } else if (bin == threshold_bin) {
         if (pass == 3) {
-          const int slot = atomicAdd(&shared_final_k, -1);
-          if (slot > 0) {
-            output_indices[TopK - slot] = idx;
+          // Keep the final_k exact-equal candidates with the smallest element
+          // index, written to distinct slots in ascending index order.
+          int rank = 0;
+          for (int q = 0; q < num_buffered; ++q) {
+            const int other = buffered_indices[src_buffer][q];
+            if (other < 0 && (other & 0x7FFFFFFF) < idx) ++rank;
+          }
+          if (rank < final_k) {
+            output_indices[TopK - final_k + rank] = idx;
           }
         } else {
           const int buffer_pos =
@@ -1228,8 +1282,24 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
         __syncthreads();
         if (tx < RADIX + 1) s_histogram[tx] = 0;
         __syncthreads();
+        if (is_last_round) {
+          // Deterministic tie-break at the final byte: mark the exact-equal
+          // candidates (bin == threshold at the last refine round) in the
+          // sign bit of their element index so the rank scan below can pick a
+          // stable subset instead of whichever ones atomicAdd hands out.
+          for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+            const int idx = s_input_idx[r_idx][i];
+            const auto raw_input = score[idx];
+            const int bin = (Traits::ToOrdered(raw_input) >> offset) & 0xFF;
+            if (bin == threshold) {
+              s_input_idx[r_idx][i] = idx | 0x80000000;
+            }
+          }
+          __syncthreads();
+        }
         for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-          const auto idx = s_input_idx[r_idx][i];
+          const int idx_raw = s_input_idx[r_idx][i];
+          const int idx = idx_raw & 0x7FFFFFFF;
           const auto raw_input = score[idx];
           const auto bin = (Traits::ToOrdered(raw_input) >> offset) & 0xFF;
           if (static_cast<int>(bin) > threshold) {
@@ -1237,9 +1307,17 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
             s_indices[pos] = idx;
           } else if (static_cast<int>(bin) == threshold) {
             if (is_last_round) {
-              const auto pos = atomicAdd(&s_last_remain, -1);
-              if (pos > 0) {
-                s_indices[top_k - pos] = idx;
+              // Keep the s_last_remain exact-equal candidates with the
+              // smallest element index; write them in ascending index order to
+              // the same output slot region the arrival-order path used.
+              const int final_remain = s_last_remain;
+              int rank = 0;
+              for (int q = 0; q < num_input; ++q) {
+                const int other = s_input_idx[r_idx][q];
+                if (other < 0 && (other & 0x7FFFFFFF) < idx) ++rank;
+              }
+              if (rank < final_remain) {
+                s_indices[top_k - final_remain + rank] = idx;
               }
             } else {
               const auto pos = atomicAdd(&s_num_input[r_idx ^ 1], 1);

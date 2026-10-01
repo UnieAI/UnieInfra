@@ -49,6 +49,12 @@ from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
 from tokenspeed_kernel.ops.attention.deep_gemm import _prepare_logits_for_topk
 from tokenspeed_kernel.ops.attention.flashinfer import dsa_topk as fi_dsa_topk
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import combine_topk_weights
+from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+    has_persistent_topk as _has_native_persistent_topk,
+)
+from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+    persistent_topk as _native_persistent_topk,
+)
 
 requires_kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() and has_cute_dsl_decode_topk()),
@@ -271,6 +277,50 @@ def test_cute_dsl_decode_topk_widened_rows_match_narrow(next_n):
     got = _gathered_topk_values(narrow, out_wide, seq_lens, index_topk, next_n)
     ref = _gathered_topk_values(narrow, out_narrow, seq_lens, index_topk, next_n)
     assert torch.equal(got, ref), "widened-view selection differs from narrow slice"
+
+
+# ---------------------------------------------------------------------------
+# CUDA persistent-radix top-k: deterministic tie handling (decode path)
+# ---------------------------------------------------------------------------
+requires_persistent_topk = pytest.mark.skipif(
+    not (torch.cuda.is_available() and _has_native_persistent_topk()),
+    reason="CUDA persistent-radix DSA top-k requires the native kernel",
+)
+
+
+@requires_persistent_topk
+def test_persistent_topk_saturated_tie_is_deterministic():
+    """persistent_topk must return the SAME top-k set for identical input.
+
+    The DSA decode indexer scores many compressed-KV slots; when the k-th
+    selection boundary lands in a run of exact-equal scores, the kernel's final
+    refinement pass saturates and previously claimed ``sFIN`` slots by
+    ``atomicAdd`` arrival order -- a nondeterministic subset. That made the
+    engine's temperature-0 decode select different KV slots per launch. The
+    final pass now marks exact-equal candidates in the high bit of their buffer
+    slot and ranks them by element index, so the kept set is stable.
+    """
+    max_len, seq_len, topk, n_high = 4096, 2684, 2048, 100
+    logits = torch.zeros((1, max_len), device="cuda", dtype=torch.float32)
+    logits[0, :n_high] = 10.0  # clearly-above winners; the rest are exact ties
+    lengths = torch.tensor([seq_len], device="cuda", dtype=torch.int32)
+    workspace = torch.zeros(1024 * 1024, device="cuda", dtype=torch.uint8)
+
+    results = []
+    for _ in range(12):
+        out = torch.full((1, topk), -1, device="cuda", dtype=torch.int32)
+        _native_persistent_topk(logits, lengths, out, workspace, topk, max_len, 1)
+        results.append(tuple(int(x) for x in out[0].tolist() if x >= 0))
+
+    distinct = set(results)
+    # Every run must select exactly the same top-k set, and it must fill all
+    # k slots (no unwritten -1 survivors) with the true top-k.
+    assert len(distinct) == 1, f"got {len(distinct)} distinct sets across launches"
+    kept = set(results[0])
+    assert kept == set(range(topk)), "top-k set must be {0..topk-1} for this input"
+    assert kept >= set(range(n_high)), "above-threshold winners must be kept"
+    assert kept <= set(range(seq_len)), "selected indices must be in-range [0, seq_len)"
+    assert len(kept) == topk
 
 
 # ---------------------------------------------------------------------------

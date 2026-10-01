@@ -78,12 +78,16 @@ cache. Both got 256/256 successful requests.
 | E2E mean / p50 / p99 (ms) | 15680 / 15502 / 21706 | 20345 / 20251 / 22924 |
 
 Both engines hit `max_tokens=128` (`usage.completion_tokens=128`,
-`finish_reason=length`). Caveat on the axes: the engine's
-`deepseek_v31` reasoning parser coalesces streamed content into ~38.5
-whitespace chunks per 128-token reply, so the raw `drive.py` `ntok`/`tpot`
-under-count the engine; the per-token TPOT row above is recomputed as
-`(e2e−ttft)/127` and aggregate tok/s is `256×128/duration`. vLLM streams
-one token per chunk (127.7 chunks/req), so its RAW numbers need no adjustment.
+`finish_reason=length`). Caveat on the axes, which is **not** a parser
+artifact: the engine runs with speculation (DSPARK, `Accept_num_tokens_avg`
+2.35–3.74), so it streams **one chunk per decode step** and a decode step
+carries ~3 accepted tokens — hence ~38.5 chunks per 128-token reply and the
+raw `drive.py` `ntok`/`tpot` under-count. The per-token TPOT row above is
+recomputed as `(e2e−ttft)/127` and aggregate tok/s is `256×128/duration`.
+With the same engine run speculation-off (1 accepted token per step) the
+stream is one chunk per token (~127.7 chunks/req), so those RAW numbers need
+no adjustment. vLLM streams one token per chunk (127.7 chunks/req), so its
+RAW numbers need no adjustment either.
 
 > **Correctness gate — root-caused, patched, self-consistency confirmed.**
 > The gate is the engine against itself: deterministic (`temperature=0` must
@@ -181,6 +185,71 @@ one token per chunk (127.7 chunks/req), so its RAW numbers need no adjustment.
 > measurement; the reorder is a small per-decode top-k re-rank and does not add
 > material cost (DSPARK `Accept_num_tokens_avg` 2.35–3.74 in this run, in line
 > with 1.6–3.5 pre-fix).
+
+## SLA angle: what a concurrency sweep says (speculation OFF)
+
+The 1.27x verdict above is measured with the engine running speculatively
+(DSPARK). To see what the engine does to a real latency SLA we re-measured the
+same AgentX cell with speculation **turned off** — same engine, same model,
+same corpus, same `max_tokens=128`/`temperature=0`, cold engine restart per
+concurrency `c∈{1,2,4,8,16,32,64,128}` — and then counted only requests that
+met the SLA deadline. This is the "effective (in-SLA) throughput" curve: raw
+RPM is not a SLA, a request that returns after its deadline is not a served
+request.
+
+| c | n | Duration (s) | RPM (raw) | tok/s | E2E p50 / p90 / p99 (s) | TTFT p50 / p99 (s) | TPOT p50 (ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 32 | 909.7 | 2.11 | 4.5 | 28.3 / 30.7 / 31.0 | 0.86 / 2.42 | 213 |
+| 2 | 48 | 708.9 | 4.06 | 8.7 | 30.1 / 31.7 / 32.2 | 1.36 / 3.07 | 222 |
+| 4 | 64 | 472.2 | 8.13 | 17.3 | 28.7 / 32.2 / 36.0 | 1.66 / 4.86 | 213 |
+| 8 | 96 | 360.7 | 15.97 | 34.1 | 29.6 / 33.2 / 34.7 | 1.96 / 7.38 | 214 |
+| 16 | 256 | 556.4 | 27.61 | 58.9 | 35.0 / 36.6 / 48.4 | 2.12 / 14.39 | 258 |
+| 32 | 256 | 303.5 | 50.61 | 108.0 | 36.3 / 48.3 / 54.1 | 2.30 / 20.66 | 266 |
+| 64 | 256 | 208.7 | 73.59 | 157.0 | 47.2 / 73.3 / 77.1 | 3.26 / 31.19 | 344 |
+| 128 | 256 | 209.9 | 73.18 | 156.1 | 80.8 / 130.6 / 183.2 | 34.32 / 140.90 | 386 |
+
+**Effective (in-SLA) throughput, `rpm(e2e ≤ D)`:**
+
+| c | D=10s | D=15s | D=20s | D=30s | D=45s | D=60s | raw RPM |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 0 | 0 | 1.58 | 2.11 | 2.11 | 2.11 |
+| 2 | 0 | 0 | 0 | 2.03 | 4.06 | 4.06 | 4.06 |
+| 4 | 0 | 0 | 0 | 5.84 | 8.13 | 8.13 | 8.13 |
+| 8 | 0 | 0 | 0 | 11.31 | 15.97 | 15.97 | 15.97 |
+| 16 | 0 | 0 | 0 | 0 | 25.99 | 27.61 | 27.61 |
+| 32 | 0 | 0 | 0 | 0 | 44.29 | 50.61 | 50.61 |
+| 64 | 0 | 0 | 0 | 0 | 14.37 | 55.20 | 73.59 |
+| 128 | 0 | 0 | 0 | 0 | 0 | 17.72 | 73.18 |
+
+Read the curve, not the raw peak. Raw RPM saturates at ~73.6 (c=64) and does
+**not** rise at c=128 — the engine admits at most `--max-num-seqs 80`, so jamming
+128 concurrent requests past the cap buys nothing but queueing. Every
+"SLA-valid" column is strictly lower and has its own knee:
+
+* **A 20 s E2E deadline is impossible at any concurrency, speculation-off.**
+  Even at `c=1` (zero queueing) the reply alone takes 28.3 s p50 —
+  128 tokens at ~213 ms/token is the floor, so 0/32 requests meet 20 s. This is
+  the single most important result: without speculation the model property
+  itself (the decode rate) breaks a 20 s SLA before the scheduler is involved.
+* **A 30 s deadline is the no-spec knee.** It is met up to `c=8` (11.31 in-SLA
+  vs 15.97 raw) and collapses to 0 by `c=16` (E2E p50 climbs to 35 s).
+* Raw throughput below the knee is *not* usable: at `c=64` the engine pours out
+  73.6 raw RPM but only 14.4 of 55.2 (E2E ≤ 45 s), and at `c=128` just 17.7 of
+  73.2 (E2E ≤ 60 s) — the tail is so bad that most requests miss even 60 s.
+* **The first-token tail is what dies under load.** TTFT p99 goes 2.4 s (c=1)
+  → 7.4 s (c=8) → 14.4 s (c=16) → 20.7 s (c=32) → 31.2 s (c=64) → **140.9 s
+  (c=128)**; decode TPOT also degrades ~1.8x (213 ms → 386 ms) as batching
+  grows.
+
+**What this means for DSPARK.** Speculation is not a throughput trinket in
+this configuration — it is what makes a 20 s E2E SLA reachable. Without it the
+engine's per-token floor (213 ms × 128 = 27 s) guarantees it cannot meet a
+20 s SLA, and its useful (in-SLA) capacity at 30 s caps at ~11.3 RPM. With
+DSPARK the same cell at `c=16` runs 59.6 RPM at E2E p50 15.5 s / p99 21.7 s and
+TTFT p99 6.1 s — a (roughly) 2.1x effective-throughput and 3.6x first-token-tail
+win. So the recovery that fixed the determinism gate does not come with a
+degrade: leaving DSPARK on is both the correctness-supported and the
+SLA-required configuration, and the deployment stays on it.
 
 ## Why the two-GPU quantization is not a no-op on Hopper
 

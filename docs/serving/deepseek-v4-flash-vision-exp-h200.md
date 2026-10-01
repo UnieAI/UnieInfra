@@ -77,22 +77,42 @@ cache. Both got 256/256 successful requests.
 | TPOT mean / p50 / p90 / p99 (ms) | 339 / 337 / 376 / 404 | 243 / 150 / 546 / 867 |
 | E2E mean / p50 / p99 (ms) | 14709 / 13902 / 27587 | 38752 / 20581 / 146568 |
 
-> **Correctness gate FAILED — do not take the 2.6x speedup at face value.**
+> **Correctness gate — root-caused and patched; A/B agreement re-run pending.**
 > Per AGENTS.md, every A/B is gated on output length and on token-for-token
 > agreement with a reference engine at temperature 0. Both engines produce
-> coherent, on-topic, non-repetitive SWE-agent text, but the two do **not**
-> agree token-for-token (exact-substring overlap 0/256), and — critically —
-> the engine is **not self-consistent** at temperature 0: re-sending the same
-> prompt to the same engine three times gave LCP 0/236 and 236/236 across
-> runs, whereas vLLM reproduced its own output exactly (LCP 481/481). The
-> engine maps `temperature=0` to greedy (`top_k=1`) in `sampling_params.py`,
-> so a correct greedy solver must be deterministic; the engine's intermittent
-> divergence is a genuine numerical/correctness defect, not a config choice.
-> The engine here is genuinely faster in wall-clock (it also has a much
-> larger KV budget: 0.87 vs 0.70 GPU util) but the result is **not a
-> validated, correctness-preserving speedup**. The throughput numbers above
-> are recorded as an observed measurement only, and the nondeterminism should
-> be root-caused before this engine is treated as production-correct.
+> coherent, on-topic, non-repetitive SWE-agent text, but the two did **not**
+> agree token-for-token (exact-substring overlap 0/256), and the engine was
+> **not self-consistent** at temperature 0: re-sending the same prompt gave
+> LCP 0/236 across runs, whereas vLLM reproduced its own output exactly (LCP
+> 481/481). The engine maps `temperature=0` to greedy (`top_k=1`) in
+> `sampling_params.py`, so a correct greedy solver must be deterministic.
+>
+> **Root cause (fixed).** When the DSA persistent-radix top-k lands the k-th
+> selection boundary inside a run of bit-exact-equal scores, the final
+> refinement pass claimed the remaining `sFIN` KV slots by `atomicAdd`
+> arrival order — an arbitrary, launch-order-dependent subset. That subset is
+> what reordered the engine's temperature-0 decode.
+> `tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/csrc/deepseek_v4_persistent_topk.cuh`
+> now marks exact-equal candidates in the high bit of their buffer slot and
+> keeps the `sFIN` *smallest element indices*, so the kept set is stable.
+> The same rank scan is applied to all three persistent-topk dispatch paths
+> (decode `histogram_2048_topk`, `histogram_256_topk`,
+> `FilteredTopKUnifiedKernel`), and
+> `test/ops/test_dsa_topk.py::test_persistent_topk_saturated_tie_is_deterministic`
+> asserts 12 launches return the same full top-k set.
+>
+> **Re-verified.** Kernel-level: 12/12 launches identical (`{0..topk-1}`) on
+> the decode, medium and filtered paths, plus a control set. Engine-level
+> (live gRPC, temperature 0): 8/8 identical 64-token continuations, LCP 64/64
+> — before the fix the same probe reported LCP 0/236.
+>
+> **Still not a validated speedup.** The engine-vs-vLLM token-agreement A/B
+> has **not** been re-run yet (the reference vLLM and the engine OpenAI
+> gateway were down at re-verification time), so the 2.6x speedup and the
+> throughput numbers above remain an observed measurement until that
+> agreement gate passes. The engine is genuinely faster in wall-clock (it also
+> has a much larger KV budget: 0.87 vs 0.70 GPU util), but it is not yet
+> re-gated as a correctness-preserving speedup.
 
 ## Why the two-GPU quantization is not a no-op on Hopper
 
@@ -229,9 +249,11 @@ fit at the current `gpu_memory_utilization=0.87` without one of:
   Nebius SWE-agent corpus drive the same conversation strands at temperature 0
   on both engines (see the AgentX-style benchmark above). The engine gateway
   accepts the multimodal-free AgentX data over `/v1/chat/completions` for text
-  requests. **Open item:** the engine is not temperature-0 self-consistent, so
-  the engine-vs-vLLM AgentX result is a timing observation only and must be
-  re-gated on token agreement once the nondeterminism is fixed.
+  requests. **Open item (partial):** the temperature-0 nondeterminism is
+  root-caused and patched (`deepseek_v4_persistent_topk.cuh`), and the engine
+  is now temperature-0 self-consistent (8/8 identical continuations). The
+  engine-vs-vLLM AgentX result is still a timing observation only until the
+  token-agreement A/B is re-run.
 - **Vision through the OpenAI gateway.** `/v1/chat/completions` rejects
   multimodal requests for this model (`invalid_multimodal_request: multimodal
   not supported for model: dsv4`) because the smg Rust registry has no

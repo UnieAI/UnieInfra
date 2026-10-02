@@ -124,6 +124,35 @@ Observations:
   decode cannot be used until the mixed-backend corruption above is fixed.
 - Embedding (2048-char prompts) is I/O-light: 46→116 req/s at sub-250 ms.
 
+### Perf verdict (algorithm level)
+
+Checked every kernel the Qwen MoE models actually dispatch, rather than
+sweeping flags:
+
+- `moe.apply -> flashinfer_cutlass_unquant_moe_apply` — the fast fused CUTLASS
+  MoE path.
+- `moe.softmax_topk -> triton_softmax_topk` — the only registered softmax-topk
+  implementation (Triton + PyTorch fallback); no faster kernel is shadowed.
+- Decode attention `fa3_mha_decode` + `flashinfer_gdn_decode_step`; prefill
+  `triton_gdn_chunk_prefill`.
+
+The prefill CUDA graph is deliberately off when the flashinfer GDN kernel is
+live. `resolve_fi_gdn_prefill_graph` (`runtime/engine/event_loop.py`) records
+the measured arms on Qwen3.5-27B RAG C=128: Triton+graph 511.9, Triton-no-graph
+472.0, flashinfer+graph 579.97 (garbage), flashinfer-no-graph **574.9 tok/s
+(correct)**. The default is already the best *correct* arm (574.9); the only
+faster combination (flashinfer+graph, 580.0) answers every request with
+`"!!!!!!!!"`. So the prefill path is at its correct optimum — switching to
+`TOKENSPEED_ENABLE_FI_GDN_SM120=0` would be a ~2% regression, not a win.
+
+For Gemma, `fa3` is hard-capped at `head_dim<=256` (see the fa3 registration
+comment, "Hopper FlashAttention caps the head dimension at 256"), so the
+512-head global layers can never run fa3; pairing fa3 (256) with Triton (512)
+in one decode step is the corrupt arm shown above. There is no safe kernel-level
+fix short of solving the engine's mixed-backend decode assembly. The all-Triton
+gate is therefore the correct and only deliverable for Gemma; its remaining gap
+is the open mixed-backend defect, not a tunable flag.
+
 ## ASR dependency note
 
 The `asr_http` endpoint decodes audio with `soundfile` and resamples with

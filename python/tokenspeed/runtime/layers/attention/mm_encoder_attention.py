@@ -54,6 +54,11 @@ from tokenspeed.runtime.utils import add_prefix, round_up
 
 logger = logging.getLogger(__name__)
 
+# One-shot guard for the cross-attention dtype normalization diagnostic. A
+# module flag is used instead of a function attribute so it survives the
+# torch.compile wrapper in the prewarm path.
+_cross_attn_warned_dtype = False
+
 _platform = current_platform()
 _is_nvidia = _platform.is_nvidia
 _is_amd = _platform.is_amd
@@ -349,6 +354,25 @@ def cross_attn_varlen(
     ``unieinfra/xref/15-encoder-embedding.md`` §6.1 before assuming the caller
     still has to materialise the gather.
     """
+    # ``flash_attn_varlen_func`` requires q/k/v in one dtype. The decoder's
+    # query projection and the encoder's key/value projection can land on
+    # different precisions (Whisper: fp16 decoder vs an encoder that keeps the
+    # checkpoint's fp32 conv weights), and flash-attn then aborts with "query
+    # and key must have the same dtype". Normalize to the model-side query
+    # dtype; a fp32/bf16 encoder key is downcast to fp16 rather than aborting.
+    if q.dtype != k.dtype or k.dtype != v.dtype:
+        global _cross_attn_warned_dtype
+        target = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else k.dtype
+        if not _cross_attn_warned_dtype:
+            _cross_attn_warned_dtype = True
+            logger.info(
+                "cross_attn_varlen normalized q=%s k=%s v=%s -> %s",
+                q.dtype,
+                k.dtype,
+                v.dtype,
+                target,
+            )
+        q, k, v = (t.to(target) for t in (q, k, v))
     result = flash_attn_varlen_func(
         q,
         k,

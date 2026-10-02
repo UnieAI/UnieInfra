@@ -182,6 +182,25 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         backend_name = config.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
 
+        # A single-head_dim contract is what the flash-attn dense kernels
+        # (fa3/fa4) are validated for. Gemma-4 breaks it per layer -- fifty
+        # sliding layers at head_dim 256 against ten global layers at
+        # `global_head_dim` 512 -- and when they are selected for the 256
+        # layers the output is silently corrupted (E2E: fa3 for sliding mixed
+        # with triton for global emits repeated-token garbage; all-triton
+        # emits the correct answer). The Triton path is what handles the
+        # per-layer geometry, so steer the whole model to it instead of
+        # degrading a subset of layers to speed.
+        layer_dims = config.layer_kv_head_dims
+        non_uniform_dims = bool(layer_dims) and len(set(layer_dims)) > 1
+        if non_uniform_dims and self.kernel_solution in (
+            None,
+            "fa3",
+            "fa4",
+            "flashinfer",
+        ):
+            self.kernel_solution = "triton"
+
         # Static information needed for metadata construction and kernel dispatch
         self.max_context_len = config.context_len
         self.page_size = config.page_size

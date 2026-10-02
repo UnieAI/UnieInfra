@@ -1109,6 +1109,13 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # Hopper FlashAttention (fa3) caps the head dimension at 256. The
+            # set must be declared or the registry treats it as a wildcard
+            # (spec_matches_traits ignores traits a spec omits) and selects
+            # fa3 for gemma-4's global layers, whose global_head_dim is 512 --
+            # which then dies inside mha_fwd. Declaring the capability routes
+            # 512 to the flashinfer_fa2 paged path (or the Triton fallback).
+            "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
@@ -1166,6 +1173,8 @@ elif platform.is_nvidia and platform.is_hopper:
         priority=Priority.SPECIALIZED,
         traits={
             "is_causal": frozenset({False, True}),
+            # Same 256 cap as the prefill kernel; see fa3_mha_prefill.
+            "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False, True}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
@@ -1228,6 +1237,8 @@ elif platform.is_nvidia and platform.is_hopper:
         priority=Priority.SPECIALIZED,
         traits={
             "sliding_window": frozenset({False, True}),
+            # Same 256 cap as the prefill kernel; see fa3_mha_prefill.
+            "head_dim": frozenset({64, 128, 256}),
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),

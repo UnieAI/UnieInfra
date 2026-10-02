@@ -60,7 +60,7 @@ single (model-side) dtype before the flash-attn call.
 `head_dim=256` and 10 `full_attention` at `global_head_dim=512`. The fa3 dense
 kernels are validated up to `head_dim=256`; selecting them for the 256 layers
 while Triton handled the 512 layers silently corrupted output (E2E: repeated
-garbage, `finish=length`). 
+garbage, `finish=length`).
 
 Fixes:
 - `tokenspeed_kernel/ops/attention/flash_attn/__init__.py`: the three fa3 MHA
@@ -70,6 +70,23 @@ Fixes:
   per-layer head dims is steered wholly to the Triton path, the only backend
   validated for that geometry. Default backend then serves `Paris` /
   `finish=stop`, deterministic across repeated temperature-0 runs.
+
+The forced-Triton path is not a masking flag: it is the only arm that keeps
+Gemma correct. A/B against per-layer backend selection (fa3 for the 256-dicts
+sliding layers, Triton for the 512-dict global layers) failed the correctness
+gate the way the engine warns about — the "corrupt arm" did not even match on
+output *length*. Same prompt, `temperature=0`, `max_tokens=64`:
+
+| Arm (bottom decoder) | Output | Length | Gate |
+| --- | --- | --- | --- |
+| Triton everywhere (default) | `The silver moon glows softly in the velvet night sky, ...` | 28 tokens, `stop` | reference |
+| fa3 for 256 + Triton for 512 (per-layer) | `"// I'm sorry, but your request is not clear. ..."` | 29 tokens, `stop` | **fails** (length + text differ) |
+
+The per-layer schedule shows the two backends interleaving on the decode step
+(`fa3_mha_decode_with_kvcache_cached` then `triton_mha_decode_with_kvcache_cached`),
+which is where the corruption enters. Mixing head-dim groups across two
+backends in one decode step is the open defect to fix; until it is, steering
+the whole model to Triton is the only correct route.
 
 ## Verification
 
@@ -83,6 +100,29 @@ Fixes:
 - **Whisper baseline** (17.4 s clip, temp 0, steady state): single request
   latency 3.40 s -> RTF 0.195 (~5× real time); at concurrency 4,
   19.4 audio-seconds/sec (aggregate RTF 0.052), all outputs byte-identical.
+
+## Performance baselines (diagnostic)
+
+`tokenspeed` suites (`4096` / `8192`-token prompts from `ts64.jsonl`,
+`temperature=0`, `max_tokens=128` unless noted), run from inside the container
+(the engine HTTP port is container-bound). "knee" = concurrency where
+throughput flattens.
+
+| Model | conc | req/s | out_tok/s | e2e p50 |
+| --- | --- | --- | --- | --- |
+| Qwen3.6-35B-A3B (TP1) | 1 / 4 / 8 / 16 | 1.64 / 2.89 / 5.64 / 7.50 | 210 / 369 / 722 / 960 | 607 / 1374 / 1474 / 2205 ms |
+| Qwen3.5-122B-A10B (TP2) | 1 / 4 / 8 / 16 | 1.18 / 2.30 / 3.99 / 4.93 | 151 / 294 / 511 / 631 | 786 / 1724 / 1844 / 3326 ms |
+| Gemma4-31b-it (TP2, Triton) | 1 / 4 / 8 / 16 | 0.60 / 2.13 / 3.26 / 6.80 | 76 / 272 / 418 / 871 | 1674 / 1854 / 2089 / 2250 ms |
+| Qwen3-Embedding-8B (TP1) | 1 / 4 / 16 / 32 | 46 / 78 / 99 / 116 | n/a | 21 / 48 / 161 / 241 ms |
+
+Observations:
+- Qwen3.6 and Qwen3.5 keep scaling through conc 16 (knee not yet hit); Qwen3.5
+  flattens around 8→16.
+- Gemma's *throughput* scales well at high concurrency (Triton batches well),
+  but its **single-stream decode is the weak point** (76 out_tok/s at conc 1).
+  That is the Triton penalty from the correctness fallback — the fast fa3
+  decode cannot be used until the mixed-backend corruption above is fixed.
+- Embedding (2048-char prompts) is I/O-light: 46→116 req/s at sub-250 ms.
 
 ## ASR dependency note
 

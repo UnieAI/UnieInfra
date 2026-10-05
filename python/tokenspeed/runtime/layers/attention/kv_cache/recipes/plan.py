@@ -731,7 +731,12 @@ def pack(
             byte ratios plus the exact-page-stride constraints their fields
             impose.
         alignment: Byte alignment for plane sizes.
-        max_padding_fraction: Padding budget per group.
+        max_padding_fraction: Padding budget per group, measured over the
+            planes a group actually occupies (not the whole parent, which may
+            hold other groups' disjoint planes). For every group that shares
+            one aliased set of byte-equal planes -- the uniform and hybrid
+            slab models -- a group's planes are the whole parent, so this is
+            the whole-parent fraction unchanged.
 
     Returns:
         The packed :class:`CacheLayout`.
@@ -929,8 +934,15 @@ def pack(
         )
 
     for group_id in ordered_group_ids:
-        # A group's share of the parent, against the bytes its block holds.
-        stride = lcm_block_bytes / packing[group_id]
+        # A group's share of the planes it occupies, against the bytes its
+        # block holds. Groups on disjoint planes (a per-layer-geometry model
+        # whose full and sliding layers differ in head_dim) are not charged
+        # for each other's planes; groups sharing every plane are measured
+        # over the whole parent, as before.
+        occupied_bytes = sum(
+            plane_bytes[plane_id] for plane_id in group_plane_bytes[group_id]
+        )
+        stride = occupied_bytes / packing[group_id]
         padding_fraction = (stride - raw_by_group[group_id]) / raw_by_group[group_id]
         if padding_fraction > max_padding_fraction:
             raise ValueError(

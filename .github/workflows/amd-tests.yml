@@ -136,8 +136,13 @@ jobs:
             matrix=$(python3 test/ci_system/pipeline.py scan \
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
+<<<<<<< HEAD
               --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
               --runner-group "gb10" \
+=======
+              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
+              --runner-group "amd" \
+>>>>>>> 67a4e309 (ci: add post-submit trigger and use for mi35x Inkling eval (#2232))
               --workflow-stage "$workflow_stage")
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
             printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"

@@ -367,7 +367,7 @@ class BaseCausalLM(nn.Module):
                 "pooling requires ForwardContext.gather_ids, which only an "
                 "extend forward carries. Got forward_mode="
                 f"{ctx.forward_mode} bs={ctx.bs} num_extends={ctx.num_extends} "
-                f"input_num_tokens={ctx.input_num_tokens}"
+                f"rows={hidden_states.shape[0]}"
             )
         return self.pooler(
             hidden_states,

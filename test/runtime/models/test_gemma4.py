@@ -727,7 +727,8 @@ class _CaptureAttn(torch.nn.Module):
         self.k = None
         self.v = None
 
-    def forward(self, q, k, v, ctx):
+    def forward(self, q, k, v, positions=None, ctx=None, **kwargs):
+        # Mirrors PagedAttention.forward(q, k, v, positions, ctx, **kwargs).
         self.q = q.detach().clone()
         self.k = k.detach().clone()
         self.v = v.detach().clone()

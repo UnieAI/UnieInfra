@@ -632,6 +632,8 @@ class PoolRowViewWidthTest(unittest.TestCase):
             layer_id=1,
             logit_cap=0.0,
             sliding_window_size=-1,
+            rotary_emb=None,
+            qk_norm=None,
         )
         n = self._PREFIX
         k = torch.randn(n, 2, 512, device="cuda", dtype=torch.bfloat16)

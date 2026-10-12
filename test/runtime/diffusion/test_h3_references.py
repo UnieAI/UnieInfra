@@ -51,12 +51,22 @@ def test_stage_and_cleanup(tmp_path: Path):
     assert not any(Path(s.path).exists() for s in staged)
 
 
-def test_residency_device_split_default_and_usp_rejected():
+def test_residency_device_split_default_usp_and_rejections():
     cfg = H3Config(model_path="/tmp", num_gpus=2)
     assert cfg.resolve_residency() == "device_split"
     cfg1 = H3Config(model_path="/tmp", num_gpus=1)
     assert cfg1.resolve_residency() == "single"
-    with pytest.raises(ValueError, match="Ulysses"):
-        H3Config(model_path="/tmp", num_gpus=2, ulysses_degree=2).resolve_residency()
+    # USP (DiT context parallel) is supported: auto picks the ulysses layout.
+    usp = H3Config(model_path="/tmp", num_gpus=2, ulysses_degree=2)
+    assert usp.resolve_residency() == "ulysses"
+    assert usp.context_parallel_world() == 2
+    with pytest.raises(ValueError, match="hybrid ulysses"):
+        H3Config(
+            model_path="/tmp", num_gpus=4, ulysses_degree=2, ring_degree=2
+        ).resolve_residency()
+    with pytest.raises(ValueError, match="residency=ulysses requires"):
+        H3Config(model_path="/tmp", num_gpus=2, residency="ulysses").resolve_residency()
+    with pytest.raises(ValueError, match="device_split requires"):
+        H3Config(model_path="/tmp", num_gpus=1, residency="device_split").resolve_residency()
     with pytest.raises(ValueError, match="text encoder"):
         H3Config(model_path="/tmp", num_gpus=2, text_encoder_tp_size=2).resolve_residency()

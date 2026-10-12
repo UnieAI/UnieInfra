@@ -106,6 +106,10 @@ def _prepared_nvfp4_head():
     return lm_head
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10),
+    reason="NVFP4 W4A16 requires SM100/SM103",
+)
 @pytest.mark.parametrize("tied", [False, True])
 def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
     draft = _DraftModel(tied)

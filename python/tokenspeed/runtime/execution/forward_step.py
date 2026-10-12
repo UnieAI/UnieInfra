@@ -258,7 +258,7 @@ class ForwardStepRunner:
             config.enforce_eager
             or not decode_graph_supported
             or config.prefill_only
-            or config.is_embedding
+            or getattr(config, "is_embedding", False)
         )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.

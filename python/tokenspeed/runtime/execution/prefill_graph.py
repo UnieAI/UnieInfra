@@ -532,7 +532,7 @@ class PrefillGraph:
         falls back to the raw ``embed_tokens`` module. The probe is on CPU-free
         device tensors but is cheap (one token) and runs once at setup.
         """
-        raw = self._raw_embed_tokens
+        raw = getattr(self, "_raw_embed_tokens", None)
         getter = getattr(self.inner_model, "get_input_embeddings", None)
         if getter is None or raw is None:
             return raw
@@ -587,7 +587,8 @@ class PrefillGraph:
         """
         if self.disable:
             return
-        weight = self._raw_embed_tokens.weight
+        raw = getattr(self, "_raw_embed_tokens", None)
+        weight = (raw if raw is not None else self._embed_tokens).weight
         self._input_embeds_buf = torch.zeros(
             max(self.capture_buckets),
             weight.shape[1],

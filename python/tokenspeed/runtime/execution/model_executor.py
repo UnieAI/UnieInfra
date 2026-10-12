@@ -283,8 +283,6 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
-    # Embedding (pooling) serving: forward produces one vector per request.
-    is_embedding: bool
     prefix_granularity: int
     max_num_seqs: int
     chunked_prefill_size: int
@@ -336,6 +334,8 @@ class ModelExecutorConfig:
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
+    # Embedding (pooling) serving: forward produces one vector per request.
+    is_embedding: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -639,7 +639,7 @@ class ModelExecutor:
 
         self.dp_sampling_runtime_config = (
             None
-            if config.is_embedding
+            if getattr(config, "is_embedding", False)
             else setup_dp_sampling(
                 model=self.model_runner.model,
                 sampling_backend=self.sampling_backend,
@@ -1562,7 +1562,7 @@ class ModelExecutor:
 
         logits_output = self._run_target_forward(ctx)
 
-        if self.config.is_embedding:
+        if getattr(self.config, "is_embedding", False):
             # Pooling forward: model returned PoolerOutput, not logits.
             return PoolerForwardResult(embeddings=logits_output.embeddings)
 
@@ -2196,7 +2196,7 @@ class ModelExecutor:
                     ctx.global_bs = dp_metadata.global_batch_size
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
-                if self.config.is_embedding:
+                if getattr(self.config, "is_embedding", False):
                     sampling_info = None
                     grammar_completion = None
                     extend_with_prefix = False

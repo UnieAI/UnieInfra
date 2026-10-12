@@ -740,7 +740,7 @@ class OutputProcesser:
         request_changes = []
         stream_out_rids = []
         stream_out_states = []
-        embeddings = results.output_embeddings
+        embeddings = getattr(results, "output_embeddings", None)
         for i, rid in enumerate(forward_op.request_ids):
             request_state: RequestState = self.rid_to_state.get(rid)
             if request_state is None:
@@ -785,7 +785,7 @@ class OutputProcesser:
         model_execution_results: ModelExecutionResult,
         is_prefill_instance: bool,
     ):
-        if model_execution_results.output_embeddings is not None:
+        if getattr(model_execution_results, "output_embeddings", None) is not None:
             return self.post_process_embedding_forward_op(
                 forward_op, model_execution_results
             )

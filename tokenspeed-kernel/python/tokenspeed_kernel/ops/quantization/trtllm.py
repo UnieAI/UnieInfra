@@ -46,7 +46,19 @@ if platform.is_nvidia:
                 "trtllm fp8_quantize_1x128 only supports group_size=128, "
                 f"got {group_size}"
             )
-        return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        if scale.dim() == 1:
+            # Some builds (SM90) return the DeepGEMM TMA buffer: a flat,
+            # over-allocated [groups, rows rounded up to 4] column-major
+            # block. Canonicalize to the contiguous [groups, rows] view the
+            # 2-D form uses.
+            rows = x.numel() // x.shape[-1]
+            groups = x.shape[-1] // group_size
+            aligned = (rows + 3) // 4 * 4
+            scale = (
+                scale[: groups * aligned].view(groups, aligned)[:, :rows].contiguous()
+            )
+        return q, scale
 
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor

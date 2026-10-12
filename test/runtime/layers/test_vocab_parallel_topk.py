@@ -63,7 +63,7 @@ def _selector(lm_head, tp_size: int, top_k: int, max_rows: int, vocab_size: int)
 
 #: The real quant method refuses to construct off Blackwell.
 _needs_nvfp4 = pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10),
     reason="NVFP4 W4A16 requires SM100/SM103 and compatible FlashInfer",
 )
 

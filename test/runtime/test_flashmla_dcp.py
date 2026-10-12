@@ -831,7 +831,11 @@ def test_global_index_candidate_merge_ties_and_empty_shards(monkeypatch, degree,
     assert counts.tolist() == [min(4, degree * 2), 0]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="DSA indexer kernels are built for SM90/SM100 only",
+)
 def test_dsa_indexer_16_heads_with_padded_quantization_scales():
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 

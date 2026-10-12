@@ -24,7 +24,7 @@
 #                           (ep_size = stage world). Same weight bytes as TP-only
 #                           at the same world size; optional MoE routing layout.
 #   ENABLE_AUTO_TOOL_CHOICE default: empty. Non-empty = --enable-auto-tool-choice
-#                           (some SMG builds reject this flag; leave off on raichu)
+#                           (some SMG builds reject this flag; leave off on the sm120 host)
 #   TOOL_CALL_PARSER     default: qwen_coder (omit by setting empty)
 #   VENV_DIR             default: ./.venv
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
@@ -34,18 +34,18 @@
 #   VLLM_BATCH_INVARIANT default: empty. Truthy (1/true/yes/on) = deterministic
 #                        comm preset: --force-deterministic-rsag +
 #                        --disable-nccl-nvls (NCCL_NVLS_ENABLE=0). Needed on
-#                        hosts with broken NVLS multicast (e.g. mewtwo). The
+#                        hosts with broken NVLS multicast (e.g. some sm90 hosts). The
 #                        engine also honors it directly from the environment.
 #   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
 #                        legacy per-knob switches (non-empty = on); still work.
 #
 # Arch → defaults (CUDA compute capability of first selected GPU):
-#   sm90  (H200 ~141 GiB, aws-mewtwo):
+#   sm90  (H200 ~141 GiB):
 #     CUDA_DEVICES=6,7  TENSOR_PARALLEL_SIZE=2
 #     bf16 weights ~114 GiB/GPU at TP=2 — fits H200. No --quantization.
 #     MoE backend = engine auto (no forced triton).
-#   sm120 (PRO 6000 ~96 GiB, aws-raichu / Blackwell):
-#     CUDA_DEVICES=6,7  TENSOR_PARALLEL_SIZE=2  (only 6,7 available on raichu)
+#   sm120 (PRO 6000 ~96 GiB, Blackwell):
+#     CUDA_DEVICES=6,7  TENSOR_PARALLEL_SIZE=2  (only 6,7 available on the sm120 host)
 #     Online --quantization fp8 + --moe-backend triton:
 #       MoE weights ~59.6 GB/GPU; total ~86 GiB used at max_model_len=8192.
 #     Default flashinfer_trtllm FP8 MoE crashes on sm120:
@@ -57,9 +57,9 @@
 #   TOKENSPEED_CUDA_ARCH to pin.
 #
 # Recommended invoke:
-#   # mewtwo (H200 / sm90) — NVLS multicast broken → batch-invariant preset
+#   # sm90 (H200) — NVLS multicast broken → batch-invariant preset
 #   CUDA_DEVICES=6,7 VLLM_BATCH_INVARIANT=1 ./scripts/qwen3.5-122b-a10b.sh
-#   # raichu (PRO 6000 / sm120) — FP8 TP=2 + triton MoE on free GPUs 6,7
+#   # sm120 (PRO 6000) — FP8 TP=2 + triton MoE on free GPUs 6,7
 #   CUDA_DEVICES=6,7 ./scripts/qwen3.5-122b-a10b.sh
 #
 # Usage:
@@ -147,7 +147,7 @@ MODEL_PATH="${MODEL_PATH:-/models/Qwen/Qwen3.5-122B-A10B}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-test}"
 HOST_PORT="${HOST_PORT:-8778}"
 if [[ "${_IS_SM120}" -eq 1 ]]; then
-    # Online FP8 shrinks weights enough for TP=2 on ~96 GiB (verified on raichu
+    # Online FP8 shrinks weights enough for TP=2 on ~96 GiB (verified on the sm120 host
     # GPUs 6,7). Triton MoE required; default flashinfer_trtllm FP8 MoE crashes
     # on sm120 (hidden_states_scale shape mismatch).
     CUDA_DEVICES="${CUDA_DEVICES:-6,7}"

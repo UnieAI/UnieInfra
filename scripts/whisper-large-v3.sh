@@ -31,9 +31,9 @@
 #   TOKENSPEED_CUDA_ARCH override detected arch (e.g. sm120 / sm90 / 12.0 / 9.0)
 #
 # Arch → defaults (CUDA compute capability of first selected GPU):
-#   sm90  (H200 ~141 GiB, aws-mewtwo): CUDA_DEVICES=6 TP=1
-#   sm120 (PRO 6000 ~96 GiB, aws-raichu / Blackwell): CUDA_DEVICES=6 TP=1
-#     (only 6,7 available on raichu; prefer GPU 6)
+#   sm90  (H200 ~141 GiB): CUDA_DEVICES=6 TP=1
+#   sm120 (PRO 6000 ~96 GiB, Blackwell): CUDA_DEVICES=6 TP=1
+#     (only 6,7 available on the sm120 host; prefer GPU 6)
 #
 # Recommended invoke:
 #   CUDA_DEVICES=6 ./scripts/whisper-large-v3.sh

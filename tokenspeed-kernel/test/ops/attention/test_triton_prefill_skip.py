@@ -444,7 +444,7 @@ def test_window_trim_auto_concurrent_ragged_stress(
     device = "cuda"
     torch.manual_seed(6)
     # One long fresh chunk + many short multi-turn extends on long prefixes
-    # (the E2E shape that crashed once on raichu gemma3 with a KV clamp+auto).
+    # (the E2E shape that crashed once on the sm120 host gemma3 with a KV clamp+auto).
     # Sized to finish in CI while still mixing a long chunk, short extends on
     # multi-k prefixes, and a tight page-table width (no spare columns).
     prefix_lens = [0, 512, 2000] + [8192] * 6 + [1600] * 4

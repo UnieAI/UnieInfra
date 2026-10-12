@@ -35,17 +35,17 @@
 #   VLLM_BATCH_INVARIANT default: empty. Truthy (1/true/yes/on) = deterministic
 #                        comm preset: --force-deterministic-rsag +
 #                        --disable-nccl-nvls (NCCL_NVLS_ENABLE=0). Needed on
-#                        hosts with broken NVLS multicast (e.g. mewtwo) when
+#                        hosts with broken NVLS multicast (e.g. some sm90 hosts) when
 #                        TP>1. Harmless to leave unset for TP=1.
 #   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
 #                        legacy per-knob switches (non-empty = on); still work.
 #
 # Arch → defaults (CUDA compute capability of first selected GPU):
-#   sm90  (H200 ~141 GiB, aws-mewtwo):
+#   sm90  (H200 ~141 GiB):
 #     CUDA_DEVICES=6  TENSOR_PARALLEL_SIZE=1
 #     bf16 weights ~15 GiB — fits one H200. No --quantization.
-#   sm120 (PRO 6000 ~96 GiB, aws-raichu / Blackwell):
-#     CUDA_DEVICES=6  TENSOR_PARALLEL_SIZE=1  (only 6,7 available on raichu;
+#   sm120 (PRO 6000 ~96 GiB, Blackwell):
+#     CUDA_DEVICES=6  TENSOR_PARALLEL_SIZE=1  (only 6,7 available on the sm120 host;
 #     single GPU 6 preferred for 8B embeds)
 #     bf16 weights ~15 GiB — fits ~96 GiB without online FP8.
 #   Override CUDA_DEVICES / TENSOR_PARALLEL_SIZE / QUANTIZATION /
@@ -53,11 +53,11 @@
 #     CUDA_DEVICES=6,7 TENSOR_PARALLEL_SIZE=2 ./scripts/qwen3-embedding-8b.sh
 #
 # Recommended invoke:
-#   # mewtwo (H200 / sm90) — single GPU 6
+#   # sm90 (H200) — single GPU 6
 #   CUDA_DEVICES=6 ./scripts/qwen3-embedding-8b.sh
-#   # raichu (PRO 6000 / sm120) — single GPU 6
+#   # sm120 (PRO 6000) — single GPU 6
 #   CUDA_DEVICES=6 ./scripts/qwen3-embedding-8b.sh
-#   # optional TP=2 on 6,7 (mewtwo: also set VLLM_BATCH_INVARIANT=1)
+#   # optional TP=2 on 6,7 (sm90 host with broken NVLS: also set VLLM_BATCH_INVARIANT=1)
 #   CUDA_DEVICES=6,7 TENSOR_PARALLEL_SIZE=2 VLLM_BATCH_INVARIANT=1 \
 #     ./scripts/qwen3-embedding-8b.sh
 #

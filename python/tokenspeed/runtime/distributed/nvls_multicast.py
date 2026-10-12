@@ -118,7 +118,7 @@ def nvls_multicast_mapping_usable() -> bool | None:
         )
         return False
     # Could not query the driver (e.g. before CUDA init). Still treat a
-    # zero-only ClusterUUID as broken: that is the measured mewtwo failure
+    # zero-only ClusterUUID as broken: that is the measured sm90-host failure
     # mode, and a false disable only costs NVLS throughput -- not
     # correctness.
     logger.warning(

@@ -47,18 +47,18 @@
 #                        comm preset: --force-deterministic-rsag +
 #                        --disable-nccl-nvls (NCCL_NVLS_ENABLE=0). Needed on
 #                        multi-GPU hosts with broken NVLS multicast (e.g.
-#                        mewtwo). Harmless no-op for single-GPU TP=1. The
+#                        some sm90 hosts). Harmless no-op for single-GPU TP=1. The
 #                        engine also honors it directly from the environment.
 #   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
 #                        legacy per-knob switches (non-empty = on); still work.
 #
 # Arch → defaults (CUDA compute capability of first selected GPU):
-#   sm90  (H200 ~141 GiB, aws-mewtwo):
+#   sm90  (H200 ~141 GiB):
 #     CUDA_DEVICES=6  TENSOR_PARALLEL_SIZE=1
 #     MAX_MODEL_LEN=8192  MAX_NUM_SEQS=32
 #     bf16 weights ~67 GiB on one GPU at TP=1 — fits H200. No --quantization.
 #     MoE backend = engine auto (no forced triton).
-#   sm120 (PRO 6000 ~96 GiB, aws-raichu / Blackwell):
+#   sm120 (PRO 6000 ~96 GiB, Blackwell):
 #     CUDA_DEVICES=6  TENSOR_PARALLEL_SIZE=1
 #     MAX_MODEL_LEN=8192  MAX_NUM_SEQS=32
 #     bf16 weights ~67 GiB on one GPU at TP=1 — fits ~96 GiB without online FP8
@@ -68,9 +68,9 @@
 #   TOKENSPEED_CUDA_ARCH to pin.
 #
 # Recommended invoke:
-#   # mewtwo (H200 / sm90) — single-GPU TP=1 on GPU 6
+#   # sm90 (H200) — single-GPU TP=1 on GPU 6
 #   CUDA_DEVICES=6 ./scripts/qwen3.6-35b-a3b.sh
-#   # raichu (PRO 6000 / sm120) — bf16 TP=1 on free GPU 6
+#   # sm120 (PRO 6000) — bf16 TP=1 on free GPU 6
 #   CUDA_DEVICES=6 ./scripts/qwen3.6-35b-a3b.sh
 #
 # Usage:

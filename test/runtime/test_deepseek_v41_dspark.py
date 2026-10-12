@@ -800,6 +800,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         prefix_granularity=64,
         load_format="auto",
         disaggregation_mode="null",
+        validate_tp_batch_invariant_weights=lambda *args: None,
     )
     configs = [
         ModelConfig(

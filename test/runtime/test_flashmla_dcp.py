@@ -337,7 +337,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
 ):
     from types import SimpleNamespace
 
-    from cache_pool_test_utils import make_arena, make_mla_memory_plan, plan_group_specs
+    from test.runtime.cache_pool_test_utils import make_arena, make_mla_memory_plan, plan_group_specs
 
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
     from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history

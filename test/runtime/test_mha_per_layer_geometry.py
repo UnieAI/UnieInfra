@@ -546,7 +546,7 @@ class PoolRowViewWidthTest(unittest.TestCase):
     _GEOMETRY_POST_TP = ((8, 256), (2, 512))
 
     def _build_pool(self, device: str):
-        from cache_pool_test_utils import make_arena
+        from test.runtime.cache_pool_test_utils import make_arena
         from tokenspeed.runtime.layers.attention.kv_cache.mha import (
             MHATokenToKVPool,
         )

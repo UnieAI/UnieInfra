@@ -41,7 +41,7 @@ hybrid_slab_group_size = _pcs.hybrid_slab_group_size
 
 
 def _specs_for_layers(**kwargs):
-    from cache_pool_test_utils import specs_for_layers
+    from test.runtime.cache_pool_test_utils import specs_for_layers
 
     return specs_for_layers(**kwargs)
 
@@ -181,7 +181,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from cache_pool_test_utils import (
+        from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,
         )
@@ -307,7 +307,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.assertNotEqual(pool.k_buffer[0].data_ptr(), pool.k_buffer[6].data_ptr())
 
     def test_aliased_sliding_plan_publishes_one_typed_pd_arena(self):
-        from cache_pool_test_utils import make_layer_group_ids
+        from test.runtime.cache_pool_test_utils import make_layer_group_ids
 
         from tokenspeed.runtime.pd.cache_protocol import (
             build_arena_cache_transfer_contract,
@@ -343,7 +343,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         # Publication is unconditional: an arena with no groups is one no
         # scheduler can address, so it is rejected at construction rather
         # than left in a contract-less mode for callers to discover.
-        from cache_pool_test_utils import make_mha_memory_plan
+        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
 
         from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 
@@ -363,7 +363,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
     def test_arena_aligns_recipe_specs_with_plan(self):
         # Recipe specs carry default packing; the arena overwrites it (and the
         # page counts) from the memory plan before publishing the contract.
-        from cache_pool_test_utils import make_arena, make_mha_memory_plan
+        from test.runtime.cache_pool_test_utils import make_arena, make_mha_memory_plan
 
         plan = make_mha_memory_plan(
             size=32,
@@ -413,7 +413,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 
     def test_pool_arranges_arena_views_without_allocating(self):
         torch = self.torch
-        from cache_pool_test_utils import make_mla_memory_plan, make_pool
+        from test.runtime.cache_pool_test_utils import make_mla_memory_plan, make_pool
 
         arena, pool = make_pool(
             self.MLATokenToKVPool,
@@ -549,7 +549,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
-            from cache_pool_test_utils import plan_fields
+            from test.runtime.cache_pool_test_utils import plan_fields
 
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
                 HybridMHATokenToKVPool,
@@ -591,7 +591,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         )
 
     def _pool(self):
-        from cache_pool_test_utils import make_pool
+        from test.runtime.cache_pool_test_utils import make_pool
 
         _, pool = make_pool(
             self.pool_cls,
@@ -612,7 +612,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         return pool
 
     def _ordinary_pool(self):
-        from cache_pool_test_utils import make_mha_memory_plan, make_pool
+        from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         _, pool = make_pool(
             self.mha_pool_cls,

@@ -26,11 +26,12 @@
 #   ENABLE_EXPERT_PARALLEL  default: empty. Non-empty = --enable-expert-parallel
 #                           (ep_size = stage world). Same weight bytes as TP-only
 #                           at the same world size; optional MoE routing layout.
-#   REASONING_PARSER     default: qwen3_thinking (chat template opens <think>
-#                           on the assistant turn when thinking is on; this
-#                           parser assumes reasoning from the first generated
-#                           token. Override to qwen3 if you always pass
-#                           enable_thinking=false / empty think block.)
+#   REASONING_PARSER     default: qwen3. The chat template has an
+#                           enable_thinking toggle (default on), so the gateway
+#                           arms the parser only when thinking is effectively
+#                           on; enable_thinking=false then returns the answer in
+#                           content. qwen3_thinking is always-in-reasoning and
+#                           would put a thinking-off answer in reasoning_content.
 #   ENABLE_AUTO_TOOL_CHOICE default: empty. Non-empty = --enable-auto-tool-choice
 #                           (current SMG builds do not accept this flag; leave
 #                           off — tool calling is enabled via TOOL_CALL_PARSER)
@@ -183,7 +184,7 @@ DTYPE="${DTYPE:-bfloat16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
 ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-}"
-REASONING_PARSER="${REASONING_PARSER:-qwen3_thinking}"
+REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen_coder}"
 # Hosts with broken NVLS multicast need these; default off for other hosts.

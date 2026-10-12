@@ -25,6 +25,10 @@
 #                        engine also honors it directly from the environment.
 #   FORCE_DETERMINISTIC_RSAG / DISABLE_NCCL_NVLS
 #                        legacy per-knob switches (non-empty = on); still work.
+#   GPU_MEMORY_UTILIZATION default: empty (engine default). TP1 on one 141GB sm90
+#                        card needs ~0.85 to fit the 31B weights + KV.
+#   MM_ENCODER_TP_MODE   default: empty (engine default: weights). "data" runs
+#                        the vision tower data-parallel across the TP ranks.
 #
 # Recommended sm90 (H200) invoke:
 #   CUDA_DEVICES=6,7 VLLM_BATCH_INVARIANT=1 ./scripts/gemma4.sh
@@ -60,6 +64,8 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
 # Hosts with broken NVLS multicast need these; default off for other hosts.
 FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-}"
 DISABLE_NCCL_NVLS="${DISABLE_NCCL_NVLS:-}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
+MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-}"
 case "${VLLM_BATCH_INVARIANT:-}" in
     1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
         FORCE_DETERMINISTIC_RSAG="${FORCE_DETERMINISTIC_RSAG:-1}"
@@ -103,6 +109,12 @@ if [[ -n "$KV_CACHE_DTYPE" ]]; then
 fi
 if [[ -n "$ATTENTION_BACKEND" ]]; then
     cmd+=(--attention-backend "$ATTENTION_BACKEND")
+fi
+if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
+    cmd+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+fi
+if [[ -n "$MM_ENCODER_TP_MODE" ]]; then
+    cmd+=(--mm-encoder-tp-mode "$MM_ENCODER_TP_MODE")
 fi
 if [[ -n "$FORCE_DETERMINISTIC_RSAG" ]]; then
     cmd+=(--force-deterministic-rsag)

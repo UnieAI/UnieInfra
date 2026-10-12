@@ -215,7 +215,11 @@ def _validate(
                 "hidden size must be a multiple of 128 and intermediate size "
                 "a multiple of 64"
             )
+<<<<<<< HEAD:tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/_triton/mxfp4.py
     return topk_weights, topk_ids, activation, expert_start
+=======
+    return topk_weights, topk_ids, activation
+>>>>>>> 379fa008 (feat(amd): enable Qwen3.8-Flash-Next MXFP4 TP2 on gfx950 (#2223)):tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/triton/mxfp4.py
 
 
 @triton.jit

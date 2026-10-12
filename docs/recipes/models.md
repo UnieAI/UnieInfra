@@ -893,13 +893,17 @@ ts serve \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --quantization mxfp4 \
+<<<<<<< HEAD
     --max-num-seqs 16 \
     --max-cudagraph-capture-size 16 \
     --kvstore-size 32 \
+=======
+>>>>>>> 379fa008 (feat(amd): enable Qwen3.8-Flash-Next MXFP4 TP2 on gfx950 (#2223))
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```
 
+<<<<<<< HEAD
 The above configuration caps the batch at 16 sequences for latency; raise
 `--max-num-seqs` and `--max-cudagraph-capture-size` together for throughput.
 Keep ReplaySSM, the default.
@@ -914,6 +918,8 @@ after the Device cache evicts them, or drop the Host cache with
 compaction (`sysctl vm.compaction_proactiveness=0`) removes the background
 trigger.
 
+=======
+>>>>>>> 379fa008 (feat(amd): enable Qwen3.8-Flash-Next MXFP4 TP2 on gfx950 (#2223))
 ### Optional `--hf-overrides`
 
 All keys are optional and can be combined in a single `--hf-overrides` JSON

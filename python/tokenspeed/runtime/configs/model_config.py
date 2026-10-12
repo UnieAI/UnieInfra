@@ -949,9 +949,10 @@ class ModelConfig:
         autotuner's dummy batch indexes past the pool. Clamped rather than
         refused: operators took a default that predates short-context models.
         """
-        if server_args is None:
+        max_num_seqs = getattr(server_args, "max_num_seqs", None)
+        if max_num_seqs is None:
             return
-        reachable = int(self.context_len) * max(1, int(server_args.max_num_seqs))
+        reachable = int(self.context_len) * max(1, int(max_num_seqs))
         for field in ("chunked_prefill_size", "max_prefill_tokens"):
             current = getattr(server_args, field, None)
             if current is None or current <= 0 or current <= reachable:

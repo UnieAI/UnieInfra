@@ -6,10 +6,14 @@ triggers:
   - manual
 runner:
   labels:
+<<<<<<< HEAD
     - slurm-gb300-4gpu
 slurm:
   nodes: 1
   gpus_per_node: 4
+=======
+    - gb200-4gpu-perf
+>>>>>>> da643a9e (bench: add Qwen3.8-Flash-Next TP4EP4 agentic benchmark (#2216))
 env:
   CI: "true"
 install:
@@ -31,6 +35,7 @@ perf:
     "$SWEEP_DIR"
 report:
   github_step_summary: true
+<<<<<<< HEAD
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Output Throughput (tok/min/gpu)].
 # Initial targets use the four-GPU SM103 measurements in #2216, converted
@@ -42,3 +47,5 @@ perf_reference:
   8:  [285.27, 23041.65]
   16: [177.00, 29504.25]
   32: [106.70, 36064.35]
+=======
+>>>>>>> da643a9e (bench: add Qwen3.8-Flash-Next TP4EP4 agentic benchmark (#2216))

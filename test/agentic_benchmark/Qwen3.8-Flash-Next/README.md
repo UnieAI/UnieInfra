@@ -47,7 +47,11 @@ local Qwen tokenizer for input/output counting. The original data stays in
 `data/source/`.
 Cached data is rebuilt when the source, tokenizer, or token budgets change.
 
+<<<<<<< HEAD
 The workload follows the Kimi-K3 agentic flow:
+=======
+The workload and metric definitions follow the Kimi-K3 agentic flow:
+>>>>>>> da643a9e (bench: add Qwen3.8-Flash-Next TP4EP4 agentic benchmark (#2216))
 
 | Phase | Concurrency | Conversations | Dataset offset |
 | --- | --- | --- | --- |
@@ -104,6 +108,7 @@ per-concurrency EvalScope JSON/SQLite artifacts and `summary.csv`.
 | `config` | `attn_tp4_moe_ep4` |
 | `Conc.` | Request concurrency |
 | `Latency (tps/user)` | `1000 / TPOT (ms)`; accepts `Avg TPOT (ms)` too |
+<<<<<<< HEAD
 | `Output Throughput (tok/min/gpu)` | EvalScope **Output Throughput (tok/s)** multiplied by **60** and divided by **4**; output tokens only |
 | `Approx Cache Hit` | EvalScope `KV Cache Hit Rate (%)` |
 | `Decoded Tok/Iter` | `sum(completion_tokens - 1) / sum(streaming gaps)` over successful requests; `-1` if unavailable |
@@ -112,6 +117,12 @@ Output throughput is `sum(completion_tokens) / test_wall_time_seconds * 60 / 4`.
 The wall time covers the first request's start through the last completion at
 each concurrency level. Input tokens, including cached history, are excluded.
 
+=======
+| `Throughput (tps/gpu)` | EvalScope **Total Throughput (tok/s)** divided by **4**, including input and output tokens |
+| `Approx Cache Hit` | EvalScope `KV Cache Hit Rate (%)` |
+| `Decoded Tok/Iter` | `sum(completion_tokens - 1) / sum(streaming gaps)` over successful requests; `-1` if unavailable |
+
+>>>>>>> da643a9e (bench: add Qwen3.8-Flash-Next TP4EP4 agentic benchmark (#2216))
 Missing required metrics (including `Failed Requests`), failed requests,
 invalid TPOT or missing concurrency results fail the run.
 To collect an existing sweep again:
@@ -125,6 +136,7 @@ python3 test/agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/collect_outputs.py 
 The manual CI task is
 `test/ci/perf/qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml`.
 It uses the same server config, setup and benchmark scripts, and emits the CSV
+<<<<<<< HEAD
 recognized by the CI GitHub step summary. Select this YAML in Slurm Dispatch
 with cluster `gb300`. It uses one node with four GPUs (`slurm-gb300-4gpu`).
 At each of the six concurrency levels,
@@ -133,3 +145,8 @@ both `Latency (tps/user)` and `Output Throughput (tok/min/gpu)` must reach
 The initial references use the four-GPU SM103 measurements in
 [#2216](https://github.com/lightseekorg/tokenspeed/pull/2216), converting output
 throughput to tokens per minute per GPU.
+=======
+recognized by the CI GitHub step summary. Select it in K8s Dispatch with the
+`gb200` runner pool or in Slurm Dispatch. Performance references can be added
+after measuring a baseline on the selected runner.
+>>>>>>> da643a9e (bench: add Qwen3.8-Flash-Next TP4EP4 agentic benchmark (#2216))

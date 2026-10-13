@@ -87,6 +87,7 @@ for t in \
   ops/test_layernorm.py ops/test_activation.py ops/test_kvcache.py \
   ops/test_sampling_triton.py ops/test_quantization.py ops/test_gemm.py \
   ops/test_attention.py ops/test_attention_gdn.py \
+  nvidia/ops/test_flashinfer_mha_capability.py \
   test_extend_split_vo_gate.py test_gemma4_extend_head_dim.py; do
   [ -f "/tmp/ktest/test/$t" ] || continue
   step "kernel tests: $t" python3 -m pytest -q -rfs -p no:cacheprovider \

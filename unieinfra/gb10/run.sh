@@ -87,8 +87,10 @@ cmd_prep() {
   else
     log "downloading $MODEL_REPO to $MODEL_DIR"
     mkdir -p "$MODEL_DIR"
-    docker run --rm --memory 2g -v "$MODEL_DIR:/out" -e HF_TOKEN "$BASE_IMAGE" bash -lc \
-      "python3 -m pip install -q huggingface_hub && \
+    # As the host user, so the checkpoint stays owned by whoever runs this.
+    docker run --rm --memory 2g --user "$(id -u):$(id -g)" -e HOME=/tmp \
+      -e PIP_BREAK_SYSTEM_PACKAGES=1 -e HF_TOKEN -v "$MODEL_DIR:/out" "$BASE_IMAGE" bash -lc \
+      "python3 -m pip install -q --user huggingface_hub && \
        python3 -c \"from huggingface_hub import snapshot_download as s; \
 s('$MODEL_REPO', local_dir='/out')\""
   fi

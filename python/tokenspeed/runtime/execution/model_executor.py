@@ -80,6 +80,7 @@ from tokenspeed.runtime.execution.types import (
     InputLogprobPlan,
     ModelExecutionResult,
     NGramInputs,
+    PoolerForwardResult,
     RequestHistorySeeds,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
@@ -109,6 +110,7 @@ from tokenspeed.runtime.layers.paged_attention import (
     bind_cache_groups,
     check_block_drafter_storage,
 )
+from tokenspeed.runtime.layers.pooler import PoolerOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -304,9 +306,10 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     autotune_cache_key: dict[str, object] | None
-    # The prefill role of a disaggregated deployment computes prompts only:
-    # it never runs a decode/verify step of its own, so the decode graph is
-    # never captured there while the prefill graph keeps its ordinary gating.
+    # The prefill role of a disaggregated deployment, and an embedding
+    # (pooling) server, compute prompts only: neither runs a decode/verify
+    # step of its own, so the decode graph is never captured there while the
+    # prefill graph keeps its ordinary gating.
     prefill_only: bool
     # The mirror image: an attention layout that serves decode rows only
     # (head TP under attention DP), so startup never runs an extend-shaped
@@ -440,7 +443,10 @@ class ModelExecutorConfig:
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
             model_is_mrope=model_is_mrope,
-            prefill_only=server_args.disaggregation_mode == "prefill",
+            prefill_only=(
+                server_args.disaggregation_mode == "prefill"
+                or not model_config.is_generation
+            ),
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
             decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
             query_shard_size=server_args.mapping.attn.qcp_size,
@@ -1518,7 +1524,7 @@ class ModelExecutor:
         self,
         bs: int,
         ctx: ForwardContext,
-        sampling_info: SamplingBatchInfo,
+        sampling_info: SamplingBatchInfo | None,
     ):
         # Fork grammar onto its side stream so fill + H2D overlap with
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
@@ -1541,6 +1547,13 @@ class ModelExecutor:
             self.drafter.prepare_target_forward(ctx)
 
         logits_output = self._run_target_forward(ctx)
+
+        if isinstance(logits_output, PoolerOutput):
+            # A pooling model returns one vector per request instead of
+            # logits: there is nothing to sample and no token for the NaN/OOV
+            # guards to check. Embedding servers run without a drafter or a
+            # grammar, so nothing above had work to do either.
+            return PoolerForwardResult(embeddings=logits_output.embeddings)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not
@@ -2065,6 +2078,8 @@ class ModelExecutor:
             grammar_completion = None
 
             input_token_logprobs = None
+            # Set only by a pooling forward; it then replaces the token outputs.
+            output_embeddings = None
             if total_tokens == 0:
                 # Fully prefix-cached prefill: no tokens to process.
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
@@ -2172,38 +2187,45 @@ class ModelExecutor:
                     ctx.global_bs = dp_metadata.global_batch_size
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
-                with nvtx_range("sampling_prep", color="yellow"):
-                    sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs)
-                    grammar_completion = setup_grammar_step(
-                        sampling_info=sampling_info,
-                        bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends < bs,
-                        spec_num_tokens=self.config.spec_num_tokens or 1,
-                        grammar_inputs=grammar_inputs,
-                        grammar_runtime=self.grammar_runtime,
-                        input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
-                        grammar_backend=self.config.grammar_backend,
-                        output_layout=output_layout,
-                    )
-                    extend_with_prefix = num_extends > 0 and any(
-                        forward_op.extend_prefix_lens
-                    )
-                    # Flip detection + per-slot scalar scatter + backend-owned
-                    # RNG state refill. Runs OUTSIDE the CUDA graph. Generators
-                    # are now backend-internal (pool-indexed, seeded on flip
-                    # from sp.seed), so the event loop no longer threads them
-                    # through.
-                    self.sampling_backend.prepare_step(
-                        request_ids=forward_op.request_ids,
-                        request_pool_indices=forward_op.request_pool_indices,
-                        sampling_params_list=sampling_params_list,
-                        num_tokens_per_req=self.config.output_length,
-                    )
-                    if timing_enabled:
-                        sampling_prep_ms = (
-                            time.perf_counter() - sampling_start
-                        ) * 1000.0
+                extend_with_prefix = num_extends > 0 and any(
+                    forward_op.extend_prefix_lens
+                )
+                if not self.model_runner.is_generation:
+                    # A pooling batch samples nothing and advances no grammar.
+                    sampling_info = None
+                else:
+                    with nvtx_range("sampling_prep", color="yellow"):
+                        sampling_start = time.perf_counter() if timing_enabled else 0.0
+                        sampling_info = self._build_sampling_info(bs)
+                        grammar_completion = setup_grammar_step(
+                            sampling_info=sampling_info,
+                            bs=bs,
+                            is_spec_decode=self.drafter is not None
+                            and num_extends < bs,
+                            spec_num_tokens=self.config.spec_num_tokens or 1,
+                            grammar_inputs=grammar_inputs,
+                            grammar_runtime=self.grammar_runtime,
+                            input_ids_buf=self.input_buffers.input_ids_buf[
+                                :total_tokens
+                            ],
+                            grammar_backend=self.config.grammar_backend,
+                            output_layout=output_layout,
+                        )
+                        # Flip detection + per-slot scalar scatter + backend-owned
+                        # RNG state refill. Runs OUTSIDE the CUDA graph. Generators
+                        # are now backend-internal (pool-indexed, seeded on flip
+                        # from sp.seed), so the event loop no longer threads them
+                        # through.
+                        self.sampling_backend.prepare_step(
+                            request_ids=forward_op.request_ids,
+                            request_pool_indices=forward_op.request_pool_indices,
+                            sampling_params_list=sampling_params_list,
+                            num_tokens_per_req=self.config.output_length,
+                        )
+                        if timing_enabled:
+                            sampling_prep_ms = (
+                                time.perf_counter() - sampling_start
+                            ) * 1000.0
 
                 with nvtx_range(
                     f"forward_step ext={num_extends} dec={bs - num_extends}",
@@ -2219,12 +2241,7 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    (
-                        output_tokens,
-                        output_lengths,
-                        output_logprobs,
-                        input_token_logprobs,
-                    ) = self.forward_step(
+                    step_result = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -2255,17 +2272,29 @@ class ModelExecutor:
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
 
-                # Update runtime state on execution_stream (NOT in the CUDA graph).
-                self._update_runtime_state(
-                    req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
-                        :bs
-                    ],
-                    output_tokens=output_tokens,
-                    accept_lengths=output_lengths,
-                    input_lengths=self.input_buffers.input_lengths_buf[:bs],
-                    num_extends=num_extends,
-                    output_layout=ctx.output_layout,
-                )
+                if isinstance(step_result, PoolerForwardResult):
+                    # A pooling request produces no next-round input and
+                    # advances no cache length: it finishes after this step.
+                    output_embeddings = step_result.embeddings
+                else:
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        input_token_logprobs,
+                    ) = step_result
+                    # Update runtime state on execution_stream (NOT in the
+                    # CUDA graph).
+                    self._update_runtime_state(
+                        req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
+                            :bs
+                        ],
+                        output_tokens=output_tokens,
+                        accept_lengths=output_lengths,
+                        input_lengths=self.input_buffers.input_lengths_buf[:bs],
+                        num_extends=num_extends,
+                        output_layout=ctx.output_layout,
+                    )
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
@@ -2304,27 +2333,36 @@ class ModelExecutor:
                 # inference mode, so re-enter it (maybe_inference_mode mirrors the
                 # forward and reduces to no_grad when inference mode is disabled,
                 # where output_tokens isn't an inference tensor anyway).
-                vocab_size = self.runtime_states.vocab_size
-                with maybe_inference_mode():
-                    output_tokens.clamp_(0, vocab_size - 1)
-
-                packed = self.sampling_backend.get_packed_output_d2h(
-                    output_tokens, output_lengths
-                )
-                if packed is not None:
-                    output_tokens, output_lengths = packed
+                if output_embeddings is not None:
+                    # Pooled vectors, not token ids: no vocab clamp (it would
+                    # corrupt every value) and no int32 output packing.
+                    output_embeddings = output_embeddings.to("cpu", non_blocking=True)
+                    output_tokens = torch.empty(0, dtype=torch.int32)
+                    output_lengths = torch.zeros(bs, dtype=torch.int32)
+                    output_logprobs = None
+                    output_nan_flags = None
                 else:
-                    output_tokens = output_tokens.to("cpu", non_blocking=True)
-                    output_lengths = output_lengths.to("cpu", non_blocking=True)
+                    vocab_size = self.runtime_states.vocab_size
+                    with maybe_inference_mode():
+                        output_tokens.clamp_(0, vocab_size - 1)
 
-                if output_logprobs is not None:
-                    output_logprobs = output_logprobs.to("cpu", non_blocking=True)
-                if input_token_logprobs is not None:
-                    input_token_logprobs = input_token_logprobs.to(
-                        "cpu", non_blocking=True
+                    packed = self.sampling_backend.get_packed_output_d2h(
+                        output_tokens, output_lengths
                     )
+                    if packed is not None:
+                        output_tokens, output_lengths = packed
+                    else:
+                        output_tokens = output_tokens.to("cpu", non_blocking=True)
+                        output_lengths = output_lengths.to("cpu", non_blocking=True)
 
-                output_nan_flags = self.nan_guard.flags_cpu
+                    if output_logprobs is not None:
+                        output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                    if input_token_logprobs is not None:
+                        input_token_logprobs = input_token_logprobs.to(
+                            "cpu", non_blocking=True
+                        )
+
+                    output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
                 copy_event.record()
@@ -2360,6 +2398,7 @@ class ModelExecutor:
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
+            output_embeddings=output_embeddings,
             input_token_logprobs=input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a
             # pipeline stage without logits adopts the last stage's logprobs on

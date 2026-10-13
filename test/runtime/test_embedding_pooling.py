@@ -24,7 +24,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-from tokenspeed.runtime.configs.pooling_config import (
+from tokenspeed.runtime.configs.model_config import (
     PoolingConfig,
     read_sentence_transformers_pooling,
     resolve_pooling_config,
@@ -107,6 +107,13 @@ class PoolReductionTest(unittest.TestCase):
         self.assertTrue(torch.equal(out.embeddings, states.index_select(0, gather_ids)))
 
 
+class _ServerArgsStub:
+    def __init__(self, is_embedding=None, pooling_type=None, pooling_normalize=None):
+        self.is_embedding = is_embedding
+        self.pooling_type = pooling_type
+        self.pooling_normalize = pooling_normalize
+
+
 def _checkpoint(pooling: dict | None, normalize_module: bool = False) -> str:
     path = tempfile.mkdtemp()
     if pooling is not None:
@@ -125,7 +132,7 @@ class PoolingConfigDetectionTest(unittest.TestCase):
     def test_generative_checkpoint_is_not_a_pooling_server(self):
         path = _checkpoint(None)
         self.assertIsNone(read_sentence_transformers_pooling(path))
-        self.assertIsNone(resolve_pooling_config(path))
+        self.assertIsNone(resolve_pooling_config(path, _ServerArgsStub()))
 
     def test_lasttoken_plus_normalize_module_is_read_off_the_checkpoint(self):
         path = _checkpoint({"pooling_mode_lasttoken": True}, normalize_module=True)
@@ -154,17 +161,20 @@ class PoolingConfigDetectionTest(unittest.TestCase):
 
     def test_explicit_off_beats_a_pooling_checkpoint(self):
         path = _checkpoint({"pooling_mode_lasttoken": True})
-        self.assertIsNone(resolve_pooling_config(path, is_embedding=False))
+        self.assertIsNone(
+            resolve_pooling_config(path, _ServerArgsStub(is_embedding=False))
+        )
 
     def test_forcing_embedding_without_a_pooling_config_is_refused(self):
         path = _checkpoint(None)
         with self.assertRaises(ValueError):
-            resolve_pooling_config(path, is_embedding=True)
+            resolve_pooling_config(path, _ServerArgsStub(is_embedding=True))
 
     def test_overrides_win_over_the_checkpoint(self):
         path = _checkpoint({"pooling_mode_lasttoken": True}, normalize_module=True)
         config = resolve_pooling_config(
-            path, pooling_type="mean", pooling_normalize=False
+            path,
+            _ServerArgsStub(pooling_type="mean", pooling_normalize=False),
         )
         self.assertEqual(
             config, PoolingConfig(pooling_type=PoolingType.MEAN, normalize=False)
@@ -172,7 +182,9 @@ class PoolingConfigDetectionTest(unittest.TestCase):
 
     def test_override_supplies_the_mode_a_bare_checkpoint_lacks(self):
         path = _checkpoint(None)
-        config = resolve_pooling_config(path, is_embedding=True, pooling_type="cls")
+        config = resolve_pooling_config(
+            path, _ServerArgsStub(is_embedding=True, pooling_type="cls")
+        )
         self.assertEqual(
             config, PoolingConfig(pooling_type=PoolingType.CLS, normalize=False)
         )

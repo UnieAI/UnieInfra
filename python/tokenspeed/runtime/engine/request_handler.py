@@ -71,6 +71,7 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
@@ -413,6 +414,14 @@ class RequestHandler:
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
+                    recv_req
+                )
+
+                new_req_specs.append(req_spec)
+                req_states.append(req_state)
+                bootstrap_infos.append(bootstrap_info)
+            elif isinstance(recv_req, TokenizedEmbeddingReqInput):
+                req_spec, req_state, bootstrap_info = self.handle_embedding_request(
                     recv_req
                 )
 
@@ -799,6 +808,31 @@ class RequestHandler:
         self.server_args.weight_version = str(version)
         self._device.set_l3_weight_version(str(version))
         return True, msg
+
+    def handle_embedding_request(
+        self,
+        recv_req: TokenizedEmbeddingReqInput,
+    ):
+        """Admit a pooling request: one prefill, one vector, then finished.
+
+        Not routed through ``handle_generate_request``: that path reads PD
+        bootstrap fields, session params and prompt-logprob options a pooling
+        request does not carry. The request is admitted with a zero-token
+        generation budget, so the scheduler reserves no decode room for it.
+        """
+        req_state = RequestState.from_embedding_req(
+            recv_req,
+            tokenizer=self.tokenizer,
+            eos_token_ids=self.hf_eos_token_id,
+        )
+        req_spec = make_spec(
+            rid=recv_req.rid,
+            tokens=recv_req.input_ids,
+            max_cached_prefix_tokens=UNBOUNDED_CACHED_PREFIX_TOKENS,
+        )
+        req_state.sampling_params.max_new_tokens = 0
+        req_spec.max_new_tokens = 0
+        return req_spec, req_state, BootstrapInfo(None, None, None)
 
     def handle_generate_request(
         self,

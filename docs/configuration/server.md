@@ -21,6 +21,20 @@ For a compact compatibility table, see
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
+| `--is-embedding` / `--no-is-embedding` | Serve the checkpoint as an embedding (pooling) model: one vector per request, no token generation. Unset, it is inferred from the checkpoint's sentence-transformers `1_Pooling/config.json`. |
+| `--pooling-type` | Override the pooling reduction: `last`, `cls`, or `mean`. Required with `--is-embedding` on a checkpoint that ships no pooling config. |
+| `--pooling-normalize` / `--no-pooling-normalize` | Override whether pooled vectors are L2-normalized; by default this follows the checkpoint's `modules.json`. |
+
+### Embedding models
+
+An embedding server runs one prefill per request and returns the pooled
+vector through `Engine.encode()`; generate requests are refused, and an
+embedding request on a generative server is refused too. At startup it turns
+off prefix caching, opens the prefill chunk budget to `--max-prefill-tokens`
+so a prompt is never split (a pooled vector reduces over the whole prompt, so
+`--max-prefill-tokens` must be at least the context length), and disables the
+overlap schedule. Speculative decoding is rejected. No decode CUDA graph is
+captured, as for the prefill role of a disaggregated deployment.
 
 ### Checkpoint prefetch and TP shards
 

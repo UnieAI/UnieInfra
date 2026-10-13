@@ -49,6 +49,7 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    GenerateReqInput,
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
 from tokenspeed.runtime.metrics.collector import (
@@ -135,7 +136,10 @@ class OutputProcessor:
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.engine.server_args.weight_version,
             }
-            logprobs_info = state.logprobs_info if not state.obj.stream else {}
+            # ``EmbeddingReqInput`` has no ``stream`` field: a pooled vector is
+            # one value, never a stream.
+            streaming = isinstance(state.obj, GenerateReqInput) and state.obj.stream
+            logprobs_info = state.logprobs_info if not streaming else {}
 
             obj = state.obj
             sp = getattr(obj, "sampling_params", None) or {}

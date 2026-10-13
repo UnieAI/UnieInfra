@@ -260,6 +260,18 @@ class ForwardLogprobs:
 
 
 @dataclass
+class PoolerForwardResult:
+    """What a pooling forward returns in place of the sampled-token tuple.
+
+    Kept as its own type rather than reusing the token tuple: an embedding
+    tensor passed through ``output_tokens`` would be clamped to the vocab range
+    and packed as int32 by the generative D2H path.
+    """
+
+    embeddings: torch.Tensor
+
+
+@dataclass
 class ModelExecutionResult:
     """
     Result of model execution returned to scheduler.
@@ -300,6 +312,10 @@ class ModelExecutionResult:
     input_top_logprobs_idx: torch.Tensor | None = None
     output_top_logprobs_val: torch.Tensor | None = None
     output_top_logprobs_idx: torch.Tensor | None = None
+    # Embedding serving only: one pooled vector per request, [bs, hidden].
+    # A pooling forward samples nothing, so output_tokens is empty when this
+    # is set.
+    output_embeddings: torch.Tensor | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:

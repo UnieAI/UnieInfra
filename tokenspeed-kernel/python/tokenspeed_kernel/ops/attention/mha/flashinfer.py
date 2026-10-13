@@ -171,6 +171,10 @@ if platform.is_nvidia and platform.is_hopper_plus:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            # The trtllm-gen FMHA cubins need tcgen05/TMEM, which consumer
+            # Blackwell (sm_120, sm_121) lacks. Without an upper bound it wins
+            # selection there and fails at the first extend.
+            max_arch_version=ArchVersion(11, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_TRTLLM_GEN_SIGNATURES,

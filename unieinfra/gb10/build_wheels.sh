@@ -14,7 +14,7 @@
 # wheels match that image's Python, torch and CUDA exactly.
 set -euo pipefail
 
-BASE_IMAGE="lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.6.18"
+BASE_IMAGE="lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.7.1rc2"
 OUT="${GB10_WHEELS:-$HOME/.cache/unieinfra-main/wheels}"
 # Each nvcc job on the heavier units (marlin MoE, the TRT-LLM fusions) holds a
 # few GB; keep jobs x ~3 GB under the Docker VM's memory.

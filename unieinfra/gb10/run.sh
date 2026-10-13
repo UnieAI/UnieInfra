@@ -31,7 +31,7 @@ SERVICE="${GB10_SERVICE:-DeepSeek-V4-Flash-Vision-Exp-EXL3}"
 WORK="${GB10_WORK:-$HOME/unieinfra-main}"
 MODEL_REPO="${GB10_MODEL_REPO:-Qwen/Qwen3-8B}"
 MODEL_DIR="${GB10_MODEL_DIR:-$HOME/models/$MODEL_REPO}"
-BASE_IMAGE="lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.6.18"
+BASE_IMAGE="lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.7.1rc2"
 # Load generator for level 2; only its `vllm bench serve` client is used.
 BENCH_IMAGE="${GB10_BENCH_IMAGE:-vllm/vllm-openai:nightly-aarch64}"
 IMAGE="unieinfra:gb10-main"

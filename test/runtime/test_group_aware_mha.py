@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import os
 import sys
+import unittest
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -33,10 +33,25 @@ def _layer(group_id, layer_id=0):
     return SimpleNamespace(group_id=group_id, layer_id=layer_id)
 
 
-class TestRouterOverMhaLeavesTest:
+def leaf_config_for_test(torch):
+    return SimpleNamespace(
+        device="cpu",
+        dtype=torch.float16,
+        is_draft=False,
+        speculative_num_draft_tokens=1,
+        context_len=24,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_mxfp8=False,
+        draft_block_decode=False,
+        max_bs=8,
+        kernel_page_size=None,
+    )
+
+
+class RouterOverMhaLeavesTest(unittest.TestCase):
     """A router with two real MHAAttnBackend leaves (P=4 and P=2)."""
 
-    def setup_method(self):
+    def setUp(self):
         try:
             import torch
 
@@ -44,7 +59,7 @@ class TestRouterOverMhaLeavesTest:
                 MHAAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHAAttnBackend = MHAAttnBackend
 
@@ -72,6 +87,23 @@ class TestRouterOverMhaLeavesTest:
         )
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
 
+    def test_mixed_batch_is_rejected_at_construction(self):
+        """--enable-mixed-batch fails at startup, not on the first mixed round."""
+        leaf = self._leaf(4)  # the default config builds fine
+        self.assertIsNotNone(leaf)
+        config = SimpleNamespace(**vars(leaf_config_for_test(self.torch)))
+        config.mixed_batch_enabled = True
+        spec = SimpleNamespace(
+            num_attention_heads=8,
+            num_kv_heads=8,
+            attn_tp_size=1,
+            head_dim=16,
+            backend_name="mha",
+            skip_softmax_threshold=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "enable-mixed-batch"):
+            self.MHAAttnBackend(config, spec, kernel_page_size=4)
+
     def _router(self, group_ids=(FULL, SWA)):
         from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
             CacheGroupGeometry,
@@ -92,10 +124,10 @@ class TestRouterOverMhaLeavesTest:
         router.bind(
             CacheGroupGeometry(
                 granularities={gid: 4 for gid in group_ids},
-                attn_kinds={gid: "full_history" for gid in group_ids},
+                families={gid: "history" for gid in group_ids},
                 full_history_group_id=FULL,
                 row_geometry={gid: (4, 1) for gid in group_ids},
-                windows={gid: None for gid in group_ids},
+                retentions={gid: ("full_history", None) for gid in group_ids},
             ),
             leaves,
         )
@@ -127,15 +159,17 @@ class TestRouterOverMhaLeavesTest:
             torch.tensor([9], dtype=torch.int32),
         )
         # FULL leaf runs at the raw grain (P=4, ratio 1): pages verbatim.
-        assert (leaves[FULL].page_table_buf[0].tolist()) == ([5, 6, 7, 0, 0, 0])
+        self.assertEqual(leaves[FULL].page_table_buf[0].tolist(), [5, 6, 7, 0, 0, 0])
         # SWA leaf runs at P=2 (ratio 2): raw page p -> kernel pages 2p, 2p+1
         # of ITS group's table — never the FULL group's pages.
-        assert (leaves[SWA].page_table_buf[0].tolist()) == (
-            [18, 19, 16, 17, 6, 7, 0, 0, 0, 0, 0, 0]
+        self.assertEqual(
+            leaves[SWA].page_table_buf[0].tolist(),
+            [18, 19, 16, 17, 6, 7, 0, 0, 0, 0, 0, 0],
         )
         # Each leaf's decode metadata views its own buffer, not a shared one.
-        assert (leaves[FULL].forward_decode_metadata.page_table.data_ptr()) != (
-            leaves[SWA].forward_decode_metadata.page_table.data_ptr()
+        self.assertNotEqual(
+            leaves[FULL].forward_decode_metadata.page_table.data_ptr(),
+            leaves[SWA].forward_decode_metadata.page_table.data_ptr(),
         )
 
     def test_write_locations_land_in_the_layers_own_group_pages(self):
@@ -153,11 +187,11 @@ class TestRouterOverMhaLeavesTest:
         )
         # pos 8, FULL (P=4): raw page 7 slot 0 -> 28 — inside FULL's pages.
         full_locs = router.write_locations(_layer(FULL), ForwardMode.DECODE)
-        assert (full_locs.tolist()) == ([28])
+        self.assertEqual(full_locs.tolist(), [28])
         # pos 8, SWA (P=2): raw page 3 -> kernel page 6 slot 0 -> 12 — SWA's
         # own table, so the two groups disagree, proving no shared table.
         swa_locs = router.write_locations(_layer(SWA), ForwardMode.DECODE)
-        assert (swa_locs.tolist()) == ([12])
+        self.assertEqual(swa_locs.tolist(), [12])
 
     def test_unknown_group_id_raises_even_with_a_sole_leaf(self):
         # The old single-group fallback (empty/unknown group_id -> the only
@@ -171,11 +205,11 @@ class TestRouterOverMhaLeavesTest:
             {FULL: torch.tensor([[5, 6, 7]], dtype=torch.int32)},
             torch.tensor([9], dtype=torch.int32),
         )
-        with pytest.raises((KeyError), match=("names cache group 'nope'")):
+        with self.assertRaisesRegex(KeyError, "names cache group 'nope'"):
             router.write_locations(_layer("nope"), ForwardMode.DECODE)
-        with pytest.raises((KeyError), match=("names cache group ''")):
+        with self.assertRaisesRegex(KeyError, "names cache group ''"):
             router.write_locations(_layer(""), ForwardMode.DECODE)
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+    unittest.main()

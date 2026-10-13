@@ -7,7 +7,11 @@ triggers:
   - manual
 runner:
   labels:
+<<<<<<< HEAD
     - amd-mi355-1gpu
+=======
+    - amd-mi35x-1gpu-test
+>>>>>>> 4afa5038 (ci(amd): split runtime-1gpu UT and merge kernel UT parts (#2256))
 env:
   CI: "true"
 install:

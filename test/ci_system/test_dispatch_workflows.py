@@ -289,7 +289,11 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
         "b200-1gpu",
         "gb200-1gpu",
         "b300-1gpu",
+<<<<<<< HEAD
         "amd-mi355-1gpu",
+=======
+        "amd-mi35x-1gpu-test",
+>>>>>>> 4afa5038 (ci(amd): split runtime-1gpu UT and merge kernel UT parts (#2256))
     }
     for label in labels:
         executions = Counter()
@@ -341,7 +345,11 @@ def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
         "h100-1gpu",
         "b200-1gpu",
         "gb200-1gpu",
+<<<<<<< HEAD
         "amd-mi355-1gpu",
+=======
+        "amd-mi35x-1gpu-test",
+>>>>>>> 4afa5038 (ci(amd): split runtime-1gpu UT and merge kernel UT parts (#2256))
     }
     for label, parts in partitions.items():
         size = parts[0][1]

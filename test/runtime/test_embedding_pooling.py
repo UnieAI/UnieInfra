@@ -172,9 +172,7 @@ class PoolingConfigDetectionTest(unittest.TestCase):
 
     def test_override_supplies_the_mode_a_bare_checkpoint_lacks(self):
         path = _checkpoint(None)
-        config = resolve_pooling_config(
-            path, is_embedding=True, pooling_type="cls"
-        )
+        config = resolve_pooling_config(path, is_embedding=True, pooling_type="cls")
         self.assertEqual(
             config, PoolingConfig(pooling_type=PoolingType.CLS, normalize=False)
         )

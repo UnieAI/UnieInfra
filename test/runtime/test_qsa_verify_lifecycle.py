@@ -50,12 +50,16 @@ def _runner(
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
-    wrapper.config = SimpleNamespace(spec_algo="MTP", max_req_pool_size=8)
+    wrapper.config = SimpleNamespace(
+        spec_algo="MTP", max_req_pool_size=8, spec_topk=1
+    )
     wrapper.device = "cpu"
+    wrapper.runtime_states = None
+    wrapper._expert_load_rows = None
     full_backend = object.__new__(AttentionBackend)
     full_backend.device = "cpu"
 
-    def commit_recurrent(accepted_lengths):
+    def commit_recurrent(accepted_lengths, accepted_path=None):
         events.append("recurrent")
         commits["recurrent"].append(accepted_lengths.tolist())
 
@@ -131,13 +135,14 @@ def _runner(
         torch.arange(16, dtype=torch.int32),
         torch.tensor([3, 1, 99, 99], dtype=torch.int32),
         None,
+        None,
     )
 
     def execute():
         events.append("execute")
         if fail_forward:
             raise RuntimeError("forward failed")
-        return result[0][:8], result[1][:2], None
+        return result[0][:8], result[1][:2], None, None
 
     wrapper._forward_func = lambda **kwargs: execute()
     wrapper.graphs = {4: SimpleNamespace(replay=execute)}
@@ -147,6 +152,8 @@ def _runner(
 
 def _run(wrapper, mode):
     ctx = SimpleNamespace(
+        output_layout=None,
+        query_shard=None,
         attn_backend=wrapper.attn_backend,
         bs=2,
         num_extends=1 if mode.is_mixed() else (2 if mode.is_extend() else 0),
@@ -170,6 +177,7 @@ def _run(wrapper, mode):
         extend_seq_lens_cpu=empty,
         positions=None,
         block_tables={},
+        block_tables_cpu={},
     )
     assert ctx.bs == 2
     return result

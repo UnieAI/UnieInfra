@@ -71,6 +71,7 @@ def _attention(
     attn.qk_rope_head_dim = ROPE
     attn.q_lora_scale = q_lora_scale
     attn.kv_lora_scale = kv_lora_scale
+    attn.has_head_tp = False
     attn.fused_qkv_a_proj_with_mqa = lambda x, block_scale, dtype: (x @ a_weight.T).to(
         dtype
     )

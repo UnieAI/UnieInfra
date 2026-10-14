@@ -304,6 +304,21 @@ def _assign_encoder_items(
 # ---------------------------------------------------------------------------
 
 
+def _fit_encoder_rows(output: torch.Tensor, expected: int) -> torch.Tensor:
+    """Truncate or zero-pad encoder rows to the placeholder count.
+
+    Gemma4 pan-and-scan (multi-view) can emit a couple of extra pooled soft
+    tokens vs SMG's n_valid//k^2 estimate used for prompt offsets; the split
+    below must match the already-expanded placeholders.
+    """
+    if output.shape[0] > expected:
+        return output[:expected]
+    if output.shape[0] < expected:
+        pad = output.new_zeros((expected - output.shape[0], output.shape[-1]))
+        return torch.cat([output, pad], dim=0)
+    return output
+
+
 class MultimodalEmbedder:
     """Multimodal input embedding pipeline for one model executor."""
 
@@ -553,11 +568,12 @@ class MultimodalEmbedder:
                 for group in pack_encoder_batches_in_order(
                     per_item_lens, max_tokens=max_tokens
                 ):
+                    group_lens = [per_item_lens[i] for i in group]
                     output = self._run_encoder([items[i] for i in group], spec, device)
-                    output = output.reshape(-1, output.shape[-1])
-                    per_item_embs.extend(
-                        torch.split(output, [per_item_lens[i] for i in group], dim=0)
+                    output = _fit_encoder_rows(
+                        output.reshape(-1, output.shape[-1]), sum(group_lens)
                     )
+                    per_item_embs.extend(torch.split(output, group_lens, dim=0))
 
             self._store_encoder_outputs(items, per_item_embs, spec, multimodal_model)
 
@@ -594,9 +610,11 @@ class MultimodalEmbedder:
         groups = pack_encoder_batches_in_order(local_lens, max_tokens=max_tokens)
         if len(groups) == 1:
             local_output = self._run_encoder(local_items, spec, device)
-            local_output = local_output.reshape(local_rows, output_width).to(
-                device=device, dtype=output_dtype
-            )
+            # Same row fit as the single-rank path: the gather sizes below are
+            # the placeholder counts, not whatever the encoder emitted.
+            local_output = _fit_encoder_rows(
+                local_output.reshape(-1, output_width), local_rows
+            ).to(device=device, dtype=output_dtype)
         else:
             # Zero or several calls fill one buffer, so the gather sends one tensor.
             local_output = torch.empty(
@@ -605,9 +623,12 @@ class MultimodalEmbedder:
             row = 0
             for group in groups:
                 rows = sum(local_lens[i] for i in group)
-                local_output[row : row + rows] = self._run_encoder(
-                    [local_items[i] for i in group], spec, device
-                ).reshape(rows, output_width)
+                local_output[row : row + rows] = _fit_encoder_rows(
+                    self._run_encoder(
+                        [local_items[i] for i in group], spec, device
+                    ).reshape(-1, output_width),
+                    rows,
+                )
                 row += rows
 
         gathered = self._gather_encoder_outputs(

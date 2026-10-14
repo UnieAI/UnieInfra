@@ -230,6 +230,7 @@ class _DenseFFN(nn.Module):
             torch.empty(config.hidden_size, config.hidden_size, dtype=torch.bfloat16)
         )
         self.shared_experts = None
+        self.owns_ep_communication = False
         self.use_mega_moe = False
 
     def forward(

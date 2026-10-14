@@ -202,3 +202,6 @@ Testing/
 AGENTS.local.md
 AGENTS.override.md
 outputs/
+
+# kiro
+.kiro/

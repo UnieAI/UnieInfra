@@ -31,10 +31,30 @@ from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
 from tokenspeed_kernel.ops.attention.mha._triton.qkv_rotary import *  # noqa: F403
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
+
+# High-precision query over fp8 paged KV. The extend and decode kernels load
+# the cache at storage dtype and convert up to the query dtype in-kernel
+# (``k.to(q.dtype)``), so do not materialize a bf16 copy of the whole pool
+# (that OOMs under --kv-cache-dtype fp8). Shared by the extend and decode
+# registrations so both accept the mixed pair; not on ``mha_prefill`` (no
+# paged KV).
+_Q_OVER_FP8_KV_SIGNATURES = frozenset(
+    format_signature(
+        q=dense_tensor_format(q_dtype),
+        k_cache=dense_tensor_format(kv_dtype),
+        v_cache=dense_tensor_format(kv_dtype),
+    )
+    for q_dtype in (torch.float16, torch.bfloat16)
+    for kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+)
 
 
 @register_kernel(
@@ -93,9 +113,8 @@ def triton_mha_prefill(
     name="triton_mha_extend_with_kvcache",
     solution="triton",
     capability=_PORTABLE_CAPABILITY,
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
-    ),
+    signatures=format_signatures(("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES)
+    | _Q_OVER_FP8_KV_SIGNATURES,
     priority=Priority.PORTABLE,
     traits={
         "is_causal": frozenset({False, True}),
@@ -155,9 +174,8 @@ def triton_mha_extend_with_kvcache(
     name="triton_mha_decode_with_kvcache",
     solution="triton",
     capability=_PORTABLE_CAPABILITY,
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
-    ),
+    signatures=format_signatures(("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES)
+    | _Q_OVER_FP8_KV_SIGNATURES,
     priority=Priority.PORTABLE,
     traits={
         "logit_cap": frozenset({False, True}),

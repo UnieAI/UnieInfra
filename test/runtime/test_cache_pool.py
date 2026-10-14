@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from cache_pool_test_utils import MinimalCacheView, make_arena, one_group
+from test.runtime.cache_pool_test_utils import MinimalCacheView, make_arena, one_group
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena

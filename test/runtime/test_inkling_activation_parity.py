@@ -241,7 +241,7 @@ class _Harness:
             ),
             leaves,
         )
-        from cache_pool_test_utils import make_mha_memory_plan, make_pool
+        from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         layer_kv_heads = tuple(
             (

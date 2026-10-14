@@ -214,7 +214,13 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter.spec_num_tokens = 8
     drafter.input_buffers = SimpleNamespace(max_bs=2)
     drafter.lm_head = SimpleNamespace()
-    drafter.logits_processor = SimpleNamespace(tp_rank=0, tp_size=1, tp_group=None)
+    drafter.logits_processor = SimpleNamespace(
+        tp_rank=0,
+        tp_size=1,
+        tp_group=None,
+        skip_all_gather=False,
+        dp_lm_head_tp=False,
+    )
 
     with mock.patch("tokenspeed.runtime.execution.drafter.dflash2.DFlash.wire_target"):
         drafter.wire_target(SimpleNamespace())
@@ -261,6 +267,8 @@ _WINDOW_AWARE_BACKENDS = frozenset(
         "mla",
         "gluon",
         "tokenspeed_mla",
+        "deepseek_v41",
+        "qsa",
     )
 )
 

@@ -121,7 +121,9 @@ def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
     quant_config = ModelOptMixedConfig(quantized_layers={"lm_head": "W4A16_NVFP4"})
     model = BaseCausalLM.__new__(BaseCausalLM)
     nn.Module.__init__(model)
-    model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
+    model.mapping = SimpleNamespace(
+        attn=SimpleNamespace(has_dp=True), lm_head=SimpleNamespace(has_tp=False)
+    )
 
     lm_head = model.resolve_lm_head(
         SimpleNamespace(

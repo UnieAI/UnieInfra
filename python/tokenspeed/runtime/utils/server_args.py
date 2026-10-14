@@ -80,6 +80,11 @@ SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
 SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN = 1.0
 SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
 # ONE extra iteration (the depth-1 event loop commits the previous step every
@@ -285,9 +290,22 @@ class ServerArgs:
     quantization_param_path: nullable_str = None
     max_model_len: int | None = None
     device: str = "cuda"
-    served_model_name: str | None = None
+    # vLLM parity: one or more API ids for the same weights/process.
+    # CLI ``nargs="+"``; first name is canonical for metrics / gRPC.
+    served_model_name: str | list[str] | None = None
     revision: str | None = None
     language_model_only: bool = False
+
+    # Embedding (pooling) serving. An embedding server answers /v1/embeddings
+    # with one vector per request and never generates tokens; no engine in the
+    # xref survey supports mixing the two modes in one server, and neither do
+    # we. Left None, the mode is inferred from the checkpoint's
+    # sentence-transformers pooling config (1_Pooling/config.json).
+    is_embedding: bool | None = None
+    # Override the pooling reduction / L2 normalization the checkpoint declares.
+    # Only needed for a checkpoint that ships no sentence-transformers config.
+    pooling_type: str | None = None
+    pooling_normalize: bool | None = None
 
     # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
     # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
@@ -692,10 +710,45 @@ class ServerArgs:
             self.tokenizer = self.model
 
         if self.served_model_name is None:
-            self.served_model_name = self.model
+            self.served_model_name = [self.model]
+        elif isinstance(self.served_model_name, str):
+            self.served_model_name = [self.served_model_name]
+        elif isinstance(self.served_model_name, list):
+            if not self.served_model_name:
+                self.served_model_name = [self.model]
+            else:
+                # Drop empties; keep order; dedupe while preserving first wins.
+                seen: set[str] = set()
+                names: list[str] = []
+                for name in self.served_model_name:
+                    if not name or name in seen:
+                        continue
+                    seen.add(name)
+                    names.append(name)
+                self.served_model_name = names or [self.model]
+        else:
+            raise TypeError(
+                "served_model_name must be str | list[str] | None, "
+                f"got {type(self.served_model_name).__name__}"
+            )
 
         if self.seed is None:
             self.seed = random.randint(0, 1 << 30)
+
+    @property
+    def served_model_names(self) -> list[str]:
+        """All served API ids (vLLM-style multi ``--served-model-name``)."""
+        names = self.served_model_name
+        if names is None:
+            return [self.model]
+        if isinstance(names, str):
+            return [names]
+        return list(names)
+
+    @property
+    def canonical_served_model_name(self) -> str:
+        """First served name — metrics / gRPC GetModelInfo canonical id."""
+        return self.served_model_names[0]
 
     def resolve_config_aliases(self):
         # Whether the block-drafter widths were given rather than defaulted.
@@ -1406,6 +1459,36 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
+        # VLLM_BATCH_INVARIANT=1: opt-in deterministic comm preset (NCCL RS/AG
+        # instead of symm-mem Triton collectives, NCCL NVLS off). Only turns
+        # flags on; explicit --force-deterministic-rsag / --disable-nccl-nvls
+        # keep working and nothing changes when the env var is unset.
+        if _env_truthy("VLLM_BATCH_INVARIANT"):
+            if not self.force_deterministic_rsag or not self.disable_nccl_nvls:
+                logger.info(
+                    "VLLM_BATCH_INVARIANT set: enabling force_deterministic_rsag "
+                    "and disable_nccl_nvls"
+                )
+            self.force_deterministic_rsag = True
+            self.disable_nccl_nvls = True
+
+        # Hosts where Fabric Manager advertises a zero ClusterUUID while the
+        # driver still claims multicast support: NCCL NVLS hard-fails at
+        # init_process_group with cuMulticastBindMem ILLEGAL_STATE. Auto-set
+        # --disable-nccl-nvls so VLLM_BATCH_INVARIANT=0 (perf path) can start;
+        # force_deterministic_rsag stays off so Triton/IPC fusion remains.
+        if not self.disable_nccl_nvls:
+            from tokenspeed.runtime.distributed.nvls_multicast import (
+                should_auto_disable_nccl_nvls,
+            )
+
+            if should_auto_disable_nccl_nvls():
+                logger.warning(
+                    "Auto-enabling disable_nccl_nvls: NVLS multicast mapping "
+                    "unavailable on this host"
+                )
+                self.disable_nccl_nvls = True
+
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()
         if (
@@ -2107,6 +2190,28 @@ class ServerArgs:
             help="If set, skip init tokenizer and pass input_ids in generate request",
         )
         parser.add_argument(
+            "--is-embedding",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.is_embedding,
+            help="Serve this checkpoint as an embedding model: /v1/embeddings "
+            "only, one pooled vector per request, no token generation. "
+            "Inferred from the checkpoint's 1_Pooling/config.json when unset.",
+        )
+        parser.add_argument(
+            "--pooling-type",
+            type=str,
+            choices=["last", "cls", "mean"],
+            default=ServerArgs.pooling_type,
+            help="Override the pooling reduction. Needed only for an "
+            "embedding checkpoint that ships no sentence-transformers config.",
+        )
+        parser.add_argument(
+            "--pooling-normalize",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pooling_normalize,
+            help="Override whether pooled embeddings are L2-normalized.",
+        )
+        parser.add_argument(
             "--language-model-only",
             action="store_true",
             default=ServerArgs.language_model_only,
@@ -2251,8 +2356,15 @@ class ServerArgs:
         parser.add_argument(
             "--served-model-name",
             type=str,
+            nargs="+",
             default=ServerArgs.served_model_name,
-            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+            help=(
+                "API model id(s) for this engine (vLLM parity). One process / one "
+                "weight set; accept any of the names on chat/completions. "
+                "First name is canonical for metrics and gRPC GetModelInfo; "
+                "all names are advertised on /v1/models. "
+                "Example: --served-model-name gemma-3-27b-it gemma3"
+            ),
         )
         parser.add_argument(
             "--revision",

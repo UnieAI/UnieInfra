@@ -36,6 +36,7 @@ from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
+from tokenspeed.runtime.layers.pooler import PoolingType
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
@@ -366,6 +367,86 @@ def _is_dflash2_mla(
     )
 
 
+_GEMMA3_ARCHITECTURES = frozenset(
+    {"Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"}
+)
+_GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN = 6
+
+_GEMMA4_ARCHITECTURES = frozenset(
+    {"Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"}
+)
+
+
+def is_gemma4(config: PretrainedConfig) -> bool:
+    """True for a gemma-4 checkpoint (multimodal wrapper or bare text).
+
+    Detected by architecture string OR by ``model_type``, the same way
+    ``_maybe_synthesize_gemma3_layer_types`` keys gemma-3: the ``model_type``
+    (``gemma4`` / ``gemma4_text``) is always on the config, whereas the
+    ``architectures`` list can be lost to None on a multimodal wrapper. gemma-4
+    is the one MHA model that splits its KV geometry by layer type, so the
+    cache path reads this to decide whether to resolve head_dim / kv-heads per
+    layer rather than once model-wide.
+    """
+    architectures = _model_architectures(config, get_hf_text_config(config))
+    if any(arch in _GEMMA4_ARCHITECTURES for arch in architectures):
+        return True
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is not None and str(getattr(cfg, "model_type", "")).startswith("gemma4"):
+            return True
+    return False
+
+
+def _maybe_synthesize_gemma3_layer_types(
+    hf_text_config: PretrainedConfig,
+    architectures: list[str],
+) -> None:
+    """Give a Gemma 3 text config an explicit ``layer_types`` list.
+
+    Gemma 3 alternates 5 local sliding-window layers to every 1 global
+    full-attention layer, but the 27B ``config.json`` declares only
+    ``sliding_window`` (+ an implicit ``sliding_window_pattern`` of 6) and no
+    per-layer ``layer_types``. The model (``models/gemma3.py``) and the KV pool
+    (``MHAConfig``) both key their sliding-group placement off ``layer_types``;
+    without it the pool collapses to a single full-history group and ignores
+    the window. Materialise the labels HF's ``Gemma3TextConfig.__post_init__``
+    would compute, so both sides agree.
+
+    No-op when the config already carries ``layer_types`` (newer checkpoints),
+    when the model is not Gemma 3, or when the layer count is unknown.
+    """
+    # Detect Gemma 3 by architecture string OR by model_type. The model_type
+    # ("gemma3" / "gemma3_text") is always present on the config, whereas
+    # ``architectures`` can be lost to None on a multimodal wrapper -- keying on
+    # both means a config that lost its arch list still gets its window.
+    is_gemma3 = any(arch in _GEMMA3_ARCHITECTURES for arch in architectures) or str(
+        getattr(hf_text_config, "model_type", "")
+    ).startswith("gemma3")
+    if not is_gemma3:
+        return
+    if getattr(hf_text_config, "layer_types", None):
+        return
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    if not num_layers:
+        return
+    pattern = int(
+        getattr(
+            hf_text_config,
+            "sliding_window_pattern",
+            _GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN,
+        )
+        or _GEMMA3_DEFAULT_SLIDING_WINDOW_PATTERN
+    )
+    layer_types = [
+        "full_attention" if (i + 1) % pattern == 0 else "sliding_attention"
+        for i in range(int(num_layers))
+    ]
+    # Bypass __setattr__: gemma3's wrapper config forwards attribute access to
+    # text_config, and we want this pinned on the object the rest of the
+    # pipeline reads.
+    hf_text_config.__dict__["layer_types"] = layer_types
+
+
 def _apply_block_spec_widths(
     server_args: ServerArgs,
     hf_config: PretrainedConfig,
@@ -454,6 +535,10 @@ def _derive_num_attention_layers(
         return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
+    if "WhisperForConditionalGeneration" in architectures:
+        # Encoder keeps no paged KV; cross-KV lives outside the arena.
+        # Size the pool for decoder self-attention only.
+        return int(getattr(hf_config, "decoder_layers", num_hidden_layers))
     if is_deepseek_v4_nextn(hf_config):
         num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
@@ -610,12 +695,31 @@ class ModelConfig:
             if hasattr(self.hf_config, "text_config"):
                 self.hf_config.text_config = self.hf_text_config
 
-        # Check model type
-        self.is_generation = is_generation_model(self.hf_config.architectures)
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
-        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
-        self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
-        self.is_audio_model = is_audio_model(self.hf_config.architectures)
+        # Check model type.
+        # A pooling checkpoint is served as an embedding model: one prefill,
+        # one vector, no decode. Draft/auxiliary checkpoints are never pooled.
+        self.pooling_config = (
+            None if is_draft_worker else resolve_pooling_config(model_path, server_args)
+        )
+        self.is_generation = self.pooling_config is None and is_generation_model(
+            self.hf_config.architectures
+        )
+        if self.pooling_config is not None:
+            # Model-facing gate, same idiom as ``hf_config.encoder_only``: the
+            # model class is constructed from the HF config alone, so the
+            # decision has to travel on it.
+            self.hf_config.pooling_config = self.pooling_config
+            if hasattr(self.hf_config, "text_config"):
+                self.hf_config.text_config.pooling_config = self.pooling_config
+        # Prefer the combined architecture list: multimodal wrappers can
+        # lose ``hf_config.architectures`` to None after text_config attach
+        # (gemma3/gemma4), while ``resolve_architecture`` / text_config still
+        # carry ``*ForConditionalGeneration``.
+        _mm_archs = _model_architectures(self.hf_config, self.hf_text_config)
+        self.is_multimodal = is_multimodal_model(_mm_archs)
+        self.is_multimodal_gen = is_multimodal_gen_model(_mm_archs)
+        self.is_image_gen = is_image_gen_model(_mm_archs)
+        self.is_audio_model = is_audio_model(_mm_archs)
 
         language_model_only = bool(getattr(server_args, "language_model_only", False))
         # Target-only flag; never apply to draft / auxiliary checkpoints.
@@ -693,6 +797,19 @@ class ModelConfig:
         else:
             self.context_len = derived_context_len
 
+        self._clamp_prefill_budget_to_context(server_args)
+
+        if getattr(self.hf_config, "is_encoder_decoder", False):
+            # Cross-attention KV is a per-slot buffer outside the paged arena.
+            # +1 mirrors the scheduler's padding slot.
+            self.hf_config.cross_attn_slots = int(server_args.max_num_seqs) + 1
+
+        if self.pooling_config is not None:
+            # Deferred to here, not to where pooling_config is resolved: the
+            # prefill-chunk guard below is stated against context_len, which
+            # only settles above.
+            self._resolve_embedding_server_args(server_args)
+
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(
             self.hf_text_config,
@@ -709,6 +826,10 @@ class ModelConfig:
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
         attention_family = _resolve_attention_family(
+            self.hf_config,
+            self.hf_text_config,
+        )
+        model_architectures = _model_architectures(
             self.hf_config,
             self.hf_text_config,
         )
@@ -734,13 +855,18 @@ class ModelConfig:
             attention_family.configure(self, server_args)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
             configure_mla_attention(self, server_args)
-        elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
+        elif "MiniCPM3ForCausalLM" in model_architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
+
+        # Gemma 3 ships as *ForConditionalGeneration and its 27B config.json
+        # omits an explicit ``layer_types`` list. Synthesise onto the text
+        # config so the model and KV pool read the same 5:1 local:global labels.
+        _maybe_synthesize_gemma3_layer_types(self.hf_text_config, model_architectures)
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
@@ -792,6 +918,9 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+        if self.image_token_id is None:
+            # Gemma 3 uses image_token_index; Gemma 4 uses image_token_id.
+            self.image_token_id = getattr(self.hf_config, "image_token_index", None)
 
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
@@ -809,6 +938,90 @@ class ModelConfig:
         return (
             self.model_profile is not None and self.model_profile.request_token_history
         )
+
+
+
+    def _clamp_prefill_budget_to_context(self, server_args: ServerArgs) -> None:
+        """Cap the per-step prefill budget at what the request pool can hold.
+
+        Whisper's decoder holds 448 positions, so the default 8192-token budget
+        implies more concurrent requests than max_num_seqs allows, and the
+        autotuner's dummy batch indexes past the pool. Clamped rather than
+        refused: operators took a default that predates short-context models.
+        """
+        max_num_seqs = getattr(server_args, "max_num_seqs", None)
+        if max_num_seqs is None:
+            return
+        reachable = int(self.context_len) * max(1, int(max_num_seqs))
+        for field in ("chunked_prefill_size", "max_prefill_tokens"):
+            current = getattr(server_args, field, None)
+            if current is None or current <= 0 or current <= reachable:
+                continue
+            logger.info(
+                "%s=%s exceeds what the request pool can hold (context_len %s "
+                "x max_num_seqs %s = %s); clamping to %s.",
+                field,
+                current,
+                self.context_len,
+                server_args.max_num_seqs,
+                reachable,
+                reachable,
+            )
+            setattr(server_args, field, reachable)
+
+    def _resolve_embedding_server_args(self, server_args: ServerArgs) -> None:
+        """Force off the features a pooling forward cannot express.
+
+        All four reference engines disable the same two things for pooling
+        models: chunked prefill (a pooled vector reduces over the whole prompt)
+        and prefix caching (a pooling request never reads back its own KV).
+        Both are forced rather than validated.
+        """
+        if server_args.enable_prefix_caching:
+            logger.info(
+                "Embedding model: disabling prefix caching. A pooling request "
+                "computes one forward and never reads its own KV back."
+            )
+            server_args.enable_prefix_caching = False
+        # Pooling reduces over the whole prompt; a partial chunk would produce
+        # a well-formed vector over the wrong tokens. Open both the admission
+        # budget and the chunk size to the context length rather than refusing
+        # a default --max-prefill-tokens the operator never set.
+        budget = max(int(server_args.max_prefill_tokens), int(self.context_len))
+        if int(server_args.max_prefill_tokens) < self.context_len:
+            logger.info(
+                "Embedding model: raising --max-prefill-tokens from %s to %s "
+                "so a pooled prompt fits in one prefill.",
+                server_args.max_prefill_tokens,
+                budget,
+            )
+            server_args.max_prefill_tokens = budget
+        if server_args.chunked_prefill_size != budget:
+            logger.info(
+                "Embedding model: opening the prefill chunk budget from %s to "
+                "%s so a pooled prompt is never split across chunks.",
+                server_args.chunked_prefill_size,
+                budget,
+            )
+            server_args.chunked_prefill_size = budget
+        if server_args.speculative_algorithm:
+            raise ValueError(
+                "Speculative decoding is meaningless for an embedding model: "
+                "there are no tokens to draft. Drop --speculative-algorithm."
+            )
+        if not server_args.disable_overlap_schedule:
+            logger.info(
+                "Embedding model: disabling the overlap schedule. A pooling "
+                "request finishes on its first forward, and overlap would "
+                "schedule a decode step against it before that lands."
+            )
+            server_args.disable_overlap_schedule = True
+
+        # Settle the tri-state: after this, `server_args.is_embedding` is the
+        # resolved answer, not the request.
+        server_args.is_embedding = True
+        server_args.pooling_type = self.pooling_config.pooling_type.value
+        server_args.pooling_normalize = self.pooling_config.normalize
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
@@ -1019,6 +1232,113 @@ def _get_and_verify_dtype(
     return torch_dtype
 
 
+
+@dataclass(frozen=True)
+class PoolingConfig:
+    """How an embedding checkpoint reduces hidden states to one vector."""
+
+    pooling_type: PoolingType
+    normalize: bool
+
+
+# sentence-transformers spells its pooling choice as a set of mutually
+# exclusive booleans. Only the three we implement are listed; a checkpoint
+# selecting any other mode is rejected rather than silently pooled the wrong
+# way -- a wrong reduction returns a well-formed vector nothing downstream
+# can catch.
+_ST_POOLING_MODES = {
+    "pooling_mode_lasttoken": PoolingType.LAST,
+    "pooling_mode_cls_token": PoolingType.CLS,
+    "pooling_mode_mean_tokens": PoolingType.MEAN,
+}
+
+
+def read_sentence_transformers_pooling(model_path: str) -> PoolingConfig | None:
+    """Read ``1_Pooling/config.json`` + ``modules.json`` from a checkpoint.
+
+    Returns None when the checkpoint ships no sentence-transformers pooling
+    config, which is how a plain generative checkpoint looks.
+    """
+    pooling_file = os.path.join(model_path, "1_Pooling", "config.json")
+    if not os.path.isfile(pooling_file):
+        return None
+    with open(pooling_file) as handle:
+        raw = json.load(handle)
+
+    selected = [
+        pooling_type for key, pooling_type in _ST_POOLING_MODES.items() if raw.get(key)
+    ]
+    enabled_unsupported = [
+        key
+        for key, value in raw.items()
+        if key.startswith("pooling_mode_") and value and key not in _ST_POOLING_MODES
+    ]
+    if enabled_unsupported:
+        raise ValueError(
+            f"{pooling_file} selects unsupported pooling mode(s) "
+            f"{sorted(enabled_unsupported)}; supported: "
+            f"{sorted(_ST_POOLING_MODES)}. Pass --pooling-type to override."
+        )
+    if len(selected) != 1:
+        raise ValueError(
+            f"{pooling_file} selects {len(selected)} pooling modes; expected "
+            "exactly one. Pass --pooling-type to override."
+        )
+
+    # Normalization is a separate sentence-transformers module, not a field of
+    # the pooling config: read it off modules.json rather than assuming it.
+    normalize = False
+    modules_file = os.path.join(model_path, "modules.json")
+    if os.path.isfile(modules_file):
+        with open(modules_file) as handle:
+            modules = json.load(handle)
+        normalize = any(
+            str(module.get("type", "")).endswith("Normalize") for module in modules
+        )
+
+    return PoolingConfig(pooling_type=selected[0], normalize=normalize)
+
+
+def resolve_pooling_config(
+    model_path: str, server_args: ServerArgs | None
+) -> PoolingConfig | None:
+    """Decide whether this server pools, and how.
+
+    Returns None for a generative server. Raises when the operator asked for
+    embedding mode on a checkpoint that declares no pooling and gave no
+    override -- an embedding server that guessed its reduction would answer
+    every request with a plausible wrong vector.
+    """
+    declared = read_sentence_transformers_pooling(model_path)
+    requested = getattr(server_args, "is_embedding", None)
+    if requested is False:
+        return None
+    if requested is None and declared is None:
+        return None
+
+    override_type = getattr(server_args, "pooling_type", None)
+    override_normalize = getattr(server_args, "pooling_normalize", None)
+
+    if declared is None and override_type is None:
+        raise ValueError(
+            f"--is-embedding was requested but {model_path} ships no "
+            "1_Pooling/config.json to say how to pool. Pass --pooling-type "
+            "(last|cls|mean), and --pooling-normalize if the checkpoint "
+            "expects L2-normalized output."
+        )
+
+    pooling_type = (
+        PoolingType(override_type)
+        if override_type is not None
+        else declared.pooling_type
+    )
+    if override_normalize is not None:
+        normalize = override_normalize
+    else:
+        normalize = declared.normalize if declared is not None else False
+    return PoolingConfig(pooling_type=pooling_type, normalize=normalize)
+
+
 def is_generation_model(model_architectures: list[str]):
     return True
 
@@ -1036,6 +1356,13 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        # Audio in, tokens out: same multimodal request shape as an image,
+        # even though Whisper is encoder-decoder rather than audio-prefix.
+        "WhisperForConditionalGeneration",
+        # Gemma 3/4 multimodal (text+image). Vision tower is optional at
+        # runtime via language_model_only / is_multimodal_active.
+        "Gemma3ForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -1050,6 +1377,7 @@ def is_image_gen_model(model_architectures: list[str]):
 
 def is_audio_model(model_architectures: list[str] | None):
     audio_architectures = {
+        "WhisperForConditionalGeneration",
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",

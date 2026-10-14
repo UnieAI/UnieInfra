@@ -345,7 +345,7 @@ def _make_planned_deepseek_v4_pool(
     max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
     pool_size = num_lcm_blocks * max_packing * plan.prefix_granularity
     specs = tuple(spec for spec, _ in groups)
-    from cache_pool_test_utils import make_pool
+    from test.runtime.cache_pool_test_utils import make_pool
 
     _, pool = make_pool(
         HybridDeepseekV4TokenToKVPool,
@@ -4083,7 +4083,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             use_fp4_indexer_cache=True,
         )
 
-        from cache_pool_test_utils import make_pool
+        from test.runtime.cache_pool_test_utils import make_pool
 
         with self.assertRaisesRegex(ValueError, "layer_num"):
             make_pool(

@@ -27,52 +27,19 @@ _KV_CACHE_DIR = (
 _RECIPE_DIR = _KV_CACHE_DIR / "recipes"
 
 
-def _load(module_name: str, path: pathlib.Path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def _load_cache_modules():
-    for package_name in (
-        "tokenspeed",
-        "tokenspeed.runtime",
-        "tokenspeed.runtime.configs",
-        "tokenspeed.runtime.layers",
-        "tokenspeed.runtime.layers.attention",
-        "tokenspeed.runtime.layers.attention.kv_cache",
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes",
-    ):
-        sys.modules.setdefault(package_name, types.ModuleType(package_name))
-    # The V4 recipe imports the kernel-page registry by its real name;
-    # register it from its file path before the recipe loads.
-    _load(
-        "tokenspeed.runtime.layers.attention.kernel_page_sizes",
-        _KV_CACHE_DIR.parent / "kernel_page_sizes.py",
+    # Import the real package: the recipes reach into attention configs and
+    # geometry modules, so loading them by file path under stub packages
+    # breaks whenever a recipe gains an import.
+    plan = importlib.import_module(
+        "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan"
     )
-    plan = _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan",
-        _RECIPE_DIR / "plan.py",
-    )
-    _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes",
-        _RECIPE_DIR / "__init__.py",
-    )
-    recipes = {}
-    for recipe in (
-        "deepseek_v4",
-        "ordinary",
-        "inkling",
-        "kimi_k3",
-        "qwen35",
-    ):
-        recipes[recipe] = _load(
-            f"tokenspeed.runtime.layers.attention.kv_cache.recipes.{recipe}",
-            _RECIPE_DIR / f"{recipe}.py",
+    recipes = {
+        recipe: importlib.import_module(
+            f"tokenspeed.runtime.layers.attention.kv_cache.recipes.{recipe}"
         )
+        for recipe in ("deepseek_v4", "ordinary", "inkling", "kimi_k3", "qwen35")
+    }
     layouts = types.SimpleNamespace(
         **{
             name: getattr(module, name)

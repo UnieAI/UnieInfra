@@ -176,7 +176,11 @@ def _assert_rows(ib, expected, mask):
 def _sample(ib, runtime, ids, num_extends, accept_lengths, has_drafter):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.drafter = object() if has_drafter else None
-    executor.config = SimpleNamespace(output_length=runtime.future_input_map.shape[1])
+    executor.config = SimpleNamespace(
+        output_length=runtime.future_input_map.shape[1],
+        query_shard_size=1,
+        query_shard_rank=0,
+    )
     executor.runtime_states = runtime
     executor.input_buffers = ib
     bs = len(accept_lengths)
@@ -554,7 +558,9 @@ def test_runtime_update_replay_shrink_idle_and_slot_reuse(buffers, record_update
     executor.input_buffers = ib
     executor.runtime_states = runtime
     executor.drafter = object()
-    executor.config = SimpleNamespace(output_length=4)
+    executor.config = SimpleNamespace(
+        output_length=4, query_shard_size=1, query_shard_rank=0
+    )
     accepts = torch.ones(4, dtype=torch.int32, device=ib.device)
     outputs = torch.full((16,), 99, dtype=torch.int32, device=ib.device)
     history = torch.empty((16, 3), dtype=torch.int64, device=ib.device)
@@ -813,6 +819,8 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.config = SimpleNamespace(
         max_num_seqs=2,
         data_parallel_size=1,
+        query_shard_size=1,
+        query_shard_rank=0,
         chunked_prefill_size=7,
         context_len=context_len,
         physical_context_len=context_len,

@@ -1650,7 +1650,10 @@ class PagedLeafRebindTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        torch.version.hip is None, "FlashInfer wrappers are NVIDIA-only"
+        torch.version.hip is None
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (9, 10),
+        "FlashMLA kernels are built for SM90/SM100 only",
     )
     def test_flashmla_leaf_forgets_the_previous_forward(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
@@ -1684,7 +1687,10 @@ class PagedLeafRebindTest(unittest.TestCase):
         self.assertEqual(leaf._verify_views_by_bs, {})
 
     @unittest.skipUnless(
-        torch.version.hip is None, "FlashInfer wrappers are NVIDIA-only"
+        torch.version.hip is None
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] in (9, 10),
+        "FlashMLA kernels are built for SM90/SM100 only",
     )
     def test_flashmla_leaf_forgets_the_tile_keepalives(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (

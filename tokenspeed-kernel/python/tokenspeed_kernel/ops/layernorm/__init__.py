@@ -48,7 +48,9 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     nvfp4_copy_supported,
+    qk_rmsnorm_rope_neox,
     reference_rmsnorm,
+    rmsnorm_residual_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
@@ -296,9 +298,14 @@ __all__ = [
     "grouped_rmsnorm",
     "nvfp4_copy_supported",
     "qk_rmsnorm",
+    "qk_rmsnorm_rope_neox",
     "reference_rmsnorm",
     "rmsnorm",
+<<<<<<< HEAD
     "weightless_qk_rmsnorm",
     "weightless_rmsnorm",
     "weightless_rmsnorm_gated_sigmoid",
+=======
+    "rmsnorm_residual_rmsnorm",
+>>>>>>> b18e37bf (gemma4: speed up gemma-4 serving on SM90 past vLLM)
 ]

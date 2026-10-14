@@ -285,7 +285,45 @@ def _config_layer_fields(
     raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
+<<<<<<< HEAD
 def _mha_layer_fields(config, layer_id: int, occurrence: int):
+=======
+def _mha_layer_geometry(spec, local_layer_id: int) -> tuple[int, int]:
+    """This layer's ``(kv_heads, head_dim)`` AFTER TP sharding.
+
+    The uniform default reads the one model-wide ``num_kv_heads`` / ``head_dim``
+    every current model carries, so the resolved page is byte-identical to
+    before. A per-layer model (gemma-4) reads this layer's own geometry out of
+    ``layer_kv_geometry`` -- full-attention layers at 4 x 512, sliding at
+    16 x 256 -- so a mixed-head_dim model pages each layer at its true width.
+    """
+    geometry = getattr(spec, "layer_kv_geometry", None)
+    if geometry is None:
+        return max(spec.num_kv_heads // spec.attn_tp_size, 1), spec.head_dim
+    kv_heads, head_dim = geometry[local_layer_id]
+    return max(kv_heads // spec.attn_tp_size, 1), head_dim
+
+
+def _mha_plane_prefix(spec, group_id: str) -> str:
+    """Plane namespace for an MHA layer's K/V planes.
+
+    Every model shares the group-agnostic ``unit`` namespace: the i-th layer
+    of each cache group sits on slab i, so a parent spans one group's depth
+    and every group's CacheBlock fills the planes it is placed on. That holds
+    for a per-layer-geometry model (gemma-4) too: its 4 x 512 full row is half
+    its 16 x 256 sliding row, so ``pack`` places two full CacheBlocks per
+    parent on the same planes (exact page strides both ways). Scoping planes
+    per group instead made every parent carry all six groups' planes while
+    each group filled only its own, so five sixths of every page sat idle.
+    """
+    del spec, group_id
+    return "unit"
+
+
+def _mha_layer_fields(
+    config, layer_id: int, local_layer_id: int, group_id: str, occurrence: int
+):
+>>>>>>> b18e37bf (gemma4: speed up gemma-4 serving on SM90 past vLLM)
     """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
     spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)

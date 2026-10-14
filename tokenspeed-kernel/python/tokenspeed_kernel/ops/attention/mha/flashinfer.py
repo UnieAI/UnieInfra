@@ -98,6 +98,13 @@ def _untuned_with_lse(function):
 
 
 if platform.is_nvidia:
+<<<<<<< HEAD
+=======
+    # FA2 paged-extend for large head_dim (gemma-4 global layers, 512) on
+    # sm90 / sm12x; on by default for 512 (TOKENSPEED_FLASHINFER_FA2_EXTEND=off
+    # opts out).
+    import tokenspeed_kernel.ops.attention.mha._flashinfer.paged_extend  # noqa: F401
+>>>>>>> b18e37bf (gemma4: speed up gemma-4 serving on SM90 past vLLM)
     from flashinfer.decode import (
         BatchDecodeWithPagedKVCacheWrapper,
     )

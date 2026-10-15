@@ -182,10 +182,7 @@ class TestGatherPagedIndexerFp8Cache(unittest.TestCase):
         torch.testing.assert_close(gathered, reference, rtol=0, atol=0)
 
 
-@unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9,
-    "Hopper FP8 indexer kernels are built for SM90 only",
-)
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestPrepareIndexerQFp8(unittest.TestCase):
     def test_scales_fold_into_weights(self):
         torch.manual_seed(0)

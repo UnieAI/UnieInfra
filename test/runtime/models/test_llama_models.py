@@ -40,8 +40,6 @@ import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
 
-from test.runtime.launch_guard import launch_skip_reason
-
 MODEL = os.environ.get("LLAMA_DENSE_MODEL", "unsloth/Llama-3.2-1B-Instruct")
 WORLD_SIZE = int(os.environ.get("LLAMA_DENSE_WORLD_SIZE", "1"))
 TIMEOUT = 600
@@ -185,12 +183,6 @@ class TestLlamaRegistry(unittest.TestCase):
 
 class TestLlamaDense(unittest.TestCase):
     """Quality checks against a live server loading a dense Llama checkpoint."""
-
-    @classmethod
-    def setUpClass(cls):
-        reason = launch_skip_reason(MODEL, min_gpus=WORLD_SIZE)
-        if reason is not None:
-            raise unittest.SkipTest(reason)
 
     def _run_quality_checks(self, extra_args=()):
         port = _next_server_port()

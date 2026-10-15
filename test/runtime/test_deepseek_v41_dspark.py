@@ -455,11 +455,7 @@ def test_window_attention_kernel_matches_reference():
     assert selected.name == expected
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] not in (9, 10),
-    reason="DeepGEMM hyper-connection kernels are built for SM90/SM100 only",
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_draft_forward_graph_and_context_seeding(monkeypatch):
     config = _draft_config()
     config.hidden_size = 256
@@ -804,7 +800,6 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         prefix_granularity=64,
         load_format="auto",
         disaggregation_mode="null",
-        validate_tp_batch_invariant_weights=lambda *args: None,
     )
     configs = [
         ModelConfig(

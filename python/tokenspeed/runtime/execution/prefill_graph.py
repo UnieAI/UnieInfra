@@ -417,18 +417,7 @@ class PrefillGraph:
         self.text_model, self.inner_model = text_and_inner_model(model)
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
         # read a static input-embeds buffer instead of gathering from input_ids.
-        #
-        # Prefer the model's ``get_input_embeddings(input_ids) -> Tensor`` when it
-        # exists AND returns a tensor: some models (Gemma 3's sqrt(hidden) scale,
-        # Qwen's ``scale_emb``) apply an embedding scale there that a raw
-        # ``embed_tokens`` lookup omits. Capturing/replaying the inner stack on
-        # UNSCALED embeddings corrupts every hidden state (Gemma 3: ~sqrt(5376)x
-        # too small) -- the residual carries the unscaled embeds while RMSNorm
-        # hides the scale on the normed branch, so layer 0 looks fine and layer 1
-        # onward diverges. Fall back to raw ``embed_tokens`` for models whose
-        # ``get_input_embeddings`` returns an ``nn.Module`` (no scale to apply).
-        self._raw_embed_tokens = getattr(self.inner_model, "embed_tokens", None)
-        self._embed_tokens = self._resolve_embed_fn()
+        self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -524,34 +513,6 @@ class PrefillGraph:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def _resolve_embed_fn(self):
-        """Return a callable ``input_ids -> embeds`` that matches the eager path.
-
-        Uses the inner model's ``get_input_embeddings`` when it is the
-        tensor-returning (scale-applying) kind, probed by a one-token call; else
-        falls back to the raw ``embed_tokens`` module. The probe is on CPU-free
-        device tensors but is cheap (one token) and runs once at setup.
-        """
-        raw = getattr(self, "_raw_embed_tokens", None)
-        getter = getattr(self.inner_model, "get_input_embeddings", None)
-        if getter is None or raw is None:
-            return raw
-        try:
-            import inspect
-
-            params = [
-                prm
-                for prm in inspect.signature(getter).parameters.values()
-                if prm.name != "self"
-            ]
-        except (TypeError, ValueError):
-            params = []
-        if not params:
-            # Zero-arg: returns an nn.Module (no scale). Use raw lookup.
-            return raw
-        # Takes input_ids and returns a tensor (possibly scaled). Use it.
-        return getter
-
     def capture(
         self,
         decode_wrapper: ForwardStepRunner | None = None,
@@ -587,8 +548,7 @@ class PrefillGraph:
         """
         if self.disable:
             return
-        raw = getattr(self, "_raw_embed_tokens", None)
-        weight = (raw if raw is not None else self._embed_tokens).weight
+        weight = self._embed_tokens.weight
         self._input_embeds_buf = torch.zeros(
             max(self.capture_buckets),
             weight.shape[1],

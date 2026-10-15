@@ -219,28 +219,20 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
 def test_hybrid_factory_selects_gdn_only_for_local_state(
     monkeypatch, is_qwen4, has_linear_config, has_local_state
 ):
-    # The GDN factory imports its backend at call time; replace it there.
-    import_module("tokenspeed.runtime.layers.attention.backends.state.gdn")
+    # Load the subclass before replacing its base class with a constructor mock.
+    import_module("tokenspeed.runtime.layers.attention.backends.state.kda")
     full = SimpleNamespace(device="cpu", spec_num_tokens=1)
     gdn = SimpleNamespace(set_kv_pool=Mock(), commit_verified_state=Mock())
     factory = Mock(return_value=gdn)
     monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.backends.state.gdn.GdnAttnBackend",
+        "tokenspeed.runtime.layers.attention.backends.state.mamba.MambaAttnBackend",
         factory,
     )
     config = _config(is_draft=False, width=1)
     components = {
         SoftmaxAttnConfig: config.component(SoftmaxAttnConfig),
         LinearAttnConfig: (
-            LinearAttnConfig(
-                num_k_heads=2,
-                num_v_heads=2,
-                head_k_dim=16,
-                head_v_dim=16,
-                conv_kernel_size=4,
-                layer_ids=(0 if has_local_state else 3,),
-                tp_size=1,
-            )
+            SimpleNamespace(layer_ids=(0 if has_local_state else 3,))
             if has_linear_config
             else None
         ),
@@ -348,27 +340,10 @@ def test_runtime_and_draft_setup_reach_attention_leaves(attention_root):
         supports_layer_sliding_window=True,
     )
     router.leaves = {FULL_ATTENTION: leaf}
-    # The router resolves each leaf's block geometry from the bound arena.
-    router.cache_pool = SimpleNamespace(
-        arena=SimpleNamespace(
-            cache_group_specs=(
-                SimpleNamespace(group_id=FULL_ATTENTION, shard_count=1),
-            ),
-            runtime_contract=SimpleNamespace(
-                virtual_block_counts={FULL_ATTENTION: 7}
-            ),
-        )
-    )
-    router._geometry = SimpleNamespace(granularity_of=lambda group_id: 64)
     pool = object()
     root.configure_runtime(token_to_kv_pool=pool)
     root.init_prefill_graph_state(16, 4)
-    leaf.configure_runtime.assert_called_once_with(
-        block_granularity=64,
-        shard_count=1,
-        virtual_block_count=7,
-        token_to_kv_pool=pool,
-    )
+    leaf.configure_runtime.assert_called_once_with(token_to_kv_pool=pool)
     leaf.init_prefill_graph_state.assert_called_once_with(16, 4)
     assert root.supports_layer_sliding_window
     slots = torch.empty(4, dtype=torch.int32)

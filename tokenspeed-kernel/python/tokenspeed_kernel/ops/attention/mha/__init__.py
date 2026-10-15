@@ -299,7 +299,6 @@ def mha_extend_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
-    host_meta: object | None = None,
 ) -> AttentionResult:
     """MHA extend with paged KV cache.
 
@@ -332,9 +331,6 @@ def mha_extend_with_kvcache(
         v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
-        host_meta: Optional host-side plan metadata (cu_seqlens_q_cpu,
-            cache_seqlens_cpu, plan_cache) for sync-free FlashInfer FA2 plan.
-            Ignored by kernels that do not declare the parameter.
 
     Each request's query tokens attend all visible cached KV tokens.
     """
@@ -390,7 +386,7 @@ def mha_extend_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        call_kwargs = dict(
+        return kernel(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
@@ -409,16 +405,6 @@ def mha_extend_with_kvcache(
             enable_pdl=pdl_enabled(),
             **scale_kwargs,
         )
-        # host_meta is FA2-only; other kernels omit the parameter.
-        try:
-            import inspect
-
-            impl = getattr(kernel, "impl", kernel)
-            if "host_meta" in inspect.signature(impl).parameters:
-                call_kwargs["host_meta"] = host_meta
-        except (TypeError, ValueError):
-            pass
-        return kernel(**call_kwargs)
 
 
 def mha_decode_with_kvcache(

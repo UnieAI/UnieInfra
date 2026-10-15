@@ -183,7 +183,7 @@ class HistoryGroupByLayerOverRealPlanTest(unittest.TestCase):
     """The pool reads layer -> group back from the planned KV fields."""
 
     def _pool(self, *, layer_types, sliding_window_tokens, num_draft_layers):
-        from test.runtime.cache_pool_test_utils import (
+        from cache_pool_test_utils import (
             make_layer_group_ids,
             make_mha_memory_plan,
             make_pool,

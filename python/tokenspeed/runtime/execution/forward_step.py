@@ -255,10 +255,7 @@ class ForwardStepRunner:
         # dummy anyway. The unified refresh still serves eager decode either
         # way; the prefill graph is gated separately (PrefillGraph.disable).
         self.disable = (
-            config.enforce_eager
-            or not decode_graph_supported
-            or config.prefill_only
-            or getattr(config, "is_embedding", False)
+            config.enforce_eager or not decode_graph_supported or config.prefill_only
         )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.

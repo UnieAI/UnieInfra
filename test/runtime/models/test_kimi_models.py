@@ -32,8 +32,6 @@ import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
 
-from test.runtime.launch_guard import launch_skip_reason
-
 MODEL = os.environ.get("KIMI_K25_MODEL", "nvidia/Kimi-K2.5-NVFP4")
 QUANTIZATION = os.environ.get("KIMI_K25_QUANTIZATION", "nvfp4")
 WORLD_SIZE = int(os.environ.get("KIMI_K25_WORLD_SIZE", "4"))
@@ -258,17 +256,6 @@ MESH_CASES = {
 
 class TestKimiK25(unittest.TestCase):
 
-    @classmethod
-    def setUpClass(cls):
-        reason = launch_skip_reason(MODEL, min_gpus=WORLD_SIZE)
-        if reason is not None:
-            raise unittest.SkipTest(reason)
-
-    def _require_draft(self, draft: str):
-        reason = launch_skip_reason(draft, min_gpus=WORLD_SIZE)
-        if reason is not None:
-            self.skipTest(reason)
-
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
         proc = _serve_server(port, case.extra_args)
@@ -294,17 +281,14 @@ class TestKimiK25(unittest.TestCase):
 
     def test_tsckpt_eagle3(self):
         """Kimi K2.5 with EAGLE3 draft."""
-        self._require_draft(DRAFT_MODEL)
         self._run_quality_checks(MESH_CASES["tsckpt_eagle3"])
 
     def test_nvckpt_eagle3(self):
         """Kimi K2.5 with MLA EAGLE3 draft (trtllm_mla drafter + FP8 KV cache)."""
-        self._require_draft(MLA_DRAFT_MODEL)
         self._run_quality_checks(MESH_CASES["nvckpt_eagle3"])
 
     def test_dflash(self):
         """Kimi K2.5 with native DFLASH block-diffusion draft (fa4 drafter)."""
-        self._require_draft(DFLASH_DRAFT_MODEL)
         self._run_quality_checks(MESH_CASES["dflash"])
 
 

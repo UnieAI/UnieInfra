@@ -39,7 +39,6 @@ sys.path.insert(
     ),
 )
 from test.runners import DEFAULT_PROMPTS, RTRunner
-from test.runtime.launch_guard import launch_skip_reason
 from test.test_utils import is_in_ci
 
 
@@ -152,13 +151,6 @@ QUALITY_CHECKS = [
 ]
 
 
-def _launch_skip_reason(model_case: ModelCase):
-    draft = model_case.extra_kwargs.get("speculative_draft_model_path")
-    return launch_skip_reason(
-        model_case.model_path, draft, min_gpus=max(1, model_case.tp_size)
-    )
-
-
 class TestGenerationModels(unittest.TestCase):
 
     @classmethod
@@ -221,7 +213,6 @@ class TestGenerationModels(unittest.TestCase):
                 )
 
     def test_ci_models(self):
-        ran = 0
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         for model_case in CI_MODELS:
             if model_case.blackwell_only and not _BLACKWELL_SYSTEM:
@@ -236,11 +227,6 @@ class TestGenerationModels(unittest.TestCase):
                     f"Skipping {model_case.model_path}: requires {model_case.min_gpu_memory_gb}GB, got {total_memory_gb:.0f}GB ({gpu_memory_gb:.0f}GB x {model_case.tp_size})"
                 )
                 continue
-            reason = _launch_skip_reason(model_case)
-            if reason is not None:
-                print(f"Skipping {model_case.model_path}: {reason}")
-                continue
-            ran += 1
             for torch_dtype in TORCH_DTYPES:
 
                 prompts = [q["messages"][0]["content"] for q in QUALITY_CHECKS]
@@ -249,13 +235,10 @@ class TestGenerationModels(unittest.TestCase):
                 self.assert_close_logits_and_output_strs(
                     prompts, model_case, torch_dtype
                 )
-        if not ran:
-            self.skipTest("no CI model can run on this machine")
 
     def test_others(self):
         if is_in_ci():
             return
-        ran = 0
 
         for model_case in ALL_OTHER_MODELS:
             # Only run a specified model
@@ -264,11 +247,6 @@ class TestGenerationModels(unittest.TestCase):
                 and os.environ["ONLY_RUN"] != model_case.model_path
             ):
                 continue
-            reason = _launch_skip_reason(model_case)
-            if reason is not None:
-                print(f"Skipping {model_case.model_path}: {reason}")
-                continue
-            ran += 1
 
             # Skip long prompts for models that do not have a long context
             prompts = DEFAULT_PROMPTS
@@ -277,8 +255,6 @@ class TestGenerationModels(unittest.TestCase):
 
             # Assert the logits and output strs are close
             self.assert_close_logits_and_output_strs(prompts, model_case, torch.float16)
-        if not ran:
-            self.skipTest("no model in ALL_OTHER_MODELS can run on this machine")
 
 
 if __name__ == "__main__":

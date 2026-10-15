@@ -26,8 +26,6 @@ import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
 
-from test.runtime.launch_guard import launch_skip_reason
-
 MODEL = os.environ.get("GPT_OSS_MODEL", "openai/gpt-oss-120b")
 WORLD_SIZE = int(os.environ.get("GPT_OSS_WORLD_SIZE", "4"))
 TIMEOUT = 600
@@ -198,12 +196,6 @@ MESH_CASES = {
 
 class TestGptOss(unittest.TestCase):
 
-    @classmethod
-    def setUpClass(cls):
-        reason = launch_skip_reason(MODEL, min_gpus=WORLD_SIZE)
-        if reason is not None:
-            raise unittest.SkipTest(reason)
-
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
         proc = _serve_server(port, case.extra_args)
@@ -236,10 +228,6 @@ class TestGptOss(unittest.TestCase):
         self._run_quality_checks(MESH_CASES["combine_dense_moe"])
 
     def test_eagle3(self):
-        draft = MESH_CASES["eagle3"].extra_args[3]
-        reason = launch_skip_reason(draft, min_gpus=WORLD_SIZE)
-        if reason is not None:
-            self.skipTest(reason)
         self._run_quality_checks(MESH_CASES["eagle3"])
 
 

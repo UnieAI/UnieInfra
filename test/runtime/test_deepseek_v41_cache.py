@@ -1529,8 +1529,7 @@ def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
     live = positions >= 0
     pair = positions[live, None] + torch.arange(2)
     expected = (full_content[pair] * full_scores[pair].softmax(1)).sum(1)
-    # Same math, but CPU reduction order varies with the host vector width.
-    torch.testing.assert_close(pooled[live], expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(pooled[live], expected, rtol=0, atol=0)
     assert not pooled[~live].any()
     assert not backend.cache_pool.compressor_tail(2)[0].any()
 

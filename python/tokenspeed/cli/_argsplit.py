@@ -80,7 +80,6 @@ _ENGINE_MULTI_VALUE_FLAGS = {
     "--prefill-graph-capture-sizes",
     "--prefill-graph-capture-token-sizes",
     "--prefill-graph-capture-batch-sizes",
-    "--served-model-name",
 }
 
 

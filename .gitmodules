@@ -1,4 +1,0 @@
-[submodule "smg"]
-	path = smg
-	url = https://github.com/nctu6/smg
-        branch = nctu6

@@ -24,71 +24,8 @@ import argparse
 import sys
 
 
-def _split_host_port(raw_argv: list[str]) -> tuple[list[str], str, int]:
-    """Engine args plus the gateway-side --host/--port this server binds."""
-    from tokenspeed.cli._argsplit import split_argv
-
-    split = split_argv(raw_argv)
-    host, port = "127.0.0.1", 8000
-    gateway = list(split.gateway)
-    if "--host" in gateway:
-        host = gateway[gateway.index("--host") + 1]
-    if "--port" in gateway:
-        port = int(gateway[gateway.index("--port") + 1])
-    return split.engine, host, port
-
-
-def _serve_asr(raw_argv: list[str]) -> None:
-    """``ts serve`` for Whisper: audio in, transcript out via asr_http.
-
-    SMG's gRPC transcription adapter currently supports Qwen3-ASR only; Whisper
-    needs log-mel features beside the decoder prompt, so this path owns the
-    OpenAI-compatible /v1/audio/transcriptions HTTP surface in-process.
-    """
-    from tokenspeed.runtime.entrypoints.asr_http import serve
-
-    engine_args, host, port = _split_host_port(raw_argv)
-    print(f"[ts serve] asr server on http://{host}:{port}")
-    serve(engine_args, host=host, port=port)
-
-
-def _serve_diffusion(raw_argv: list[str]) -> None:
-    """``ts serve`` for diffusers pipelines (MiniMax-H3, MiniMax-Music3, ...).
-
-    SMG has no video/music RPC. ``entrypoints/diffusion_http`` dispatches:
-    H3 → ``/v1/videos`` (+ sync); Music3 → ``music3_http`` ``/v1/audio/speech``.
-    Flags keep vLLM-familiar names (``--tensor-parallel-size``, ``--task-type``)
-    at the CLI boundary; the implementation is TokenSpeed-native.
-    """
-    from tokenspeed.runtime.entrypoints.diffusion_http import serve
-
-    _, host, port = _split_host_port(raw_argv)
-    print(f"[ts serve] diffusion server on http://{host}:{port}")
-    serve(raw_argv, host=host, port=port)
-
-
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     from tokenspeed.cli.serve_smg import run_smg_from_args
-
-    if not getattr(args, "headless", False):
-        # Resolve from the first positional model path in raw argv (same shape
-        # as ``tokenspeed serve <model> ...``).
-        from tokenspeed.runtime_select import describe_runtime, resolve_serving_runtime
-
-        model = next((a for a in raw_argv if a and not a.startswith("-")), "")
-        # Also accept ``--model <path>`` (vLLM-shaped) when no positional.
-        if not model and "--model" in raw_argv:
-            idx = raw_argv.index("--model")
-            if idx + 1 < len(raw_argv):
-                model = raw_argv[idx + 1]
-        runtime = resolve_serving_runtime(model) if model else "generate"
-        print(f"[ts serve] runtime: {runtime} -- {describe_runtime(runtime)}")
-        if runtime == "asr":
-            _serve_asr(raw_argv)
-            return
-        if runtime == "diffusion":
-            _serve_diffusion(raw_argv)
-            return
 
     run_smg_from_args(args, raw_argv)
 

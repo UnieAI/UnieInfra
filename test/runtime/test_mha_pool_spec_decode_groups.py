@@ -36,7 +36,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan
 
         kwargs = {
             "size": 32,
@@ -50,7 +50,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             "rank": 0,
         }
         kwargs.update(overrides)
-        from test.runtime.cache_pool_test_utils import make_layer_group_ids
+        from cache_pool_test_utils import make_layer_group_ids
 
         # Resolve the labels the way a recipe does: one per layer,
         # full-history when the test declares none.
@@ -72,7 +72,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             layer_types=layer_types,
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
-        from test.runtime.cache_pool_test_utils import specs_for_layers
+        from cache_pool_test_utils import specs_for_layers
 
         kwargs.setdefault(
             "cache_group_specs",
@@ -88,7 +88,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         for owned_by_arena in ("size", "prefix_granularity", "enable_memory_saver"):
             kwargs.pop(owned_by_arena, None)
         kwargs.pop("layer_types", None)
-        from test.runtime.cache_pool_test_utils import make_pool
+        from cache_pool_test_utils import make_pool
 
         _, pool = make_pool(self.MHATokenToKVPool, plan, device=device, **kwargs)
         return pool

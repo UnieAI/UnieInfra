@@ -130,12 +130,6 @@ class TestQwen35VlmE2E(unittest.TestCase):
         if not current_platform().is_blackwell:
             raise unittest.SkipTest("Qwen3.5 FP8 VLM requires NVIDIA Blackwell")
 
-        from test.runtime.launch_guard import launch_skip_reason
-
-        reason = launch_skip_reason(MODEL)
-        if reason is not None:
-            raise unittest.SkipTest(reason)
-
     def test_image_chat_completion(self):
         import requests
 

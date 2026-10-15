@@ -403,7 +403,7 @@ def _moe_api(impl, routing_modes, deferred):
         _validate_selected_deepep_mode=Mock(),
         _validate_combine_order=Mock(),
         COMBINE_ORDERS=("rank", "slot"),
-        _build_traits=Mock(return_value={"supports_all_to_all_ep": False}),
+        _build_traits=Mock(return_value={}),
         select_kernel=lambda *args, **kwargs: impl,
         format_signature=lambda **kwargs: kwargs,
         dense_tensor_format=lambda dtype: dtype,
@@ -817,7 +817,7 @@ def test_bf16_joint_adapter_uses_one_fi_dispatch(pdl, provided_out, n, k, expect
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
-        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names", "_canonical_bf16_view"),
+        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names"),
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
@@ -994,7 +994,7 @@ def test_joint_adapter_propagates_fi_failure():
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
-        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names", "_canonical_bf16_view"),
+        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names"),
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
@@ -1036,7 +1036,7 @@ def test_joint_bf16_adapter_declines_large_m(m):
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
-        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names", "_canonical_bf16_view"),
+        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names"),
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
@@ -1143,7 +1143,7 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
             torch=torch,
             BF16_GEMM_MAX_M=32,
             flashinfer_joint_bf16_supported=lambda *args: fi,
-            current_platform=lambda: SimpleNamespace(is_cdna4=False, is_cdna5=cdna5),
+            current_platform=lambda: SimpleNamespace(is_cdna5=cdna5),
             _select=select,
             torch_decode_gemv=fallback,
         ),

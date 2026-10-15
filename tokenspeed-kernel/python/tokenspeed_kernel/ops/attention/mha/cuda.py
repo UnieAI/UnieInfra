@@ -535,20 +535,6 @@ elif platform.is_nvidia and platform.is_hopper:
         get_scheduler_metadata,
     )
 
-    # FA3 on Hopper supports head_dim at most 256 (flash_attn_3 fwd guard).
-    # Gemma-4 full-attention layers use global_head_dim=512; without this trait
-    # the registry selects fa3 for those layers and crashes at kernel launch.
-    # Keep the set aligned with FA4's dense MHA dims up through 256.
-    _FA3_HOPPER_HEAD_DIMS = frozenset(range(8, 257, 8))
-
-    def _fa3_sinks(sinks: torch.Tensor | None) -> torch.Tensor | None:
-        # The FA3 Hopper API requires bf16 sinks regardless of the q/kv dtype
-        # (fp16, bf16 or fp8). Sinks are per-head softmax logits, so bf16
-        # precision is sufficient; cast instead of failing at kernel launch.
-        if sinks is None or sinks.dtype == torch.bfloat16:
-            return sinks
-        return sinks.to(torch.bfloat16).contiguous()
-
     @register_kernel(
         "attention",
         "mha_prefill",
@@ -566,7 +552,6 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -604,7 +589,7 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=True,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=_fa3_sinks(sinks),
+            sinks=sinks,
         )
 
     @register_kernel(
@@ -624,7 +609,6 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
@@ -668,7 +652,7 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=is_causal,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=_fa3_sinks(sinks),
+            sinks=sinks,
         )
 
     @register_kernel(
@@ -688,7 +672,6 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": _FA3_HOPPER_HEAD_DIMS,
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -726,6 +709,6 @@ elif platform.is_nvidia and platform.is_hopper:
             causal=max_seqlen_q > 1,
             window_size=((window_left, 0) if window_left >= 0 else (-1, -1)),
             softcap=logit_cap,
-            sinks=_fa3_sinks(sinks),
+            sinks=sinks,
         )
         return out.view_as(q)

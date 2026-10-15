@@ -149,11 +149,6 @@ def chunk_scaled_dot_kkt_fwd(
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    # On SM90 the software-pipelined (num_stages >= 2) build of this kernel
-    # produces run-to-run different A tiles for identical inputs, which then
-    # propagates through solve_tril / w,u / h / o. A single-stage build is
-    # deterministic and the K loop is only K // BK iterations long.
-    num_stages = 1 if torch.cuda.get_device_capability(k.device)[0] == 9 else 3
     chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
         k=k,
         beta=beta,
@@ -168,7 +163,7 @@ def chunk_scaled_dot_kkt_fwd(
         BT=BT,
         BK=64,
         num_warps=8,
-        num_stages=num_stages,
+        num_stages=3,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

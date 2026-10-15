@@ -314,7 +314,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_pool_transfer_layout_matches_scheduler_group_order(self):
         try:
-            from test.runtime.cache_pool_test_utils import MinimalCacheView
+            from cache_pool_test_utils import MinimalCacheView
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 

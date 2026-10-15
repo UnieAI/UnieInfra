@@ -1,43 +1,12 @@
-"""Shared runtime-test hooks and helpers for Kimi-K3 cache-group tests."""
+"""Shared helpers for Kimi-K3 cache-group runtime tests."""
 
 from __future__ import annotations
 
-import os
-import signal
-import threading
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-
-def _reap_launched_processes() -> None:
-    """Kill every process this pytest run spawned (servers, schedulers)."""
-    try:
-        from tokenspeed.runtime.utils.process import kill_process_tree
-
-        kill_process_tree(os.getpid(), include_parent=False)
-    except Exception:
-        pass
-
-
-def _reap_on_sigterm(signum, frame):
-    # An outer `timeout`/job controller ends the run with SIGTERM, which skips
-    # every fixture finalizer; without this, launched schedulers outlive the
-    # run and keep their GPUs.
-    _reap_launched_processes()
-    signal.signal(signum, signal.SIG_DFL)
-    os.kill(os.getpid(), signum)
-
-
-def pytest_configure(config):
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGTERM, _reap_on_sigterm)
-
-
-def pytest_unconfigure(config):
-    _reap_launched_processes()
-
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"

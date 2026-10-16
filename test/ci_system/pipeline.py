@@ -51,7 +51,14 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_RUNNER_GROUPS = (
+    "all",
+    "amd",
+    "gb10",
+    "nvidia",
+    "nvidia-arm",
+    "nvidia-x86",
+)
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -121,6 +128,8 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
         return True
     if runner_group == "amd":
         return is_amd_runner(runner)
+    if runner_group == "gb10":
+        return runner == "gb10-altos"
     if runner_group == "nvidia":
         return not is_amd_runner(runner)
     if runner_group == "nvidia-arm":

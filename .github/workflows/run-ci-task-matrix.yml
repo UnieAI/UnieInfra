@@ -63,6 +63,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       # Cross-repository PRs cannot receive repository secrets.
       TOKENSPEED_CI_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      CI_IMAGE: unieinfra:gb10-main
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -112,6 +113,7 @@ jobs:
           key: mi450-sim-${{ runner.os }}-rocjitsu-9083cc2a-rocm-20260822-v1
 
       - name: Install pipeline dependency
+        if: matrix.runner != 'gb10-altos'
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
         # index, which strict pip>=22 refuses to parse. Retry a few times.
         run: |
@@ -124,16 +126,41 @@ jobs:
 
       - name: Install CI task
         run: |
-          cd "${{ env.WORK_DIR }}"
-          mkdir -p .ci-artifacts
-          python3 test/ci_system/pipeline.py execute \
-            --config "${{ matrix.config }}" \
-            --runner "${{ matrix.runner }}" \
-            --work-dir "${{ env.WORK_DIR }}" \
-            --print-plan \
-            --only-stage install \
-            --keep-runner-state \
-            --result-json .ci-artifacts/result.json
+          if [ "${{ matrix.runner }}" = "gb10-altos" ]; then
+            docker run --rm --gpus all --network host --ipc host --shm-size=16g \
+              --env INSTALL_TOKENSPEED_MLA_FROM_SOURCE \
+              --env BASE_REF \
+              --env CANDIDATE_REF \
+              --env PR_NUMBER \
+              --env MERGE_SHA \
+              --env HF_TOKEN \
+              --env TOKENSPEED_CI_FORK_PR \
+              --volume "${{ env.WORK_DIR }}:/workspace" \
+              --volume /home/altos/models:/home/altos/models:ro \
+              --workdir /workspace \
+              "${{ env.CI_IMAGE }}" bash -lc '
+                mkdir -p .ci-artifacts
+                python3 test/ci_system/pipeline.py execute \
+                  --config "${{ matrix.config }}" \
+                  --runner "${{ matrix.runner }}" \
+                  --work-dir /workspace \
+                  --print-plan \
+                  --only-stage install \
+                  --keep-runner-state \
+                  --result-json .ci-artifacts/result.json
+              '
+          else
+            cd "${{ env.WORK_DIR }}"
+            mkdir -p .ci-artifacts
+            python3 test/ci_system/pipeline.py execute \
+              --config "${{ matrix.config }}" \
+              --runner "${{ matrix.runner }}" \
+              --work-dir "${{ env.WORK_DIR }}" \
+              --print-plan \
+              --only-stage install \
+              --keep-runner-state \
+              --result-json .ci-artifacts/result.json
+          fi
 
       - name: Save MI450 simulator cache
         # Keep disabled while the simulator toolchain is baked into the
@@ -149,16 +176,41 @@ jobs:
 
       - name: Execute CI task
         run: |
-          cd "${{ env.WORK_DIR }}"
-          mkdir -p .ci-artifacts
-          python3 test/ci_system/pipeline.py execute \
-            --config "${{ matrix.config }}" \
-            --runner "${{ matrix.runner }}" \
-            --work-dir "${{ env.WORK_DIR }}" \
-            --print-plan \
-            --skip-stage install \
-            --reuse-runner-state \
-            --result-json .ci-artifacts/result.json
+          if [ "${{ matrix.runner }}" = "gb10-altos" ]; then
+            docker run --rm --gpus all --network host --ipc host --shm-size=16g \
+              --env INSTALL_TOKENSPEED_MLA_FROM_SOURCE \
+              --env BASE_REF \
+              --env CANDIDATE_REF \
+              --env PR_NUMBER \
+              --env MERGE_SHA \
+              --env HF_TOKEN \
+              --env TOKENSPEED_CI_FORK_PR \
+              --volume "${{ env.WORK_DIR }}:/workspace" \
+              --volume /home/altos/models:/home/altos/models:ro \
+              --workdir /workspace \
+              "${{ env.CI_IMAGE }}" bash -lc '
+                mkdir -p .ci-artifacts
+                python3 test/ci_system/pipeline.py execute \
+                  --config "${{ matrix.config }}" \
+                  --runner "${{ matrix.runner }}" \
+                  --work-dir /workspace \
+                  --print-plan \
+                  --skip-stage install \
+                  --reuse-runner-state \
+                  --result-json .ci-artifacts/result.json
+              '
+          else
+            cd "${{ env.WORK_DIR }}"
+            mkdir -p .ci-artifacts
+            python3 test/ci_system/pipeline.py execute \
+              --config "${{ matrix.config }}" \
+              --runner "${{ matrix.runner }}" \
+              --work-dir "${{ env.WORK_DIR }}" \
+              --print-plan \
+              --skip-stage install \
+              --reuse-runner-state \
+              --result-json .ci-artifacts/result.json
+          fi
 
       - name: Checkout source reporter
         if: always()

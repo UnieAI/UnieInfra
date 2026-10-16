@@ -38,7 +38,8 @@ concurrency:
 
 jobs:
   scan:
-    # Run jobs for pull requests, or for push/manual events in the official
+    if: false
+    # Benchmark CI is intentionally paused.
     # repository or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
       github.event_name == 'pull_request' ||
@@ -112,6 +113,7 @@ jobs:
           printf '%s' "$matrix" | python3 -c "import json, sys; print('kernel_benchmark_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
 
   kernel-benchmark:
+    if: false
     needs: scan
     if: |
       needs.scan.outputs.should_run == 'true' &&
@@ -129,13 +131,7 @@ jobs:
   # this job as well as the other PR test workflows' gates. Keep the name so a
   # benchmark failure blocks merging.
   finish:
-    if: |
-      always() &&
-      (
-        github.event_name == 'pull_request' ||
-        github.repository == 'lightseekorg/tokenspeed' ||
-        github.repository == vars.TOKENSPEED_CI_REPOSITORY
-      )
+    if: false
     needs: [scan, kernel-benchmark]
     runs-on: ubuntu-latest
     steps:

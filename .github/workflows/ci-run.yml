@@ -9,7 +9,7 @@ permissions:
   checks: write
   contents: read
   issues: write
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   ci-run:
@@ -28,12 +28,16 @@ jobs:
               core.setOutput("triggered", "false");
               return;
             }
-            await github.rest.reactions.createForIssueComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: context.payload.comment.id,
-              content: "rocket",
-            });
+            try {
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+                content: "rocket",
+              });
+            } catch (error) {
+              core.warning(`Could not add reaction: ${error.message}`);
+            }
             core.setOutput("triggered", "true");
             core.notice("Accepted /ci-run; GB10 CI dispatch started.");
 

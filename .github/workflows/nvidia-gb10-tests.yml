@@ -41,6 +41,7 @@ jobs:
       (
         github.event_name == 'pull_request' ||
         github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == 'UnieAI/UnieInfra' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
       )
     runs-on: ubuntu-latest
@@ -126,6 +127,7 @@ jobs:
       (
         github.event_name == 'pull_request' ||
         github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == 'UnieAI/UnieInfra' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
       ) &&
       (
@@ -185,6 +187,7 @@ jobs:
       (
         github.event_name == 'pull_request' ||
         github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == 'UnieAI/UnieInfra' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
       ) &&
       (github.event.action != 'labeled' || github.event.label.name == 'high priority')

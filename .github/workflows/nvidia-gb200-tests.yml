@@ -1,27 +1,8 @@
 name: NVIDIA GB200 Tests
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/nvidia-gb200-tests.yml"
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/nvidia-gb200-tests.yml"
+  # Keep the workflow and submission scripts available for manual reruns,
+  # but do not create GB200 checks on every PR or main push.
   workflow_dispatch:
 
 permissions:

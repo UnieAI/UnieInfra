@@ -19,7 +19,11 @@
 # SOFTWARE.
 
 
+<<<<<<< HEAD
 """Muse Spark's prepared TP4/TP8 policy and decoder fusions."""
+=======
+"""Muse Spark's prepared TP4 policy and decoder fusions."""
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 
 import torch
 import torch.distributed as dist
@@ -34,6 +38,7 @@ from tokenspeed_kernel.ops.communication._iris import (
 from tokenspeed_kernel.ops.communication._iris.all_gather import (
     IrisAllGather,
     all_gather_columns_can_run,
+<<<<<<< HEAD
     iris_fused_pull_allgather_rmsnorm_mxfp4,
     iris_pull_allgather_rows,
 )
@@ -42,6 +47,16 @@ from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
     iris_pack_moe_inputs,
     iris_pull_allgather_moe_inputs,
+=======
+    iris_fused_pull_allgather_rmsnorm_mxfp4_tp4,
+    iris_pull_allgather_rows_tp4,
+)
+from tokenspeed_kernel.ops.communication._iris.all_reduce import TP4AllReduce
+from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
+from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
+    iris_pack_moe_inputs,
+    iris_pull_allgather_moe_inputs_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
     iris_a2a_transpose_qkvg,
@@ -52,12 +67,21 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     iris_fused_push_oneshot_allreduce_muse_attntail,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+<<<<<<< HEAD
     iris_fused_lamport_allreduce_routed_rmsnorm_sum,
     iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
     iris_routed_rmsnorm_weighted_sum_write_through,
 )
 from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
     iris_pull_reduce_scatter,
+=======
+    iris_fused_lamport_allreduce_routed_rmsnorm_sum_tp4,
+    iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum_tp4,
+    iris_routed_rmsnorm_weighted_sum_write_through,
+)
+from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+    iris_pull_reduce_scatter_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 )
 from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 from tokenspeed_kernel.platform import current_platform
@@ -77,6 +101,7 @@ class MuseIrisState:
     All layers reuse these buffers in stream order. Reductions and gathers can
     return borrowed activations; a consumer must finish before the next write.
     The generic all-reduce retains its independent-output contract.
+<<<<<<< HEAD
     TP4/EP4 and TP8/EP8 use the same global padded-token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.
     """
@@ -101,13 +126,36 @@ class MuseIrisState:
             size += allocation_bytes(
                 (2, _MUSE_ROW_GATHER_PROGRAMS, world_size), torch.uint32
             )
+=======
+    """
+
+    @staticmethod
+    def heap_bytes(max_numel: int, *, enable_lamport: bool) -> int:
+        rows = min(max_numel // _MUSE_BOUNDARY_WIDTH, _MUSE_BOUNDARY_MAX_ROWS)
+        size = TP4AllReduce.heap_bytes(
+            max_numel, enable_lamport=enable_lamport
+        ) + IrisAllGather.heap_bytes(4)
+        if enable_lamport:
+            size += IrisBroadcast.heap_bytes(max_numel)
+        if rows:
+            size += allocation_bytes((2, 4, rows, _MUSE_BOUNDARY_WIDTH), torch.bfloat16)
+            size += allocation_bytes((2, rows, 4), torch.int32)
+        if max_numel >= _MUSE_ROW_BOUNDARY_MIN_ROWS * _MUSE_BOUNDARY_WIDTH:
+            size += allocation_bytes((_MUSE_ROW_SCATTER_PROGRAMS, 4), torch.uint32)
+            size += allocation_bytes((2, _MUSE_ROW_GATHER_PROGRAMS, 4), torch.uint32)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         return size
 
     def __init__(self, all_reduce: IrisAllReduce, *, enable_lamport: bool):
         self.all_reduce = all_reduce
+<<<<<<< HEAD
         self.world_size = all_reduce.world_size
         self.enable_lamport = enable_lamport
         self.reduction = ProducerAllReduce(
+=======
+        self.enable_lamport = enable_lamport
+        self.reduction = TP4AllReduce(
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             all_reduce.producer_pull, enable_lamport=enable_lamport
         )
         self.gather = IrisAllGather(all_reduce.producer)
@@ -120,21 +168,33 @@ class MuseIrisState:
         self.row_boundary_supported = (
             capacity >= _MUSE_ROW_BOUNDARY_MIN_ROWS * _MUSE_BOUNDARY_WIDTH
             and all_reduce.producer_pull.scratch.numel()
+<<<<<<< HEAD
             >= triton.cdiv(_MUSE_ROW_BOUNDARY_MIN_ROWS, self.world_size)
             * _MUSE_BOUNDARY_WIDTH
         )
         self.boundary_inbox = (
             peers.ctx.empty(
                 (2, self.world_size, self.boundary_max_rows, _MUSE_BOUNDARY_WIDTH),
+=======
+            >= triton.cdiv(_MUSE_ROW_BOUNDARY_MIN_ROWS, 4) * _MUSE_BOUNDARY_WIDTH
+        )
+        self.boundary_inbox = (
+            peers.ctx.empty(
+                (2, 4, self.boundary_max_rows, _MUSE_BOUNDARY_WIDTH),
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 dtype=all_reduce.dtype,
             )
             if self.boundary_max_rows
             else None
         )
         self.boundary_ready_flags = (
+<<<<<<< HEAD
             peers.ctx.zeros(
                 (2, self.boundary_max_rows, self.world_size), dtype=torch.int32
             )
+=======
+            peers.ctx.zeros((2, self.boundary_max_rows, 4), dtype=torch.int32)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             if self.boundary_max_rows
             else None
         )
@@ -144,22 +204,34 @@ class MuseIrisState:
             else None
         )
         self.row_scatter_flags = (
+<<<<<<< HEAD
             peers.ctx.zeros(
                 (_MUSE_ROW_SCATTER_PROGRAMS, self.world_size), dtype=torch.uint32
             )
+=======
+            peers.ctx.zeros((_MUSE_ROW_SCATTER_PROGRAMS, 4), dtype=torch.uint32)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             if self.row_boundary_supported
             else None
         )
         self.row_gather_flags = (
+<<<<<<< HEAD
             peers.ctx.zeros(
                 (2, _MUSE_ROW_GATHER_PROGRAMS, self.world_size), dtype=torch.uint32
             )
+=======
+            peers.ctx.zeros((2, _MUSE_ROW_GATHER_PROGRAMS, 4), dtype=torch.uint32)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             if self.row_boundary_supported
             else None
         )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+<<<<<<< HEAD
         """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy."""
+=======
+        """Reduce an ordinary tensor in place using the prepared TP4 policy."""
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         numel = tensor.numel()
         assert tensor.dtype == self.all_reduce.dtype and tensor.is_contiguous()
         reduced = self.reduction.run(tensor, tensor, numel)
@@ -174,7 +246,11 @@ class MuseIrisState:
         assert self.all_reduce.owns_outputs(tensors)
         shapes = tuple(tuple(t.shape) for t in tensors)
         numel = sum(t.numel() for t in tensors)
+<<<<<<< HEAD
         if numel % (self.world_size * 8):
+=======
+        if numel % 32:
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             return self.all_reduce.all_reduce_symmetric(tensors)
         reduced = self.reduction.run(
             self.all_reduce.producer.data, self.gather.output, numel
@@ -182,8 +258,13 @@ class MuseIrisState:
         return self.all_reduce.producer.views(reduced, shapes)
 
     def can_use_owned_rows(self, rows: int) -> bool:
+<<<<<<< HEAD
         """Check capacity for splitting token rows across the group."""
         local_elements = triton.cdiv(rows, self.world_size) * _MUSE_BOUNDARY_WIDTH
+=======
+        """Check capacity for splitting token rows across four ranks."""
+        local_elements = triton.cdiv(rows, 4) * _MUSE_BOUNDARY_WIDTH
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         return (
             self.row_boundary_supported
             and _MUSE_OWNED_MIN_ROWS <= rows
@@ -196,7 +277,11 @@ class MuseIrisState:
     def acquire_owned_qkvg_output(self, rows: int) -> torch.Tensor:
         """Borrow the producer prefix until the QKVG transpose has completed."""
         assert self.can_use_owned_rows(rows)
+<<<<<<< HEAD
         local_rows = triton.cdiv(rows, self.world_size)
+=======
+        local_rows = triton.cdiv(rows, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         elements = local_rows * 18432
         assert elements <= self.all_reduce.producer_direct_max_numel
         return self.all_reduce.producer.data[:elements].view(local_rows, 18432)
@@ -216,15 +301,23 @@ class MuseIrisState:
         assert tensor.is_contiguous() and tensor.dtype == torch.bfloat16
         assert tensor.device == self.all_reduce.device
         output = torch.empty(
+<<<<<<< HEAD
             (rows, 18432 // self.world_size),
             dtype=tensor.dtype,
             device=self.all_reduce.device,
+=======
+            (rows, 4608), dtype=tensor.dtype, device=self.all_reduce.device
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         )
         iris_a2a_transpose_qkvg[(_MUSE_ROW_GATHER_PROGRAMS,)](
             tensor,
             output,
             self.row_gather_flags,
+<<<<<<< HEAD
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             rows,
             RANK=self.all_reduce.rank_in_group,
             FLAG_ROWS=_MUSE_ROW_GATHER_PROGRAMS,
@@ -264,11 +357,17 @@ class MuseIrisState:
         assert cos_sin_cache.device == self.all_reduce.device
         outputs = tuple(
             torch.empty(
+<<<<<<< HEAD
                 (rows, width // self.world_size),
                 dtype=tensor.dtype,
                 device=self.all_reduce.device,
             )
             for width in (8192, 1024, 1024, 8192)
+=======
+                (rows, width), dtype=tensor.dtype, device=self.all_reduce.device
+            )
+            for width in (2048, 256, 256, 2048)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         )
         iris_fused_a2a_transpose_qkvg_norm_rope[(_MUSE_ROW_GATHER_PROGRAMS,)](
             tensor,
@@ -276,7 +375,11 @@ class MuseIrisState:
             positions,
             cos_sin_cache,
             self.row_gather_flags,
+<<<<<<< HEAD
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             rows,
             RANK=self.all_reduce.rank_in_group,
             FLAG_ROWS=_MUSE_ROW_GATHER_PROGRAMS,
@@ -292,7 +395,11 @@ class MuseIrisState:
     def acquire_owned_post_expert_output(self, rows: int, width: int) -> torch.Tensor:
         """Borrow the producer buffer after the region holding pre-expert rows."""
         assert self.can_use_owned_rows(rows) and width == _MUSE_BOUNDARY_WIDTH
+<<<<<<< HEAD
         local_rows = triton.cdiv(rows, self.world_size)
+=======
+        local_rows = triton.cdiv(rows, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         start = self.all_reduce.producer_direct_max_numel // 2
         return self.all_reduce.producer.data[start : start + local_rows * width].view(
             local_rows, width
@@ -306,6 +413,7 @@ class MuseIrisState:
         assert tensor.device == self.all_reduce.device
         if tensor.data_ptr() != self.all_reduce.producer.data.data_ptr():
             self.all_reduce.producer.data[: tensor.numel()].copy_(tensor.view(-1))
+<<<<<<< HEAD
         local_rows = triton.cdiv(rows, self.world_size)
         output = self.all_reduce.producer_pull.scratch[: local_rows * width].view(
             local_rows, width
@@ -315,6 +423,17 @@ class MuseIrisState:
             output,
             self.row_scatter_flags,
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+        local_rows = triton.cdiv(rows, 4)
+        output = self.all_reduce.producer_pull.scratch[: local_rows * width].view(
+            local_rows, width
+        )
+        iris_pull_reduce_scatter_tp4[(_MUSE_ROW_SCATTER_PROGRAMS,)](
+            self.all_reduce.producer.data,
+            output,
+            self.row_scatter_flags,
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             ROWS=rows,
             RANK=self.all_reduce.rank_in_group,
             WIDTH=width,
@@ -384,16 +503,28 @@ class MuseIrisState:
             WEIGHT_OFFSET=weight_offset,
             num_warps=8,
         )
+<<<<<<< HEAD
         local_rows = triton.cdiv(num_tokens, self.world_size)
+=======
+        local_rows = triton.cdiv(num_tokens, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         output = self.all_reduce.producer_pull.scratch[: local_rows * 4096].view(
             local_rows, 4096
         )
         # The local producer uses write-through stores; peer reads need no cache writeback.
+<<<<<<< HEAD
         iris_pull_reduce_scatter[(_MUSE_ROW_SCATTER_PROGRAMS,)](
             self.all_reduce.producer.data,
             output,
             self.row_scatter_flags,
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+        iris_pull_reduce_scatter_tp4[(_MUSE_ROW_SCATTER_PROGRAMS,)](
+            self.all_reduce.producer.data,
+            output,
+            self.row_scatter_flags,
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             ROWS=num_tokens,
             RANK=self.all_reduce.rank_in_group,
             WIDTH=4096,
@@ -414,7 +545,11 @@ class MuseIrisState:
     ) -> torch.Tensor:
         """Gather each rank's BF16 token rows into complete projection inputs."""
         assert self.can_use_owned_rows(rows)
+<<<<<<< HEAD
         local_rows = triton.cdiv(rows, self.world_size)
+=======
+        local_rows = triton.cdiv(rows, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         assert tensor.shape == (local_rows, _MUSE_BOUNDARY_WIDTH)
         assert tensor.dtype == torch.bfloat16 and tensor.is_contiguous()
         assert tensor.device == self.all_reduce.device
@@ -440,11 +575,19 @@ class MuseIrisState:
             dtype=tensor.dtype,
             device=self.all_reduce.device,
         )
+<<<<<<< HEAD
         iris_pull_allgather_rows[(_MUSE_ROW_GATHER_PROGRAMS,)](
             tensor,
             output,
             self.row_gather_flags,
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+        iris_pull_allgather_rows_tp4[(_MUSE_ROW_GATHER_PROGRAMS,)](
+            tensor,
+            output,
+            self.row_gather_flags,
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             rows,
             RANK=self.all_reduce.rank_in_group,
             WIDTH=tensor.shape[1],
@@ -468,7 +611,11 @@ class MuseIrisState:
     ]:
         """Gather pre-expert activations, expert IDs, and weights in one packed buffer."""
         assert self.can_use_owned_rows(rows)
+<<<<<<< HEAD
         local_rows = triton.cdiv(rows, self.world_size)
+=======
+        local_rows = triton.cdiv(rows, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         assert valid_rows == min(
             local_rows, max(0, rows - self.all_reduce.rank_in_group * local_rows)
         )
@@ -535,14 +682,22 @@ class MuseIrisState:
             NUM_WARPS=4,
             num_warps=4,
         )
+<<<<<<< HEAD
         iris_pull_allgather_moe_inputs[(_MUSE_ROW_GATHER_PROGRAMS,)](
+=======
+        iris_pull_allgather_moe_inputs_tp4[(_MUSE_ROW_GATHER_PROGRAMS,)](
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             packet,
             output.view(torch.uint8),
             output_scales,
             output_ids.view(torch.uint8),
             output_weights.view(torch.uint8),
             self.row_gather_flags,
+<<<<<<< HEAD
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             rows,
             RANK=self.all_reduce.rank_in_group,
             QUANTIZED=quantized,
@@ -576,8 +731,12 @@ class MuseIrisState:
                     self.row_boundary_supported
                     and post_weight is None
                     and branch.shape[0] >= _MUSE_ROW_BOUNDARY_MIN_ROWS
+<<<<<<< HEAD
                     and triton.cdiv(branch.shape[0], self.world_size)
                     * _MUSE_BOUNDARY_WIDTH
+=======
+                    and triton.cdiv(branch.shape[0], 4) * _MUSE_BOUNDARY_WIDTH
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                     <= self.all_reduce.producer_pull.scratch.numel()
                 )
             )
@@ -634,6 +793,7 @@ class MuseIrisState:
             assert self.all_reduce.producer_pull.scratch is not None
             assert self.row_scatter_flags is not None
             assert self.row_gather_flags is not None
+<<<<<<< HEAD
             local_rows = triton.cdiv(rows, self.world_size)
             shard = self.all_reduce.producer_pull.scratch[: local_rows * width]
             iris_pull_reduce_scatter[(_MUSE_ROW_SCATTER_PROGRAMS,)](
@@ -641,6 +801,15 @@ class MuseIrisState:
                 shard,
                 self.row_scatter_flags,
                 self.all_reduce.peers.addresses[: self.world_size],
+=======
+            local_rows = triton.cdiv(rows, 4)
+            shard = self.all_reduce.producer_pull.scratch[: local_rows * width]
+            iris_pull_reduce_scatter_tp4[(_MUSE_ROW_SCATTER_PROGRAMS,)](
+                branch,
+                shard,
+                self.row_scatter_flags,
+                self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 ROWS=rows,
                 RANK=self.all_reduce.rank_in_group,
                 WIDTH=width,
@@ -664,7 +833,11 @@ class MuseIrisState:
                 pre_fp32,
                 pre_bf16,
                 self.row_gather_flags,
+<<<<<<< HEAD
                 self.all_reduce.peers.addresses[: self.world_size],
+=======
+                self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 rows=rows,
                 local_rows=local_rows,
                 RANK=self.all_reduce.rank_in_group,
@@ -697,7 +870,11 @@ class MuseIrisState:
             pre_bf16,
             self.boundary_generations,
             self.boundary_ready_flags,
+<<<<<<< HEAD
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             RANK=self.all_reduce.rank_in_group,
             WORLD_SIZE=self.all_reduce.world_size,
             WIDTH=width,
@@ -723,11 +900,19 @@ class MuseIrisState:
         norm_weight: torch.Tensor,
         weight_offset: float,
     ) -> bool:
+<<<<<<< HEAD
         """Check the gfx950 TP4/TP8 routed-normalization collective contract."""
         width = int(norm_weight.shape[0]) if norm_weight.ndim == 1 else 0
         return (
             current_platform().is_cdna4
             and self.world_size in (4, 8)
+=======
+        """Check the gfx950 TP4 routed-normalization collective contract."""
+        width = int(norm_weight.shape[0]) if norm_weight.ndim == 1 else 0
+        return (
+            current_platform().is_cdna4
+            and self.all_reduce.world_size == 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             and self.all_reduce.dtype == torch.bfloat16
             and 0 < num_tokens
             and (
@@ -780,7 +965,11 @@ class MuseIrisState:
         eps: float,
         weight_offset: float,
     ) -> torch.Tensor:
+<<<<<<< HEAD
         """Normalize and sum local routes while reducing the result across TP4/TP8."""
+=======
+        """Normalize and sum local routes while reducing the result across TP4."""
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         if not self.can_all_reduce_routed_rmsnorm_sum(
             routes,
             route_map,
@@ -800,7 +989,11 @@ class MuseIrisState:
             and num_tokens * 4096 <= self.reduction.lamport_max_numel
         ):
             assert self.gather.output is not None
+<<<<<<< HEAD
             iris_fused_lamport_allreduce_routed_rmsnorm_sum[(num_tokens,)](
+=======
+            iris_fused_lamport_allreduce_routed_rmsnorm_sum_tp4[(num_tokens,)](
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 routes,
                 route_map,
                 route_weights,
@@ -808,7 +1001,11 @@ class MuseIrisState:
                 self.gather.output,
                 self.reduction.lamport_region,
                 self.reduction.lamport_epochs,
+<<<<<<< HEAD
                 self.reduction.lamport_peer_addresses[: self.world_size],
+=======
+                self.reduction.lamport_peer_addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 RANK=self.all_reduce.rank_in_group,
                 WIDTH=4096,
                 row_stride=routes.stride(0),
@@ -824,7 +1021,11 @@ class MuseIrisState:
         width = int(norm_weight.shape[0])
         block = triton.next_power_of_2(width)
         num_warps = 8
+<<<<<<< HEAD
         iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum[(num_tokens,)](
+=======
+        iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum_tp4[(num_tokens,)](
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             routes,
             route_map,
             route_weights,
@@ -832,7 +1033,11 @@ class MuseIrisState:
             self.all_reduce.producer.data,
             self.gather.output,
             self.all_reduce.producer_pull.ready_flags,
+<<<<<<< HEAD
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             rank=self.all_reduce.rank_in_group,
             width=width,
             row_stride=routes.stride(0),
@@ -849,10 +1054,17 @@ class MuseIrisState:
         local: torch.Tensor,
         weight: torch.Tensor,
     ) -> bool:
+<<<<<<< HEAD
         """Check the TP4/TP8 gather-and-quantize contract."""
         if (
             not current_platform().is_cdna4
             or self.world_size not in (4, 8)
+=======
+        """Check the TP4 gather-and-quantize contract."""
+        if (
+            not current_platform().is_cdna4
+            or self.all_reduce.world_size != 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             or local.ndim != 2
             or local.dtype != torch.bfloat16
             or self.all_reduce.dtype != torch.bfloat16
@@ -882,7 +1094,11 @@ class MuseIrisState:
         eps: float,
         weight_offset: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+<<<<<<< HEAD
         """Gather feature shards and return normalized MXFP4 rows."""
+=======
+        """Gather four feature shards and return normalized MXFP4 rows."""
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         if not self.can_all_gather_rmsnorm_mxfp4_quant(local, weight):
             raise RuntimeError("unsupported Iris gather-and-MXFP4 fusion")
         assert self.all_reduce.producer.data is not None
@@ -892,7 +1108,11 @@ class MuseIrisState:
             empty_swizzled_cdna4_mxfp4_scale,
         )
 
+<<<<<<< HEAD
         total_width = local_width * self.world_size
+=======
+        total_width = local_width * 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         packed = torch.empty(
             (rows, total_width // 2),
             dtype=torch.uint8,
@@ -904,14 +1124,22 @@ class MuseIrisState:
             device=self.all_reduce.producer.data.device,
         )
         block_k = triton.next_power_of_2(total_width)
+<<<<<<< HEAD
         iris_fused_pull_allgather_rmsnorm_mxfp4[(rows,)](
+=======
+        iris_fused_pull_allgather_rmsnorm_mxfp4_tp4[(rows,)](
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             local,
             self.all_reduce.producer.data,
             weight,
             packed,
             scales,
             self.gather.ready_flags,
+<<<<<<< HEAD
             self.all_reduce.peers.addresses[: self.world_size],
+=======
+            self.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             rank=self.all_reduce.rank_in_group,
             local_width=local_width,
             total_width=total_width,
@@ -962,9 +1190,13 @@ def prepare_muse_communication(
         capacity = all_reduce.producer_direct_max_numel
     else:
         capacity = producer_direct_max_numel
+<<<<<<< HEAD
     size = MuseIrisState.heap_bytes(
         capacity, world_size=group.size(), enable_lamport=enable_lamport
     )
+=======
+    size = MuseIrisState.heap_bytes(capacity, enable_lamport=enable_lamport)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     if all_reduce is None:
         size += IrisAllReduce.heap_bytes(
             staged_max_numel, capacity, group.size(), torch.bfloat16

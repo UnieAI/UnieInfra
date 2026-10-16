@@ -217,12 +217,21 @@ _DIRECT_STAGE2_BLOCK_K = 128
 def _select_direct_stage2_tiles(
     num_tokens: int,
     *,
+<<<<<<< HEAD
     ep_deferred: bool,
 ) -> tuple[int, int]:
     """Return the rocprof-tuned gfx950 ``(BLOCK_N, BLOCK_K)`` pair."""
     if not ep_deferred:
         return _DIRECT_STAGE2_BLOCK_N, _DIRECT_STAGE2_BLOCK_K
     # Wide output tiles amortize deferred expert stores at the largest captured
+=======
+    ep4_deferred: bool,
+) -> tuple[int, int]:
+    """Return the rocprof-tuned gfx950 ``(BLOCK_N, BLOCK_K)`` pair."""
+    if not ep4_deferred:
+        return _DIRECT_STAGE2_BLOCK_N, _DIRECT_STAGE2_BLOCK_K
+    # Wide output tiles amortize deferred EP4 stores at the largest captured
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     # batch; deeper K tiles shorten the four-tile dependency chain at M <= 8.
     block_n = 32 if num_tokens >= 16 else _DIRECT_STAGE2_BLOCK_N
     block_k = 256 if num_tokens <= 8 else _DIRECT_STAGE2_BLOCK_K
@@ -895,7 +904,11 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     """Select direct or route-tiled MFMA with token/slot intermediates.
 
     ``max_m`` bounds direct execution; ``route_tile_max_m`` bounds the measured
+<<<<<<< HEAD
     EP4/EP8 route-tiled schedule. Both reuse gdot128-shuffled weights/scales
+=======
+    EP4 route-tiled schedule. Both reuse gdot128-shuffled weights/scales
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     and preserve the per-route gate/up, SwiGLU, quantization and W2 order.
     """
     n_tokens, hidden_dim, device, input_dtype = _mxfp4_input_metadata(hidden_states)
@@ -973,6 +986,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     if w2_k_pk * 2 != inter_dim or out_dim != hidden_dim:
         return None
 
+<<<<<<< HEAD
     local_experts = int(w13_runtime.shape[0])
     is_ep_deferred = not do_finalize and (
         global_num_experts == 4 * local_experts
@@ -986,6 +1000,14 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     use_route_tiles = (
         is_ep_deferred
         and int(w13_runtime.shape[0]) in (32, 64)
+=======
+    is_ep4_deferred = not do_finalize and global_num_experts == 4 * int(
+        w13_runtime.shape[0]
+    )
+    use_route_tiles = (
+        is_ep4_deferred
+        and int(w13_runtime.shape[0]) == 64
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         and global_num_experts == 256
         and hidden_dim == inter_dim == out_dim == 4096
         and int(w2_runtime.shape[2]) == 4096
@@ -1179,9 +1201,15 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         out = torch.empty(output_shape, dtype=out_dtype, device=device)
     stage2_block_n, stage2_block_k = _select_direct_stage2_tiles(
         n_tokens,
+<<<<<<< HEAD
         ep_deferred=is_ep_deferred,
     )
     stage2_pipeline_k = not is_ep_deferred
+=======
+        ep4_deferred=is_ep4_deferred,
+    )
+    stage2_pipeline_k = not is_ep4_deferred
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     expanded_idx = (
         None
         if do_finalize

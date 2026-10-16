@@ -979,7 +979,11 @@ if platform.is_amd:
             "supports_prequantized_input": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
+<<<<<<< HEAD
             "ep_size": frozenset({4, 8}),
+=======
+            "ep_size": frozenset({4}),
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             "ispp": frozenset({4096}),
             "internal_activation_dtype": frozenset({"mxfp4"}),
             "supports_bias": frozenset({False}),
@@ -999,7 +1003,11 @@ if platform.is_amd:
         enable_pdl: bool = False,
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
+<<<<<<< HEAD
         """Run the gfx950 dynamic-A4W4 EP4/EP8 path with optional finalization.
+=======
+        """Run the gfx950 dynamic-A4W4 EP4 path with optional finalization.
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 
         Args:
             plan: Kernel plan selected by the MoE registry.
@@ -1064,7 +1072,11 @@ if platform.is_amd:
         if (
             w.hidden_size != 4096
             or w.intermediate_size != 4096
+<<<<<<< HEAD
             or w.num_local_experts not in (32, 64)
+=======
+            or w.num_local_experts != 64
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             or w.num_experts != 256
             or w.top_k != 8
             or _swiglu_args(w) != (1.0, 0.0, 0.0)
@@ -1142,8 +1154,13 @@ if platform.is_amd:
                 packed = torch.zeros((rows, 2048), device=device, dtype=torch.uint8)
                 scales = empty_swizzled_cdna4_mxfp4_scale(rows, 128, device=device)
                 scales.fill_(127)
+<<<<<<< HEAD
                 # Global token routes are replicated. Each rank computes only
                 # the slots whose expert IDs belong to its local weights.
+=======
+                # Global token routes remain replicated under EP4; each rank
+                # owns a quarter of these slots, not a quarter of the rows.
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 ids = torch.arange(rows * 8, device=device, dtype=torch.int32)
                 ids = ids.remainder(256).view(rows, 8)
                 weights = torch.full(

@@ -24,8 +24,13 @@
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_drain_subgroup_vmem,
+<<<<<<< HEAD
     _iris_peer_pointers,
     _iris_rendezvous,
+=======
+    _iris_tp4_peer_pointers,
+    _tp4_rendezvous,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 )
 
 
@@ -100,7 +105,11 @@ def iris_pack_moe_inputs(
 
 
 @gluon.jit(do_not_specialize=["rows"])
+<<<<<<< HEAD
 def iris_pull_allgather_moe_inputs(
+=======
+def iris_pull_allgather_moe_inputs_tp4(
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     packet,
     data,
     scales,
@@ -117,38 +126,64 @@ def iris_pull_allgather_moe_inputs(
 ):
     """All-gather packed MoE rows and restore their original token order.
 
+<<<<<<< HEAD
     Each rank supplies ceil(rows / WORLD_SIZE) packet rows. Unpack the 4096-feature
+=======
+    Each rank supplies ceil(rows / 4) packet rows. Unpack the 4096-feature
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     activations and eight route IDs/weights into data, scales, ids and weights,
     ignoring the last owner's padding. Restore CDNA4 scales without requantization.
     ready_flags coordinate publication and finish peer reads before packet reuse.
     """
+<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(heaps)
+=======
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     DATA_BYTES: gl.constexpr = 2048 if QUANTIZED else 8192
     SCALE_BYTES: gl.constexpr = 128 if QUANTIZED else 0
     PACKET_BYTES: gl.constexpr = DATA_BYTES + SCALE_BYTES + 64
     program = gl.program_id(0)
+<<<<<<< HEAD
     peers = _iris_peer_pointers(packet, heaps, RANK)
     epoch = (
         gl.atomic_add(
             ready_flags + program * WORLD_SIZE + RANK, 1, sem="relaxed", scope="gpu"
         )
+=======
+    peers = _iris_tp4_peer_pointers(packet, heaps, RANK)
+    epoch = (
+        gl.atomic_add(ready_flags + program * 4 + RANK, 1, sem="relaxed", scope="gpu")
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         + 1
     )
     _iris_drain_subgroup_vmem()
     gl.barrier()
+<<<<<<< HEAD
     _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     local_rows = gl.cdiv(rows, WORLD_SIZE)
+=======
+    _tp4_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
+    local_rows = gl.cdiv(rows, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     local_bytes = local_rows * PACKET_BYTES
     lanes = gl.arange(0, BLOCK, layout=gl.BlockedLayout([16], [64], [NUM_WARPS], [0]))
     for tile in range(program, gl.cdiv(local_bytes, BLOCK), gl.num_programs(0)):
         offsets = tile * BLOCK + lanes
         local_row = offsets // PACKET_BYTES
         field = offsets % PACKET_BYTES
+<<<<<<< HEAD
         for step in gl.static_range(WORLD_SIZE):
             row = ((RANK + step) % WORLD_SIZE) * local_rows + local_row
             valid = (offsets < local_bytes) & (row < rows)
             values = gl.amd.cdna4.buffer_load(
                 peers[(RANK + step) % WORLD_SIZE], offsets, valid, 0, cache=".cg"
+=======
+        for step in gl.static_range(4):
+            row = ((RANK + step) % 4) * local_rows + local_row
+            valid = (offsets < local_bytes) & (row < rows)
+            values = gl.amd.cdna4.buffer_load(
+                peers[(RANK + step) % 4], offsets, valid, 0, cache=".cg"
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             )
             gl.amd.cdna4.buffer_store(
                 values, data, row * DATA_BYTES + field, valid & (field < DATA_BYTES)
@@ -176,6 +211,7 @@ def iris_pull_allgather_moe_inputs(
             )
     _iris_drain_subgroup_vmem()
     gl.barrier()
+<<<<<<< HEAD
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
         heaps,
@@ -184,4 +220,8 @@ def iris_pull_allgather_moe_inputs(
         RANK,
         NUM_WARPS,
         False,
+=======
+    _tp4_rendezvous(
+        ready_flags + FLAG_ROWS * 4, heaps, program, epoch, RANK, NUM_WARPS, False
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )

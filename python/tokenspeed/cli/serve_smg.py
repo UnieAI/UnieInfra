@@ -90,8 +90,11 @@ KIMI_K3_REASONING_PARSER = "kimi_k3"
 KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
 MUSE_SPARK_REASONING_PARSER = "muse"
 MUSE_SPARK_TOOL_CALL_PARSER = "muse"
+<<<<<<< HEAD
 MUSE_SPARK_GATEWAY_PARSER = "symphony"
 MUSE_SPARK_GRAMMAR_BACKEND = "xgrammar"
+=======
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 DEFAULT_SMG_LOG_LEVEL = "warn"
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
@@ -549,6 +552,7 @@ def _is_muse_spark_model(model_id: str | None) -> bool:
     )
 
 
+<<<<<<< HEAD
 def _args_select_tree_drafting(engine_args: list[str]) -> bool:
     """Whether the engine argv drafts a tree (``--speculative-eagle-topk`` != 1).
 
@@ -568,6 +572,8 @@ def _args_select_tree_drafting(engine_args: list[str]) -> bool:
         return True
 
 
+=======
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -603,12 +609,15 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", MUSE_SPARK_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", MUSE_SPARK_TOOL_CALL_PARSER])
+<<<<<<< HEAD
         if "--parser" not in gateway_result:
             gateway_result.extend(["--parser", MUSE_SPARK_GATEWAY_PARSER])
         if "--grammar-backend" not in engine_result and not _args_select_tree_drafting(
             engine_result
         ):
             engine_result.extend(["--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND])
+=======
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 
     elif _is_deepseek_v41_model(model_id):
         if (

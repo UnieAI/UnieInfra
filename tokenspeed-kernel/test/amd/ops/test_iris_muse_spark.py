@@ -97,12 +97,17 @@ def _column_all_gather_worker(rank, world_size, device):
     state = _muse_state(rank, device, 8, False)
     weight = torch.linspace(0.75, 1.25, 4096, dtype=torch.bfloat16, device=device)
     overwrite = torch.full(
+<<<<<<< HEAD
         (1, (4096 // world_size)), -7 * (rank + 1), dtype=torch.bfloat16, device=device
+=======
+        (1, 1024), -7 * (rank + 1), dtype=torch.bfloat16, device=device
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
     # Published M1, ordinary rows, and three chunks exceeding the prepared capacity.
     for rows in (1, 4, 16, 33):
         if rows == 1:
             published = state.all_reduce.acquire_outputs(((1, 4096),))[0]
+<<<<<<< HEAD
             local = published[
                 :, rank * (4096 // world_size) : (rank + 1) * (4096 // world_size)
             ]
@@ -117,6 +122,14 @@ def _column_all_gather_worker(rank, world_size, device):
                 for peer in range(world_size)
             ],
             dim=-1,
+=======
+            local = published[:, rank * 1024 : (rank + 1) * 1024]
+        else:
+            local = torch.empty((rows, 1024), dtype=torch.bfloat16, device=device)
+        row_values = torch.arange(rows, dtype=torch.bfloat16, device=device)[:, None]
+        expected = torch.cat(
+            [(row_values + peer + 1).expand(-1, 1024) for peer in range(4)], dim=-1
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         )
         fused = rows <= 16 and current_platform().is_cdna4
 
@@ -155,6 +168,7 @@ def _column_all_gather_worker(rank, world_size, device):
     with assert_no_triton_compile(iris_pull_allgather_columns):
         for rows in (3, 7):
             local = torch.full(
+<<<<<<< HEAD
                 (rows, (4096 // world_size)),
                 rank + 1,
                 dtype=torch.bfloat16,
@@ -162,6 +176,12 @@ def _column_all_gather_worker(rank, world_size, device):
             )
             expected = torch.cat(
                 [torch.full_like(local, peer + 1) for peer in range(world_size)], dim=-1
+=======
+                (rows, 1024), rank + 1, dtype=torch.bfloat16, device=device
+            )
+            expected = torch.cat(
+                [torch.full_like(local, peer + 1) for peer in range(4)], dim=-1
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             )
             torch.testing.assert_close(
                 state.gather.run(local), expected, atol=0, rtol=0
@@ -191,7 +211,11 @@ def _logical_cdna4_scales(
 
 def _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+<<<<<<< HEAD
         iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
+=======
+        iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
     from tokenspeed_kernel.ops.moe import routed_input_scale_rmsnorm_sum_gathered
     from utils import assert_no_triton_compile
@@ -257,15 +281,25 @@ def _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device):
         expected = update(scale, empty)
         torch.cuda._sleep((rank + 1) * 20000)
         with assert_no_triton_compile(
+<<<<<<< HEAD
             iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum
+=======
+            iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum_tp4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         ):
             graph.replay()
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
+<<<<<<< HEAD
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_iris_column_all_gather(world_size):
     """Concatenate model-shaped TP4/TP8 hidden shards with the Gluon transport."""
+=======
+def test_iris_column_all_gather_world4():
+    """Concatenate model-shaped TP4 hidden shards with the Gluon transport."""
+    world_size = 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     _skip_if_unsupported(world_size, "Iris inner all-gather tests")
     port = _get_open_port()
     _spawn_and_collect(
@@ -318,7 +352,11 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
         iris_fused_pull_allgather_muse_attntail,
     )
     from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+<<<<<<< HEAD
         iris_pull_reduce_scatter,
+=======
+        iris_pull_reduce_scatter_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
     from utils import assert_no_triton_compile
 
@@ -406,7 +444,11 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
                 )
     if sharded:
         with assert_no_triton_compile(
+<<<<<<< HEAD
             iris_pull_reduce_scatter, iris_fused_pull_allgather_muse_attntail
+=======
+            iris_pull_reduce_scatter_tp4, iris_fused_pull_allgather_muse_attntail
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         ):
             for rows in (1025, 4096):
                 values = torch.ones((rows, 8192), device=device, dtype=torch.bfloat16)
@@ -415,11 +457,19 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
     dist.barrier()
 
 
+<<<<<<< HEAD
 def _muse_collective_policy_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_lamport_bf16_allreduce,
         iris_pull_twoshot_allreduce,
         iris_push_twoshot_allreduce,
+=======
+def _muse_tp4_policy_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_lamport_allreduce_tp4,
+        iris_pull_twoshot_allreduce_tp4,
+        iris_push_twoshot_allreduce_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
     from utils import assert_no_triton_compile
 
@@ -494,6 +544,7 @@ def _muse_collective_policy_worker(rank, world_size, device):
         graph.replay()
         for output in outputs:
             torch.testing.assert_close(
+<<<<<<< HEAD
                 output,
                 torch.full_like(
                     output, (world_size * (world_size + 1) // 2) * (step + 1) / 8
@@ -505,6 +556,11 @@ def _muse_collective_policy_worker(rank, world_size, device):
             world_size * boundary_base
             + (world_size * (world_size + 1) // 2) * (step + 1) / 8
         ).bfloat16()
+=======
+                output, torch.full_like(output, 10 * (step + 1) / 8), rtol=0, atol=0
+            )
+        reduced = (4 * boundary_base + 10 * (step + 1) / 8).bfloat16()
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         expected = _boundary_reference(
             boundary_stream, reduced, None, coefficients, coefficients, pre_weight
         )
@@ -516,36 +572,54 @@ def _muse_collective_policy_worker(rank, world_size, device):
                 rtol=2e-5 if actual.dtype == torch.float32 else 0.008,
             )
     with assert_no_triton_compile(
+<<<<<<< HEAD
         iris_lamport_bf16_allreduce,
         iris_push_twoshot_allreduce,
         iris_pull_twoshot_allreduce,
+=======
+        iris_lamport_allreduce_tp4,
+        iris_push_twoshot_allreduce_tp4,
+        iris_pull_twoshot_allreduce_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     ):
         for rows in (3, 17, 127, 130):
             branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
             branch.fill_(rank + 1)
             output = state.reduce_outputs((branch,))[0]
             torch.testing.assert_close(
+<<<<<<< HEAD
                 output,
                 torch.full_like(output, world_size * (world_size + 1) // 2),
                 rtol=0,
                 atol=0,
+=======
+                output, torch.full_like(output, 10), rtol=0, atol=0
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             )
     for numel in (512, 44 * 4096, 129 * 8192):
         ordinary = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)
         result = state.reduce(ordinary)
         assert result.data_ptr() == ordinary.data_ptr()
         torch.testing.assert_close(
+<<<<<<< HEAD
             ordinary,
             torch.full_like(ordinary, world_size * (world_size + 1) // 2),
             rtol=0,
             atol=0,
+=======
+            ordinary, torch.full_like(ordinary, 10), rtol=0, atol=0
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         )
 
 
 def _muse_owned_packet_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
         iris_pack_moe_inputs,
+<<<<<<< HEAD
         iris_pull_allgather_moe_inputs,
+=======
+        iris_pull_allgather_moe_inputs_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
     from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
@@ -557,7 +631,11 @@ def _muse_owned_packet_worker(rank, world_size, device):
     norm_weight = torch.linspace(-0.25, 0.25, 4096, device=device).bfloat16()
 
     def make_inputs(rows):
+<<<<<<< HEAD
         local_rows = (rows + world_size - 1) // world_size
+=======
+        local_rows = (rows + 3) // 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         first = rank * local_rows
         valid_rows = min(local_rows, max(0, rows - first))
         local = torch.empty((local_rows, 4096), device=device, dtype=torch.bfloat16)
@@ -638,12 +716,16 @@ def _muse_owned_packet_worker(rank, world_size, device):
             retained, packed_result, bf16_result, generic = result
             full, full_ids, full_weights = reference
             torch.testing.assert_close(
+<<<<<<< HEAD
                 generic,
                 torch.full_like(
                     generic, (world_size * (world_size + 1) // 2) * (step + 1)
                 ),
                 atol=0,
                 rtol=0,
+=======
+                generic, torch.full_like(generic, 10 * (step + 1)), atol=0, rtol=0
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             )
             expected_packed, expected_scales = rmsnorm_mxfp4_quant(
                 full, norm_weight, 1e-8, 1.0
@@ -665,6 +747,7 @@ def _muse_owned_packet_worker(rank, world_size, device):
                 torch.testing.assert_close(actual_ids, full_ids, atol=0, rtol=0)
                 torch.testing.assert_close(actual_weights, full_weights, atol=0, rtol=0)
             torch.testing.assert_close(
+<<<<<<< HEAD
                 retained,
                 torch.full_like(
                     retained, (world_size * (world_size + 1) // 2) * (step + 1)
@@ -673,6 +756,13 @@ def _muse_owned_packet_worker(rank, world_size, device):
                 rtol=0,
             )
     with assert_no_triton_compile(iris_pack_moe_inputs, iris_pull_allgather_moe_inputs):
+=======
+                retained, torch.full_like(retained, 10 * (step + 1)), atol=0, rtol=0
+            )
+    with assert_no_triton_compile(
+        iris_pack_moe_inputs, iris_pull_allgather_moe_inputs_tp4
+    ):
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         item = make_inputs(2049)
         update(item, 7)
         one(item)
@@ -764,7 +854,11 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         full_weights[name] = weight
         projection.weight_loader(projection.weight, weight, name)
         expected_columns.append(
+<<<<<<< HEAD
             columns[rank * (width // world_size) : (rank + 1) * (width // world_size)]
+=======
+            columns[rank * (width // 4) : (rank + 1) * (width // 4)]
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         )
     expected_columns = torch.cat(expected_columns)
     parameter_pointer = projection.weight.data_ptr()
@@ -784,7 +878,11 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     )
 
     def make_inputs(rows):
+<<<<<<< HEAD
         local_rows = (rows + world_size - 1) // world_size
+=======
+        local_rows = (rows + 3) // 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         first = rank * local_rows
         valid = min(local_rows, rows - first)
         full = (
@@ -800,9 +898,13 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         positions = (
             torch.arange(rows, device=device, dtype=torch.int64) * 17 + 31
         ) % 16384
+<<<<<<< HEAD
         k_cache = torch.empty(
             (rows, 16 // world_size, 64), dtype=torch.bfloat16, device=device
         )
+=======
+        k_cache = torch.empty((rows, 4, 64), dtype=torch.bfloat16, device=device)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         cache = HeadKVCache(
             k_cache,
             torch.empty_like(k_cache),
@@ -825,9 +927,13 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             projected = projection.project_owned_rows(local, full.shape[0])
             output = state.all_to_all_transpose_qkvg(projected, full.shape[0])
             table = rope if full.shape[0] < 4096 else nope
+<<<<<<< HEAD
             q, k, v, gate = output.split(
                 tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
             )
+=======
+            q, k, v, gate = output.split((2048, 256, 256, 2048), dim=-1)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             prepared = gqa_prologue(
                 q,
                 k,
@@ -899,6 +1005,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             expected = full.index_select(1, expected_columns) * gain
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
             torch.testing.assert_close(
+<<<<<<< HEAD
                 gathered,
                 torch.full_like(gathered, world_size * (world_size + 1) // 2),
                 rtol=0,
@@ -909,6 +1016,12 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
                 torch.full_like(previous, world_size * (world_size + 1) // 2),
                 rtol=0,
                 atol=0,
+=======
+                gathered, torch.full_like(gathered, 10), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                previous, torch.full_like(previous, 10), rtol=0, atol=0
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             )
         small = inputs[0][0][:4].contiguous()
         small_output, _ = projection(small)
@@ -933,11 +1046,19 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
 
 def _muse_routed_lamport_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+<<<<<<< HEAD
         iris_lamport_bf16_allreduce,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
         iris_fused_lamport_allreduce_routed_rmsnorm_sum,
         iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
+=======
+        iris_lamport_allreduce_tp4,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_lamport_allreduce_routed_rmsnorm_sum_tp4,
+        iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
     from tokenspeed_kernel.ops.moe._triton.routed_norm import (
         triton_routed_input_scale_rmsnorm_sum_gathered,
@@ -953,14 +1074,24 @@ def _muse_routed_lamport_worker(rank, world_size, device):
 
     def raw(index):
         value = raw_inputs[index]
+<<<<<<< HEAD
         iris_lamport_bf16_allreduce[(value.numel() // 512,)](
+=======
+        iris_lamport_allreduce_tp4[(value.numel() // 512,)](
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             value,
             state.reduction.lamport_region,
             raw_outputs[index],
             state.reduction.lamport_epochs,
+<<<<<<< HEAD
             state.reduction.lamport_peer_addresses[:world_size],
             RANK=rank,
             WORLD_SIZE=world_size,
+=======
+            state.reduction.lamport_peer_addresses[:4],
+            RANK=rank,
+            WORLD_SIZE=4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             total_elements=value.numel(),
             MAX_ELEMENTS=state.reduction.lamport_max_numel,
             NUM_STAGES=3,
@@ -980,7 +1111,11 @@ def _muse_routed_lamport_worker(rank, world_size, device):
         indices = torch.arange(rows * 8, dtype=torch.int32, device=device)
 
         def update(phase):
+<<<<<<< HEAD
             owner = (indices + phase) % (world_size - 1 if phase == 3 else world_size)
+=======
+            owner = (indices + phase) % (3 if phase == 3 else 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             mapping.copy_(torch.where(owner == rank, indices, -1))
             routes.copy_(
                 torch.where((owner == rank)[:, None], values * (phase + 1), torch.nan)
@@ -1017,7 +1152,11 @@ def _muse_routed_lamport_worker(rank, world_size, device):
                     rows * 4096,
                 ).clone()
             else:
+<<<<<<< HEAD
                 iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum[(rows,)](
+=======
+                iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum_tp4[(rows,)](
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                     routes,
                     mapping,
                     weights,
@@ -1025,7 +1164,11 @@ def _muse_routed_lamport_worker(rank, world_size, device):
                     state.all_reduce.producer.data,
                     state.gather.output,
                     state.all_reduce.producer_pull.ready_flags,
+<<<<<<< HEAD
                     state.all_reduce.peers.addresses[:world_size],
+=======
+                    state.all_reduce.peers.addresses[:4],
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                     rank=rank,
                     width=4096,
                     row_stride=routes.stride(0),
@@ -1044,7 +1187,11 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             run()
         else:
             with assert_no_triton_compile(
+<<<<<<< HEAD
                 iris_fused_lamport_allreduce_routed_rmsnorm_sum
+=======
+                iris_fused_lamport_allreduce_routed_rmsnorm_sum_tp4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             ):
                 run()
         torch.cuda.synchronize()
@@ -1063,9 +1210,13 @@ def _muse_routed_lamport_worker(rank, world_size, device):
                 actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
             )
             for output in raw_outputs:
+<<<<<<< HEAD
                 reference = torch.full_like(
                     output, (world_size * (world_size + 1) // 2) * (phase + 1) / 16
                 )
+=======
+                reference = torch.full_like(output, 10 * (phase + 1) / 16)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 reference[0] = 0.0
                 torch.testing.assert_close(output, reference, rtol=0, atol=0)
         dist.barrier()
@@ -1077,7 +1228,11 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         iris_routed_rmsnorm_weighted_sum_write_through,
     )
     from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+<<<<<<< HEAD
         iris_pull_reduce_scatter,
+=======
+        iris_pull_reduce_scatter_tp4,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
     from tokenspeed_kernel.ops.moe import (
         routed_input_scale_rmsnorm_sum,
@@ -1104,7 +1259,11 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     def inputs(rows):
         torch.manual_seed(rows + rank * 17)
         original = torch.randn(rows * 8, 4096, device=device, dtype=torch.bfloat16)
+<<<<<<< HEAD
         local_rows = (rows + world_size - 1) // world_size
+=======
+        local_rows = (rows + 3) // 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         return dict(
             rows=rows,
             original=original,
@@ -1119,7 +1278,11 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         )
 
     def update(case, step):
+<<<<<<< HEAD
         owner = (case["index"] + step) % (world_size - 1 if step == 2 else world_size)
+=======
+        owner = (case["index"] + step) % (3 if step == 2 else 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         case["mapping"].copy_(torch.where(owner == rank, case["index"], -1))
         case["routes"].copy_(
             torch.where(
@@ -1166,12 +1329,20 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         producer = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
         producer.copy_(case["attention"])
         state.reduce_scatter_owned_rows(producer)
+<<<<<<< HEAD
         local_rows = (rows + world_size - 1) // world_size
+=======
+        local_rows = (rows + 3) // 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         valid = max(0, min(local_rows, rows - rank * local_rows))
         packet, _, _ = state.gather_owned_moe_inputs(
             case["packet"], case["ids"], case["scores"], rows, valid
         )
+<<<<<<< HEAD
         if rank == rows % world_size:
+=======
+        if rank == rows % 4:
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             torch.cuda._sleep(20000)
         actual = moe._reduce_expert_routes(
             case["routes"], case["mapping"], rows, case["weights"], owned_rows=True
@@ -1203,7 +1374,11 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
             )
             rows = case["rows"]
+<<<<<<< HEAD
             local_rows = (rows + world_size - 1) // world_size
+=======
+            local_rows = (rows + 3) // 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             valid = max(0, min(local_rows, rows - rank * local_rows))
             torch.testing.assert_close(
                 actual[valid:], torch.zeros_like(actual[valid:]), rtol=0, atol=0
@@ -1230,7 +1405,11 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     unseen = inputs(2051)
     update(unseen, 0)
     with assert_no_triton_compile(
+<<<<<<< HEAD
         iris_routed_rmsnorm_weighted_sum_write_through, iris_pull_reduce_scatter
+=======
+        iris_routed_rmsnorm_weighted_sum_write_through, iris_pull_reduce_scatter_tp4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     ):
         expected, actual, _, _ = run(unseen)
         torch.testing.assert_close(
@@ -1263,13 +1442,18 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(
             partial(_muse_boundary_worker, sharded=True), "nccl", id="boundary_scatter"
         ),
+<<<<<<< HEAD
         pytest.param(_muse_collective_policy_worker, "nccl", id="collective_policy"),
+=======
+        pytest.param(_muse_tp4_policy_worker, "nccl", id="collective_policy"),
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
     ],
 )
+<<<<<<< HEAD
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_muse_collective_replay(check, backend, world_size):
     _skip_if_unsupported(world_size, "Muse collective replay")
@@ -1280,3 +1464,10 @@ def test_muse_collective_replay(check, backend, world_size):
         (world_size, _get_open_port(), check, backend),
         world_size,
     )
+=======
+def test_muse_collective_replay(check, backend):
+    _skip_if_unsupported(4, "Muse collective replay")
+    if not current_platform().is_cdna4:
+        pytest.skip("Muse collectives require CDNA4")
+    _spawn_and_collect(_communication_worker, (4, _get_open_port(), check, backend), 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))

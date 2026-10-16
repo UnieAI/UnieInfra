@@ -19,18 +19,31 @@
 # SOFTWARE.
 
 
+<<<<<<< HEAD
 """TP4/TP8 pull reduce-scatter over consecutive, possibly uneven token rows."""
+=======
+"""TP4 pull reduce-scatter over consecutive, possibly uneven token rows."""
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_drain_subgroup_vmem,
+<<<<<<< HEAD
     _iris_peer_pointers,
     _iris_rendezvous,
+=======
+    _iris_tp4_peer_pointers,
+    _tp4_rendezvous,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 )
 
 
 @gluon.jit(do_not_specialize=["ROWS"])
+<<<<<<< HEAD
 def iris_pull_reduce_scatter(
+=======
+def iris_pull_reduce_scatter_tp4(
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     input_ptr,
     output_ptr,
     ready_flags,
@@ -44,14 +57,22 @@ def iris_pull_reduce_scatter(
     EXIT_BARRIER: gl.constexpr,
     PRODUCER_WRITES_THROUGH: gl.constexpr,
 ):
+<<<<<<< HEAD
     """Reduce BF16 contributions into consecutive, possibly uneven rows.
 
     Sum input_ptr's [ROWS, WIDTH] partials in FP32 and write a BF16 shard of
     ceil(ROWS / WORLD_SIZE) rows to output_ptr on each rank, zeroing the padding.
+=======
+    """Reduce TP4 BF16 contributions into consecutive, possibly uneven rows.
+
+    Sum input_ptr's [ROWS, WIDTH] partials in FP32 and write a BF16 shard of
+    ceil(ROWS / 4) rows to output_ptr on each rank, zeroing the padding.
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     ready_flags publish the inputs; EXIT_BARRIER waits for peer reads to finish.
     PRODUCER_WRITES_THROUGH requires WIDTH=4096 and EXIT_BARRIER; ordinary
     producers publish with release ordering and support the caller's width.
     """
+<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(heaps)
     if PRODUCER_WRITES_THROUGH:
         gl.static_assert(EXIT_BARRIER and WIDTH == 4096)
@@ -66,6 +87,18 @@ def iris_pull_reduce_scatter(
         flags, heaps, pid, epoch, RANK, NUM_WARPS, not PRODUCER_WRITES_THROUGH
     )
     local_rows = gl.cdiv(ROWS, WORLD_SIZE)
+=======
+    if PRODUCER_WRITES_THROUGH:
+        gl.static_assert(EXIT_BARRIER and WIDTH == 4096)
+    inputs = _iris_tp4_peer_pointers(input_ptr, heaps, RANK)
+    flags = ready_flags.to(gl.pointer_type(gl.uint32))
+    pid = gl.program_id(0)
+    epoch = gl.atomic_add(flags + pid * 4 + RANK, 1, sem="relaxed", scope="gpu") + 1
+    _tp4_rendezvous(
+        flags, heaps, pid, epoch, RANK, NUM_WARPS, not PRODUCER_WRITES_THROUGH
+    )
+    local_rows = gl.cdiv(ROWS, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     elements = local_rows * WIDTH
     layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK, layout=layout)
@@ -74,6 +107,7 @@ def iris_pull_reduce_scatter(
         source = RANK * elements + offsets
         mask = (offsets < elements) & (source < ROWS * WIDTH)
         values = ()
+<<<<<<< HEAD
         for step in gl.static_range(WORLD_SIZE):
             values += (
                 gl.amd.cdna4.buffer_load(
@@ -84,6 +118,18 @@ def iris_pull_reduce_scatter(
         reduced = values[(0 - RANK) % WORLD_SIZE]
         for peer in gl.static_range(1, WORLD_SIZE):
             reduced += values[(peer - RANK) % WORLD_SIZE]
+=======
+        for step in gl.static_range(4):
+            values += (
+                gl.amd.cdna4.buffer_load(
+                    inputs[(RANK + step) % 4], source, mask, 0, cache=".cg"
+                ).to(gl.float32),
+            )
+        # All owners use the same sum order and round the result to BF16.
+        reduced = (
+            (values[(0 - RANK) % 4] + values[(1 - RANK) % 4]) + values[(2 - RANK) % 4]
+        ) + values[(3 - RANK) % 4]
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         gl.amd.cdna4.buffer_store(
             reduced.to(gl.bfloat16),
             output_ptr,
@@ -94,6 +140,7 @@ def iris_pull_reduce_scatter(
     if EXIT_BARRIER:
         _iris_drain_subgroup_vmem()
         gl.barrier()
+<<<<<<< HEAD
         done = (
             gl.atomic_add(
                 flags + pid * WORLD_SIZE + RANK, 1, sem="relaxed", scope="gpu"
@@ -101,3 +148,7 @@ def iris_pull_reduce_scatter(
             + 1
         )
         _iris_rendezvous(flags, heaps, pid, done, RANK, NUM_WARPS, False)
+=======
+        done = gl.atomic_add(flags + pid * 4 + RANK, 1, sem="relaxed", scope="gpu") + 1
+        _tp4_rendezvous(flags, heaps, pid, done, RANK, NUM_WARPS, False)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))

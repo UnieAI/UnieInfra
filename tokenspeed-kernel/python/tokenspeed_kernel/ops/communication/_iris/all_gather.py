@@ -27,12 +27,21 @@ from tokenspeed_kernel.ops.communication._iris import allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     ProducerBuffer,
     _iris_drain_subgroup_vmem,
+<<<<<<< HEAD
     _iris_group_heap_base,
     _iris_heap_base,
     _iris_peer_pointers,
     _iris_rendezvous,
     _iris_sync_peers,
     _iris_sync_rank_epoch,
+=======
+    _iris_heap_base,
+    _iris_sync_rank_epoch,
+    _iris_tp4_heap_base,
+    _iris_tp4_peer_pointers,
+    _iris_tp4_sync_peers,
+    _tp4_rendezvous,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 )
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
 from tokenspeed_kernel.platform import current_platform
@@ -64,10 +73,17 @@ class IrisAllGather:
         self.output = torch.empty_like(producer.data)
 
     def can_run(self, tensor: torch.Tensor) -> bool:
+<<<<<<< HEAD
         """Check prepared TP4/TP8 storage for a possibly chunked hidden-shard gather."""
         return (
             current_platform().is_cdna4
             and self.producer.peers.world_size in (4, 8)
+=======
+        """Check prepared TP4 storage for a possibly chunked hidden-shard gather."""
+        return (
+            current_platform().is_cdna4
+            and self.producer.peers.world_size == 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             and tensor.ndim == 2
             and tensor.dtype == self.producer.data.dtype == torch.bfloat16
             and tensor.device == self.producer.data.device
@@ -84,7 +100,11 @@ class IrisAllGather:
         )
 
     def run(self, tensor: torch.Tensor) -> torch.Tensor:
+<<<<<<< HEAD
         """Concatenate equal hidden-dimension TP4/TP8 shards through symmetric memory."""
+=======
+        """Concatenate equal hidden-dimension TP4 shards through symmetric memory."""
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         assert tensor.ndim == 2, "Iris column all-gather requires a 2D tensor"
         assert (
             tensor.device == self.producer.data.device
@@ -156,7 +176,11 @@ def all_gather_columns_can_run(
     dtype: torch.dtype,
     max_bytes: int,
 ) -> bool:
+<<<<<<< HEAD
     """Check whether Iris can concatenate equal TP4/TP8 hidden shards.
+=======
+    """Check whether Iris can concatenate equal TP4 hidden shards.
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 
     Args:
         world_size: Number of ranks contributing equal-width shards.
@@ -173,7 +197,11 @@ def all_gather_columns_can_run(
     elements_per_word = 8 // element_bytes
     return (
         current_platform().is_cdna4
+<<<<<<< HEAD
         and world_size in (4, 8)
+=======
+        and world_size == 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         and num_tokens > 0
         and local_hidden_size > 0
         and dtype in _PRODUCER_DIRECT_GL_DTYPES
@@ -300,7 +328,11 @@ def iris_pull_allgather_columns(
 
 
 @gluon.jit(do_not_specialize=["rows"])
+<<<<<<< HEAD
 def iris_pull_allgather_rows(
+=======
+def iris_pull_allgather_rows_tp4(
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     source,
     output,
     ready_flags,
@@ -315,11 +347,16 @@ def iris_pull_allgather_rows(
 ):
     """Gather consecutive BF16 row shards into every rank's output.
 
+<<<<<<< HEAD
     Each source holds ceil(rows / WORLD_SIZE) rows of WIDTH features. Copy valid rows in
+=======
+    Each source holds ceil(rows / 4) rows of WIDTH features. Copy valid rows in
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     rank order into output and mask padding beyond rows. Publish producer writes
     through ready_flags, then wait for all peer reads before source is reused.
     PRODUCER_WRITES_THROUGH selects the matching input-publication protocol.
     """
+<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(heaps)
     program = gl.program_id(0)
     peers = _iris_peer_pointers(source, heaps, RANK)
@@ -327,30 +364,52 @@ def iris_pull_allgather_rows(
         gl.atomic_add(
             ready_flags + program * WORLD_SIZE + RANK, 1, sem="relaxed", scope="gpu"
         )
+=======
+    program = gl.program_id(0)
+    peers = _iris_tp4_peer_pointers(source, heaps, RANK)
+    epoch = (
+        gl.atomic_add(ready_flags + program * 4 + RANK, 1, sem="relaxed", scope="gpu")
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         + 1
     )
     if PRODUCER_WRITES_THROUGH:
         _iris_drain_subgroup_vmem()
         gl.barrier()
+<<<<<<< HEAD
         _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     else:
         _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, True)
     local_rows = gl.cdiv(rows, WORLD_SIZE)
+=======
+        _tp4_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
+    else:
+        _tp4_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, True)
+    local_rows = gl.cdiv(rows, 4)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     local_elements = local_rows * WIDTH
     layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK, layout=layout)
     for tile in range(program, gl.cdiv(local_elements, BLOCK), gl.num_programs(0)):
         offsets = tile * BLOCK + lanes
+<<<<<<< HEAD
         for step in gl.static_range(WORLD_SIZE):
             destination = ((RANK + step) % WORLD_SIZE) * local_elements + offsets
             mask = (offsets < local_elements) & (destination < rows * WIDTH)
             values = gl.amd.cdna4.buffer_load(
                 peers[(RANK + step) % WORLD_SIZE], offsets, mask, 0, cache=".cg"
+=======
+        for step in gl.static_range(4):
+            destination = ((RANK + step) % 4) * local_elements + offsets
+            mask = (offsets < local_elements) & (destination < rows * WIDTH)
+            values = gl.amd.cdna4.buffer_load(
+                peers[(RANK + step) % 4], offsets, mask, 0, cache=".cg"
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             )
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The next producer may reuse the owner scratch.
     _iris_drain_subgroup_vmem()
     gl.barrier()
+<<<<<<< HEAD
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
         heaps,
@@ -359,11 +418,19 @@ def iris_pull_allgather_rows(
         RANK,
         NUM_WARPS,
         False,
+=======
+    _tp4_rendezvous(
+        ready_flags + FLAG_ROWS * 4, heaps, program, epoch, RANK, NUM_WARPS, False
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     )
 
 
 @gluon.jit
+<<<<<<< HEAD
 def iris_fused_pull_allgather_rmsnorm_mxfp4(
+=======
+def iris_fused_pull_allgather_rmsnorm_mxfp4_tp4(
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     local_input,
     symmetric_input,
     weight,
@@ -382,16 +449,25 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
     input_published: gl.constexpr,
     num_warps: gl.constexpr,
 ):
+<<<<<<< HEAD
     """Gather BF16 feature shards, apply RMSNorm, and quantize to MXFP4.
+=======
+    """Gather four BF16 feature shards, apply RMSNorm, and quantize to MXFP4.
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 
     Widths, RMSNorm epsilon/weight offset, and output-scale strides are supplied
     by the caller. Scales use the CDNA4 layout with 32-row and eight-group tiles.
     Write packed_output and scale_output directly, retaining FP32 normalized
     values until quantization. Peer counters protect symmetric_input reuse.
     """
+<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(heaps)
     row = gl.program_id(0)
     local_heap = _iris_group_heap_base(rank, heaps)
+=======
+    row = gl.program_id(0)
+    local_heap = _iris_tp4_heap_base(rank, heaps)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     input_offset = tl.cast(symmetric_input, gl.uint64) - local_heap
 
     layout: gl.constexpr = scaled_downcast_layout(1, block_k, num_warps)
@@ -409,6 +485,7 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
             mask=offsets < local_width,
         )
 
+<<<<<<< HEAD
     epoch_ptr = ready_flags + row * WORLD_SIZE + rank
     ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_peers(ready_flags, row, ready_epoch, heaps, rank, num_warps)
@@ -416,6 +493,15 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
     values = gl.zeros((block_k,), gl.float32, layout=offsets.type.layout)
     for peer in gl.static_range(0, WORLD_SIZE):
         peer_heap = _iris_group_heap_base(peer, heaps)
+=======
+    epoch_ptr = ready_flags + row * 4 + rank
+    ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+    _iris_tp4_sync_peers(ready_flags, row, ready_epoch, heaps, rank, num_warps)
+
+    values = gl.zeros((block_k,), gl.float32, layout=offsets.type.layout)
+    for peer in gl.static_range(0, 4):
+        peer_heap = _iris_tp4_heap_base(peer, heaps)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         peer_input = tl.cast(
             peer_heap + input_offset,
             gl.pointer_type(gl.bfloat16),
@@ -480,4 +566,8 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
     )
 
     done_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+<<<<<<< HEAD
     _iris_sync_peers(ready_flags, row, done_epoch, heaps, rank, num_warps)
+=======
+    _iris_tp4_sync_peers(ready_flags, row, done_epoch, heaps, rank, num_warps)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))

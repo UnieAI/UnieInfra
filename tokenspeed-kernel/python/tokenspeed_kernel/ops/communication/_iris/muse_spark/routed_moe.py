@@ -29,14 +29,24 @@ sum the normalized routes. The Lamport and write-through variants specialize
 from tokenspeed_kernel._triton import gl, gluon, tl
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_drain_subgroup_vmem,
+<<<<<<< HEAD
     _iris_group_heap_base,
     _iris_sanitize_lamport_bf16,
     _iris_sync_peers,
+=======
+    _iris_sanitize_lamport_bf16,
+    _iris_tp4_heap_base,
+    _iris_tp4_sync_peers,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 )
 
 
 @gluon.jit
+<<<<<<< HEAD
 def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
+=======
+def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum_tp4(
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     routes,
     route_map,
     route_weights,
@@ -61,7 +71,10 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     BF16 token sum in symmetric_input. Pull peer sums and write BF16 output.
     ready_flags coordinate input publication and completion before storage reuse.
     """
+<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(heaps)
+=======
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     token = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout(
         [block // (64 * num_warps)],
@@ -97,6 +110,7 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     local = combined.to(gl.bfloat16)
     gl.store(symmetric_input + row_offsets, local, mask=valid)
 
+<<<<<<< HEAD
     local_heap = _iris_group_heap_base(rank, heaps)
     epoch_ptr = ready_flags + token * WORLD_SIZE + rank
     ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
@@ -108,6 +122,19 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
         if peer != rank:
             peer_input = tl.cast(
                 _iris_group_heap_base(peer, heaps) + input_offset,
+=======
+    local_heap = _iris_tp4_heap_base(rank, heaps)
+    epoch_ptr = ready_flags + token * 4 + rank
+    ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+    _iris_tp4_sync_peers(ready_flags, token, ready_epoch, heaps, rank, num_warps)
+
+    input_offset = tl.cast(symmetric_input, gl.uint64) - local_heap
+    reduced = local.to(gl.float32)
+    for peer in gl.static_range(0, 4):
+        if peer != rank:
+            peer_input = tl.cast(
+                _iris_tp4_heap_base(peer, heaps) + input_offset,
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 gl.pointer_type(gl.bfloat16),
             )
             reduced += gl.load(
@@ -119,16 +146,26 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     gl.store(output + row_offsets, reduced.to(gl.bfloat16), mask=valid)
 
     done_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+<<<<<<< HEAD
     _iris_sync_peers(ready_flags, token, done_epoch, heaps, rank, num_warps)
 
 
 @gluon.jit
 def _iris_lamport_poll_bf16(addresses):
     """Wait for every peer BF16 pack and return its packed 32-bit words."""
+=======
+    _iris_tp4_sync_peers(ready_flags, token, done_epoch, heaps, rank, num_warps)
+
+
+@gluon.jit
+def _iris_lamport_poll_three_bf16(address0, address1, address2):
+    """Wait for three peer BF16 packs and return their packed 32-bit words."""
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     # Native Gluon waits for the whole workgroup; each lane reads 16 aligned bytes.
     layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [8, 1], [0, 1])
     source_layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [8, 1], [0, 1])
     element = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
+<<<<<<< HEAD
     pointers = ()
     values = ()
     missing = gl.full((512, 4), False, gl.int1, layout)
@@ -155,6 +192,47 @@ def _iris_lamport_poll_bf16(addresses):
     words = ()
     for peer in gl.static_range(len(addresses)):
         even, odd = gl.split(values[peer].reshape(512, 2, 2))
+=======
+    a0 = gl.convert_layout(address0, gl.SliceLayout(1, layout))
+    a1 = gl.convert_layout(address1, gl.SliceLayout(1, layout))
+    a2 = gl.convert_layout(address2, gl.SliceLayout(1, layout))
+    p0 = gl.multiple_of(a0.to(gl.pointer_type(gl.uint32)), 16)
+    p1 = gl.multiple_of(a1.to(gl.pointer_type(gl.uint32)), 16)
+    p2 = gl.multiple_of(a2.to(gl.pointer_type(gl.uint32)), 16)
+    v0 = gl.load(p0[:, None] + element[None, :], cache_modifier=".cv", volatile=True)
+    v1 = gl.load(p1[:, None] + element[None, :], cache_modifier=".cv", volatile=True)
+    v2 = gl.load(p2[:, None] + element[None, :], cache_modifier=".cv", volatile=True)
+    missing = (
+        ((v0 & 0xFFFF) == 0x8000)
+        | ((v0 >> 16) == 0x8000)
+        | ((v1 & 0xFFFF) == 0x8000)
+        | ((v1 >> 16) == 0x8000)
+        | ((v2 & 0xFFFF) == 0x8000)
+        | ((v2 >> 16) == 0x8000)
+    )
+    while gl.sum(gl.sum(missing.to(gl.int32), 1), 0) != 0:
+        v0 = gl.load(
+            p0[:, None] + element[None, :], cache_modifier=".cv", volatile=True
+        )
+        v1 = gl.load(
+            p1[:, None] + element[None, :], cache_modifier=".cv", volatile=True
+        )
+        v2 = gl.load(
+            p2[:, None] + element[None, :], cache_modifier=".cv", volatile=True
+        )
+        missing = (
+            ((v0 & 0xFFFF) == 0x8000)
+            | ((v0 >> 16) == 0x8000)
+            | ((v1 & 0xFFFF) == 0x8000)
+            | ((v1 >> 16) == 0x8000)
+            | ((v2 & 0xFFFF) == 0x8000)
+            | ((v2 >> 16) == 0x8000)
+        )
+    words = ()
+    for i in gl.static_range(3):
+        value = (v0, v1, v2)[i]
+        even, odd = gl.split(value.reshape(512, 2, 2))
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         w0, w2 = gl.split(even)
         w1, w3 = gl.split(odd)
         words += (
@@ -188,7 +266,11 @@ def _iris_lamport_unpack_bf16(w0, w1, w2, w3, element):
 
 
 @gluon.jit
+<<<<<<< HEAD
 def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
+=======
+def iris_fused_lamport_allreduce_routed_rmsnorm_sum_tp4(
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     routes,
     route_map,
     route_weights,
@@ -212,7 +294,10 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
     the consumed mailbox slot. PORTABLE_MATH preserves the portable path's
     multiplication and rank-addition order; epochs select the rotating slot.
     """
+<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(regions)
+=======
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     # Preserve the arithmetic of each existing routed normalization path.
     gl.static_assert(WIDTH == 4096)
     gl.static_assert(gl.num_warps() == 8)
@@ -243,15 +328,25 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
     offsets = token * WIDTH + pack[:, None] * 8 + element[None, :]
     tile = token * (WIDTH // 512) + pack // 64
     stage = gl.load(epochs + tile).to(gl.uint32).to(gl.uint64) % 3
+<<<<<<< HEAD
     slot = stage[:, None] * WORLD_SIZE * MAX_ELEMENTS
+=======
+    slot = stage[:, None] * 4 * MAX_ELEMENTS
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     local = _iris_sanitize_lamport_bf16(
         gl.convert_layout(
             gl.reshape(combined.to(gl.bfloat16), [WIDTH // 8, 8]), packed_layout
         )
     )
+<<<<<<< HEAD
     for delta in gl.static_range(1, WORLD_SIZE):
         peer = (RANK + delta) % WORLD_SIZE
         address = _iris_group_heap_base(peer, regions)
+=======
+    for delta in gl.static_range(1, 4):
+        peer = (RANK + delta) % 4
+        address = _iris_tp4_heap_base(peer, regions)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         target = gl.multiple_of(address.to(gl.pointer_type(gl.bfloat16)), 16)
         gl.amd.cdna4.buffer_store(
             local,
@@ -260,17 +355,27 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
             cache=".wt",
         )
     addresses = ()
+<<<<<<< HEAD
     for delta in gl.static_range(1, WORLD_SIZE):
         peer = (RANK + delta) % WORLD_SIZE
         addresses += (
             (
                 region
                 + stage * WORLD_SIZE * MAX_ELEMENTS
+=======
+    for delta in gl.static_range(1, 4):
+        peer = (RANK + delta) % 4
+        addresses += (
+            (
+                region
+                + stage * 4 * MAX_ELEMENTS
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
                 + peer * MAX_ELEMENTS
                 + token * WIDTH
                 + pack * 8
             ).to(gl.uint64),
         )
+<<<<<<< HEAD
     words = _iris_lamport_poll_bf16(addresses)
     values = ()
     for peer in gl.static_range(WORLD_SIZE - 1):
@@ -297,14 +402,55 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
                 reduced += values[(peer - RANK + WORLD_SIZE) % WORLD_SIZE - 1].to(
                     gl.float32
                 )
+=======
+    word0, word1, word2 = _iris_lamport_poll_three_bf16(*addresses)
+    values = (
+        _iris_lamport_unpack_bf16(word0[0], word0[1], word0[2], word0[3], element),
+        _iris_lamport_unpack_bf16(word1[0], word1[1], word1[2], word1[3], element),
+        _iris_lamport_unpack_bf16(word2[0], word2[1], word2[2], word2[3], element),
+    )
+    if PORTABLE_MATH:
+        # The portable two-pass path rounds locally, then sums global rank order.
+        if RANK == 0:
+            v0, v1, v2, v3 = local, values[0], values[1], values[2]
+        elif RANK == 1:
+            v0, v1, v2, v3 = values[2], local, values[0], values[1]
+        elif RANK == 2:
+            v0, v1, v2, v3 = values[1], values[2], local, values[0]
+        else:
+            v0, v1, v2, v3 = values[0], values[1], values[2], local
+        reduced = ((v0.to(gl.float32) + v1.to(gl.float32)) + v2.to(gl.float32)) + v3.to(
+            gl.float32
+        )
+    else:
+        # Preserve local first, followed by increasing global peer rank.
+        reduced = local.to(gl.float32)
+        if RANK == 1:
+            reduced = (
+                (reduced + values[2].to(gl.float32)) + values[0].to(gl.float32)
+            ) + values[1].to(gl.float32)
+        elif RANK == 2:
+            reduced = (
+                (reduced + values[1].to(gl.float32)) + values[2].to(gl.float32)
+            ) + values[0].to(gl.float32)
+        else:
+            reduced = (
+                (reduced + values[0].to(gl.float32)) + values[1].to(gl.float32)
+            ) + values[2].to(gl.float32)
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     gl.amd.cdna4.buffer_store(reduced.to(gl.bfloat16), output, offsets)
     sentinel = (
         gl.where(offsets % 2 == 0, 0, 0x8000)
         .to(gl.uint16)
         .to(gl.bfloat16, bitcast=True)
     )
+<<<<<<< HEAD
     for delta in gl.static_range(1, WORLD_SIZE):
         peer = (RANK + delta) % WORLD_SIZE
+=======
+    for delta in gl.static_range(1, 4):
+        peer = (RANK + delta) % 4
+>>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         gl.amd.cdna4.buffer_store(
             sentinel,
             region,

@@ -36,6 +36,14 @@ so a prompt is never split (a pooled vector reduces over the whole prompt, so
 overlap schedule. Speculative decoding is rejected. No decode CUDA graph is
 captured, as for the prefill role of a disaggregated deployment.
 
+`ts serve` on an embedding checkpoint does not start the smg gateway (its
+engine protocol has no embedding RPC). It serves OpenAI-compatible
+`/v1/embeddings`, `/v1/models` and `/health` from the engine process on
+`--host`/`--port`. `--api-key` requires `Authorization: Bearer <key>` on
+`/v1/*`; without it the endpoints are unauthenticated. `encoding_format`
+accepts `float` and `base64`; `dimensions` is rejected. Other gateway flags
+and multi-node launches are refused.
+
 ### Checkpoint prefetch and TP shards
 
 Safetensors loading prefetches checkpoints into the OS page cache. Ranks on

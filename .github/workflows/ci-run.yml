@@ -8,18 +8,37 @@ permissions:
   actions: write
   checks: write
   contents: read
+  issues: write
   pull-requests: read
 
 jobs:
   ci-run:
     name: ci-run / GB10
-    if: >-
-      github.event.issue.pull_request &&
-      github.event.comment.body == '/ci-run'
+    if: github.event.issue.pull_request
     runs-on: ubuntu-latest
     timeout-minutes: 130
     steps:
+      - name: Validate command and react
+        id: trigger
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const command = context.payload.comment.body.trim();
+            if (command !== "/ci-run") {
+              core.setOutput("triggered", "false");
+              return;
+            }
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: "rocket",
+            });
+            core.setOutput("triggered", "true");
+            core.notice("Accepted /ci-run; GB10 CI dispatch started.");
+
       - name: Dispatch and wait for GB10 CI
+        if: steps.trigger.outputs.triggered == 'true'
         uses: actions/github-script@v7
         with:
           script: |

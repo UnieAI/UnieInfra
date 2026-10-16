@@ -6,6 +6,7 @@ on:
 
 permissions:
   actions: write
+  checks: write
   contents: read
   pull-requests: read
 
@@ -56,6 +57,34 @@ jobs:
             }
 
             const headSha = pull.head.sha;
+            async function completeGate(conclusion, title, summary) {
+              const { data } = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: headSha,
+                per_page: 100,
+              });
+              const gate = data.check_runs
+                .filter((run) => run.name === "GB10 CI Gate")
+                .sort(
+                  (left, right) =>
+                    Date.parse(right.started_at || right.created_at) -
+                    Date.parse(left.started_at || left.created_at),
+                )[0];
+              if (!gate) {
+                core.warning("GB10 CI Gate check was not found");
+                return;
+              }
+              await github.rest.checks.update({
+                owner,
+                repo,
+                check_run_id: gate.id,
+                status: "completed",
+                conclusion,
+                completed_at: new Date().toISOString(),
+                output: { title, summary },
+              });
+            }
             const defaultBranch = context.payload.repository.default_branch;
             const requestedAt = Date.now();
             core.notice(
@@ -106,17 +135,37 @@ jobs:
             }
 
             if (!run) {
+              await completeGate(
+                "failure",
+                "GB10 CI dispatch failed",
+                "The GB10 workflow did not create a run.",
+              );
               core.setFailed("GB10 workflow dispatch did not create a run");
               return;
             }
             if (run.status !== "completed") {
+              await completeGate(
+                "failure",
+                "GB10 CI timed out",
+                `GB10 CI did not complete: ${run.html_url}`,
+              );
               core.setFailed(`GB10 CI timed out: ${run.html_url}`);
               return;
             }
             if (run.conclusion !== "success") {
+              await completeGate(
+                "failure",
+                "GB10 CI failed",
+                `GB10 CI concluded ${run.conclusion}: ${run.html_url}`,
+              );
               core.setFailed(
                 `GB10 CI concluded ${run.conclusion}: ${run.html_url}`,
               );
               return;
             }
+            await completeGate(
+              "success",
+              "GB10 CI passed",
+              `GB10 CI passed: ${run.html_url}`,
+            );
             core.notice(`GB10 CI passed: ${run.html_url}`);

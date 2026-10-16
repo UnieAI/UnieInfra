@@ -531,8 +531,14 @@ class CudaKernelBuilder:
 
     # Target GPU architectures: detect from the CUDA driver or use env var override.
     # FLASHINFER_CUDA_ARCH_LIST is accepted for compatibility, but TokenSpeed
-    # docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200.
+    # docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200. Concrete targets may use
+    # an sm-prefixed value, for example sm121 for GB10.
     def _normalize_cuda_arch(self, arch):
+        arch = arch.strip().lower()
+        explicit_sm_prefix = arch.startswith("sm")
+        if explicit_sm_prefix:
+            arch = arch[2:]
+
         has_suffix = arch.endswith("a")
         arch_clean = arch.rstrip("a")
         if "." in arch_clean:
@@ -542,7 +548,12 @@ class CudaKernelBuilder:
         else:
             major = int(arch_clean[:-1])
             minor = int(arch_clean[-1])
-        suffix = "a" if has_suffix or major >= 9 else ""
+
+        # Legacy CUDA_ARCH_LIST values such as 100/103 refer to the
+        # architecture family and retain the `a` suffix. An explicit `sm`
+        # value is already a concrete gencode target: sm121 -> 121 and
+        # sm121a -> 121a.
+        suffix = "a" if has_suffix or (major >= 9 and not explicit_sm_prefix) else ""
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):

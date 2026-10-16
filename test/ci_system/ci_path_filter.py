@@ -10,6 +10,7 @@ from pipeline import is_amd_runner, is_nvidia_arm_runner, load_yaml
 
 RUNNER_GROUPS = (
     "amd",
+    "gb10",
     "nvidia-arm",
     "nvidia-gb200-slurm",
     "nvidia-gb300-slurm",
@@ -20,6 +21,7 @@ RUNNER_GROUPS = (
 # expressed per vendor so a new NVIDIA runner group needs no new path list.
 RUNNER_GROUP_VENDORS = {
     "amd": "amd",
+    "gb10": "nvidia",
     "nvidia-arm": "nvidia",
     "nvidia-gb200-slurm": "nvidia",
     "nvidia-gb300-slurm": "nvidia",
@@ -232,6 +234,8 @@ def runner_label_in_group(label: str, runner_group: str) -> bool:
     """
     if runner_group == "amd":
         return is_amd_runner(label)
+    if runner_group == "gb10":
+        return label == "gb10-altos"
     if is_amd_runner(label):
         return False
     if runner_group == "nvidia-x86":

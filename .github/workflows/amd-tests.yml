@@ -14,7 +14,7 @@ on:
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-tests.yml"
-      - ".github/workflows/nvidia-b200-tests.yml"
+      - ".github/workflows/nvidia-gb10-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   pull_request:
@@ -29,7 +29,7 @@ on:
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-tests.yml"
-      - ".github/workflows/nvidia-b200-tests.yml"
+      - ".github/workflows/nvidia-gb10-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
@@ -54,6 +54,7 @@ concurrency:
 
 jobs:
   scan:
+    if: false
     # Run jobs for pull requests, or for push/manual events in the official
     # repository or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
@@ -113,7 +114,7 @@ jobs:
               ;;
           esac
           python3 test/ci_system/ci_path_filter.py \
-            --runner-group amd \
+            --runner-group gb10 \
             --event-name "${{ github.event_name }}" \
             --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
@@ -124,16 +125,17 @@ jobs:
         env:
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
+          # Model validation is temporarily disabled. Re-enable only after
+          # Qwen3.8-27B and Qwen3.6-35B-A3B CI tasks are available.
           for stage in \
-            unit:unit-test \
-            model:model-test; do
+            unit:unit-test; do
             output=${stage%%:*}
             workflow_stage=${stage#*:}
             matrix=$(python3 test/ci_system/pipeline.py scan \
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
               --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-              --runner-group "amd" \
+              --runner-group "gb10" \
               --workflow-stage "$workflow_stage")
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
             printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"

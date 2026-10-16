@@ -1,39 +1,19 @@
-name: NVIDIA B200 Tests
+name: NVIDIA Tests
+run-name: "NVIDIA GB10 Tests /ci-run ${{ inputs.pr_number || 'manual' }} @ ${{ inputs.commit || github.sha }}"
 
-# Split vendor CI into separate workflows so either side can be rerun without
-# waiting for the other side's jobs to finish.
+# GB10 CI is intentionally maintainer-triggered only. A maintainer comments
+# `/ci-run` on a PR; ci-run.yml dispatches this workflow for the PR head SHA.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-kernel-amd/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/amd-tests.yml"
-      - ".github/workflows/nvidia-b200-tests.yml"
-      - ".github/workflows/pr-test-nvidia-arm.yml"
-      - ".github/workflows/run-ci-task-matrix.yml"
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-kernel-amd/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/amd-tests.yml"
-      - ".github/workflows/nvidia-b200-tests.yml"
-      - ".github/workflows/pr-test-nvidia-arm.yml"
-      - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
     inputs:
+      commit:
+        description: "Exact PR head commit to test"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number associated with the commit"
+        required: true
+        type: string
       trigger:
         description: "CI task trigger to run"
         required: false
@@ -75,6 +55,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
 
       - name: Install scan dependency
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
@@ -102,18 +84,12 @@ jobs:
                 -q '.[] | .filename, (.previous_filename // empty)' \
                 > "$changed_files"
               ;;
-            push)
-              gh api \
-                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
-                -q '.files[] | .filename, (.previous_filename // empty)' \
-                > "$changed_files"
-              ;;
             *)
               : > "$changed_files"
               ;;
           esac
           python3 test/ci_system/ci_path_filter.py \
-            --runner-group nvidia-x86 \
+            --runner-group gb10 \
             --event-name "${{ github.event_name }}" \
             --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
@@ -124,6 +100,8 @@ jobs:
         env:
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,b300,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
+          # Model validation is temporarily disabled. Re-enable only after
+          # Qwen3.8-27B and Qwen3.6-35B-A3B CI tasks are available.
           for stage in \
             unit:unit-test \
             model:model-test; do
@@ -132,8 +110,8 @@ jobs:
             matrix=$(python3 test/ci_system/pipeline.py scan \
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
-              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-              --runner-group "nvidia-x86" \
+              --trigger "${{ inputs.trigger || 'manual' }}" \
+              --runner-group "gb10" \
               --workflow-stage "$workflow_stage")
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
             printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
@@ -159,6 +137,7 @@ jobs:
       matrix: ${{ needs.scan.outputs.unit_matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      checkout_ref: ${{ inputs.commit || github.sha }}
     secrets: inherit
 
   model-test:
@@ -180,6 +159,7 @@ jobs:
       timeout_minutes: 120
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      checkout_ref: ${{ inputs.commit || github.sha }}
     secrets: inherit
 
   model-test-eager:
@@ -195,6 +175,7 @@ jobs:
       timeout_minutes: 120
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      checkout_ref: ${{ inputs.commit || github.sha }}
     secrets: inherit
 
   finish:

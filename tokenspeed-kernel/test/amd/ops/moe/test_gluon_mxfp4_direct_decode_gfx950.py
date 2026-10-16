@@ -657,6 +657,7 @@ def test_route_tiled_gemms_preserve_route_slots(rows: int) -> None:
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 @pytest.mark.parametrize("ep_size", [4, 8])
 def test_package_muse_changed_graph_inputs(ep_size) -> None:
 
@@ -667,12 +668,21 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
         num_experts=local_experts,
 =======
 def test_package_muse_changed_graph_inputs() -> None:
+=======
+@pytest.mark.parametrize("ep_size", [4, 8])
+def test_package_muse_changed_graph_inputs(ep_size) -> None:
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
+    local_experts = 256 // ep_size
     generator = torch.Generator(device="cuda").manual_seed(20261003)
     runtime = _make_runtime_weights(
         generator,
+<<<<<<< HEAD
         num_experts=64,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        num_experts=local_experts,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         hidden_size=4096,
         intermediate_size=4096,
         scale=120,
@@ -683,10 +693,14 @@ def test_package_muse_changed_graph_inputs() -> None:
         hidden_size=4096,
         intermediate_size=4096,
 <<<<<<< HEAD
+<<<<<<< HEAD
         num_local_experts=local_experts,
 =======
         num_local_experts=64,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        num_local_experts=local_experts,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         num_experts=256,
         top_k=8,
         ep_rank=1,
@@ -702,10 +716,14 @@ def test_package_muse_changed_graph_inputs() -> None:
         requires_deferred_finalize=True,
         routing_mode="precomputed_topk",
 <<<<<<< HEAD
+<<<<<<< HEAD
         ep_size=ep_size,
 =======
         ep_size=4,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        ep_size=ep_size,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         ispp=4096,
         hidden=4096,
         swiglu_form="standard",
@@ -756,12 +774,18 @@ def test_package_muse_changed_graph_inputs() -> None:
         packed, scales = _quantize_mxfp4_activation(hidden)
         ids = (
 <<<<<<< HEAD
+<<<<<<< HEAD
             torch.arange(
                 local_experts, local_experts + 8, device="cuda", dtype=torch.int32
             )
 =======
             torch.arange(64, 72, device="cuda", dtype=torch.int32)
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            torch.arange(
+                local_experts, local_experts + 8, device="cuda", dtype=torch.int32
+            )
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             .expand(rows, 8)
             .clone()
         )
@@ -783,10 +807,14 @@ def test_package_muse_changed_graph_inputs() -> None:
                 intermediate,
                 8,
 <<<<<<< HEAD
+<<<<<<< HEAD
                 local_experts,
 =======
                 64,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                local_experts,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 intermediate_scales,
                 BLOCK_N=64,
                 swiglu_alpha=1.0,
@@ -803,10 +831,14 @@ def test_package_muse_changed_graph_inputs() -> None:
                 reference,
                 8,
 <<<<<<< HEAD
+<<<<<<< HEAD
                 local_experts,
 =======
                 64,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                local_experts,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 False,
                 reference_map,
                 BLOCK_N=16,
@@ -840,6 +872,7 @@ def test_package_muse_changed_graph_inputs() -> None:
             if phase == 0 and rows == 191:
                 # Maximizes B32 padding while keeping each token's top8 distinct.
 <<<<<<< HEAD
+<<<<<<< HEAD
                 remaining = (
                     [161] * 9 + [89 - local_experts] + [1] * (local_experts - 10)
                 )
@@ -854,16 +887,30 @@ def test_package_muse_changed_graph_inputs() -> None:
                 for _ in range(rows):
                     selected = sorted(range(64), key=lambda e: (-remaining[e], e))[:8]
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                remaining = (
+                    [161] * 9 + [89 - local_experts] + [1] * (local_experts - 10)
+                )
+                routes = []
+                for _ in range(rows):
+                    selected = sorted(
+                        range(local_experts), key=lambda e: (-remaining[e], e)
+                    )[:8]
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                     assert all(remaining[e] > 0 for e in selected)
                     routes.append(selected)
                     for expert in selected:
                         remaining[expert] -= 1
                 assert not any(remaining)
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 ids.copy_(
                     torch.tensor(routes, device="cuda", dtype=torch.int32)
                     + local_experts
                 )
+<<<<<<< HEAD
                 sorted_ids, _, _, valid, _ = gluon_moe_sorting(
                     ids,
                     weights,
@@ -875,20 +922,31 @@ def test_package_muse_changed_graph_inputs() -> None:
                     weights,
                     64,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                sorted_ids, _, _, valid, _ = gluon_moe_sorting(
+                    ids,
+                    weights,
+                    local_experts,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                     4096,
                     torch.bfloat16,
                     32,
                     runtime_rows=True,
                     use_minimum_route_chunks=False,
 <<<<<<< HEAD
+<<<<<<< HEAD
                     expert_start=local_experts,
 =======
                     expert_start=64,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                    expert_start=local_experts,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 )
                 assert (
                     int(valid[0])
                     == sorted_ids.numel()
+<<<<<<< HEAD
 <<<<<<< HEAD
                     == _max_padded_route_capacity(rows * 8, local_experts, 32)
                     == (3488 if local_experts == 64 else 2496)
@@ -906,6 +964,17 @@ def test_package_muse_changed_graph_inputs() -> None:
             elif phase == 0:
                 ids.copy_(torch.arange(64, 72, device="cuda").expand(rows, 8))
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                    == _max_padded_route_capacity(rows * 8, local_experts, 32)
+                    == (3488 if local_experts == 64 else 2496)
+                )
+            elif phase == 0:
+                ids.copy_(
+                    torch.arange(
+                        local_experts, local_experts + 8, device="cuda"
+                    ).expand(rows, 8)
+                )
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             elif phase == 1:
                 ids.copy_(torch.arange(128, 136, device="cuda").expand(rows, 8))
             else:
@@ -924,12 +993,18 @@ def test_package_muse_changed_graph_inputs() -> None:
             graph.replay()
             torch.cuda.synchronize()
 <<<<<<< HEAD
+<<<<<<< HEAD
             owned = (ids.flatten() >= local_experts) & (
                 ids.flatten() < 2 * local_experts
             )
 =======
             owned = (ids.flatten() >= 64) & (ids.flatten() < 128)
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            owned = (ids.flatten() >= local_experts) & (
+                ids.flatten() < 2 * local_experts
+            )
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             expected_map = torch.where(
                 owned, torch.arange(rows * 8, device="cuda", dtype=torch.int32), -1
             )

@@ -806,6 +806,7 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
 @requires_gpu
 @pytest.mark.parametrize("with_rope", [False, True])
 <<<<<<< HEAD
+<<<<<<< HEAD
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_owned_attention_stores_prepared_rows_once(
     monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int
@@ -813,6 +814,11 @@ def test_owned_attention_stores_prepared_rows_once(
 def test_owned_attention_stores_prepared_rows_once(
     monkeypatch: pytest.MonkeyPatch, with_rope: bool
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_owned_attention_stores_prepared_rows_once(
+    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 ) -> None:
     """Prepared receiver outputs pass through the real prologue's cache store,
     preserving prefix slots and reaching attention without another head norm."""
@@ -822,6 +828,7 @@ def test_owned_attention_stores_prepared_rows_once(
     from tokenspeed.runtime.layers import paged_attention
 
 <<<<<<< HEAD
+<<<<<<< HEAD
     rows, head_dim, heads, kv_heads = 2049, 64, 128 // world_size, 16 // world_size
     attention = _stub(MuseSparkAttention)
     attention.tp_size = world_size
@@ -829,6 +836,11 @@ def test_owned_attention_stores_prepared_rows_once(
     rows, head_dim, heads, kv_heads = 2049, 64, 32, 4
     attention = _stub(MuseSparkAttention)
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+    rows, head_dim, heads, kv_heads = 2049, 64, 128 // world_size, 16 // world_size
+    attention = _stub(MuseSparkAttention)
+    attention.tp_size = world_size
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     attention.hidden_size, attention.head_dim = 8192, head_dim
     attention.num_heads, attention.num_kv_heads = heads, kv_heads
     attention.q_size, attention.kv_size = heads * head_dim, kv_heads * head_dim
@@ -869,6 +881,7 @@ def test_owned_attention_stores_prepared_rows_once(
         )
     )
 <<<<<<< HEAD
+<<<<<<< HEAD
     local_rows = (rows + world_size - 1) // world_size
     local = torch.empty(local_rows, 8192, dtype=torch.bfloat16, device="cuda")
     attention.qkv_proj = SimpleNamespace(
@@ -880,6 +893,13 @@ def test_owned_attention_stores_prepared_rows_once(
     attention.qkv_proj = SimpleNamespace(
         project_owned_rows=lambda value, global_rows: value, tp_group=(0, 1, 2, 3)
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+    local_rows = (rows + world_size - 1) // world_size
+    local = torch.empty(local_rows, 8192, dtype=torch.bfloat16, device="cuda")
+    attention.qkv_proj = SimpleNamespace(
+        project_owned_rows=lambda value, global_rows: value,
+        tp_group=tuple(range(world_size)),
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     )
     attention._project = lambda value: (value, None, 1)
 
@@ -1333,10 +1353,14 @@ def test_attention_output_preserves_dense_projection(
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> None:
 =======
 def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> None:
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,
     )
@@ -1348,10 +1372,14 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
 <<<<<<< HEAD
+<<<<<<< HEAD
         world_size=world_size,
 =======
         world_size=4,
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        world_size=world_size,
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     )
     try:
         device = torch.device("cuda", rank)
@@ -1367,10 +1395,14 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
         torch.set_default_dtype(torch.bfloat16)
         with torch.device(device):
 <<<<<<< HEAD
+<<<<<<< HEAD
             linear = _shard_linear(4096, 256, tp_rank=rank, tp_size=world_size)
 =======
             linear = _shard_linear(4096, 256, tp_rank=rank, tp_size=4)
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            linear = _shard_linear(4096, 256, tp_rank=rank, tp_size=world_size)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         linear.weight.data.zero_()
         linear.weight.data[:, rank] = 1
         linear.workspace = torch.zeros(64, 4096, device=device)
@@ -1386,6 +1418,7 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
             for tokens in (64, 65):
                 x = torch.ones(tokens, 256, device=device)
 <<<<<<< HEAD
+<<<<<<< HEAD
                 x[:, :world_size] = torch.arange(1, world_size + 1, device=device)
                 rows, packed = linear.forward_mxfp4(x, norm_weight, 1e-6, 1.0)
                 assert rows.shape == (tokens, 4096)
@@ -1398,6 +1431,14 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
                 assert rows.shape == (tokens, 4096)
                 expected_rows = x[:, :4].repeat_interleave(1024, dim=1)
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                x[:, :world_size] = torch.arange(1, world_size + 1, device=device)
+                rows, packed = linear.forward_mxfp4(x, norm_weight, 1e-6, 1.0)
+                assert rows.shape == (tokens, 4096)
+                expected_rows = x[:, :world_size].repeat_interleave(
+                    4096 // world_size, dim=1
+                )
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 expected = rmsnorm_mxfp4_quant(expected_rows, norm_weight, 1e-6, 1.0)
                 torch.testing.assert_close(packed[0], expected[0], atol=0, rtol=0)
                 m = torch.arange(tokens, device=device)[:, None]
@@ -1409,12 +1450,17 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
                 )
                 torch.testing.assert_close(
 <<<<<<< HEAD
+<<<<<<< HEAD
                     packed[1].T.flatten()[offsets],
                     expected[1].T.flatten()[offsets],
 =======
                     packed[1].flatten()[offsets],
                     expected[1].flatten()[offsets],
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                    packed[1].T.flatten()[offsets],
+                    expected[1].T.flatten()[offsets],
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                     atol=0,
                     rtol=0,
                 )
@@ -1427,10 +1473,14 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
 
 @requires_gpu
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_gathered_mxfp4_preserves_rows_across_workspace_boundary(world_size) -> None:
     if not current_platform().is_cdna4 or torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} CDNA4 GPUs")
+<<<<<<< HEAD
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -1451,15 +1501,29 @@ def test_replicated_pool_preserves_column_projection_after_reload(
 def test_gathered_mxfp4_preserves_rows_across_workspace_boundary() -> None:
     if not current_platform().is_cdna4 or torch.cuda.device_count() < 4:
         pytest.skip("requires four CDNA4 GPUs")
+=======
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_gathered_mxfp4_workspace_worker, args=(port,), nprocs=4, join=True)
+    mp.spawn(
+        _gathered_mxfp4_workspace_worker,
+        args=(port, world_size),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 @requires_gpu
+<<<<<<< HEAD
 def test_replicated_pool_preserves_column_projection_after_reload(bf16_default_dtype):
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_replicated_pool_preserves_column_projection_after_reload(
+    bf16_default_dtype, world_size
+):
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
     torch.manual_seed(123)
     full_weight = torch.randn((4096, 8192), device="cuda", dtype=torch.bfloat16)
@@ -1468,10 +1532,14 @@ def test_replicated_pool_preserves_column_projection_after_reload(bf16_default_d
         for rows in (1, 17)
     ]
 <<<<<<< HEAD
+<<<<<<< HEAD
     for rank in range(world_size):
 =======
     for rank in range(4):
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+    for rank in range(world_size):
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         pre_expert = object.__new__(module._MuseGatheredLinear)
         ColumnParallelLinear.__init__(
             pre_expert,
@@ -1485,6 +1553,7 @@ def test_replicated_pool_preserves_column_projection_after_reload(bf16_default_d
         )
         pre_expert = pre_expert.cuda()
 <<<<<<< HEAD
+<<<<<<< HEAD
         pre_expert.rank, pre_expert.group = rank, tuple(range(world_size))
         pre_expert.gather_column_view = True
         pre_expert.workspace = None
@@ -1497,6 +1566,13 @@ def test_replicated_pool_preserves_column_projection_after_reload(bf16_default_d
         pre_expert.multicast = None
         reference = _shard_linear(4096, 8192, rank, 4).cuda()
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        pre_expert.rank, pre_expert.group = rank, tuple(range(world_size))
+        pre_expert.gather_column_view = True
+        pre_expert.workspace = None
+        pre_expert.multicast = None
+        reference = _shard_linear(4096, 8192, rank, world_size).cuda()
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         for scale in (1.0, -0.5):
             loaded = full_weight * scale
             pre_expert.weight_loader(pre_expert.weight, loaded)

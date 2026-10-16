@@ -310,10 +310,14 @@ class AutoBackend(CommBackend):
         if (
             not current_platform().is_cdna4
 <<<<<<< HEAD
+<<<<<<< HEAD
             or len(group) not in (4, 8)
 =======
             or len(group) != 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            or len(group) not in (4, 8)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             or self._force_deterministic_rsag()
             or self._group_spans_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
@@ -325,10 +329,14 @@ class AutoBackend(CommBackend):
         if (
             not current_platform().is_cdna4
 <<<<<<< HEAD
+<<<<<<< HEAD
             or len(group) not in (4, 8)
 =======
             or len(group) != 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            or len(group) not in (4, 8)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             or self._group_spans_nodes(group)
         ):
             return False

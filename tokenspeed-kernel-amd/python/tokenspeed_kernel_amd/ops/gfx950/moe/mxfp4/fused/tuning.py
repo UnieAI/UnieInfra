@@ -49,10 +49,14 @@ class _GroupedMoEConfig(NamedTuple):
 # Entries: inclusive row bounds and the shared sorting/GEMM configuration.
 _GROUPED_MOE_CONFIGS = {
 <<<<<<< HEAD
+<<<<<<< HEAD
     (4096, 4096, 4096, local_experts, 256, 8): (
 =======
     (4096, 4096, 4096, 64, 256, 8): (
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+    (4096, 4096, 4096, local_experts, 256, 8): (
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         (
             49,
             128,
@@ -71,11 +75,16 @@ _GROUPED_MOE_CONFIGS = {
             ),
         ),
 <<<<<<< HEAD
+<<<<<<< HEAD
     )
     for local_experts in (32, 64)
 =======
     ),
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+    )
+    for local_experts in (32, 64)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 }
 
 

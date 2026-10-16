@@ -20,10 +20,14 @@
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 """Prepared TP4/TP8 broadcast of exact int32 words from group rank zero."""
 =======
 """Prepared TP4 broadcast of exact int32 words from group rank zero."""
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+"""Prepared TP4/TP8 broadcast of exact int32 words from group rank zero."""
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
@@ -49,10 +53,14 @@ class IrisBroadcast:
 
     def __init__(self, peers: IrisGroup, max_words: int):
 <<<<<<< HEAD
+<<<<<<< HEAD
         assert peers.world_size in (4, 8) and max_words > 0
 =======
         assert peers.world_size == 4 and max_words > 0
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        assert peers.world_size in (4, 8) and max_words > 0
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         self.peers = peers
         self.tiles = min(self.MAX_TILES, triton.cdiv(max_words, self.WORDS_PER_TILE))
         self.mailbox = peers.ctx.empty(
@@ -79,10 +87,14 @@ class IrisBroadcast:
         assert self.mailbox is not None
         assert tensor.is_cuda and tensor.is_contiguous() and tensor.dtype == torch.int32
 <<<<<<< HEAD
+<<<<<<< HEAD
         subgroups = self.peers.world_size if self.peers.rank == 0 else 1
 =======
         subgroups = 4 if self.peers.rank == 0 else 1
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        subgroups = self.peers.world_size if self.peers.rank == 0 else 1
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         programs = min(
             triton.cdiv(tensor.numel(), self.WORDS_PER_TILE),
             self.tiles,
@@ -91,10 +103,14 @@ class IrisBroadcast:
             tensor,
             self.mailbox,
 <<<<<<< HEAD
+<<<<<<< HEAD
             self.peer_addresses[: self.peers.world_size],
 =======
             self.peer_addresses[:4],
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            self.peer_addresses[: self.peers.world_size],
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             tensor.numel(),
             RANK=self.peers.rank,
             SOURCE=0,
@@ -116,10 +132,14 @@ def iris_lamport_broadcast(
     SUBGROUPS: gl.constexpr,
 ):
 <<<<<<< HEAD
+<<<<<<< HEAD
     """Broadcast int32 values in place through sentinel-marked TP4/TP8 mailboxes.
 =======
     """Broadcast int32 values in place through sentinel-marked TP4 mailboxes.
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+    """Broadcast int32 values in place through sentinel-marked TP4/TP8 mailboxes.
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
     The source writes each word as two 16-bit halves, so every int32 value is
     distinct from the empty marker. Receivers copy both halves into their local
@@ -130,6 +150,7 @@ def iris_lamport_broadcast(
         mailbox: Local uint32 storage, initialized to 0x80000000, with two
             BLOCK-word halves per workgroup.
 <<<<<<< HEAD
+<<<<<<< HEAD
         peer_addresses: Mailbox base addresses for the group ranks.
         words: Number of int32 elements to broadcast.
         RANK: This process's rank within the group.
@@ -138,12 +159,19 @@ def iris_lamport_broadcast(
         SUBGROUPS: Subgroups per workgroup; one per group rank at the source.
 =======
         peer_addresses: Mailbox base addresses for the four group ranks.
+=======
+        peer_addresses: Mailbox base addresses for the group ranks.
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         words: Number of int32 elements to broadcast.
-        RANK: This process's rank within the four-rank group.
+        RANK: This process's rank within the group.
         SOURCE: Group rank supplying the input; its tensor remains unchanged.
         BLOCK: Number of int32 elements handled by one mailbox tile.
+<<<<<<< HEAD
         SUBGROUPS: Subgroups per workgroup; the source requires four.
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        SUBGROUPS: Subgroups per workgroup; one per group rank at the source.
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
     Returns:
         Nothing. Writes the broadcast result into tensor on receiving ranks.
@@ -151,15 +179,20 @@ def iris_lamport_broadcast(
     # Two 16-bit halves encode every int32 without colliding with the empty
     # DWORD sentinel. Polls consume the payload itself with system-scope reads.
 <<<<<<< HEAD
+<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(peer_addresses)
 =======
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+    WORLD_SIZE: gl.constexpr = len(peer_addresses)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     sentinel: gl.constexpr = 0x80000000
     # Program i always owns mailbox i, including when later calls change size.
     mailbox_offset = gl.program_id(0) * 2 * BLOCK
     first_word = gl.program_id(0) * BLOCK
     word_stride = gl.num_programs(0) * BLOCK
     if RANK == SOURCE:
+<<<<<<< HEAD
 <<<<<<< HEAD
         gl.static_assert(SUBGROUPS == WORLD_SIZE)
         layout: gl.constexpr = gl.BlockedLayout(
@@ -184,6 +217,20 @@ def iris_lamport_broadcast(
             gl.pointer_type(gl.uint32)
         )
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        gl.static_assert(SUBGROUPS == WORLD_SIZE)
+        layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [WORLD_SIZE, 1], [1, 0]
+        )
+        peers = gl.arange(0, WORLD_SIZE, layout=gl.SliceLayout(1, layout))
+        offsets = gl.arange(0, BLOCK, layout=gl.SliceLayout(0, layout))
+        destinations = gl.full(
+            (WORLD_SIZE,), peer_addresses[0], gl.uint64, gl.SliceLayout(1, layout)
+        )
+        for peer in gl.static_range(1, WORLD_SIZE):
+            destinations = gl.where(peers == peer, peer_addresses[peer], destinations)
+        destinations = destinations.to(gl.pointer_type(gl.uint32))
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         pointers = destinations[:, None] + mailbox_offset + offsets[None, :]
         mask = (peers != SOURCE)[:, None]
         for start in range(first_word, words, word_stride):

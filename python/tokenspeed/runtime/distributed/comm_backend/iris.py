@@ -283,10 +283,14 @@ class IrisBackend(CommBackend):
         if (
             current_platform().is_cdna4
 <<<<<<< HEAD
+<<<<<<< HEAD
             and len(group) in (4, 8)
 =======
             and len(group) == 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            and len(group) in (4, 8)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             and tensor.ndim == 2
             and dim in (-1, tensor.ndim - 1)
             and tensor.dtype == torch.bfloat16

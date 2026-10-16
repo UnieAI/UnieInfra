@@ -158,10 +158,14 @@ def _muse_all_reduce(
             and tensor.is_contiguous()
             and 0 < tensor.numel() <= iris.all_reduce.producer_direct_max_numel
 <<<<<<< HEAD
+<<<<<<< HEAD
             and tensor.numel() % (iris.world_size * 8) == 0
 =======
             and tensor.numel() % 32 == 0
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            and tensor.numel() % (iris.world_size * 8) == 0
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         ):
             results.append(iris.reduce(tensor))
         else:
@@ -198,10 +202,14 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             tp_size > 1
             and current_platform().is_cdna4
 <<<<<<< HEAD
+<<<<<<< HEAD
             and len(tp_group) in (4, 8)
 =======
             and len(tp_group) == 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            and len(tp_group) in (4, 8)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             and torch.get_default_dtype() == torch.bfloat16
             and (input_size, output_size) in ((4096, 8192), (8192, 4096))
             and not global_server_args_dict.get("force_deterministic_rsag", False)
@@ -718,11 +726,16 @@ class MuseSparkAttention(nn.Module):
                 and current_platform().is_cdna4
                 and mapping.pp_size == 1
 <<<<<<< HEAD
+<<<<<<< HEAD
                 and mapping.attn.tp_size == mapping.moe.ep_size
                 and mapping.attn.tp_size in (4, 8)
 =======
                 and mapping.attn.tp_size == mapping.moe.ep_size == 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+                and mapping.attn.tp_size == mapping.moe.ep_size
+                and mapping.attn.tp_size in (4, 8)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 and mapping.moe.tp_size == 1
                 and mapping.attn.tp_group == mapping.moe.ep_group
                 and config.hidden_size == 8192
@@ -856,11 +869,16 @@ class MuseSparkAttention(nn.Module):
             and ctx.token_to_kv_pool.dtype == torch.bfloat16
             and normalized.dtype == torch.bfloat16
 <<<<<<< HEAD
+<<<<<<< HEAD
             and (self.head_dim, self.q_size, self.kv_size)
             == (64, 8192 // self.tp_size, 1024 // self.tp_size)
 =======
             and (self.head_dim, self.q_size, self.kv_size) == (64, 2048, 256)
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            and (self.head_dim, self.q_size, self.kv_size)
+            == (64, 8192 // self.tp_size, 1024 // self.tp_size)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         ):
             cos_sin_cache = (
                 self.rotary_emb.cos_sin_cache
@@ -1810,11 +1828,16 @@ class MuseSparkModel(BaseTransformerModel):
             and not ctx.forward_mode.is_mixed()
             and mapping.pp_size == 1
 <<<<<<< HEAD
+<<<<<<< HEAD
             and mapping.attn.tp_size == mapping.moe.ep_size
             and mapping.attn.tp_size in (4, 8)
 =======
             and mapping.attn.tp_size == mapping.moe.ep_size == 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            and mapping.attn.tp_size == mapping.moe.ep_size
+            and mapping.attn.tp_size in (4, 8)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             and mapping.moe.tp_size == 1
             and mapping.attn.tp_group == mapping.moe.ep_group
             and self.config.hidden_size == 8192
@@ -1862,12 +1885,18 @@ class MuseSparkModel(BaseTransformerModel):
         attention_input = None
         if owned_global_rows is not None:
 <<<<<<< HEAD
+<<<<<<< HEAD
             local_rows = (
                 rows + self.mapping.attn.tp_size - 1
             ) // self.mapping.attn.tp_size
 =======
             local_rows = (rows + 3) // 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            local_rows = (
+                rows + self.mapping.attn.tp_size - 1
+            ) // self.mapping.attn.tp_size
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             first_row = self.mapping.attn.tp_rank * local_rows
             valid_rows = min(local_rows, max(0, rows - first_row))
             norm = self.layers[0].input_layernorm
@@ -2112,10 +2141,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
 <<<<<<< HEAD
+<<<<<<< HEAD
         """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""
 =======
         """Prepare and bind Muse's TP4 state before cache sizing and capture."""
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+        """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
 
         mapping = self.mapping
@@ -2124,10 +2157,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if (
             not current_platform().is_cdna4
 <<<<<<< HEAD
+<<<<<<< HEAD
             or mapping.attn.tp_size not in (4, 8)
 =======
             or mapping.attn.tp_size != 4
 >>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
+=======
+            or mapping.attn.tp_size not in (4, 8)
+>>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             or group != mapping.moe.tp_ep_group
             or not isinstance(backend, AutoBackend)
             or not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)

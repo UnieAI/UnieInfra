@@ -54,10 +54,10 @@ concurrency:
 
 jobs:
   scan:
-    if: false
     # Run jobs for pull requests, or for push/manual events in the official
     # repository or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
+      false &&
       (github.event.action != 'labeled' || github.event.label.name == 'high priority') &&
       (
         github.event_name == 'pull_request' ||

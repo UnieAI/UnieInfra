@@ -121,9 +121,7 @@ def resolve_pooling_config(
         )
 
     resolved_type = (
-        PoolingType(pooling_type)
-        if pooling_type is not None
-        else declared.pooling_type
+        PoolingType(pooling_type) if pooling_type is not None else declared.pooling_type
     )
     if pooling_normalize is not None:
         normalize = pooling_normalize

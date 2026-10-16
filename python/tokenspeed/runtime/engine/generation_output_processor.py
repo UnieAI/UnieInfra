@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
+from tokenspeed.runtime.engine.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from tokenspeed.runtime.engine.request_stats import (
     NOOP_STATS,
     RequestStats,
@@ -47,7 +47,10 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.engine.io_struct import TokenizedGenerateReqInput
+    from tokenspeed.runtime.engine.io_struct import (
+        TokenizedEmbeddingReqInput,
+        TokenizedGenerateReqInput,
+    )
     from tokenspeed.runtime.execution.types import ModelExecutionResult
     from tokenspeed.runtime.metrics.collector import EngineMetrics
     from tokenspeed.runtime.grammar.base_grammar_backend import (
@@ -112,6 +115,9 @@ class RequestState:
 
         # --- generation state (updated with forward step) ---
         self.output_ids: list[int] = []
+        # Embedding serving only: the pooled vector, set when the request's
+        # single forward commits.
+        self.embedding: list[float] | None = None
         self.finished_reason: BaseFinishReason | None = None
         self.cached_tokens: int = 0
         self.prefix_len: int = 0
@@ -230,6 +236,28 @@ class RequestState:
             token_ids_logprob=recv_req.token_ids_logprob,
             multimodal_inputs=recv_req.multimodal_inputs,
             prompt_input_ids_unpadded=recv_req.input_ids_unpadded,
+            created_time=recv_req.created_time,
+        )
+
+    @classmethod
+    def from_embedding_req(
+        cls,
+        recv_req: TokenizedEmbeddingReqInput,
+        tokenizer,
+        eos_token_ids: list[int],
+    ) -> RequestState:
+        """Build the state for an admitted pooling request.
+
+        A pooled vector is one value, never a stream, and a pooling forward
+        scores no prompt rows, so there are no logprobs to accumulate.
+        """
+        return cls(
+            prompt_input_ids=recv_req.input_ids,
+            sampling_params=recv_req.sampling_params,
+            stream=False,
+            tokenizer=tokenizer,
+            computes_prompt_logprobs=False,
+            eos_token_ids=eos_token_ids,
             created_time=recv_req.created_time,
         )
 
@@ -719,12 +747,90 @@ class OutputProcesser:
             if rs := self.rid_to_state.get(rid):
                 rs.cached_tokens += max(0, prefix_len + replay_len - rs.computed_length)
 
+    def post_process_embedding_forward_op(self, forward_op, results):
+        """Commit a pooling forward: one vector per request, then finished.
+
+        Kept separate from the token path rather than folded into it. The
+        token loop is built around "how many tokens did this slot produce and
+        is the request finished yet"; for pooling both answers are fixed (none,
+        and yes), and every branch in that loop -- grammar, spec verify,
+        logprobs, NaN sanitisation, chunked-prefill continuation -- is dead.
+
+        Emits ExtendResult with an empty token list (a no-op append that still
+        clears the scheduler's pending forward result) followed by Finish.
+        ``results`` arrives already synced by ``PendingExecution.result()``.
+        """
+        self.add_cached_tokens(
+            forward_op.request_ids,
+            forward_op.extend_prefix_lens,
+            forward_op.extend_replay_lens,
+        )
+        self.add_computed_length(
+            forward_op.request_ids,
+            forward_op.input_lengths,
+            forward_op.extend_prefix_lens,
+        )
+
+        request_changes = []
+        stream_out_rids = []
+        stream_out_states = []
+        embeddings = results.output_embeddings
+        stats_now = time.time() if self.enable_log_request_stats else 0.0
+        for i, rid in enumerate(forward_op.request_ids):
+            request_state: RequestState = self.rid_to_state.get(rid)
+            if request_state is None:
+                continue
+            # Embedding servers open the prefill chunk budget to the context
+            # length at startup, so a slot that is not prefill-finished means
+            # the batch was built by a path that ignored that.
+            if not request_state.prefill_finished:
+                raise RuntimeError(
+                    f"pooling request {rid} was scheduled as a partial prefill; "
+                    "embedding models require whole-prompt prefill"
+                )
+
+            request_changes.append(make_extend_result_event(rid))
+            request_changes.append(make_finish_event(rid))
+            if not request_state.to_abort:
+                # A client abort already tore down the tokenizer-side state,
+                # so only a live request ships its vector.
+                request_state.embedding = embeddings[i].tolist()
+                request_state.finished_reason = FINISH_LENGTH(length=0)
+                stream_out_rids.append(rid)
+                stream_out_states.append(request_state)
+            self._log_request_stats(rid, request_state, stats_now)
+            self.rid_to_state.pop(rid)
+
+        self.stream_embedding_output(stream_out_rids, stream_out_states)
+        return request_changes
+
+    def stream_embedding_output(
+        self, rids: list[str], states: list[RequestState]
+    ) -> None:
+        """Ship pooled vectors to AsyncLLM over the same socket as tokens."""
+        if not states:
+            return
+        batch_out = BatchEmbeddingOut(
+            rids=rids,
+            finished_reasons=[
+                state.finished_reason.to_json() if state.finished_reason else None
+                for state in states
+            ],
+            embeddings=[state.embedding for state in states],
+            prompt_tokens=[state.input_length for state in states],
+        )
+        self.send_to_tokenizer.send_pyobj(batch_out)
+
     def post_process_forward_op(
         self,
         forward_op,
         model_execution_results: ModelExecutionResult,
         is_prefill_instance: bool,
     ):
+        if model_execution_results.output_embeddings is not None:
+            return self.post_process_embedding_forward_op(
+                forward_op, model_execution_results
+            )
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,

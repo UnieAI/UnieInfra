@@ -2308,6 +2308,41 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
     )
 
 
+def test_moe_relayout_can_free_the_loaded_experts(monkeypatch, tmp_path):
+    """The loader must not hold the loaded expert Parameters during re-layout.
+
+    post_load_weights replaces each MoE layer's experts with re-laid-out
+    Parameters. A name->Parameter map still alive in the loading frame keeps the
+    originals too, so the peak is twice the expert weights -- ~63 GiB extra per
+    rank at TP4, an OOM on 141 GB H200s. Each hook here drops the module's own
+    reference and checks that nothing else keeps the old Parameter alive.
+    """
+    import gc
+    import weakref
+
+    config = _loader_config()
+    with set_default_torch_dtype(torch.bfloat16):
+        model = _loader_model(monkeypatch, config, 0, "cpu")
+    survivors = []
+
+    def relayout(self, module):
+        old = weakref.ref(module.w13_weight)
+        module.w13_weight = torch.nn.Parameter(
+            torch.empty(0, dtype=torch.uint8), requires_grad=False
+        )
+        gc.collect()
+        survivors.append(old() is not None)
+
+    monkeypatch.setattr(MoELayer, "process_weights_after_loading", relayout)
+    weights = _checkpoint(config)
+    rest = _bind_engram_tables(model, weights, tmp_path)
+    model.load_weights(rest.items())
+    assert survivors and not any(survivors), (
+        f"{sum(survivors)}/{len(survivors)} MoE layers kept their loaded experts "
+        "alive through the re-layout"
+    )
+
+
 @pytest.mark.parametrize(
     "missing",
     [

@@ -368,6 +368,7 @@ class _Result:
         )
         self.grammar_completion = None
         self.next_input_ids = None
+        self.output_embeddings = None
         self.input_logprob_plan = plan
         self.input_token_logprobs = (
             torch.tensor(input_token_logprobs, dtype=torch.float32)

@@ -1028,7 +1028,17 @@ def _index_finish_parts(scores, ids, k, output, lengths):
     _finish_topk(values, ids.gather(1, positions), output, lengths)
 
 
-@triton.jit
+# Row strides, widths and the candidate table's strides follow the batch and the
+# live history, and every buffer here is a view at a batch-dependent offset: none
+# of them may select a compilation (each new one stalled serving 0.3-3.5 s).
+_FINISH_TOPK_RUNTIME = ["S0", "I0", "C0", "C1", "O0", "WIDTH", "K"]
+
+
+@triton.jit(
+    do_not_specialize=_FINISH_TOPK_RUNTIME,
+    do_not_specialize_on_alignment=_FINISH_TOPK_RUNTIME
+    + ["Scores", "Ids", "Cands", "Out", "Lens"],
+)
 def _finish_topk_kernel(
     Scores,
     Ids,
@@ -1070,6 +1080,13 @@ def _finish_topk_kernel(
     tl.store(Lens + row, tl.sum(live.to(tl.int32), axis=0))
 
 
+def _finish_topk_block(width: int) -> int:
+    """Compile-time row width: at least the top-k most selectors emit (512), so a
+    short history does not compile its own variant for every power of two below
+    it; wider candidate pools take the next power of two (1024, 2048)."""
+    return max(512, triton.next_power_of_2(max(1, width)))
+
+
 def _finish_topk(scores, ids, output, lengths, candidates=None):
     """Pack the selected ids into a sorted, -1 padded prefix and count them.
 
@@ -1095,7 +1112,7 @@ def _finish_topk(scores, ids, output, lengths, candidates=None):
         output.shape[1],
         BLOCK_SIZE=8,
         HAS_CANDIDATES=candidates is not None,
-        BLOCK=triton.next_power_of_2(max(1, output.shape[1])),
+        BLOCK=_finish_topk_block(output.shape[1]),
         num_warps=8,
     )
 

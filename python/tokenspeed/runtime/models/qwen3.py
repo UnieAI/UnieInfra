@@ -26,7 +26,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
@@ -41,23 +40,21 @@ from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.utils import get_layer_id
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
-    kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.utils import (
-    create_fused_set_kv_buffer_arg,
-    validate_attention_partition,
-)
+from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 # ModelOpt checkpoints that declare ``kv_cache_quant_algo`` carry per-layer KV
 # scales next to the k/v projections. They are only materialised as parameters
@@ -186,107 +183,37 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        # Visibility only; the cache plan decides storage (bound at startup).
+        sliding_window_size = -1
+        if config.layer_types[layer_id] == "sliding_attention":
+            if config.sliding_window is None:
+                raise ValueError(
+                    "Qwen3 sliding_attention layers require config.sliding_window."
+                )
+            sliding_window_size = hf_sliding_window_to_window_left(
+                config.sliding_window
+            )
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window_size,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
-
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.weight.data,
-            self.k_norm.weight.data,
-            self.q_norm.variance_epsilon,
-        )
-
-    def _rotate_half(self, x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _apply_rotary_pos_emb(self, t, cos, sin):
-        return (t * cos) + self._rotate_half(t) * sin
-
-    def _attn(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        """RoPE + attention, using the fused RoPE+KV pre-write when possible.
-
-        Same scaffolding as ``LlamaAttention._attn``. It matters more than it
-        looks: the standalone KV write is a Triton launch whose *kernel* is
-        1.7-2.2x faster than vLLM's CUDA one (0.97 vs 1.64 us at one token) but
-        whose Python launch costs ~14.9 us of host time against vLLM's 7.5 us
-        -- and below a few thousand tokens the host is what the step actually
-        waits on. Folding the write into the RoPE kernel removes the launch
-        rather than trying to make it cheaper.
-
-        Falls back to plain RoPE + ``self.attn(q, k, v)`` whenever the backend
-        cannot pre-write or the layer has non-trivial k/v scales; without that
-        fallback those layers would silently lose their KV writes.
-        """
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            n = v.shape[0]
-            fused_kv_arg = create_fused_set_kv_buffer_arg(
-                value=v.view(n, self.num_kv_heads, self.head_dim),
-                layer=self.attn,
-                # Flat path: prewrite at this layer's group locations. Identity
-                # for backends without flat cache groups, so it costs nothing
-                # and keeps the hybrid ones writing where the reader looks.
-                out_cache_loc=ctx.attn_backend.select_out_cache_loc(
-                    self.attn, out_cache_loc, ctx.forward_mode
-                ),
-                token_to_kv_pool=ctx.token_to_kv_pool,
-            )
-            if fused_kv_arg is not None:
-                # No ``output_q_rope``: rope Q in place, so the tensor handed to
-                # attention is the same strided view of qkv the unfused path
-                # passes. Allocating a fresh contiguous Q instead (as llama.py
-                # does) changes the attention kernel's last bits and made greedy
-                # decode diverge from the unfused path on near-tied logits --
-                # the KV bytes are identical either way, verified bitwise. It
-                # also saves one allocation per layer.
-                self.rotary_emb(
-                    positions,
-                    q,
-                    k,
-                    fused_set_kv_buffer_arg=fused_kv_arg,
-                    enable_pdl=pdl_enabled(),
-                )
-                return self.attn(
-                    q,
-                    None,
-                    None,
-                    ctx,
-                    out_cache_loc,
-                    save_kv_cache=False,
-                )
-        q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx, out_cache_loc)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        attn_output = self._attn(positions, q, k, v, ctx, out_cache_loc)
+        attn_output = self.attn(q, k, v, positions, ctx)
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -348,7 +275,6 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -375,7 +301,6 @@ class Qwen3DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             cos_sin=cos_sin,
         )
 
@@ -442,7 +367,6 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if input_embeds is None:
@@ -457,7 +381,6 @@ class Qwen3Model(nn.Module):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 cos_sin=None,
             )
@@ -472,26 +395,6 @@ class Qwen3Model(nn.Module):
                 residual,
             )
         return hidden_states, None
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = self.mapping.attn.tp_size
-        tp_rank = self.mapping.attn.tp_rank
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
-            quantization_param_path,
-            tp_rank,
-            tp_size,
-            self.config.num_hidden_layers,
-            self.config.__class__.model_type,
-        ):
-            if not isinstance(self.layers[layer_idx], nn.Identity):
-                layer_self_attn = self.layers[layer_idx].self_attn
-            if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
-            else:
-                raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
-                )
 
 
 class Qwen3ForCausalLM(BaseCausalLM):
@@ -610,9 +513,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
 
 
 EntryClass = Qwen3ForCausalLM

@@ -93,8 +93,8 @@ def register() -> None:
         priority=Priority.PLUGIN,
         traits={
             "sliding_window": frozenset({False}),
-            "support_sinks": frozenset({False}),
-            "support_logit_cap": frozenset({False}),
+            "sinks": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
         tags={"unieinfra", "sm120"},

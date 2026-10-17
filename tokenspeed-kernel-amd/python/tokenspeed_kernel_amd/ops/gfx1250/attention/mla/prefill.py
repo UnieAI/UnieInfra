@@ -34,7 +34,9 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
     maximum,
 )
 
-gfx1250 = gl.amd.gfx1250
+cdna5 = gl.amd.cdna5
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 @gluon.aggregate
@@ -186,9 +188,9 @@ class AttentionProgram:
     q_start: gl.tensor
     q_head: gl.tensor
     kv_head: gl.tensor
-    k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    k_rope_desc: gl.amd.gfx1250.tdm.tensor_descriptor
-    v_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    k_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    k_rope_desc: gl.amd.cdna5.tdm.tensor_descriptor
+    v_desc: gl.amd.cdna5.tdm.tensor_descriptor
     k_buffer: gl.shared_memory_descriptor
     k_rope_buffer: gl.shared_memory_descriptor
     v_buffer: gl.shared_memory_descriptor
@@ -257,21 +259,21 @@ class AttentionProgram:
         kv_len = gl.load(cu_seqlens_kv_ptr + batch + 1) - seq_base_kv
         q_start = q_block * cfg.BLOCK_M
 
-        k_desc = gfx1250.tdm.make_tensor_descriptor(
+        k_desc = cdna5.tdm.make_tensor_descriptor(
             base=k_ptr + cfg.k_strides.offsets(seq_base_kv, kv_head, 0),
             shape=(kv_len, cfg.HEAD_DIM),
             strides=(cfg.k_strides.stride_t, cfg.k_strides.stride_d),
             block_shape=(cfg.BLOCK_N, cfg.HEAD_DIM),
             layout=cfg.k_smem_layout,
         )
-        k_rope_desc = gfx1250.tdm.make_tensor_descriptor(
+        k_rope_desc = cdna5.tdm.make_tensor_descriptor(
             base=k_ptr + cfg.k_strides.offsets(seq_base_kv, kv_head, cfg.HEAD_DIM),
             shape=(kv_len, cfg.ROPE_DIM),
             strides=(cfg.k_strides.stride_t, cfg.k_strides.stride_d),
             block_shape=(cfg.BLOCK_N, cfg.ROPE_DIM),
             layout=cfg.k_rope_smem_layout,
         )
-        v_desc = gfx1250.tdm.make_tensor_descriptor(
+        v_desc = cdna5.tdm.make_tensor_descriptor(
             base=v_ptr + cfg.v_strides.offsets(seq_base_kv, kv_head, 0),
             shape=(kv_len, cfg.HEAD_DIM),
             strides=(cfg.v_strides.stride_t, cfg.v_strides.stride_d),
@@ -325,7 +327,7 @@ class AttentionProgram:
         offsets = cfg.q_strides.offsets(
             self.seq_base_q + offs_m[:, None], self.q_head, offs_d[None, :]
         )
-        return gfx1250.buffer_load(
+        return cdna5.buffer_load(
             self.q_ptr, offsets, mask=offs_m[:, None] < self.q_len, other=0.0
         )
 
@@ -341,21 +343,21 @@ class AttentionProgram:
         offsets = cfg.q_strides.offsets(
             self.seq_base_q + offs_m[:, None], self.q_head, offs_d[None, :]
         )
-        return gfx1250.buffer_load(
+        return cdna5.buffer_load(
             self.q_ptr, offsets, mask=offs_m[:, None] < self.q_len, other=0.0
         )
 
     @gluon.jit
     def issue_tile_loads(self, kv_start, buffer_index):
-        gfx1250.tdm.async_load(
+        cdna5.tdm.async_load(
             self.k_desc, [kv_start, 0], self.k_buffer.index(buffer_index)
         )
-        gfx1250.tdm.async_load(
+        cdna5.tdm.async_load(
             self.k_rope_desc,
             [kv_start, 0],
             self.k_rope_buffer.index(buffer_index),
         )
-        gfx1250.tdm.async_load(
+        cdna5.tdm.async_load(
             self.v_desc, [kv_start, 0], self.v_buffer.index(buffer_index)
         )
 
@@ -385,8 +387,8 @@ class AttentionProgram:
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
-        qk = gfx1250.wmma(q, k, qk)
-        return gfx1250.wmma(q_rope, k_rope, qk)
+        qk = cdna5.wmma(q, k, qk)
+        return cdna5.wmma(q_rope, k_rope, qk)
 
     @gluon.jit
     def apply_mask(self, qk, kv_start):
@@ -402,6 +404,24 @@ class AttentionProgram:
         if cfg.IS_CAUSAL:
             # Align the last query with the last key for q_len != kv_len.
             valid &= offs_n[None, :] <= offs_m[:, None] + self.kv_len - self.q_len
+        return gl.where(valid, qk, -float("inf"))
+
+    @gluon.jit
+    def mask_keys(self, qk, kv_start):
+        # Rows past q_len are never stored, so only keys need masking.
+        cfg = self.cfg
+        offs_n = kv_start + gl.arange(
+            0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+        )
+        if cfg.IS_CAUSAL:
+            offs_m = self.q_start + gl.arange(
+                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+            )
+            # Align the last query with the last key for q_len != kv_len.
+            last_key = gl.minimum(offs_m + self.kv_len - self.q_len, self.kv_len - 1)
+            valid = offs_n[None, :] <= last_key[:, None]
+        else:
+            valid = (offs_n < self.kv_len)[None, :]
         return gl.where(valid, qk, -float("inf"))
 
     @gluon.jit
@@ -442,7 +462,7 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        return gfx1250.wmma(p, v, acc)
+        return cdna5.wmma(p, v, acc)
 
     @gluon.jit
     def store_lse(self, l_i, m_i):
@@ -462,7 +482,7 @@ class AttentionProgram:
                 (m_i * cfg.SM_SCALE + gl.log2(safe_l)) * _LN2,
                 -float("inf"),
             )
-            gfx1250.buffer_store(lse, self.lse_ptr, offsets, mask=offs_m < self.q_len)
+            cdna5.buffer_store(lse, self.lse_ptr, offsets, mask=offs_m < self.q_len)
 
     @gluon.jit
     def store_output(self, output):
@@ -475,7 +495,7 @@ class AttentionProgram:
             self.seq_base_q + offs_m[:, None], self.q_head, offs_d[None, :]
         )
         output = output.to(self.output_ptr.dtype.element_ty)
-        gfx1250.buffer_store(
+        cdna5.buffer_store(
             output,
             self.output_ptr,
             offsets,
@@ -484,7 +504,7 @@ class AttentionProgram:
 
 
 @gluon.jit
-def process_query_block(program: AttentionProgram, num_tiles):
+def process_query_block(program: AttentionProgram, num_tiles, main_end):
     cfg = program.cfg
     q = program.load_q_nope()
     q_rope = program.load_q_rope()
@@ -499,21 +519,25 @@ def process_query_block(program: AttentionProgram, num_tiles):
     for tile_idx in range(0, num_tiles):
         buffer_index = tile_idx % cfg.NUM_BUFFERS
         if tile_idx + 1 < num_tiles:
-            gfx1250.tdm.async_wait(3)
+            cdna5.tdm.async_wait(3)
         else:
-            gfx1250.tdm.async_wait(0)
+            cdna5.tdm.async_wait(0)
 
         k = program.shared_load_k(buffer_index)
         k_rope = program.shared_load_k_rope(buffer_index)
         v = program.shared_load_v(buffer_index)
         kv_start = tile_idx * cfg.BLOCK_N
         qk = program.compute_qk(q, k, q_rope, k_rope)
-        qk = program.apply_mask(qk, kv_start)
+        # Tiles below main_end are visible to every row of this query block, so
+        # they need neither the causal mask nor the out-of-range value guard.
+        if tile_idx >= main_end:
+            qk = program.apply_mask(qk, kv_start)
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-        v_n = kv_start + gl.arange(
-            0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout)
-        )
-        v = gl.where((v_n < program.kv_len)[:, None], v, 0.0)
+        if tile_idx >= main_end:
+            v_n = kv_start + gl.arange(
+                0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout)
+            )
+            v = gl.where((v_n < program.kv_len)[:, None], v, 0.0)
         acc = program.compute_pv(p, v, acc)
 
         if tile_idx + 2 < num_tiles:
@@ -522,6 +546,105 @@ def process_query_block(program: AttentionProgram, num_tiles):
                 next_tile_idx * cfg.BLOCK_N,
                 next_tile_idx % cfg.NUM_BUFFERS,
             )
+
+    program.store_lse(l_i, m_i)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    output = acc * (1.0 / denom)[:, None]
+    output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
+def _attend_tile_fp8(
+    program: AttentionProgram,
+    q_smem,
+    q_rope_smem,
+    tile_idx,
+    num_tiles,
+    m_i,
+    l_i,
+    acc,
+    MASKED: gl.constexpr,
+):
+    cfg = program.cfg
+    buffer_index = tile_idx % cfg.NUM_BUFFERS
+    if tile_idx + 1 < num_tiles:
+        cdna5.tdm.async_wait(3)
+    else:
+        cdna5.tdm.async_wait(0)
+    kv_start = tile_idx * cfg.BLOCK_N
+
+    qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout)
+    # Half-width NoPE operands keep the peak inside the three-wave register
+    # budget.
+    half_dim: gl.constexpr = cfg.HEAD_DIM // 2
+    for half in gl.static_range(2):
+        q = q_smem.slice(half * half_dim, half_dim, 1).load(layout=cfg.q_layout)
+        k = (
+            program.k_buffer.index(buffer_index)
+            .slice(half * half_dim, half_dim, 1)
+            .permute([1, 0])
+            .load(layout=cfg.k_layout)
+        )
+        qk = cdna5.wmma(q, k, qk)
+    q_rope = q_rope_smem.load(layout=cfg.q_layout)
+    k_rope = program.shared_load_k_rope(buffer_index)
+    qk = cdna5.wmma(q_rope, k_rope, qk)
+    if MASKED:
+        qk = program.mask_keys(qk, kv_start)
+    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+    # TDM zero-fills tile rows past kv_len, and their scores are -inf, so V
+    # needs no mask of its own.
+    v = program.shared_load_v(buffer_index)
+    acc = program.compute_pv(p, v, acc)
+
+    if tile_idx + 2 < num_tiles:
+        next_tile_idx = tile_idx + 2
+        program.issue_tile_loads(
+            next_tile_idx * cfg.BLOCK_N, next_tile_idx % cfg.NUM_BUFFERS
+        )
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def process_query_block_fp8(program: AttentionProgram, num_tiles, main_end):
+    # Q is re-read from LDS on every tile so that a wave fits the register
+    # budget of three waves per SIMD.
+    cfg = program.cfg
+    q = program.load_q_nope()
+    q_rope = program.load_q_rope()
+    q_smem = gl.allocate_shared_memory(
+        q.dtype,
+        [cfg.BLOCK_M, cfg.HEAD_DIM],
+        gl.PaddedSharedLayout.with_identity_for(
+            [[cfg.HEAD_DIM, 16]], [cfg.BLOCK_M, cfg.HEAD_DIM], [1, 0]
+        ),
+    )
+    q_rope_smem = gl.allocate_shared_memory(
+        q_rope.dtype,
+        [cfg.BLOCK_M, cfg.ROPE_DIM],
+        gl.PaddedSharedLayout.with_identity_for(
+            [[cfg.ROPE_DIM, 16]], [cfg.BLOCK_M, cfg.ROPE_DIM], [1, 0]
+        ),
+    )
+    q_smem.store(q)
+    q_rope_smem.store(q_rope)
+    m_i, l_i, acc = program.init_state()
+
+    program.issue_tile_loads(0, 0)
+    if num_tiles > 1:
+        program.issue_tile_loads(cfg.BLOCK_N, 1)
+
+    # Separate loops keep the mask out of the fully visible tiles: a masked
+    # branch inside one loop is flattened into selects on every tile.
+    for tile_idx in range(0, main_end):
+        m_i, l_i, acc = _attend_tile_fp8(
+            program, q_smem, q_rope_smem, tile_idx, num_tiles, m_i, l_i, acc, False
+        )
+    for tile_idx in range(main_end, num_tiles):
+        m_i, l_i, acc = _attend_tile_fp8(
+            program, q_smem, q_rope_smem, tile_idx, num_tiles, m_i, l_i, acc, True
+        )
 
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
@@ -540,7 +663,7 @@ def store_empty_query_block(program: AttentionProgram):
 
 
 @gluon.jit
-def _mla_prefill_gfx1250_kernel(
+def gluon_mla_prefill_gfx1250(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -602,11 +725,20 @@ def _mla_prefill_gfx1250_kernel(
             kv_end = program.kv_len - program.q_len + program.q_start + cfg.BLOCK_M
             kv_end = gl.minimum(kv_end, program.kv_len)
             kv_end = gl.maximum(kv_end, 0)
+            # Tiles strictly below the first query row's causal limit are fully
+            # visible, so they can skip masking entirely.
+            main_end = program.kv_len - program.q_len + program.q_start
+            main_end = gl.maximum(main_end, 0) // cfg.BLOCK_N
+            main_end = gl.minimum(main_end, program.kv_len // cfg.BLOCK_N)
         else:
             kv_end = program.kv_len
+            main_end = program.kv_len // cfg.BLOCK_N
         num_tiles = (kv_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N
         if num_tiles > 0:
-            process_query_block(program, num_tiles)
+            if cfg.IS_FP8:
+                process_query_block_fp8(program, num_tiles, main_end)
+            else:
+                process_query_block(program, num_tiles, main_end)
         else:
             store_empty_query_block(program)
 
@@ -620,6 +752,7 @@ class LaunchConfig(NamedTuple):
     block_m: int
     block_n: int
     num_warps: int
+    waves_per_eu: int
     grid: tuple[int, ...]
 
 
@@ -634,13 +767,16 @@ def get_config(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
     softmax_scale: float,
-    is_fp8: bool,
 ) -> LaunchConfig:
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
     block_m = 128
     block_n = 64
     num_warps = 4
+    # The FP8 loop is sized for three waves per SIMD, so other workgroups'
+    # waves run while one waits. 16-bit operands need more registers than that
+    # allows.
+    waves_per_eu = 3 if q.dtype in _FP8_DTYPES else 1
     batch_size = cu_seqlens_q.numel() - 1
     return LaunchConfig(
         n_heads=n_heads,
@@ -651,11 +787,12 @@ def get_config(
         block_m=block_m,
         block_n=block_n,
         num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
         grid=(batch_size, n_heads, _cdiv(max_seqlen_q, block_m)),
     )
 
 
-def gluon_mla_prefill_gfx1250(
+def launch_gluon_mla_prefill_gfx1250(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -703,13 +840,12 @@ def gluon_mla_prefill_gfx1250(
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.stride(-1) != 1:
             raise ValueError(f"{name} must have contiguous last dimension")
-    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-    supported_dtypes = (torch.float16, torch.bfloat16, *fp8_dtypes)
+    supported_dtypes = (torch.float16, torch.bfloat16, *_FP8_DTYPES)
     if q.dtype not in supported_dtypes:
         raise TypeError(f"unsupported MLA prefill dtype {q.dtype}")
     if k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("q, k, and v must use the same dtype")
-    is_fp8 = q.dtype in fp8_dtypes
+    is_fp8 = q.dtype in _FP8_DTYPES
 
     total_tokens, n_heads, _ = q.shape
     output_shape = (total_tokens, n_heads, 128)
@@ -732,9 +868,8 @@ def gluon_mla_prefill_gfx1250(
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max_seqlen_q,
         softmax_scale=softmax_scale,
-        is_fp8=is_fp8,
     )
-    _mla_prefill_gfx1250_kernel[config.grid](
+    gluon_mla_prefill_gfx1250[config.grid](
         q,
         k,
         v,
@@ -763,7 +898,7 @@ def gluon_mla_prefill_gfx1250(
         config.block_n,
         is_fp8,
         num_warps=config.num_warps,
-        waves_per_eu=1,
+        waves_per_eu=config.waves_per_eu,
     )
     if return_lse:
         return out, lse

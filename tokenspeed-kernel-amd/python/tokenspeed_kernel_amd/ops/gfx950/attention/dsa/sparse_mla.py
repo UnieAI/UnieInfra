@@ -31,9 +31,14 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
-    _combine_scoring_query_heads_kernel,
-    _dsa_decode_logits_fp8_kernel,
-    _dsa_prefill_logits_fp8_kernel,
+    gluon_dsa_decode_topk_fp8_gfx950,
+    gluon_dsa_prefill_topk_fp8_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (
+    gluon_dsa_decode_topk_standard_gfx950,
+    gluon_dsa_prefill_topk_standard_gfx950,
+    gluon_kpool_prefill_topk_fp8_gfx950,
+    gluon_kpool_prefill_topk_fp8_plan_gfx950,
 )
 
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
@@ -63,8 +68,6 @@ _PERSISTENT_NUM_BUCKETS = gl.constexpr(1 << 11)
 _PERSISTENT_NUM_PASSES = gl.constexpr(3)
 _PERSISTENT_COUNTER_STRIDE = gl.constexpr(32)
 _PERSISTENT_WORKSPACE_CACHE_MAXSIZE = 16
-_GLM52_SCORING_HEADS = 32
-_GLM52_FUSED_DECODE_MAX_CANDIDATES = 16384
 
 _persistent_topk_workspace_cache: OrderedDict[
     tuple[int, int, int], tuple[torch.Tensor, ...]
@@ -73,8 +76,13 @@ _persistent_topk_graph_workspace_keys: set[tuple[int, int, int]] = set()
 _persistent_topk_workspace_lock = Lock()
 
 __all__ = [
-    "gluon_dsa_decode_topk_fp8_gfx950",
-    "gluon_dsa_prefill_topk_fp8_gfx950",
+    "launch_gluon_dsa_decode_topk_fp8_gfx950",
+    "launch_gluon_dsa_decode_topk_standard_gfx950",
+    "gluon_dsa_kpool_prefill_logits_gfx950",
+    "gluon_dsa_kpool_prefill_plan_logits_gfx950",
+    "gluon_dsa_logical_topk_gfx950",
+    "launch_gluon_dsa_prefill_topk_fp8_gfx950",
+    "launch_gluon_dsa_prefill_topk_standard_gfx950",
 ]
 
 
@@ -91,11 +99,6 @@ def _fp32_to_topk_key(x):
     bits = x.to(gl.uint32, bitcast=True)
     sign = bits & 0x80000000
     return bits ^ gl.where(sign != 0, 0, 0x7FFFFFFF)
-
-
-@gluon.jit
-def _topk_add(a, b):
-    return a + b
 
 
 @gluon.jit(noinline=True)
@@ -350,7 +353,6 @@ def _dsa_persistent_radix_topk_kernel(
     # Initialize local state before this row's radix passes.
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
-    gl.barrier()
 
     bucket_offsets = gl.arange(
         0,
@@ -369,9 +371,7 @@ def _dsa_persistent_radix_topk_kernel(
     # radix loop.
     for pass_index in gl.static_range(_PERSISTENT_NUM_PASSES):
         if pass_index != 0:
-            gl.barrier()
             shared_histogram.store(histogram_zeros)
-            gl.barrier()
 
         shift = gl.maximum(21 - pass_index * 11, 0)
         bucket_mask = gl.where(pass_index == 2, 0x3FF, 0x7FF)
@@ -422,7 +422,6 @@ def _dsa_persistent_radix_topk_kernel(
                 value_layout,
             )
 
-        gl.barrier()
         local_counts = shared_histogram.load(hist_layout)
         row_histogram = (
             histograms
@@ -474,7 +473,7 @@ def _dsa_persistent_radix_topk_kernel(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        cumulative = gl.cumsum(group_counts, 0)
         before_group = cumulative - group_counts
         selected_group = (before_group < remaining) & (cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([_PERSISTENT_NUM_BUCKETS // 2, 2])
@@ -552,7 +551,6 @@ def _dsa_persistent_radix_topk_kernel(
             value_layout,
         )
 
-    gl.barrier()
     output_counter_offsets = gl.arange(0, 2, layout=output_counter_layout)
     local_output_counts = shared_output_counters.load(output_counter_layout)
     local_greater = gl.sum(
@@ -612,7 +610,6 @@ def _dsa_persistent_radix_topk_kernel(
         mask=equal_write,
     )
 
-    gl.barrier()
     reset_old = gl.atomic_add(
         reset_arrivals + row * _PERSISTENT_COUNTER_STRIDE,
         1,
@@ -650,7 +647,7 @@ def _dsa_persistent_radix_topk_kernel(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("block_table_cols",))
 def _dsa_trivial_topk_kernel(
     block_table,
     row_starts,
@@ -658,7 +655,7 @@ def _dsa_trivial_topk_kernel(
     out,
     lens_out,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1004,7 +1001,12 @@ def _emit_compact_final_topk(
     )
 
 
-@gluon.jit
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_cols",
+    ),
+)
 def _dsa_oneblock_manual_radix_topk_kernel(
     logits,
     block_table,
@@ -1012,9 +1014,9 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     row_ends,
     out,
     lens_out,
-    logits_stride: gl.constexpr,
+    logits_stride,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1131,7 +1133,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
 
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
-    gl.barrier()
 
     candidate_logits = logits + row * logits_stride + candidate_start
     vector_end = candidate_len & -4
@@ -1152,9 +1153,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             shift = 0
 
         if pass_index != 0:
-            gl.barrier()
             shared_histogram.store(histogram_zeros)
-            gl.barrier()
 
         full_end = candidate_len & -BLOCK_N
         if USE_COMPACT_FINAL and pass_index == 2:
@@ -1295,14 +1294,13 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     True,
                 )
 
-        gl.barrier()
         counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        group_cumulative = gl.cumsum(group_counts, 0)
         group_greater = group_cumulative - group_counts
         selected_group = (group_greater < remaining) & (group_cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([MAX_BUCKETS // 2, 2])
@@ -1381,6 +1379,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     )
 
                 if IS_DECODE:
+                    # ``out`` was just written by other threads; the
+                    # compiler only orders shared-memory hazards.
                     gl.barrier()
                     logical_offsets = gl.load(
                         out + row * out_stride + output_offsets,
@@ -1460,6 +1460,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         )
 
     if IS_DECODE:
+        # ``out`` was just written by other threads; the compiler only
+        # orders shared-memory hazards.
         gl.barrier()
         logical_offsets = gl.load(
             out + row * out_stride + output_offsets,
@@ -1488,10 +1490,10 @@ def _check_score_input_contract(
 ) -> None:
     if weights.device != q.device or index_k_cache.device != q.device:
         raise ValueError("q, weights, and index_k_cache must be on the same device")
-    if not (
-        q.is_contiguous() and weights.is_contiguous() and index_k_cache.is_contiguous()
-    ):
-        raise ValueError("q, weights, and index_k_cache must be contiguous")
+    if not q.is_contiguous() or not weights.is_contiguous():
+        raise ValueError("q and weights must be contiguous")
+    if index_k_cache.stride(-1) != 1:
+        raise ValueError("index_k_cache pages must contain contiguous bytes")
 
 
 def _check_topk_contract(topk: int) -> None:
@@ -1897,32 +1899,511 @@ def _dsa_topk_indices(
     )
 
 
-def _combine_scoring_query_heads(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-) -> torch.Tensor:
-    if not weights.is_contiguous():
-        weights = weights.contiguous()
-    combined = torch.empty(
-        (q.shape[0], q.shape[2]),
-        dtype=torch.float32,
-        device=q.device,
+def gluon_dsa_logical_topk_gfx950(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the largest values from independent logical FP32 rows.
+
+    ``row_starts`` and ``row_ends`` describe an inclusive/exclusive candidate
+    range in every logits row. Returned indices are logical columns in
+    ``logits``; this entry point never performs DSA page-table remapping.
+    Callers must provide bounds satisfying ``0 <= start <= end <= cols``.
+
+    Args:
+        logits: Contiguous CUDA FP32 scores shaped ``[rows, cols]``.
+        row_starts: Contiguous CUDA int32 inclusive bounds shaped ``[rows]``.
+        row_ends: Contiguous CUDA int32 exclusive bounds shaped ``[rows]``.
+        topk: Number of candidates to select per row.
+        out: Optional contiguous CUDA int32 destination shaped ``[rows, topk]``.
+        lens_out: Optional contiguous CUDA int32 destination shaped ``[rows]``.
+
+    Returns:
+        Logical column indices padded with ``-1`` and valid counts per row.
+    """
+    topk = int(topk)
+    _check_topk_contract(topk)
+    if logits.dim() != 2:
+        raise ValueError(f"logits must be 2-D, got shape={tuple(logits.shape)}")
+    if logits.dtype != torch.float32:
+        raise TypeError(f"logits must be float32, got {logits.dtype}")
+    if not logits.is_cuda:
+        raise RuntimeError("Gluon logical top-k requires CUDA tensors")
+    if not logits.is_contiguous():
+        raise ValueError("logits must be contiguous")
+
+    rows = int(logits.shape[0])
+    for name, bounds in (("row_starts", row_starts), ("row_ends", row_ends)):
+        if bounds.shape != (rows,):
+            raise ValueError(
+                f"{name} must have shape {(rows,)}, got {tuple(bounds.shape)}"
+            )
+        if bounds.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {bounds.dtype}")
+        if bounds.device != logits.device:
+            raise ValueError(f"{name} must be on the same device as logits")
+        if not bounds.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    expected_out_shape = (rows, topk)
+    if out is None:
+        out = torch.empty(expected_out_shape, dtype=torch.int32, device=logits.device)
+    else:
+        if out.shape != expected_out_shape:
+            raise ValueError(
+                f"out must have shape {expected_out_shape}, got {tuple(out.shape)}"
+            )
+        if out.dtype != torch.int32:
+            raise TypeError(f"out must be int32, got {out.dtype}")
+        if out.device != logits.device:
+            raise ValueError("out must be on the same device as logits")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    expected_lens_shape = (rows,)
+    if lens_out is None:
+        lens_out = torch.empty(
+            expected_lens_shape, dtype=torch.int32, device=logits.device
+        )
+    else:
+        if lens_out.shape != expected_lens_shape:
+            raise ValueError(
+                "lens_out must have shape "
+                f"{expected_lens_shape}, got {tuple(lens_out.shape)}"
+            )
+        if lens_out.dtype != torch.int32:
+            raise TypeError(f"lens_out must be int32, got {lens_out.dtype}")
+        if lens_out.device != logits.device:
+            raise ValueError("lens_out must be on the same device as logits")
+        if not lens_out.is_contiguous():
+            raise ValueError("lens_out must be contiguous")
+
+    if rows == 0:
+        return out, lens_out
+    return _dsa_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
     )
-    if q.shape[0] == 0:
-        return combined
-    _combine_scoring_query_heads_kernel[(q.shape[0],)](
+
+
+def gluon_dsa_kpool_prefill_logits_gfx950(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    causal_lens: torch.Tensor,
+    req_ids: torch.Tensor,
+    index_block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    pool_offset: int,
+    window_cols: int,
+    softmax_scale: float,
+    ordered_head_fold: bool = False,
+    out: torch.Tensor | None = None,
+    row_ends_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score a local GLM KPool prefill window with the GFX950 Gluon scorer.
+
+    Each output column represents the global pool ``pool_offset + column``.
+    Only complete pools visible at each query row are written. ``row_ends``
+    returns the exclusive local bound for every row, so a length-aware top-k
+    can ignore untouched output capacity.
+
+    Args:
+        q: BF16 queries shaped ``[tokens, 32, 128]``.
+        pooled_k_cache: Page-major scaled-FP8 pooled keys. Each page stores all
+            FP8 key rows followed by one FP32 scale per row. Padded page strides
+            are supported.
+        weights: BF16 or FP32 signed head weights shaped ``[tokens, 32]``.
+        causal_lens: Int32 visible raw-token counts shaped ``[tokens]``.
+        req_ids: Int32 request row for each query token.
+        index_block_table: Int32 logical-pool to physical-page mapping.
+        pool_size: Raw tokens represented by a pooled key. Must be ``4``.
+        page_size: Pooled keys per physical page. Must be ``16``.
+        pool_offset: First global pool represented by output column zero.
+        window_cols: Number of local output columns.
+        softmax_scale: Model scale applied after the weighted per-head ReLU
+            reduction.
+        ordered_head_fold: When true, accumulate the 32 signed head
+            contributions from logical head zero through 31 instead of using
+            the MFMA layout's tree reduction.
+        out: Optional contiguous FP32 destination ``[tokens, window_cols]``.
+        row_ends_out: Optional contiguous int32 destination ``[tokens]``.
+
+    Returns:
+        ``(logits, row_ends)`` with local-window logits and exclusive valid
+        bounds. The default valid scores equal
+        ``softmax_scale * sum(weights * relu(query @ pooled_key))``.
+    """
+    pool_size = int(pool_size)
+    page_size = int(page_size)
+    pool_offset = int(pool_offset)
+    window_cols = int(window_cols)
+    if not isinstance(ordered_head_fold, bool):
+        raise TypeError(
+            f"ordered_head_fold must be bool, got {type(ordered_head_fold).__name__}"
+        )
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"KPool Gluon scorer requires BF16 q, got {q.dtype}")
+    if q.dim() != 3 or tuple(q.shape[1:]) != (32, 128):
+        raise ValueError(
+            f"KPool Gluon scorer requires q=[tokens, 32, 128], got {tuple(q.shape)}"
+        )
+    if q.stride(-1) != 1:
+        raise ValueError("q must have a contiguous head-dimension axis")
+    if not q.is_cuda:
+        raise RuntimeError("KPool Gluon scorer requires CUDA tensors")
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"KPool weights must be BF16 or FP32, got {weights.dtype}")
+    if weights.shape != q.shape[:2]:
+        raise ValueError(
+            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
+        )
+    if weights.stride(-1) != 1:
+        raise ValueError("weights must have a contiguous head axis")
+    if pool_size != 4 or page_size != 16:
+        raise ValueError(
+            "KPool Gluon scorer requires pool_size=4 and page_size=16, got "
+            f"pool_size={pool_size}, page_size={page_size}"
+        )
+    if pool_offset < 0:
+        raise ValueError(f"pool_offset must be nonnegative, got {pool_offset}")
+    if window_cols <= 0:
+        raise ValueError(f"window_cols must be positive, got {window_cols}")
+
+    row_bytes = 128 + 4
+    compact_page_bytes = page_size * row_bytes
+    cache_shape_ok = (
+        pooled_k_cache.dim() == 2 and pooled_k_cache.shape[1] == compact_page_bytes
+    ) or (
+        pooled_k_cache.dim() == 3
+        and tuple(pooled_k_cache.shape[1:]) == (page_size, row_bytes)
+    )
+    if not cache_shape_ok:
+        raise ValueError(
+            "pooled_k_cache must have shape "
+            f"[pages, {compact_page_bytes}] or [pages, {page_size}, {row_bytes}], "
+            f"got {tuple(pooled_k_cache.shape)}"
+        )
+    if pooled_k_cache.dtype != torch.uint8:
+        raise TypeError(f"pooled_k_cache must be uint8, got {pooled_k_cache.dtype}")
+    cache_page_stride_bytes = int(pooled_k_cache.stride(0))
+    packed_within_page = (
+        pooled_k_cache.dim() == 2 or pooled_k_cache.stride(1) == row_bytes
+    )
+    if (
+        pooled_k_cache.stride(-1) != 1
+        or not packed_within_page
+        or cache_page_stride_bytes < compact_page_bytes
+        or cache_page_stride_bytes % 4
+        or pooled_k_cache.storage_offset() % 4
+    ):
+        raise ValueError(
+            "pooled_k_cache requires byte-contiguous rows and a nonoverlapping, "
+            "4-byte-aligned page stride"
+        )
+
+    tokens = int(q.shape[0])
+    for name, value in (("causal_lens", causal_lens), ("req_ids", req_ids)):
+        if value.shape != (tokens,):
+            raise ValueError(f"{name} must have shape {(tokens,)}, got {value.shape}")
+        if value.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {value.dtype}")
+        if not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if index_block_table.dim() != 2:
+        raise ValueError(
+            f"index_block_table must be 2-D, got shape={tuple(index_block_table.shape)}"
+        )
+    if index_block_table.dtype != torch.int32:
+        raise TypeError(
+            f"index_block_table must be int32, got {index_block_table.dtype}"
+        )
+    if index_block_table.stride(-1) != 1:
+        raise ValueError("index_block_table must have contiguous page columns")
+    if tokens and index_block_table.shape[0] == 0:
+        raise ValueError("index_block_table must have at least one request row")
+    for name, value in (
+        ("weights", weights),
+        ("pooled_k_cache", pooled_k_cache),
+        ("causal_lens", causal_lens),
+        ("req_ids", req_ids),
+        ("index_block_table", index_block_table),
+    ):
+        if value.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q")
+
+    expected_logits = (tokens, window_cols)
+    if out is None:
+        out = torch.empty(expected_logits, dtype=torch.float32, device=q.device)
+    elif (
+        out.shape != expected_logits
+        or out.dtype != torch.float32
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous FP32 on q.device with shape "
+            f"{expected_logits}, got shape={tuple(out.shape)}, dtype={out.dtype}, "
+            f"device={out.device}, contiguous={out.is_contiguous()}"
+        )
+    if row_ends_out is None:
+        row_ends_out = torch.empty((tokens,), dtype=torch.int32, device=q.device)
+    elif (
+        row_ends_out.shape != (tokens,)
+        or row_ends_out.dtype != torch.int32
+        or row_ends_out.device != q.device
+        or not row_ends_out.is_contiguous()
+    ):
+        raise ValueError(
+            "row_ends_out must be contiguous int32 on q.device with shape "
+            f"{(tokens,)}, got shape={tuple(row_ends_out.shape)}, "
+            f"dtype={row_ends_out.dtype}, device={row_ends_out.device}, "
+            f"contiguous={row_ends_out.is_contiguous()}"
+        )
+    if tokens == 0:
+        return out, row_ends_out
+
+    max_candidates = int(index_block_table.shape[1]) * page_size
+    if max_candidates and pooled_k_cache.shape[0] == 0:
+        raise ValueError("a nonempty index_block_table requires pooled cache pages")
+    if max_candidates == 0 or pool_offset >= max_candidates:
+        row_ends_out.zero_()
+        return out, row_ends_out
+
+    block_n = 128
+    num_warps = 4
+    gluon_kpool_prefill_topk_fp8_gfx950[(tokens, 1)](
         q,
         weights,
-        combined,
-        num_heads=q.shape[1],
-        head_dim=q.shape[2],
-        BLOCK_D=128,
-        num_warps=4,
+        pooled_k_cache.view(torch.float8_e4m3fn),
+        pooled_k_cache.view(torch.float32),
+        weights,
+        causal_lens,
+        req_ids,
+        index_block_table,
+        out,
+        row_ends_out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        index_block_table.stride(0),
+        out.stride(0),
+        float(softmax_scale),
+        max_candidates,
+        pool_offset,
+        PAGE_SIZE=page_size,
+        PAGE_STRIDE_BYTES=cache_page_stride_bytes,
+        POOL_SIZE=pool_size,
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=block_n,
+        WINDOW_COLS=window_cols,
+        NUM_WARPS=num_warps,
+        ORDERED_HEAD_FOLD=ordered_head_fold,
+        USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
+        USE_BUFFER_STORE=out.nbytes < 2**31,
+        num_warps=num_warps,
+        waves_per_eu=4,
     )
-    return combined
+    return out, row_ends_out
 
 
-def gluon_dsa_decode_topk_fp8_gfx950(
+def gluon_dsa_kpool_prefill_plan_logits_gfx950(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    pool_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    pool_offset: int,
+    window_cols: int,
+    softmax_scale: float,
+    ordered_head_fold: bool = False,
+    out: torch.Tensor | None = None,
+    row_ends_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score a KPool window through the current physical-slot prefill plan.
+
+    ``pool_workspace_slots`` stores physical pooled-cache rows in request-local
+    logical order. ``row_starts`` and ``row_ends`` select the visible prefix for
+    every query row. Output columns remain request-local pool ids beginning at
+    ``pool_offset``.
+    """
+    pool_size = int(pool_size)
+    page_size = int(page_size)
+    pool_offset = int(pool_offset)
+    window_cols = int(window_cols)
+    if not isinstance(ordered_head_fold, bool):
+        raise TypeError(
+            f"ordered_head_fold must be bool, got {type(ordered_head_fold).__name__}"
+        )
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"KPool Gluon scorer requires BF16 q, got {q.dtype}")
+    if q.dim() != 3 or tuple(q.shape[1:]) != (32, 128):
+        raise ValueError(
+            f"KPool Gluon scorer requires q=[tokens, 32, 128], got {tuple(q.shape)}"
+        )
+    if q.stride(-1) != 1:
+        raise ValueError("q must have a contiguous head-dimension axis")
+    if not q.is_cuda:
+        raise RuntimeError("KPool Gluon scorer requires CUDA tensors")
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"KPool weights must be BF16 or FP32, got {weights.dtype}")
+    if weights.shape != q.shape[:2] or weights.stride(-1) != 1:
+        raise ValueError("weights must match q and have a contiguous head axis")
+    if pool_size != 4 or page_size != 16:
+        raise ValueError(
+            "KPool Gluon scorer requires pool_size=4 and page_size=16, got "
+            f"pool_size={pool_size}, page_size={page_size}"
+        )
+    if pool_offset < 0:
+        raise ValueError(f"pool_offset must be nonnegative, got {pool_offset}")
+    if window_cols <= 0:
+        raise ValueError(f"window_cols must be positive, got {window_cols}")
+
+    row_bytes = 128 + 4
+    compact_page_bytes = page_size * row_bytes
+    cache_shape_ok = (
+        pooled_k_cache.dim() == 2 and pooled_k_cache.shape[1] == compact_page_bytes
+    ) or (
+        pooled_k_cache.dim() == 3
+        and tuple(pooled_k_cache.shape[1:]) == (page_size, row_bytes)
+    )
+    cache_page_stride_bytes = int(pooled_k_cache.stride(0))
+    packed_within_page = (
+        pooled_k_cache.dim() == 2 or pooled_k_cache.stride(1) == row_bytes
+    )
+    if pooled_k_cache.dtype != torch.uint8:
+        raise TypeError(f"pooled_k_cache must be uint8, got {pooled_k_cache.dtype}")
+    if not cache_shape_ok or (
+        pooled_k_cache.stride(-1) != 1
+        or not packed_within_page
+        or cache_page_stride_bytes < compact_page_bytes
+        or cache_page_stride_bytes % 4
+        or pooled_k_cache.storage_offset() % 4
+    ):
+        raise ValueError(
+            "pooled_k_cache requires packed rows and a nonoverlapping, "
+            "4-byte-aligned page stride"
+        )
+
+    tokens = int(q.shape[0])
+    if pool_workspace_slots.dim() != 1:
+        raise ValueError("pool_workspace_slots must be one-dimensional")
+    if pool_workspace_slots.dtype != torch.int64:
+        raise TypeError(
+            f"pool_workspace_slots must be int64, got {pool_workspace_slots.dtype}"
+        )
+    for name, value in (("row_starts", row_starts), ("row_ends", row_ends)):
+        if value.shape != (tokens,):
+            raise ValueError(f"{name} must have shape {(tokens,)}, got {value.shape}")
+        if value.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {value.dtype}")
+    for name, value in (
+        ("weights", weights),
+        ("pooled_k_cache", pooled_k_cache),
+        ("pool_workspace_slots", pool_workspace_slots),
+        ("row_starts", row_starts),
+        ("row_ends", row_ends),
+    ):
+        if value.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q")
+    for name, value in (
+        ("pool_workspace_slots", pool_workspace_slots),
+        ("row_starts", row_starts),
+        ("row_ends", row_ends),
+    ):
+        if not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    expected_logits = (tokens, window_cols)
+    if out is None:
+        out = torch.empty(expected_logits, dtype=torch.float32, device=q.device)
+    elif (
+        out.shape != expected_logits
+        or out.dtype != torch.float32
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous FP32 on q.device with shape "
+            f"{expected_logits}, got shape={tuple(out.shape)}, dtype={out.dtype}, "
+            f"device={out.device}, contiguous={out.is_contiguous()}"
+        )
+    if row_ends_out is None:
+        row_ends_out = torch.empty((tokens,), dtype=torch.int32, device=q.device)
+    elif (
+        row_ends_out.shape != (tokens,)
+        or row_ends_out.dtype != torch.int32
+        or row_ends_out.device != q.device
+        or not row_ends_out.is_contiguous()
+    ):
+        raise ValueError("row_ends_out must be contiguous int32 on q.device")
+    if tokens == 0:
+        return out, row_ends_out
+    if pool_workspace_slots.numel() and pooled_k_cache.shape[0] == 0:
+        raise ValueError("a nonempty prefill plan requires pooled cache pages")
+
+    block_n = 128
+    num_warps = 4
+    gluon_kpool_prefill_topk_fp8_plan_gfx950[(tokens, 1)](
+        q,
+        weights,
+        pooled_k_cache.view(torch.float8_e4m3fn),
+        pooled_k_cache.view(torch.float32),
+        weights,
+        pool_workspace_slots,
+        row_starts,
+        row_ends,
+        out,
+        row_ends_out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        out.stride(0),
+        float(softmax_scale),
+        int(pool_workspace_slots.numel()),
+        pool_offset,
+        PAGE_SIZE=page_size,
+        PAGE_STRIDE_BYTES=cache_page_stride_bytes,
+        POOL_SIZE=pool_size,
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=block_n,
+        WINDOW_COLS=window_cols,
+        NUM_WARPS=num_warps,
+        ORDERED_HEAD_FOLD=ordered_head_fold,
+        USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
+        USE_BUFFER_STORE=out.nbytes < 2**31,
+        num_warps=num_warps,
+        waves_per_eu=4,
+    )
+    return out, row_ends_out
+
+
+def launch_gluon_dsa_decode_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1947,8 +2428,10 @@ def gluon_dsa_decode_topk_fp8_gfx950(
             f"DSA Gluon top-k supports q_len_per_req=1..6, got {q_len_per_req}"
         )
     if index_k_cache is None:
-        raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
-    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+        raise RuntimeError("Gluon DSA paged top-k requires an FP8 index_k_cache")
+    _, page_stride_bytes = _check_packed_fp8_inputs(
+        q, index_k_cache, weights, int(page_size)
+    )
     if not weights.is_contiguous():
         weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
@@ -1987,18 +2470,6 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         )
         return empty_out, empty_lens
     max_seq_len = int(block_table.shape[1]) * int(page_size)
-    fold_weighted_heads = (
-        q.shape[1] == _GLM52_SCORING_HEADS
-        and q.shape[0] * max_seq_len <= _GLM52_FUSED_DECODE_MAX_CANDIDATES
-    )
-    if fold_weighted_heads:
-        score_q = q
-        score_num_heads = q.shape[1]
-    else:
-        # Fusing avoids a launch for small grids; larger grids would repeat the
-        # head reduction once per cache tile, so reduce it once before scoring.
-        score_q = _combine_scoring_query_heads(q, weights)[:, None, :]
-        score_num_heads = 1
     if out is None:
         out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
     if lens_out is None:
@@ -2008,8 +2479,8 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     )
     block_n = 32
     score_grid = (q.shape[0], triton.cdiv(max_seq_len, block_n))
-    _dsa_decode_logits_fp8_kernel[score_grid](
-        score_q,
+    gluon_dsa_decode_topk_fp8_gfx950[score_grid](
+        q,
         index_k_cache.view(torch.float8_e4m3fn),
         index_k_cache.view(torch.float32),
         weights,
@@ -2019,14 +2490,13 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         block_table.stride(0),
         logits.stride(0),
         page_size=int(page_size),
-        row_bytes=row_bytes,
+        page_stride_bytes=page_stride_bytes,
         max_seq_len=max_seq_len,
-        num_heads=score_num_heads,
+        num_heads=q.shape[1],
         head_dim=q.shape[2],
         num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
         q_len_per_req=q_len_per_req,
-        FOLD_WEIGHTED_HEADS=fold_weighted_heads,
         BLOCK_N=block_n,
         BLOCK_D=128,
         num_warps=4,
@@ -2044,7 +2514,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     )
 
 
-def gluon_dsa_prefill_topk_fp8_gfx950(
+def launch_gluon_dsa_prefill_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -2066,9 +2536,11 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError(
-            "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
+            "Gluon DSA top-k requires an FP8 index_k_cache and page_size"
         )
-    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    _, page_stride_bytes = _check_packed_fp8_inputs(
+        q, index_k_cache, weights, int(page_size)
+    )
     if not weights.is_contiguous():
         weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
@@ -2121,16 +2593,16 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     block_n = 32
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
-        combined_q = _combine_scoring_query_heads(q[start:end], weights[start:end])
         logits = torch.empty(
             (end - start, seq_len_sum), dtype=torch.float32, device=q.device
         )
-        _dsa_prefill_logits_fp8_kernel[
+        gluon_dsa_prefill_topk_fp8_gfx950[
             (end - start, triton.cdiv(seq_len_sum, block_n))
         ](
-            combined_q[:, None, :],
+            q[start:end],
             index_k_cache.view(torch.float8_e4m3fn),
             index_k_cache.view(torch.float32),
+            weights[start:end],
             kv_workspace_slots,
             row_starts[start:end],
             row_ends[start:end],
@@ -2138,14 +2610,328 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             logits.stride(0),
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
-            row_bytes=row_bytes,
-            num_heads=1,
+            page_stride_bytes=page_stride_bytes,
+            num_heads=q.shape[1],
             head_dim=q.shape[2],
             num_groups=q.shape[2] // 128,
             softmax_scale=float(softmax_scale),
             BLOCK_N=block_n,
             BLOCK_D=128,
             num_warps=4,
+        )
+        _dsa_topk_indices(
+            logits,
+            row_starts[start:end],
+            row_ends[start:end],
+            topk=topk,
+            out=out[start:end],
+            lens_out=lens_out[start:end],
+        )
+    return out, lens_out
+
+
+def _check_standard_scorer_inputs(
+    q: torch.Tensor,
+    q_scales: torch.Tensor | None,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    page_size: int,
+) -> tuple[int, int, bool]:
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError(
+            f"standard-cache DSA scorer expects BF16 or FP8 q, got {q.dtype}"
+        )
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"DSA weights must be BF16 or FP32, got {weights.dtype}")
+    if q.dim() != 3 or q.shape[1] not in (32, 64) or q.shape[2] != 128:
+        raise ValueError(
+            "standard-cache DSA scorer requires q=[tokens, 32|64, 128], got "
+            f"{tuple(q.shape)}"
+        )
+    if weights.shape != q.shape[:2]:
+        raise ValueError(
+            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
+        )
+    if q.stride(-1) != 1 or weights.stride(-1) != 1:
+        raise ValueError("q and weights must have contiguous innermost dimensions")
+    if page_size != 64:
+        raise ValueError(
+            f"standard-cache DSA scorer requires page_size=64, got {page_size}"
+        )
+    if index_k_cache.dtype != torch.uint8:
+        raise TypeError("index_k_cache must be a uint8 tensor")
+    row_bytes = 128 + 4
+    if index_k_cache.dim() != 2:
+        raise ValueError(
+            "index_k_cache must be a packed slot matrix or page-planar matrix, "
+            f"got shape {tuple(index_k_cache.shape)}"
+        )
+    page_bytes = page_size * row_bytes
+    if index_k_cache.shape[1] == row_bytes:
+        if not index_k_cache.is_contiguous():
+            raise ValueError("packed index_k_cache must be contiguous")
+        if index_k_cache.shape[0] % page_size:
+            raise ValueError("index_k_cache slot count must be page aligned")
+        page_stride_bytes = page_bytes
+    elif (
+        index_k_cache.shape[1] >= page_bytes
+        and index_k_cache.stride(1) == 1
+        and index_k_cache.stride(0) >= page_bytes
+    ):
+        page_stride_bytes = index_k_cache.stride(0)
+    else:
+        raise ValueError(
+            "index_k_cache must be contiguous [slots, row_bytes] or page-planar "
+            f"[pages, at least {page_bytes} bytes], got "
+            f"shape={tuple(index_k_cache.shape)}, stride={index_k_cache.stride()}"
+        )
+    if index_k_cache.storage_offset() % 4 or page_stride_bytes % 4:
+        raise ValueError("index_k_cache page storage must be float32 aligned")
+    if weights.device != q.device or index_k_cache.device != q.device:
+        raise ValueError("q, weights, and index_k_cache must be on the same device")
+    q_is_fp8 = q.dtype == torch.float8_e4m3fn
+    if q_is_fp8:
+        if q_scales is None:
+            raise ValueError("FP8 q requires per-token/head q_scales")
+        if (
+            q_scales.dtype != torch.float32
+            or q_scales.shape != q.shape[:2]
+            or q_scales.device != q.device
+            or q_scales.stride(-1) != 1
+        ):
+            raise ValueError(
+                "q_scales must be FP32 [tokens, heads] with a contiguous head axis"
+            )
+    elif q_scales is not None:
+        raise ValueError("q_scales is only valid with FP8 q")
+    return row_bytes, page_stride_bytes, q_is_fp8
+
+
+def launch_gluon_dsa_decode_topk_standard_gfx950(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    index_k_cache: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
+    seq_lens_2d: torch.Tensor | None = None,
+    plan: object | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score the standard paged cache and return global top-k slots."""
+    del plan, seq_lens_2d
+    topk = int(topk)
+    q_len_per_req = int(q_len_per_req)
+    _check_topk_contract(topk)
+    if q_len_per_req not in (1, 2, 3, 4, 5, 6):
+        raise ValueError(f"q_len_per_req must be in 1..6, got {q_len_per_req}")
+    if index_k_cache is None:
+        raise RuntimeError("standard-cache DSA scorer requires index_k_cache")
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+        q, q_scales, weights, index_k_cache, int(page_size)
+    )
+    if seq_lens.dtype != torch.int32 or block_table.dtype != torch.int32:
+        raise TypeError("seq_lens and block_table must be int32")
+    if not seq_lens.is_contiguous() or not block_table.is_contiguous():
+        raise ValueError("seq_lens and block_table must be contiguous")
+    if seq_lens.device != q.device or block_table.device != q.device:
+        raise ValueError("decode metadata must be on the same device as q")
+    if q.shape[0] != seq_lens.numel() * q_len_per_req:
+        raise ValueError("q rows must equal seq_lens rows times q_len_per_req")
+    if block_table.dim() != 2 or block_table.shape[0] < seq_lens.numel():
+        raise ValueError("block_table must have at least one row per request")
+    if out is None:
+        out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
+    if lens_out is None:
+        lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
+    if q.shape[0] == 0:
+        return out, lens_out
+
+    max_candidates = int(block_table.shape[1]) * int(page_size)
+    if max_candidates == 0:
+        out.fill_(-1)
+        lens_out.zero_()
+        return out, lens_out
+    logits = torch.empty(
+        (q.shape[0], max_candidates), dtype=torch.float32, device=q.device
+    )
+    if q.shape[1] == 32 and q_is_fp8:
+        block_n = 64
+        waves_per_eu = 4
+    else:
+        block_n = 32
+        waves_per_eu = 2
+    chunk_n = 256
+    num_warps = 1
+    q_scale_arg = q_scales if q_scales is not None else weights
+    grid = (q.shape[0], triton.cdiv(max_candidates, chunk_n))
+    gluon_dsa_decode_topk_standard_gfx950[grid](
+        q,
+        q_scale_arg,
+        index_k_cache.view(torch.float8_e4m3fn),
+        index_k_cache.view(torch.float32),
+        weights,
+        seq_lens,
+        block_table,
+        logits,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q_scale_arg.stride(0),
+        q_scale_arg.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        block_table.stride(0),
+        logits.stride(0),
+        float(softmax_scale),
+        max_candidates,
+        q_len_per_req,
+        PAGE_SIZE=int(page_size),
+        PAGE_STRIDE_BYTES=page_stride_bytes,
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=block_n,
+        CHUNK_N=chunk_n,
+        NUM_WARPS=num_warps,
+        Q_IS_FP8=q_is_fp8,
+        USE_BUFFER_LOAD=(
+            (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
+            + index_k_cache.shape[1]
+            < 2**31
+        ),
+        USE_BUFFER_STORE=logits.nbytes < 2**31,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
+    return _dsa_topk_indices(
+        logits,
+        seq_lens,
+        seq_lens,
+        block_table=block_table,
+        page_size=int(page_size),
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def launch_gluon_dsa_prefill_topk_standard_gfx950(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    softmax_scale: float,
+    index_k_cache: torch.Tensor | None = None,
+    page_size: int | None = None,
+    index_k_fp8: torch.Tensor | None = None,
+    index_k_scale: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score workspace slots in-kernel and return workspace-row top-k ids."""
+    del index_k_fp8, index_k_scale
+    topk = int(topk)
+    _check_topk_contract(topk)
+    if index_k_cache is None or page_size is None:
+        raise RuntimeError("standard-cache DSA scorer requires cache and page_size")
+    _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+        q, q_scales, weights, index_k_cache, int(page_size)
+    )
+    if (
+        kv_workspace_slots.dtype != torch.int64
+        or row_starts.dtype != torch.int32
+        or row_ends.dtype != torch.int32
+    ):
+        raise TypeError("workspace slots must be int64 and row bounds must be int32")
+    if (
+        kv_workspace_slots.shape != (kv_workspace_slots.numel(),)
+        or row_starts.shape != (q.shape[0],)
+        or row_ends.shape != (q.shape[0],)
+    ):
+        raise ValueError("workspace slots must be 1-D and row bounds must be [tokens]")
+    if not (
+        kv_workspace_slots.is_contiguous()
+        and row_starts.is_contiguous()
+        and row_ends.is_contiguous()
+    ):
+        raise ValueError("prefill metadata must be contiguous")
+    if not (
+        kv_workspace_slots.device == row_starts.device == row_ends.device == q.device
+    ):
+        raise ValueError("prefill metadata must be on the same device as q")
+    if out is None:
+        out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
+    if lens_out is None:
+        lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
+    if q.shape[0] == 0:
+        return out, lens_out
+    workspace_rows = int(kv_workspace_slots.numel())
+    if workspace_rows == 0:
+        out.fill_(-1)
+        lens_out.zero_()
+        return out, lens_out
+
+    max_query_rows = q.shape[0]
+    if max_logits_bytes is not None:
+        max_query_rows = max(1, int(max_logits_bytes) // (max(workspace_rows, 1) * 4))
+    q_scale_arg = q_scales if q_scales is not None else weights
+    block_n = 128
+    num_warps = 4
+    waves_per_eu = 4 if q.shape[1] == 32 else 2
+    dummy_table = row_starts
+    for start in range(0, q.shape[0], max_query_rows):
+        end = min(start + max_query_rows, q.shape[0])
+        logits = torch.empty(
+            (end - start, workspace_rows), dtype=torch.float32, device=q.device
+        )
+        gluon_dsa_prefill_topk_standard_gfx950[(end - start, 1)](
+            q[start:end],
+            q_scale_arg[start:end],
+            index_k_cache.view(torch.float8_e4m3fn),
+            index_k_cache.view(torch.float32),
+            weights[start:end],
+            kv_workspace_slots,
+            row_starts[start:end],
+            row_ends[start:end],
+            dummy_table,
+            logits,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q_scale_arg.stride(0),
+            q_scale_arg.stride(1),
+            weights.stride(0),
+            weights.stride(1),
+            logits.stride(0),
+            float(softmax_scale),
+            workspace_rows,
+            PAGE_SIZE=int(page_size),
+            PAGE_STRIDE_BYTES=page_stride_bytes,
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            BLOCK_N=block_n,
+            NUM_WARPS=num_warps,
+            Q_IS_FP8=q_is_fp8,
+            USE_BUFFER_LOAD=(
+                (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
+                + index_k_cache.shape[1]
+                < 2**31
+            ),
+            USE_BUFFER_STORE=logits.nbytes < 2**31,
+            num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
         )
         _dsa_topk_indices(
             logits,

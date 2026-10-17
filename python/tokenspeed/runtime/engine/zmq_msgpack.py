@@ -28,6 +28,7 @@ from tokenspeed.runtime.engine.io_struct import (
     MsgpackEncoder,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
 
 logger = logging.getLogger(__name__)
 
@@ -57,33 +58,73 @@ class MsgpackRecvSocket:
     RequestHandler's drain loop relies on.
 
     ``vocab_size`` lets this socket run ``sampling_params.verify`` on each
-    generate request, and ``enable_output_logprobs`` gates ``return_logprob``
-    (the pickle path enforces both in the tokenizer_manager's input processor,
-    which the msgpack path bypasses; the pure wire ``to_io_struct`` has neither
-    value). An invalid request is not dropped — that would hang the frontend's
-    stream with no terminal frame. It is marked via ``validation_error`` so
-    RequestHandler admits it pre-finished (FINISH_ABORT) and OutputProcesser
-    emits a terminal "abort" output.
+    generate request, ``enable_output_logprobs`` gates ``return_logprob`` and
+    ``supports_prompt_logprobs`` (the engine's startup verdict, see
+    ``DeviceSpecs``) gates a ``logprob_start_len`` that asks for prompt
+    logprobs (the pickle path enforces all three in the tokenizer_manager's
+    input processor, which the msgpack path bypasses; the pure wire
+    ``to_io_struct`` has none of these values). An invalid request is not
+    dropped — that would hang the frontend's stream with no terminal frame. It
+    is marked via ``validation_error`` so RequestHandler admits it pre-finished
+    (FINISH_ABORT) and OutputProcesser emits a terminal "abort" output.
     """
 
     def __init__(
         self,
         socket: zmq.Socket,
         vocab_size: int,
-        enable_output_logprobs: bool = False,
+        *,
+        enable_output_logprobs: bool,
+        supports_prompt_logprobs: bool,
     ) -> None:
         self._socket = socket
         self._vocab_size = vocab_size
         self._enable_output_logprobs = enable_output_logprobs
+        self._supports_prompt_logprobs = supports_prompt_logprobs
         self._pending: collections.deque = collections.deque()
 
     def _validation_error(self, obj: TokenizedGenerateReqInput) -> str | None:
-        """Return the reason ``obj`` must be rejected, or None if it is valid."""
+        """Return the reason ``obj`` must be rejected, or None if it is valid.
+
+        Mirrors the tokenizer-side ``InputProcessor`` gate for the SGLang
+        logprob knobs. ``logprob_start_len`` is resolved in place (-1 -> last
+        prompt token). A start that asks for prompt logprobs is refused when
+        the engine cannot compute them (``supports_prompt_logprobs``), and
+        otherwise because the slim per-step output (``BatchTokenIDOutSlim``)
+        has no prompt-logprob columns -- computing them would silently drop
+        them on the wire.
+        """
         if obj.return_logprob and not self._enable_output_logprobs:
             return (
                 "logprobs were requested but the server was started without "
                 "--enable-output-logprobs"
             )
+        if obj.return_logprob:
+            if obj.top_logprobs_num:
+                return (
+                    "top_logprobs_num > 0 (output top-k logprobs) is not supported yet"
+                )
+            if obj.token_ids_logprob:
+                return "token_ids_logprob is not supported yet"
+            if obj.input_ids is None:
+                return "return_logprob requires token inputs"
+            try:
+                obj.logprob_start_len = resolve_logprob_start_len(
+                    obj.logprob_start_len, len(obj.input_ids)
+                )
+            except ValueError as exc:
+                return str(exc)
+            if obj.logprob_start_len < len(obj.input_ids) - 1:
+                if not self._supports_prompt_logprobs:
+                    return (
+                        "logprob_start_len >= 0 (prompt logprobs) is not supported by "
+                        "this engine: the model narrows its prefill rows or runs "
+                        "pipeline parallel; use logprob_start_len=-1"
+                    )
+                return (
+                    "logprob_start_len >= 0 (prompt logprobs) is not carried on the "
+                    "msgpack output wire; use logprob_start_len=-1"
+                )
         try:
             obj.sampling_params.verify(self._vocab_size)
         except ValueError as exc:
@@ -103,11 +144,9 @@ class MsgpackRecvSocket:
                 # the engine; drop the message and keep draining.
                 logger.warning(
                     "msgpack input: dropping malformed message "
-                    "(%d frames, sizes=%s, head=%s): %s",
-                    len(frames),
-                    [len(frame) for frame in frames],
-                    frames[0][:8].hex() if frames else "",
-                    exc,
+                    f"({len(frames):d} frames, sizes="
+                    f"{[len(frame) for frame in frames]!s}, head="
+                    f"{(frames[0][:8].hex() if frames else '')!s}): {exc!s}",
                 )
                 continue
             for obj in decoded:
@@ -118,9 +157,8 @@ class MsgpackRecvSocket:
                     reason = obj.validation_error or self._validation_error(obj)
                     if reason is not None:
                         logger.warning(
-                            "msgpack input: aborting invalid request %s: %s",
-                            obj.rid,
-                            reason,
+                            f"msgpack input: aborting invalid request {obj.rid!s}: "
+                            f"{reason!s}",
                         )
                         obj.validation_error = reason
                 self._pending.append(obj)
@@ -144,18 +182,51 @@ class MsgpackSendSocket:
         self._socket = socket
         self._engine_index = engine_index
         self._encoder = MsgpackEncoder()
+        self._load_snapshot = (0, 0, 0, 0)
+
+    def set_load_snapshot(
+        self,
+        num_running: int,
+        num_waiting: int,
+        kv_active_pages: int,
+        kv_total_pages: int,
+    ) -> None:
+        """Replace the load tail for the next ordinary output batch.
+
+        Observation and output forwarding share the scheduler thread, so this
+        latest-wins assignment needs neither a lock nor a standalone send.
+        """
+        self._load_snapshot = (
+            num_running,
+            num_waiting,
+            kv_active_pages,
+            kv_total_pages,
+        )
 
     def send_pyobj(self, obj) -> None:
         if isinstance(obj, BatchTokenIDOut):
             # The PULL side carries no routing identity, so the batch itself
             # names its producing rank; the frontend attributes per-rank
             # outputs and load by this index under DP.
-            slim = BatchTokenIDOutSlim.from_full(obj, engine_index=self._engine_index)
+            (
+                num_running,
+                num_waiting,
+                kv_active_pages,
+                kv_total_pages,
+            ) = self._load_snapshot
+            slim = BatchTokenIDOutSlim.from_full(
+                obj,
+                engine_index=self._engine_index,
+                num_running=num_running,
+                num_waiting=num_waiting,
+                kv_active_pages=kv_active_pages,
+                kv_total_pages=kv_total_pages,
+            )
             self._socket.send_multipart(self._encoder.encode(slim), copy=False)
         else:
             logger.warning(
-                "msgpack output: dropping unsupported control reply %s",
-                type(obj).__name__,
+                "msgpack output: dropping unsupported control reply "
+                f"{type(obj).__name__!s}",
             )
 
     def send_engine_dead(self) -> None:
@@ -167,7 +238,7 @@ class MsgpackSendSocket:
         try:
             self._socket.send(ENGINE_CORE_DEAD, zmq.NOBLOCK)
         except Exception as exc:
-            logger.warning("msgpack output: ENGINE_CORE_DEAD send failed: %s", exc)
+            logger.warning(f"msgpack output: ENGINE_CORE_DEAD send failed: {exc!s}")
 
     def close(self) -> None:
         self._socket.close()
@@ -182,8 +253,7 @@ def _recv_init_with_timeout(socket: zmq.Socket) -> list[bytes]:
             return socket.recv_multipart()
         waited_ms += _INIT_POLL_SLICE_MS
         logger.info(
-            "msgpack handshake: waiting for SMG INIT (%ds elapsed)",
-            waited_ms // 1000,
+            f"msgpack handshake: waiting for SMG INIT ({waited_ms // 1000:d}s elapsed)",
         )
     raise TimeoutError(
         f"SMG msgpack handshake timed out waiting for INIT after {_INIT_TIMEOUT_MS} ms"
@@ -196,7 +266,9 @@ def connect_msgpack_engine(
     engine_index: int,
     ready_response: "zmq_wire.WireEngineCoreReadyResponse",
     vocab_size: int,
-    enable_output_logprobs: bool = False,
+    *,
+    enable_output_logprobs: bool,
+    supports_prompt_logprobs: bool,
 ) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
     """Run the startup handshake against SMG and return the wrapped
     data-plane sockets.
@@ -215,7 +287,7 @@ def connect_msgpack_engine(
     handshake = context.socket(zmq.DEALER)
     handshake.setsockopt(zmq.IDENTITY, identity)
     handshake.connect(handshake_address)
-    logger.info("msgpack handshake: connected to %s", handshake_address)
+    logger.info(f"msgpack handshake: connected to {handshake_address!s}")
 
     handshake.send(
         zmq_wire.encode(
@@ -238,7 +310,7 @@ def connect_msgpack_engine(
     input_address = init.addresses.inputs[0]
     output_address = init.addresses.outputs[0]
     logger.info(
-        "msgpack handshake: INIT input=%s output=%s", input_address, output_address
+        f"msgpack handshake: INIT input={input_address!s} output={output_address!s}",
     )
 
     input_socket = context.socket(zmq.DEALER)
@@ -251,8 +323,73 @@ def connect_msgpack_engine(
     output_socket.connect(output_address)
 
     handshake.close()
-    logger.info("msgpack handshake: complete (engine_index=%s)", engine_index)
+    logger.info(f"msgpack handshake: complete (engine_index={engine_index!s})")
     return (
-        MsgpackRecvSocket(input_socket, vocab_size, enable_output_logprobs),
+        MsgpackRecvSocket(
+            input_socket,
+            vocab_size,
+            enable_output_logprobs=enable_output_logprobs,
+            supports_prompt_logprobs=supports_prompt_logprobs,
+        ),
         MsgpackSendSocket(output_socket, engine_index=engine_index),
+    )
+
+
+def _tokenspeed_version() -> str:
+    try:
+        from tokenspeed.version import __version__
+
+        return __version__
+    except Exception:
+        return "unknown"
+
+
+def connect_msgpack_engine_for_loop(
+    context: zmq.Context, loop
+) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
+    """Build the engine's ready response from an event loop's state and run
+    the SMG startup handshake (see ``connect_msgpack_engine``).
+
+    Args:
+        context: The loop's ZMQ context.
+        loop: The scheduler EventLoop; supplies the model/cache geometry and
+            parallel layout the ready response reports to the frontend.
+
+    Returns:
+        The wrapped msgpack (input, output) sockets.
+
+    Each DP rank dials SMG with its own engine identity (zmq_engine_index +
+    dp_rank): the frontend's grouped worker awaits dp_size engines on one
+    socket set and tells the ranks apart — and routes inputs back — by this
+    index. The ready response carries the true dp rank/size alongside.
+    """
+    server_args = loop.server_args
+    geometry = loop._scheduler_cache_geometry
+    ready_response = zmq_wire.WireEngineCoreReadyResponse(
+        max_model_len=loop.model_config.context_len,
+        num_gpu_blocks=geometry.num_device_pages,
+        prefix_granularity=geometry.prefix_granularity,
+        dtype=zmq_wire.wire_dtype(loop.model_config.dtype),
+        multimodal_encoder_dtype=loop.multimodal_encoder_dtype,
+        vllm_version=f"tokenspeed-{_tokenspeed_version()}",
+        world_size=loop.world_size,
+        data_parallel_size=loop.dp_size,
+        tensor_parallel_size=loop.attn_tp_size,
+        decode_context_parallel_size=server_args.kv_parallel_size,
+        data_parallel_rank=loop.dp_rank,
+        max_num_seqs=server_args.max_num_seqs,
+        # chunked_prefill_size=-1 means "disabled"; the wire field is a
+        # non-negative integer for the frontend, so clamp to 0 (= no cap).
+        max_num_batched_tokens=max(0, server_args.chunked_prefill_size),
+        instance_id=server_args.served_model_name or server_args.model,
+        kv_cache_size_tokens=loop.max_total_num_tokens,
+    )
+    return connect_msgpack_engine(
+        context,
+        server_args.zmq_handshake_endpoint(),
+        server_args.zmq_engine_index + loop.dp_rank,
+        ready_response,
+        loop.model_config.vocab_size,
+        enable_output_logprobs=server_args.enable_output_logprobs,
+        supports_prompt_logprobs=loop.supports_prompt_logprobs,
     )

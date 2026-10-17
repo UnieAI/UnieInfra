@@ -22,36 +22,74 @@
 
 #include <stdexcept>
 
+#include "cache/prefix/prefix_hasher.h"
 #include "fsm/forward_events.h"
 
 namespace tokenspeed {
 
-Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
+Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
       token_container_{spec.tokens},
+      submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
-      page_size_{page_size},
-      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {}
+      max_cached_prefix_tokens_{spec.max_cached_prefix_tokens},
+      prefix_granularity_{prefix_granularity},
+      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
 
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(
         Overloaded{
             [](const fsm::Prefilling& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::RemotePrefilling& state) { return state.CurrentPrefillInfo(); },
             [](const fsm::PrefillDone& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillAwaitingResult& state) { return state.CurrentPrefillInfo(); },
             [this](const auto&) -> PrefillInfo {
-                throw std::logic_error("Request::CurrentPrefillInfo: expected Prefilling or PrefillDone; got " +
-                                       StateName());
+                throw std::logic_error(
+                    "Request::CurrentPrefillInfo: expected Prefilling, RemotePrefilling or PrefillDone; got " +
+                    StateName());
             },
         },
         state_);
 }
 
-fsm::ForwardState& Request::forwardState(const char* operation) {
-    fsm::ForwardState* result = std::visit(
-        []<typename State>(State& state) -> fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+std::optional<TailPublication> Request::TailPublicationAt(std::int32_t num_computed_tokens,
+                                                          const std::string& prior) const {
+    _assert(num_computed_tokens >= 0 && num_computed_tokens <= TokenSize(),
+            "the computed frontier lies inside the request's tokens");
+    const std::int32_t tail_tokens = num_computed_tokens % prefix_granularity_;
+    if (tail_tokens == 0) {
+        return std::nullopt;
+    }
+    return TailPublication{
+        .tail_tokens = tail_tokens,
+        .hash = HashPrefixPage(TokenSlice(num_computed_tokens - tail_tokens, tail_tokens), prior),
+    };
+}
+
+std::int32_t Request::NumComputedTokens() const {
+    return std::visit(
+        Overloaded{
+            [](const fsm::Prefilling& state) { return state.window.begin + state.window.size; },
+            [](const fsm::PrefillDone& state) { return state.window.begin + state.window.size; },
+            // Every token but the last is computed; the last is the sampled
+            // token no landed forward consumed.
+            [this](const fsm::Decoding&) { return TokenSize() - 1; },
+            [this](const fsm::Finishing&) { return TokenSize() - 1; },
+            [this](const auto&) -> std::int32_t {
+                throw std::logic_error(
+                    "Request::NumComputedTokens: expected Prefilling, PrefillDone, Decoding or Finishing; got " +
+                    StateName());
+            },
+        },
+        state_);
+}
+
+fsm::ForwardResources& Request::forwardResources(const char* operation) {
+    fsm::ForwardResources* result = std::visit(
+        []<typename State>(State& state) -> fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },
@@ -62,11 +100,11 @@ fsm::ForwardState& Request::forwardState(const char* operation) {
     return *result;
 }
 
-const fsm::ForwardState& Request::forwardState(const char* operation) const {
-    const fsm::ForwardState* result = std::visit(
-        []<typename State>(const State& state) -> const fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+const fsm::ForwardResources& Request::forwardResources(const char* operation) const {
+    const fsm::ForwardResources* result = std::visit(
+        []<typename State>(const State& state) -> const fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },

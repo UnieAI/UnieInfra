@@ -70,6 +70,12 @@ _STREAM_CHUNK_SIZE = 8192
 # inactivity (a genuinely hung/stalled upstream) without killing a legitimately
 # long but actively-streaming request.
 _PROXY_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
+# A Mooncake weight load replies only once every worker has read its shard of
+# the checkpoint, which for a large model is minutes of silence on the
+# upstream socket; the default inactivity bound would abort a healthy load.
+_WEIGHT_LOAD_PROXY_TIMEOUT = aiohttp.ClientTimeout(
+    total=None, sock_connect=30, sock_read=3600
+)
 
 
 def _stub() -> pb_grpc.TokenSpeedSchedulerStub:
@@ -111,9 +117,40 @@ async def _grpc_call(coro) -> JSONResponse:
     return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))
 
 
+def flatten_server_info(info: dict) -> dict:
+    """Merge the nested ``server_args`` of a ``GetServerInfo`` dict into the top level.
+
+    TokenSpeed's gRPC ``GetServerInfoResponse`` nests engine flags under a
+    ``server_args`` key. RL trainers read ``/get_server_info`` flat: slime's
+    external-engine discovery and its post-launch sanity check look up engine
+    flags as top-level keys (e.g. ``info["enable_memory_saver"]``) and abort
+    when one is missing. Copy ``server_args`` to the top level for them while
+    keeping the nested ``server_args`` key for existing consumers. Top-level
+    fields win over server-arg keys on collision (there are none today).
+    The control API key is omitted from both shapes.
+    """
+    info = {k: v for k, v in info.items() if k != "rl_control_api_key"}
+    server_args = info.get("server_args")
+    if not isinstance(server_args, dict):
+        return info
+    server_args = {k: v for k, v in server_args.items() if k != "rl_control_api_key"}
+    shaped: dict = dict(server_args)
+    shaped.update({k: v for k, v in info.items() if k != "server_args"})
+    shaped["server_args"] = server_args
+    return shaped
+
+
 @app.get("/get_server_info")
 async def get_server_info():
-    return await _grpc_call(_stub().GetServerInfo(pb.GetServerInfoRequest()))
+    try:
+        resp = await _stub().GetServerInfo(pb.GetServerInfoRequest())
+    except grpc.aio.AioRpcError as exc:
+        return JSONResponse(
+            {"error": "engine unavailable", "detail": exc.details()},
+            status_code=503,
+        )
+    info = MessageToDict(resp, preserving_proto_field_name=True)
+    return JSONResponse(flatten_server_info(info))
 
 
 @app.get("/get_model_info")
@@ -148,6 +185,7 @@ async def _proxy_request(
     request: Request,
     base_url: str | None = None,
     body_override: bytes | None = None,
+    timeout: aiohttp.ClientTimeout = _PROXY_TIMEOUT,
 ) -> StreamingResponse | Response:
     base_url = base_url if base_url is not None else _gateway_url
     url = f"{base_url.rstrip('/')}{request.url.path}"
@@ -172,7 +210,7 @@ async def _proxy_request(
             url=url,
             headers=headers,
             data=body,
-            timeout=_PROXY_TIMEOUT,
+            timeout=timeout,
         )
     except Exception:
         await session.close()
@@ -226,21 +264,32 @@ async def _served_model() -> str | None:
     return _served_model_id
 
 
-async def _inject_default_model(body: bytes) -> bytes:
-    """Return ``body`` with ``model`` set to the served model when the JSON
-    body omits it. Non-JSON or already-populated bodies pass through."""
+async def _prepare_sglang_generate_body(body: bytes) -> bytes:
+    """Translate SGLang request aliases and add the default model."""
     if not body:
         return body
     try:
         data = json.loads(body)
     except ValueError:
         return body
-    if not isinstance(data, dict) or data.get("model"):
+    if not isinstance(data, dict):
         return body
-    model_id = await _served_model()
-    if not model_id:
-        return body
-    data["model"] = model_id
+
+    # Slime uses SGLang's sampling_seed name; TokenSpeed's native parameter is
+    # seed. Preserve an explicit native seed when both are present.
+    sampling_params = data.get("sampling_params")
+    params_list = (
+        sampling_params if isinstance(sampling_params, list) else [sampling_params]
+    )
+    for params in params_list:
+        if isinstance(params, dict) and "sampling_seed" in params:
+            params.setdefault("seed", params["sampling_seed"])
+            params.pop("sampling_seed")
+
+    if not data.get("model"):
+        model_id = await _served_model()
+        if model_id:
+            data["model"] = model_id
     return json.dumps(data).encode()
 
 
@@ -304,7 +353,7 @@ def _add_output_token_logprobs(obj: dict) -> bool:
 async def generate(request: Request):
     if request.method != "POST":
         return await _proxy_request(request)
-    body = await _inject_default_model(await request.body())
+    body = await _prepare_sglang_generate_body(await request.body())
     resp = await _proxy_request(request, body_override=body)
     if not (isinstance(resp, Response) and resp.body):
         return resp  # streaming or empty: pass through
@@ -377,73 +426,20 @@ async def stop_profile(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# RL weight transfer — proxied to the in-engine control plane
-#
-# The weight-update HTTP API that RL trainers drive. The heavy weight payloads
-# travel out-of-band (NCCL / CUDA-IPC); only metadata flows through here. The
-# control plane runs inside the engine process next to AsyncLLM (see
-# runtime/entrypoints/vllm_compat_http.py); the sidecar proxies to it on
-# _rl_control_url.
+# SGLang-compatible RL control, proxied to the in-engine control app.
+# Heavy distributed weight payloads travel out-of-band; HTTP carries metadata.
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_to_rl_control(request: Request) -> StreamingResponse | Response:
+async def _proxy_to_rl_control(
+    request: Request, timeout: aiohttp.ClientTimeout = _PROXY_TIMEOUT
+) -> StreamingResponse | Response:
     if not _rl_control_url:
         return JSONResponse(
             {"error": "weight-sync control plane is unavailable on this server"},
             status_code=503,
         )
-    return await _proxy_request(request, base_url=_rl_control_url)
-
-
-@app.post("/init_weight_transfer_engine")
-async def init_weight_transfer_engine(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/start_weight_update")
-async def start_weight_update(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/update_weights")
-async def update_weights(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/finish_weight_update")
-async def finish_weight_update(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/pause")
-async def pause(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/resume")
-async def resume(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.get("/get_world_size")
-async def get_world_size(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.get("/is_paused")
-async def is_paused(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-# ---------------------------------------------------------------------------
-# RL weight transfer — SGLang dialect, proxied to the same in-engine control app
-#
-# These routes are mounted on the same in-engine RL control app as the
-# SGLang-compatible handlers (runtime/entrypoints/sglang_compat_http.py), so they
-# proxy to the same _rl_control_url. Endpoint names/fields match SGLang so
-# slime/miles and verl's SGLang rollout drive tokenspeed unchanged.
-# ---------------------------------------------------------------------------
+    return await _proxy_request(request, base_url=_rl_control_url, timeout=timeout)
 
 
 @app.post("/init_weights_update_group")
@@ -461,8 +457,18 @@ async def update_weights_from_distributed(request: Request):
     return await _proxy_to_rl_control(request)
 
 
+@app.post("/update_weights_from_mooncake")
+async def update_weights_from_mooncake(request: Request):
+    return await _proxy_to_rl_control(request, timeout=_WEIGHT_LOAD_PROXY_TIMEOUT)
+
+
 @app.post("/update_weights_from_tensor")
 async def update_weights_from_tensor(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
+@app.post("/rebalance_experts")
+async def rebalance_experts(request: Request):
     return await _proxy_to_rl_control(request)
 
 
@@ -508,6 +514,11 @@ async def health_generate(request: Request):
     return await _proxy_to_rl_control(request)
 
 
+@app.get("/v1/loads")
+async def get_loads(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
 @app.get("/get_weight_version")
 async def get_weight_version(request: Request):
     return await _proxy_to_rl_control(request)
@@ -544,9 +555,8 @@ def build_control_server(
     Args:
         gateway_url: Base URL of the smg gateway for generation passthrough.
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
-        rl_control_url: Base URL of the in-engine RL control plane (vLLM-compatible
-            + SGLang-compatible weight sync). Empty disables those routes (they
-            return 503).
+        rl_control_url: Base URL of the in-engine SGLang-compatible RL control
+            app. Empty makes those routes return 503.
         host: Bind address.
         port: Bind port.
     """
@@ -555,13 +565,9 @@ def build_control_server(
     _engine_grpc_addr = engine_grpc_addr
     _rl_control_url = rl_control_url
     logger.info(
-        "Starting TokenSpeed HTTP server on %s:%d "
-        "(gateway: %s, engine gRPC: %s, weight transfer: %s)",
-        host,
-        port,
-        gateway_url,
-        engine_grpc_addr,
-        rl_control_url or "disabled",
+        f"Starting TokenSpeed HTTP server on {host!s}:{port:d} "
+        f"(gateway: {gateway_url!s}, engine gRPC: {engine_grpc_addr!s}, weight "
+        f"transfer: {rl_control_url or 'disabled'!s})",
     )
     return uvicorn.Server(
         uvicorn.Config(app, host=host, port=port, log_level="warning")

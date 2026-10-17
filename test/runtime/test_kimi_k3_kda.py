@@ -1,12 +1,12 @@
-"""Kimi-K3 KDA recurrent state on the paged-cache contract path.
+"""Kimi-K3 KDA recurrent state on the cache contract path.
 
 Coverage:
 
-- per-group KDA state metadata: ``state_in_pages_by_group`` /
-  ``state_out_pages_by_group``
+- per-group KDA state metadata: ``state_in_blocks_by_group`` /
+  ``state_out_blocks_by_group``
   mappings keyed by state group id, dual-index computed ONCE per group per
   batch, with a proof the three groups' indices are independent and selected
-  per layer via ``pool.group_id_for_layer``;
+  per layer via ``pool.state_group_by_layer``;
 - structural binding of the two KDA components (``conv_state`` /
   ``recurrent_state``) from the LCM pool's no-copy component views;
 - eager prefill and decode over dual state page indices compared against a
@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.kda import kda_recurrent_layout
 from tokenspeed_kernel.platform import current_platform
 
 # The chunked-prefill KDA path resolves to the flash-linear-attention ("fla")
@@ -45,7 +46,7 @@ _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
-from test.runtime.conftest import cache_metadata_for as _metadata_for
+from test.runtime.conftest import block_tables_for as _tables_for
 from test.runtime.conftest import layer_for_group as _kda_layer_for_group
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
 from test.runtime.conftest import requires_cuda
@@ -53,16 +54,16 @@ from test.runtime.conftest import requires_cuda
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends import hybrid_linear_attn
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-    MambaAttnBackend,
-    compute_state_page_indices,
+from tokenspeed.runtime.layers.attention.backends.state import kda, mamba
+from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+    compute_state_block_indices,
 )
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    PagedCacheRuntimeContract,
+    CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 
 register_cuda_ci(est_time=240, suite="runtime-1gpu")
@@ -70,50 +71,140 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 _LOWER_BOUND = -5.0
 
 
-def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(
-        device=device,
+@pytest.mark.parametrize("lengths", [(4, 2), (1,)])
+def test_prefill_hands_the_stored_state_to_the_op_untouched(
+    lengths, monkeypatch
+) -> None:
+    backend = object.__new__(KdaAttnBackend)
+    backend.kda_recurrent_layout = "v_major"
+    backend.kda_backend = "auto"
+    backend._kda_gate = lambda g_raw, *_args: g_raw
+    # Prepare boundaries once; repeated preparation must preserve their identity.
+    boundaries = torch.tensor([0, *np.cumsum(lengths)], dtype=torch.int32)
+    scan_boundaries = backend._prepare_prefill_scan_query_start_loc(boundaries)
+    assert scan_boundaries.dtype == torch.int64
+    assert torch.equal(scan_boundaries, boundaries)
+    assert (
+        backend._prepare_prefill_scan_query_start_loc(scan_boundaries)
+        is scan_boundaries
+    )
+    # The scan takes the boundaries it is handed, never the metadata's cached
+    # ones, even when those have the same row count.
+    full_boundaries = torch.tensor([0, 5, 8], dtype=torch.int32)
+    full_scan_boundaries = full_boundaries.to(torch.int64)
+    backend.forward_metadata = mamba.MambaForwardMetadata(
+        query_start_loc=full_boundaries,
+        scan_query_start_loc=full_scan_boundaries,
+        query_start_loc_int64=full_scan_boundaries,
+    )
+    num_tokens = sum(lengths)
+    stored = torch.arange(len(lengths) * 24, dtype=torch.float32).view(
+        len(lengths), 2, 3, 4
+    )
+    final = torch.empty_like(stored)
+    captured = {}
+
+    def fake_prefill(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(out=torch.empty(1, num_tokens, 2, 4), final_state=final)
+
+    monkeypatch.setattr(kda, "kda_paged_prefill", fake_prefill)
+    query = torch.empty(1, num_tokens, 2, 3)
+    value = torch.empty(1, num_tokens, 2, 4)
+    _, final_state = backend._prefill_scan(
+        query,
+        query,
+        value,
+        stored,
+        scan_boundaries,
+        A_log=torch.empty(2),
+        dt_bias=torch.empty(2, 3),
+        D=None,
+        a=None,
+        b=None,
+        g_raw=torch.empty_like(query),
+        f_a_out=None,
+        f_b_weight=None,
+        beta_raw=torch.empty(1, num_tokens, 2),
+        seq_len=num_tokens,
+        num_real_tokens=num_tokens,
+        lower_bound=-5.0,
+        cu_seqlens_cpu=boundaries.to(torch.int64),
+    )
+    assert captured["initial_state"] is stored
+    assert captured["cu_seqlens"] is scan_boundaries
+    assert captured["recurrent_layout"] == "v_major"
+    assert final_state is final
+    assert "out" not in captured
+
+
+def _backend_config(device: str, *, spec_tokens: int = 1):
+    """(AttnConfig, softmax spec): model-wide facts + softmax geometry."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    spec = MHAConfig(
         num_attention_heads=4,
         num_kv_heads=4,
-        attn_tp_size=1,
-        dtype=torch.bfloat16,
         head_dim=128,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=64,
+        context_len=4096,
+        max_bs=8,
         is_draft=False,
         speculative_num_draft_tokens=spec_tokens,
+        components=(spec,),
     )
+    return config, spec
 
 
-def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> MambaAttnBackend:
+def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBackend:
     kda_backend = "auto" if current_platform().is_amd else "fla"
-    backend = MambaAttnBackend(
-        _backend_config(device, spec_tokens=spec_tokens),
-        is_kda=True,
+    backend = KdaAttnBackend(
+        *_backend_config(device, spec_tokens=spec_tokens),
+        enable_prefill_graph=False,
         kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)
     return backend
 
 
-def _stub_contract(*, block_size: int, usable_pages: int):
+def _stub_contract(*, prefix_granularity: int, usable_pages: int):
     """Small-P contract with the Kimi group topology (1 history + 3 state)."""
     group_ids = ("full_attention", *_STATE_GROUPS)
     specs = tuple(
-        PagedCacheGroupSpec(
-            group_id=group_id,
-            retention="full_history",
-            rows_per_page=block_size,
-            entry_stride_tokens=1,
-            sliding_window_tokens=None,
-            family="history" if group_id == "full_attention" else "state",
+        (
+            CacheGroupSpec(
+                group_id=group_id,
+                attn_kind="full_history",
+                rows_per_page=prefix_granularity,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                replayable=False,
+            )
+            if group_id == "full_attention"
+            else CacheGroupSpec(
+                group_id=group_id,
+                attn_kind="state",
+                sliding_window_tokens=None,
+                replayable=False,
+            )
         )
         for group_id in group_ids
     )
-    return PagedCacheRuntimeContract(
-        block_size=block_size,
+    return CacheRuntimeContract(
+        prefix_granularity=prefix_granularity,
         num_lcm_blocks=usable_pages,
-        token_capacity=usable_pages * block_size,
+        token_capacity=usable_pages * prefix_granularity,
         group_specs=specs,
         group_page_counts={spec.group_id: usable_pages + 1 for spec in specs},
+        group_packing={spec.group_id: 1 for spec in specs},
     )
 
 
@@ -122,7 +213,8 @@ class _StubContractPool:
     conv/recurrent component slabs indexed by page id (page 0 = null)."""
 
     def __init__(self, contract, device, conv_dim, width, num_heads, head_dim):
-        self.runtime_contract = contract
+        # The arena publishes the contract; a view only names its arena.
+        self.arena = SimpleNamespace(runtime_contract=contract)
         num_pages = contract.group_page_counts[_STATE_GROUPS[0]]
         self._groups = {i: _STATE_GROUPS[i] for i in range(3)}
         self._components = {
@@ -142,8 +234,9 @@ class _StubContractPool:
             for layer_id in self._groups
         }
 
-    def group_id_for_layer(self, layer_id: int) -> str:
-        return self._groups[layer_id]
+    @property
+    def state_group_by_layer(self) -> dict[int, str]:
+        return self._groups
 
     def get_component(self, layer_id: int, name: str) -> torch.Tensor:
         return self._components[layer_id][name]
@@ -184,16 +277,67 @@ def _naive_kda_scan(q, k, v, g_raw, beta_raw, A_log, dt_bias, lower_bound, S0):
 # ---------------------------------------------------------------------------
 
 
-def test_set_kv_pool_binds_contract_state_groups() -> None:
+def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
+    replay_probe = {}
+
+    def probe_replay(_dtype, **kwargs):
+        replay_probe.update(kwargs)
+        return False
+
+    monkeypatch.setattr(kda, "kda_replay_commit_supported", probe_replay)
     pool = _make_kimi_pool("cpu")
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
-    assert backend._state_page_size == pool.page_size
+    _, state = backend._state_components(backend._state_layer_ids()[0])
+    assert replay_probe == {
+        "recurrent_layout": backend.kda_recurrent_layout,
+        "num_heads": state.shape[1],
+        "head_dim": state.shape[2],
+    }
+
+
+def test_kda_verify_seed_omits_only_the_recurrent_state(monkeypatch) -> None:
+    """KDA reads committed recurrence directly while GDN keeps full seeding."""
+    contract = _stub_contract(prefix_granularity=4, usable_pages=8)
+    pool = _StubContractPool(
+        contract,
+        "cpu",
+        conv_dim=3 * 4 * 128,
+        width=4,
+        num_heads=4,
+        head_dim=128,
+    )
+    state_pages = {
+        group_id: torch.tensor([1, 2], dtype=torch.int32) for group_id in _STATE_GROUPS
+    }
+    calls = []
+
+    def record_copy(*_args, **kwargs):
+        calls.append(kwargs["row_bytes"])
+
+    monkeypatch.setattr(mamba, "copy_state_rows", record_copy)
+
+    kda = _backend("cpu", contract_pool=pool, spec_tokens=4)
+    kda._replay_active = False
+    kda.preallocate_verify_workspace(2, 4)
+    kda.forward_metadata = SimpleNamespace(state_in_blocks_by_group=state_pages)
+    kda._seed_verify_scratch_batched(2, 4)
+    conv_bytes = pool.get_component(0, "conv_state")[0].nbytes
+    state_bytes = pool.get_component(0, "recurrent_state")[0].nbytes
+    assert calls == [conv_bytes]
+
+    calls.clear()
+    gdn = mamba.MambaAttnBackend(*_backend_config("cpu", spec_tokens=4))
+    gdn.set_kv_pool(pool)
+    gdn.preallocate_verify_workspace(2, 4)
+    gdn.forward_metadata = SimpleNamespace(state_in_blocks_by_group=state_pages)
+    gdn._seed_verify_scratch_batched(2, 4)
+    assert calls == [conv_bytes, state_bytes]
 
 
 # ---------------------------------------------------------------------------
-# Per-group dual-index metadata
+# Per-group two-slot metadata
 # ---------------------------------------------------------------------------
 
 
@@ -211,61 +355,61 @@ def _kimi_tables(bs: int, width: int, *, base: int = 1) -> dict[str, np.ndarray]
     return tables
 
 
-def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
+def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
     monkeypatch,
 ) -> None:
     pool = _make_kimi_pool("cpu", usable_pages=24)
     backend = _backend("cpu", contract_pool=pool)
-    page_size = pool.page_size
 
-    plan_calls = 0
-    real = hybrid_linear_attn._compute_state_page_index_plan
+    resolve_calls = 0
+    real = mamba.compute_state_block_indices
 
     def counting(*args, **kwargs):
-        nonlocal plan_calls
-        plan_calls += 1
+        nonlocal resolve_calls
+        resolve_calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(hybrid_linear_attn, "_compute_state_page_index_plan", counting)
+    monkeypatch.setattr(mamba, "compute_state_block_indices", counting)
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
-    metadata, forward_op = _metadata_for(pool.runtime_contract, tables, "cpu")
-    # Decode: request 0 crosses into its second page, request 1 stays inside
-    # its first page.
-    seq_lens = torch.tensor([page_size + 1, 5], dtype=torch.int32)
-    backend.init_forward_metadata(
-        bs=bs,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=seq_lens,
+    # Request 0 is the first decode after prompt end (the rotated checkpoint
+    # in slot 0); request 1 evolves its live block in place.
+    for group_id in _STATE_GROUPS:
+        tables[group_id][1, 0] = 0
+    delivered = _tables_for(pool.arena.runtime_contract, tables, "cpu")
+    seq_lens = torch.tensor([65, 5], dtype=torch.int32)
+    backend.init_cuda_graph_state(max_bs=bs)
+    backend.refresh_decode_metadata(
+        bs,
+        bs,
+        torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables=delivered,
     )
 
-    # Conversion and slot arithmetic run once for the whole batch. Each state
-    # group only gathers its independent page ids from that shared plan.
-    assert plan_calls == 1
+    # One resolve per state group over its own table, never per layer.
+    assert resolve_calls == len(_STATE_GROUPS)
 
     md = backend.forward_metadata
-    assert tuple(sorted(md.state_in_pages_by_group)) == _STATE_GROUPS
-    assert tuple(sorted(md.state_out_pages_by_group)) == _STATE_GROUPS
+    assert tuple(sorted(md.state_in_blocks_by_group)) == _STATE_GROUPS
+    assert tuple(sorted(md.state_out_blocks_by_group)) == _STATE_GROUPS
     for group_id in _STATE_GROUPS:
         rows = tables[group_id]
-        # req 0: before=P -> in slot 0, out slot 1; req 1: before=4 -> slot 0.
-        assert md.state_in_pages_by_group[group_id].tolist() == [
+        assert md.state_in_blocks_by_group[group_id].tolist() == [
             int(rows[0, 0]),
-            int(rows[1, 0]),
+            int(rows[1, 1]),
         ]
-        assert md.state_out_pages_by_group[group_id].tolist() == [
+        assert md.state_out_blocks_by_group[group_id].tolist() == [
             int(rows[0, 1]),
-            int(rows[1, 0]),
+            int(rows[1, 1]),
         ]
     # Three groups carry three disjoint page-id sets (independence).
     all_pages = [
         page
         for group_id in _STATE_GROUPS
-        for page in md.state_out_pages_by_group[group_id].tolist()
+        for page in md.state_out_blocks_by_group[group_id].tolist()
     ]
     assert len(set(all_pages)) == len(all_pages)
 
@@ -275,7 +419,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
     # op, per group, and pads dummy rows to the pad slot id.
     pool = _make_kimi_pool("cpu", usable_pages=24)
     backend = _backend("cpu", contract_pool=pool)
-    backend.init_cuda_graph_state(max_num_tokens=2)
+    backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
@@ -287,29 +431,27 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
     }
     # Distinct per-group tables so the refresh is provably group-specific.
     tables = _kimi_tables(bs=2, width=4, base=1)
-    metadata, forward_op = _metadata_for(pool.runtime_contract, tables, "cpu")
+    delivered = _tables_for(pool.arena.runtime_contract, tables, "cpu")
     # bs 2 requests, one padding row (real_bs 1). Decode: before = seq-1.
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=torch.tensor([5, 1], dtype=torch.int32),
+    backend.refresh_decode_metadata(
+        2,
+        1,
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([5, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
-        num_padding=1,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        for_graph_replay=True,
+        block_tables=delivered,
     )
     md = backend.forward_metadata
     for gid in _STATE_GROUPS:
         buf = backend.state_in_by_group[gid][1]
         # Same storage as capture (in-place refresh, no realloc).
         assert buf.data_ptr() == captured_ptrs[gid]
-        assert md.state_in_pages_by_group[gid].data_ptr() == captured_ptrs[gid]
+        assert md.state_in_blocks_by_group[gid].data_ptr() == captured_ptrs[gid]
         # Real row 0 refreshed from this group's table; padded row 1 -> pad.
-        expected_in, _ = compute_state_page_indices(
+        expected_in, _ = compute_state_block_indices(
             torch.as_tensor(tables[gid][:1]),
-            pool.runtime_contract.block_size,
             torch.tensor([4]),  # before = seq_len 5 - 1
-            torch.tensor([5]),
             validate=False,
             group_id=gid,
         )
@@ -318,17 +460,18 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
 
 
 # ---------------------------------------------------------------------------
-# GPU: KDA prefill/decode over dual state page indices vs naive + FLA
+# GPU: KDA prefill/decode over two-slot state tables vs naive + FLA
 # ---------------------------------------------------------------------------
 
 
 class _KDAHarness:
-    """Drives MambaAttnBackend KDA forwards over a contract pool and mirrors
+    """Drives KdaAttnBackend forwards over a contract pool and mirrors
     them with naive fp32 + FLA oracles."""
 
     H = 4
     D = 128
     WIDTH = 4
+    MAX_BS = 4
 
     def __init__(self, pool, contract, layer_ids, device="cuda", seed=0):
         torch.manual_seed(seed)
@@ -340,6 +483,7 @@ class _KDAHarness:
         self.value_dim = self.H * self.D
         self.conv_dim = 3 * self.key_dim
         self.backend = _backend(device, contract_pool=pool)
+        self.backend.init_cuda_graph_state(max_bs=self.MAX_BS)
         # Per-layer weights and full token streams (so each group is proven
         # independent, not accidentally identical).
         self.params = {}
@@ -389,26 +533,45 @@ class _KDAHarness:
             lower_bound=_LOWER_BOUND,
         )
 
-    def init_metadata(self, tables, seq_lens, mode, extend_prefix_lens=None):
-        bs = len(seq_lens)
+    def _delivered(self, tables):
         np_tables = {
             gid: np.asarray(rows, dtype=np.int32) for gid, rows in tables.items()
         }
-        metadata, forward_op = _metadata_for(self.contract, np_tables, self.device)
-        kwargs = dict(
-            cache_metadata=metadata,
-            forward_batch=forward_op,
-        )
-        if extend_prefix_lens is not None:
-            kwargs["extend_prefix_lens"] = torch.tensor(
-                extend_prefix_lens, dtype=torch.int32, device=self.device
-            )
+        return _tables_for(self.contract, np_tables, self.device)
+
+    def extend_metadata(self, tables, seq_lens, extend_prefix_lens):
+        """An EXTEND batch: every row extends, the executor's host mirrors
+        carry each row's new-token and prefix lengths."""
+        bs = len(seq_lens)
+        prefix_cpu = torch.tensor(extend_prefix_lens, dtype=torch.int32)
+        new_cpu = torch.tensor(seq_lens, dtype=torch.int32) - prefix_cpu
         self.backend.init_forward_metadata(
             bs=bs,
+            num_extends=bs,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
-            forward_mode=mode,
-            **kwargs,
+            forward_mode=ForwardMode.EXTEND,
+            block_tables=self._delivered(tables),
+            extend_seq_lens=new_cpu.to(self.device),
+            extend_seq_lens_cpu=new_cpu,
+            extend_prefix_lens=prefix_cpu.to(self.device),
+            extend_prefix_lens_cpu=prefix_cpu,
+            extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
+            extend_prompt_lens_cpu=prefix_cpu + new_cpu,
+            extend_with_prefix=bool(prefix_cpu.any()),
+            query_shard=None,
+        )
+
+    def decode_metadata(self, tables, seq_lens):
+        """A decode step: the same unpadded refresh the runner issues."""
+        bs = len(seq_lens)
+        self.backend.refresh_decode_metadata(
+            bs,
+            bs,
+            torch.arange(bs, dtype=torch.int32, device=self.device),
+            torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._delivered(tables),
         )
 
     def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1):
@@ -426,6 +589,7 @@ class _KDAHarness:
             bs=bs,
             forward_mode=ForwardMode.EXTEND,
             mixed_qkv=mixed.clone(),
+            save_kv_cache=True,
             g_raw=g_raw,
             beta_raw=beta_raw,
             seq_len=seq_len,
@@ -451,11 +615,14 @@ class _KDAHarness:
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
         sequence starting from the zero state."""
-        from tokenspeed_kernel.ops.attention.triton.linear.kda import (
+        from tokenspeed_kernel.ops.attention.gdn.triton import (
+            CAUSAL_CONV1D_BLOCK_M,
+            build_causal_conv1d_prefill_metadata,
+        )
+        from tokenspeed_kernel.ops.attention.kda._triton.fla import (
             kda_chunk_prefill,
         )
-
-        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+        from tokenspeed_kernel.ops.conv import (
             causal_conv1d_fn,
         )
 
@@ -468,6 +635,9 @@ class _KDAHarness:
             device=self.device,
             dtype=torch.bfloat16,
         )
+        query_start_loc = torch.tensor(
+            [0, total], dtype=torch.int32, device=self.device
+        )
         conv_out = causal_conv1d_fn(
             mixed.transpose(0, 1),
             p["conv_weights"],
@@ -476,10 +646,12 @@ class _KDAHarness:
             conv_states=conv_state,
             has_initial_state=torch.zeros(1, dtype=torch.bool, device=self.device),
             cache_indices=torch.zeros(1, dtype=torch.int32, device=self.device),
-            query_start_loc=torch.tensor(
-                [0, total], dtype=torch.int32, device=self.device
+            query_start_loc=query_start_loc,
+            prefill_metadata=build_causal_conv1d_prefill_metadata(
+                query_start_loc,
+                torch.tensor([total], dtype=torch.int32),
+                CAUSAL_CONV1D_BLOCK_M,
             ),
-            seq_lens_cpu=torch.tensor([total], dtype=torch.int32),
         ).transpose(0, 1)[:total]
         q, k, v = torch.split(
             conv_out, [self.key_dim, self.key_dim, self.value_dim], dim=-1
@@ -518,10 +690,17 @@ class _KDAHarness:
         )
         return (
             naive_out.flatten(0, 1),
-            naive_state,
+            _to_slab_layout(naive_state),
             fla_out[0].flatten(0, 1),
-            fla_state[0].float(),
+            _to_slab_layout(fla_state[0].float()),
         )
+
+
+def _to_slab_layout(state: torch.Tensor) -> torch.Tensor:
+    """Oracles build K-major states; the slab holds the platform's own layout."""
+    if kda_recurrent_layout() == "v_major":
+        return state.transpose(-1, -2)
+    return state
 
 
 def _assert_close(actual, expected, what, mean_tol=2e-3, atol=1e-1, rtol=1e-2):
@@ -535,56 +714,68 @@ def _assert_close(actual, expected, what, mean_tol=2e-3, atol=1e-1, rtol=1e-2):
 @requires_cuda
 @requires_fla
 def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
-    """Prefill from zero state, same-page decode, boundary-crossing decode,
-    per-group table independence — vs naive fp32 recurrence AND FLA."""
+    """Prefill from zero state, the first decode off the rotated prompt-end
+    checkpoint, in-place decodes, per-group table independence -- vs naive
+    fp32 recurrence AND FLA."""
     P, usable = 4, 8
-    contract = _stub_contract(block_size=P, usable_pages=usable)
+    contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
     )
     h = _KDAHarness(pool, contract, layer_ids=[0, 1, 2])
-    # Distinct pages per group: writes to the wrong group's pages would land
-    # in rows this test asserts stay zero.
-    tables = {
-        "linear_attention_0": [[1, 4]],
-        "linear_attention_1": [[2, 5]],
-        "linear_attention_2": [[3, 6]],
+    # Distinct blocks per group: writes to the wrong group's blocks would land
+    # in rows this test asserts stay zero. Block (checkpoint, live) per group.
+    blocks = {
+        "linear_attention_0": (1, 4),
+        "linear_attention_1": (2, 5),
+        "linear_attention_2": (3, 6),
     }
     streams = {layer_id: h.token_stream(6) for layer_id in [0, 1, 2]}
 
     outputs = {layer_id: [] for layer_id in [0, 1, 2]}
-    # Prefill 3 tokens: in = null page 0 (zero state), out = slot 0.
-    h.init_metadata(
-        tables, seq_lens=[3], mode=ForwardMode.EXTEND, extend_prefix_lens=[0]
+    # Prefill 3 tokens from the zero state (slot 0 null) into the checkpoint block.
+    h.extend_metadata(
+        {gid: [[0, checkpoint]] for gid, (checkpoint, _) in blocks.items()},
+        seq_lens=[3],
+        extend_prefix_lens=[0],
     )
     md = h.backend.forward_metadata
     for gid in _STATE_GROUPS:
-        assert md.state_in_pages_by_group[gid].tolist() == [0]
-        assert md.state_out_pages_by_group[gid].tolist() == [tables[gid][0][0]]
+        assert md.state_in_blocks_by_group[gid].tolist() == [0]
+        assert md.state_out_blocks_by_group[gid].tolist() == [blocks[gid][0]]
     for layer_id in [0, 1, 2]:
         s = streams[layer_id]
         outputs[layer_id].append(
             h.extend(layer_id, s["mixed"][:3], s["g_raw"][:3], s["beta_raw"][:3])
         )
-
-    # Decode token 4 (same page), 5 (crossing), 6 (same new page).
-    expected_pages = {
-        gid: [
-            (rows[0][0], rows[0][0]),
-            (rows[0][0], rows[0][1]),
-            (rows[0][1], rows[0][1]),
-        ]
-        for gid, rows in tables.items()
-    }
+    # The prompt-end block is published: read-only from here on.
     snapshot = {}
+    for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
+        page = blocks[gid][0]
+        snapshot[layer_id] = (
+            pool.get_component(layer_id, "conv_state")[page].clone(),
+            pool.get_component(layer_id, "recurrent_state")[page].clone(),
+        )
+
+    # Decode token 4 reads the rotated checkpoint and writes the fresh live
+    # block; tokens 5 and 6 evolve the live block in place (slot 0 released).
+    decode_tables = [
+        {gid: [[checkpoint, live]] for gid, (checkpoint, live) in blocks.items()},
+        {gid: [[0, live]] for gid, (_, live) in blocks.items()},
+        {gid: [[0, live]] for gid, (_, live) in blocks.items()},
+    ]
+    expected_pages = {
+        gid: [(checkpoint, live), (live, live), (live, live)]
+        for gid, (checkpoint, live) in blocks.items()
+    }
     for step, pos in enumerate(range(3, 6)):
-        h.init_metadata(tables, seq_lens=[pos + 1], mode=ForwardMode.DECODE)
+        h.decode_metadata(decode_tables[step], seq_lens=[pos + 1])
         md = h.backend.forward_metadata
         for gid in _STATE_GROUPS:
-            assert md.state_in_pages_by_group[gid].tolist() == [
+            assert md.state_in_blocks_by_group[gid].tolist() == [
                 expected_pages[gid][step][0]
             ]
-            assert md.state_out_pages_by_group[gid].tolist() == [
+            assert md.state_out_blocks_by_group[gid].tolist() == [
                 expected_pages[gid][step][1]
             ]
         for layer_id in [0, 1, 2]:
@@ -598,14 +789,6 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
                     bs=1,
                 )
             )
-        if pos == 3:
-            # Page written at the P boundary becomes a read-only snapshot.
-            for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
-                page = tables[gid][0][0]
-                snapshot[layer_id] = (
-                    pool.get_component(layer_id, "conv_state")[page].clone(),
-                    pool.get_component(layer_id, "recurrent_state")[page].clone(),
-                )
 
     for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
         s = streams[layer_id]
@@ -617,24 +800,23 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
         _assert_close(flat_out, fla_out, f"layer {layer_id} out vs FLA")
         ssm = pool.get_component(layer_id, "recurrent_state")
         conv = pool.get_component(layer_id, "conv_state")
-        final_page = tables[gid][0][1]
+        snap_page, final_page = blocks[gid]
         _assert_close(ssm[final_page], naive_state, f"layer {layer_id} state vs naive")
         _assert_close(ssm[final_page], fla_state, f"layer {layer_id} state vs FLA")
-        # Snapshot page untouched by the boundary-crossing decode.
-        snap_page = tables[gid][0][0]
+        # The published checkpoint is untouched by the decode that read it.
         assert torch.equal(conv[snap_page], snapshot[layer_id][0])
         assert torch.equal(ssm[snap_page], snapshot[layer_id][1])
         assert ssm[snap_page].abs().max().item() > 0.0
         # Null page 0 is never written.
         assert conv[0].abs().max().item() == 0.0
         assert ssm[0].abs().max().item() == 0.0
-        # Independence: pages belonging to the OTHER groups stay zero in this
-        # layer's slabs — the layer consumed only its own group's indices.
+        # Independence: blocks belonging to the OTHER groups stay zero in this
+        # layer's slabs -- the layer consumed only its own group's indices.
         other_pages = [
             page
-            for other_gid, rows in tables.items()
+            for other_gid, pages in blocks.items()
             if other_gid != gid
-            for page in rows[0]
+            for page in pages
         ]
         for page in other_pages:
             assert ssm[page].abs().max().item() == 0.0, (layer_id, page)
@@ -644,10 +826,10 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
 @requires_cuda
 @requires_fla
 def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
-    """Prefix hit at a P boundary: the shared snapshot page is read-only for
-    both branches (CoW), and batched decode keeps requests isolated."""
-    P, usable = 4, 12
-    contract = _stub_contract(block_size=P, usable_pages=usable)
+    """Prefix hit at a published prompt-end checkpoint: the shared block is
+    read-only for both branches, and batched decode keeps requests isolated."""
+    P, usable = 4, 16
+    contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
     )
@@ -660,8 +842,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
         # computes indices for every group once per batch).
         return {
             "linear_attention_0": rows0,
-            "linear_attention_1": [[p + 4 for p in row] for row in rows0],
-            "linear_attention_2": [[p + 8 for p in row] for row in rows0],
+            "linear_attention_1": [[p + 4 if p else 0 for p in row] for row in rows0],
+            "linear_attention_2": [[p + 8 if p else 0 for p in row] for row in rows0],
         }
 
     # Shared prefix: 4 tokens (exactly one page). Branch A continues with 2
@@ -680,10 +862,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     a_full = cat(prefix, a_new)
     b_full = cat(prefix, b_new)
 
-    # 1) A prefills the shared 4-token prefix -> snapshot page 1.
-    h.init_metadata(
-        tables_for([[1]]), seq_lens=[4], mode=ForwardMode.EXTEND, extend_prefix_lens=[0]
-    )
+    # 1) A prefills the shared 4-token prefix -> its prompt-end state, block 1.
+    h.extend_metadata(tables_for([[0, 1]]), seq_lens=[4], extend_prefix_lens=[0])
     a_outs = [h.extend(layer_id, prefix["mixed"], prefix["g_raw"], prefix["beta_raw"])]
     conv = pool.get_component(layer_id, "conv_state")
     ssm = pool.get_component(layer_id, "recurrent_state")
@@ -691,11 +871,12 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     snap_ssm = ssm[1].clone()
     assert snap_ssm.abs().max().item() > 0.0
 
-    # 2) A decodes token 5: crossing out of the snapshot (in=1, out=2).
-    h.init_metadata(tables_for([[1, 2]]), seq_lens=[5], mode=ForwardMode.DECODE)
+    # 2) A's first decode (token 5) reads the rotated checkpoint (slot 0 =
+    #    block 1) and writes the fresh live block 2.
+    h.decode_metadata(tables_for([[1, 2]]), seq_lens=[5])
     md = h.backend.forward_metadata
-    assert md.state_in_pages_by_group[gid].tolist() == [1]
-    assert md.state_out_pages_by_group[gid].tolist() == [2]
+    assert md.state_in_blocks_by_group[gid].tolist() == [1]
+    assert md.state_out_blocks_by_group[gid].tolist() == [2]
     a_outs.append(
         h.decode(
             layer_id,
@@ -708,17 +889,12 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 3) B resumes from the shared snapshot: extend prefix=4 -> 7 tokens
-    #    (in = shared page 1, out = fresh page 3; page 1 must stay intact).
-    h.init_metadata(
-        tables_for([[1, 3]]),
-        seq_lens=[7],
-        mode=ForwardMode.EXTEND,
-        extend_prefix_lens=[4],
-    )
+    # 3) B hits the published checkpoint: extend prefix=4 -> 7 tokens
+    #    (in = shared block 1, out = fresh block 3; block 1 must stay intact).
+    h.extend_metadata(tables_for([[1, 3]]), seq_lens=[7], extend_prefix_lens=[4])
     md = h.backend.forward_metadata
-    assert md.state_in_pages_by_group[gid].tolist() == [1]
-    assert md.state_out_pages_by_group[gid].tolist() == [3]
+    assert md.state_in_blocks_by_group[gid].tolist() == [1]
+    assert md.state_out_blocks_by_group[gid].tolist() == [3]
     b_outs = [
         h.extend(
             layer_id, b_new["mixed"][:3], b_new["g_raw"][:3], b_new["beta_raw"][:3]
@@ -727,16 +903,14 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 4) Batched decode: A token 6 (in-page evolution on page 2) and B token 8
-    #    (crossing to page 5) in ONE forward — isolation between requests.
-    h.init_metadata(
-        tables_for([[1, 2], [1, 3]]),
-        seq_lens=[6, 8],
-        mode=ForwardMode.DECODE,
-    )
+    # 4) Batched decode: A token 6 (in place on block 2, slot 0 released) and
+    #    B's first decode, token 8 (its prompt-end block 3 rotated into slot 0,
+    #    fresh live block 5), in ONE forward -- isolation between requests.
+    h.decode_metadata(tables_for([[0, 2], [3, 5]]), seq_lens=[6, 8])
     md = h.backend.forward_metadata
-    assert md.state_in_pages_by_group[gid].tolist() == [2, 3]
-    assert md.state_out_pages_by_group[gid].tolist() == [2, 3]
+    assert md.state_in_blocks_by_group[gid].tolist() == [2, 3]
+    assert md.state_out_blocks_by_group[gid].tolist() == [2, 5]
+    b_prompt_end = (conv[3].clone(), ssm[3].clone())
     mixed = torch.cat([a_new["mixed"][1:2], b_new["mixed"][3:4]], dim=0)
     g_raw = torch.cat([a_new["g_raw"][1:2], b_new["g_raw"][3:4]], dim=0)
     beta_raw = torch.cat([a_new["beta_raw"][1:2], b_new["beta_raw"][3:4]], dim=0)
@@ -744,9 +918,11 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     a_outs.append(both[: h.H])
     b_outs.append(both[h.H :])
 
-    # Shared snapshot page is still byte-identical after everything.
+    # Both published checkpoints are still byte-identical after everything.
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
+    assert torch.equal(conv[3], b_prompt_end[0])
+    assert torch.equal(ssm[3], b_prompt_end[1])
     assert ssm[0].abs().max().item() == 0.0
 
     naive_a, state_a, fla_a, fla_state_a = h.oracle(
@@ -763,15 +939,15 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     _assert_close(flat_b, fla_b[4 * h.H :], "branch B out vs FLA")
     _assert_close(ssm[2], state_a, "branch A final state vs naive")
     _assert_close(ssm[2], fla_state_a, "branch A final state vs FLA")
-    _assert_close(ssm[3], state_b, "branch B final state vs naive")
-    _assert_close(ssm[3], fla_state_b, "branch B final state vs FLA")
+    _assert_close(ssm[5], state_b, "branch B final state vs naive")
+    _assert_close(ssm[5], fla_state_b, "branch B final state vs FLA")
 
 
 @requires_cuda
 @requires_fla
 @pytest.mark.skipif(
     not current_platform().is_amd,
-    reason="indexed paged cache KDA decode is an AMD-specific contract",
+    reason="indexed cache-group KDA decode is an AMD-specific contract",
 )
 def test_kda_cache_pool_component_views_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
@@ -780,7 +956,7 @@ def test_kda_cache_pool_component_views_end_to_end(
     through the conv + KDA kernels: prefill + decodes on one KDA layer of
     each of the three groups, vs naive + FLA."""
     pool = _make_kimi_pool("cuda", usable_pages=4)
-    contract = pool.runtime_contract
+    contract = pool.arena.runtime_contract
     layer_ids = [_kda_layer_for_group(pool, gid) for gid in _STATE_GROUPS]
 
     # Kimi TP8 geometry: 12 heads, D=128, conv_dim 4608.
@@ -795,22 +971,20 @@ def test_kda_cache_pool_component_views_end_to_end(
     streams = {layer_id: h.token_stream(total) for layer_id in layer_ids}
 
     outputs = {layer_id: [] for layer_id in layer_ids}
-    h.init_metadata(
-        tables, seq_lens=[8], mode=ForwardMode.EXTEND, extend_prefix_lens=[0]
-    )
+    h.extend_metadata(tables, seq_lens=[8], extend_prefix_lens=[0])
     for layer_id in layer_ids:
         s = streams[layer_id]
         outputs[layer_id].append(
             h.extend(layer_id, s["mixed"][:8], s["g_raw"][:8], s["beta_raw"][:8])
         )
 
-    from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent
+    from tokenspeed_kernel.ops.attention.kda._triton import recurrent
 
     def _unexpected_megafuse(*args, **kwargs):
-        raise AssertionError("AMD paged cache decode must bypass the FLA KDA megafuse")
+        raise AssertionError("AMD cache-group decode must bypass the FLA KDA megafuse")
 
     indexed_decode_calls = 0
-    indexed_decode = hybrid_linear_attn.kda_paged_decode
+    indexed_decode = kda.kda_paged_decode
 
     def _indexed_decode_spy(*args, **kwargs):
         nonlocal indexed_decode_calls
@@ -818,17 +992,17 @@ def test_kda_cache_pool_component_views_end_to_end(
         return indexed_decode(*args, **kwargs)
 
     monkeypatch.setattr(
-        fla_kda_recurrent,
+        recurrent,
         "fused_recurrent_kda_megafuse",
         _unexpected_megafuse,
     )
     monkeypatch.setattr(
-        hybrid_linear_attn,
+        kda,
         "kda_paged_decode",
         _indexed_decode_spy,
     )
     for pos in range(8, total):
-        h.init_metadata(tables, seq_lens=[pos + 1], mode=ForwardMode.DECODE)
+        h.decode_metadata(tables, seq_lens=[pos + 1])
         for layer_id in layer_ids:
             s = streams[layer_id]
             outputs[layer_id].append(
@@ -863,25 +1037,97 @@ def test_kda_cache_pool_component_views_end_to_end(
         assert ssm[0].abs().max().item() == 0.0
 
 
-def test_mask_fresh_initial_state_zeroes_recycled_bytes() -> None:
+def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> None:
     """Fresh sequences must not inherit a recycled page's stale bytes as
-    their initial recurrent state: only rows with real history keep the
-    gathered state."""
-    from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-        _mask_fresh_initial_state,
+    their initial recurrent state: only the row that resumes real history
+    keeps the gathered snapshot, and no row reads physical page 0."""
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        _prepare_cache_prefill_state_inputs,
     )
 
-    stale = torch.full((3, 2, 4, 4), float("nan"))
-    stale[1] = 7.0  # the one resuming row carries a real (finite) snapshot
+    # Pages 1, 3, 4 are freshly allocated working pages still carrying a
+    # previous tenant's bytes; page 2 is a real (finite) snapshot.
+    ssm_states = torch.full((5, 2, 4, 4), float("nan"))
+    ssm_states[0] = 0.0
+    ssm_states[2] = 7.0
+    conv_states = torch.arange(5, dtype=torch.float32).view(5, 1, 1).expand(5, 3, 2)
+    conv_states = conv_states.clone()
+    state_in = torch.tensor([0, 2, 0], dtype=torch.int32)
+    state_out = torch.tensor([1, 3, 4], dtype=torch.int64)
 
-    # None => every sequence fresh => all zeros.
-    out = _mask_fresh_initial_state(stale, None)
-    assert (out == 0).all()
+    recurrent_state, has_initial_state = _prepare_cache_prefill_state_inputs(
+        conv_states, ssm_states, state_in, state_out
+    )
 
-    has_init = torch.tensor([False, True, False])
-    out = _mask_fresh_initial_state(stale, has_init)
-    assert (out[0] == 0).all() and (out[2] == 0).all()
-    assert (out[1] == 7.0).all()
+    assert has_initial_state.tolist() == [False, True, False]
+    assert (recurrent_state[0] == 0).all() and (recurrent_state[2] == 0).all()
+    assert (recurrent_state[1] == 7.0).all()
+    # The resumed row copies its snapshot's conv page into its working page;
+    # fresh rows keep their own working page and never touch page 0.
+    assert (conv_states[3] == 2.0).all()
+    assert (conv_states[1] == 1.0).all() and (conv_states[4] == 4.0).all()
+    assert (conv_states[0] == 0.0).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("prefix", [0, 1024])
+def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
+    """Native KDA outputs and persistent state match the old staging ops."""
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
+
+    if not cutedsl_kda_supported():
+        pytest.skip("requires the native CuteDSL KDA prefill package")
+
+    contract = _stub_contract(prefix_granularity=1024, usable_pages=8)
+    pools = [
+        _StubContractPool(
+            contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
+        )
+        for _ in range(2)
+    ]
+    for layer_id in range(3):
+        for component in ("conv_state", "recurrent_state"):
+            before = pools[0].get_component(layer_id, component)
+            before.normal_(0, 0.1)
+            pools[1].get_component(layer_id, component).copy_(before)
+    harnesses = [
+        _KDAHarness(pool, contract, layer_ids=[0, 1, 2], device="cuda", seed=42)
+        for pool in pools
+    ]
+    tables = {
+        gid: [[2 * row + 1, 2 * row + 2]] for row, gid in enumerate(_STATE_GROUPS)
+    }
+    for harness in harnesses:
+        harness.backend.kda_backend = "cutedsl_kda"
+        harness.extend_metadata(
+            tables, seq_lens=[prefix + 868], extend_prefix_lens=[prefix]
+        )
+
+    def pytorch_staging(conv, state, sources, destinations):
+        history = sources > 0
+        safe = torch.where(history, sources, destinations).long()
+        conv[destinations.long()] = conv[safe]
+        recurrent = state[safe]
+        recurrent.masked_fill_(~history[:, None, None, None], 0)
+        return recurrent, history
+
+    before, after = harnesses
+    for layer_id in range(3):
+        stream = before.token_stream(868)
+        with monkeypatch.context() as patch:
+            patch.setattr(mamba, "_prepare_cache_prefill_state_inputs", pytorch_staging)
+            expected = before.extend(
+                layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+            )
+        actual = after.extend(
+            layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+        )
+        assert torch.equal(actual, expected)
+        for component in ("conv_state", "recurrent_state"):
+            assert torch.equal(
+                pools[0].get_component(layer_id, component),
+                pools[1].get_component(layer_id, component),
+            )
 
 
 if __name__ == "__main__":

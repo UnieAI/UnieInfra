@@ -21,17 +21,65 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include "cache/core/cache_types.h"
 #include "core/token_container.h"
+#include "fsm/forward_states.h"
+#include "resource/allocator/req_pool_allocator.h"
+#include "scheduler/request_spec.h"
+
+// States that exist only under PD disaggregation: a fused engine never
+// enters any of them. The universal lifecycle lives in forward_states.h;
+// these extend it with the P and D roles' parking states.
 
 namespace tokenspeed {
 namespace fsm {
 struct Bootstrapping {
-    Bootstrapping(TokenContainer* _token_container, std::int32_t _page_size)
-        : token_container{_token_container}, page_size{_page_size} {}
+    Bootstrapping(TokenContainer* _token_container, std::int32_t _prefix_granularity)
+        : token_container{_token_container}, prefix_granularity{_prefix_granularity} {}
 
     TokenContainer* token_container{};
-    std::int32_t page_size{};
+    std::int32_t prefix_granularity{};
+};
+
+// The peer node is prefilling this prompt: this engine admitted and holds
+// the destination pages, and nothing here is schedulable work -- the state
+// advances only when RemotePrefillDoneEvent lands with the bootstrap token.
+// A state of its own, not Prefilling with a source flag: the two share the
+// data layout (hence the inheritance) but no lifecycle.
+struct RemotePrefilling : public Prefilling {
+    using Prefilling::Prefilling;
+};
+
+// P role: every chunk is scheduled, but the FINAL chunk's result has not
+// landed yet -- and the remote decode that hands this prompt to the peer
+// needs the bootstrap token that arrives with it. Nothing is schedulable
+// here; the only event this state accepts is that result, which turns it
+// into PrefillDone.
+//
+// A sibling of PrefillDone, not a subclass: `Is<PrefillDone>()` must mean
+// "schedulable" with no exceptions, and inheritance would make the answer
+// depend on how the caller dispatches (holds_alternative vs derived_from vs
+// an overload set).
+struct PrefillAwaitingResult {
+    PrefillAwaitingResult(ForwardResources resources, TokenContainer::Window window,
+                          std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
+          window{window},
+          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
+
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
+    TokenContainer::Window window{};
+
+private:
+    std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
 }  // namespace fsm

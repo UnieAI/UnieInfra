@@ -61,6 +61,8 @@ class DisaggBootstrapServerBase:
         self.world_size = None
         self.dp_size = None
         self.tp_size_per_dp_rank = None
+        # Prefill chunk-pipeline stage count (1 when the source has no PP).
+        self.pp_size = 1
         self.prefill_port_table: dict[int, dict[int, dict[str, str | int]]] = {}
 
         # Initialize every field shared with the server thread before starting
@@ -152,6 +154,11 @@ class DisaggBootstrapServerBase:
         if self.dp_size is None:
             self.dp_size = dp_size
 
+        self.pp_size = int(data.get("pp_size", self.pp_size or 1))
+
+        # With PP the per-dp world spans pp stages; the port table keys by the
+        # dense stage-major rank (pp_rank * tp + tp_rank == global rank at
+        # dp_size == 1, which PP requires).
         tp_size_per_dp_rank = world_size // dp_size
         if self.tp_size_per_dp_rank is None:
             self.tp_size_per_dp_rank = tp_size_per_dp_rank
@@ -170,10 +177,8 @@ class DisaggBootstrapServerBase:
                 "rank_port": rank_port,
             }
             logger.debug(
-                "Register prefill bootstrap: %s with rank_ip: %s and rank_port: %s",
-                engine_rank,
-                rank_ip,
-                rank_port,
+                f"Register prefill bootstrap: {engine_rank!s} with rank_ip: {rank_ip!s}"
+                f" and rank_port: {rank_port!s}",
             )
 
         return web.Response(text="OK", status=200)
@@ -189,6 +194,7 @@ class DisaggBootstrapServerBase:
             prefill_parallel_info = {
                 "prefill_tp_size": self.world_size,
                 "prefill_dp_size": self.dp_size,
+                "prefill_pp_size": self.pp_size,
             }
             prefill_parallel_info.update(self._extra_parallel_info())
             return web.json_response(prefill_parallel_info, status=200)
@@ -256,7 +262,7 @@ class DisaggBootstrapServerBase:
                 logger.exception("Bootstrap server failed after startup")
             else:
                 self._startup_error = exc
-                logger.error("Bootstrap server startup failed: %s", str(exc))
+                logger.error(f"Bootstrap server startup failed: {str(exc)!s}")
         finally:
             # Wake a constructor waiting for startup even when loop creation,
             # runner setup, or TCP bind failed.

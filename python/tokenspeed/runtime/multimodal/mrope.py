@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.rotary_embedding import MRotaryEmbedding
 # (vision_config.spatial_merge_size, image/video/vision_start token ids, etc.).
 _MROPE_ARCHITECTURES = {
     "Qwen3_5ForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
 }
@@ -247,7 +248,7 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
         return _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items)
 
     model_type = getattr(hf_config, "model_type", None)
-    if model_type in ("qwen3_5", "qwen3_5_moe"):
+    if model_type in ("qwen3_5", "qwen3_5_moe", "qwen4_exp"):
         fast = _compute_qwen35_mrope_positions_from_offsets(
             hf_config,
             input_ids,
@@ -271,7 +272,11 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     # The vision encoder still consumes the original grid [T, H, W], but the
     # text prompt contains T separate <|video_pad|> runs. Split only the RoPE
     # grid to match HuggingFace's Qwen3.5 get_rope_index behavior.
-    if video_grid_thw is not None and model_type in ("qwen3_5", "qwen3_5_moe"):
+    if video_grid_thw is not None and model_type in (
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen4_exp",
+    ):
         video_grid_thw = torch.repeat_interleave(
             video_grid_thw, video_grid_thw[:, 0].to(torch.long), dim=0
         )
@@ -474,39 +479,3 @@ def _cat_grids_or_single(grids):
     if len(grids) == 1:
         return grids[0]
     return torch.cat(grids, dim=0)
-
-
-def extend_mrope_positions_for_retracted_request(
-    mrope_positions: torch.Tensor, output_ids_len: int
-) -> torch.Tensor:
-    """Extend ``mrope_positions`` to cover already-generated output tokens.
-
-    When a request carrying M-RoPE positions is retracted, the positions must be
-    extended over the output_ids generated so far. Output tokens are pure text,
-    so all three axes share the same incremental sequence.
-
-    Args:
-        mrope_positions: original positions, shape ``(3, origin_input_ids_len)``.
-        output_ids_len: number of output tokens to generate positions for.
-
-    Returns:
-        Extended positions, shape ``(3, origin_input_ids_len + output_ids_len)``.
-    """
-    if output_ids_len <= 0:
-        return mrope_positions
-
-    # Continue the incremental sequence from the last input position.
-    last_position = mrope_positions[:, -1]  # (3,)
-    start_pos = last_position[0] + 1
-    output_positions = (
-        torch.arange(
-            start_pos,
-            start_pos + output_ids_len,
-            dtype=torch.int64,
-            device=mrope_positions.device,
-        )
-        .unsqueeze(0)
-        .expand(3, -1)
-    )  # (3, output_ids_len)
-
-    return torch.cat([mrope_positions, output_positions], dim=1)

@@ -20,7 +20,7 @@
 
 """Budget-bucketed CUDA graph capture/replay for multimodal encoders.
 
-The :class:`EncoderCudaGraphWrapper` is the generic manager: it owns budget
+The :class:`EncoderForwardStepRunner` is the generic manager: it owns budget
 selection, graph capture, replay buffer updates, greedy packing, and eager
 fallback. Model/modality-specific input layout is supplied by an adapter object.
 """
@@ -34,7 +34,9 @@ from functools import cached_property
 from typing import Any, Protocol
 
 import torch
+from tokenspeed_kernel.workspace import capture_session
 
+from tokenspeed.runtime.multimodal.encoder_batching import pack_encoder_batches
 from tokenspeed.runtime.utils import logger
 
 
@@ -53,7 +55,7 @@ class BudgetGraphMetadata:
 
 
 class EncoderCudaGraphBatch(Protocol):
-    """Minimal batch contract consumed by :class:`EncoderCudaGraphWrapper`."""
+    """Minimal batch contract consumed by :class:`EncoderForwardStepRunner`."""
 
     @property
     def input_tensors(self) -> dict[str, torch.Tensor]: ...
@@ -70,7 +72,7 @@ class EncoderCudaGraphBatch(Protocol):
 
 
 class EncoderCudaGraphAdapter(Protocol):
-    """Model/modality-specific contract used by :class:`EncoderCudaGraphWrapper`."""
+    """Model/modality-specific contract used by :class:`EncoderForwardStepRunner`."""
 
     @property
     def modality_name(self) -> str: ...
@@ -285,7 +287,7 @@ class VisionEncoderCudaGraphAdapter:
         return self.post_encode(encoder_outs, batch.grid)
 
 
-class EncoderCudaGraphWrapper:
+class EncoderForwardStepRunner:
     """Generic budget-based CUDA graph manager for encoder callables.
 
     The wrapper does not know about image/video/audio internals. It only expects
@@ -338,13 +340,11 @@ class EncoderCudaGraphWrapper:
             )
         )
         logger.info(
-            "EncoderCudaGraphWrapper initialized: modality=%s, budgets=%s, "
-            "max_batch_size=%d, max_metadata_sequences_per_batch=%s, encoder_tp=%d",
-            self.modality_name,
-            self.encoder_output_token_budgets,
-            self.max_batch_size,
-            metadata_sequence_budget_log_value,
-            self.capture_tp_size,
+            f"EncoderForwardStepRunner initialized: modality={self.modality_name!s}, "
+            f"budgets={self.encoder_output_token_budgets!s}, "
+            f"max_batch_size={self.max_batch_size:d}, max_metadata_sequences_per_batch="
+            f"{metadata_sequence_budget_log_value!s}, encoder_tp="
+            f"{self.capture_tp_size:d}",
         )
 
     def __call__(self, items: list[Any]) -> torch.Tensor:
@@ -381,9 +381,8 @@ class EncoderCudaGraphWrapper:
         for encoder_output_token_budget in self.encoder_output_token_budgets:
             self._capture_one(encoder_output_token_budget)
         logger.info(
-            "Encoder CUDA graph capture complete: modality=%s, %d budget graphs.",
-            self.modality_name,
-            len(self.budget_graphs),
+            f"Encoder CUDA graph capture complete: modality={self.modality_name!s}, "
+            f"{len(self.budget_graphs):d} budget graphs.",
         )
 
     def _capture_one(self, encoder_output_token_budget: int) -> None:
@@ -420,7 +419,9 @@ class EncoderCudaGraphWrapper:
         # No pool= argument: each budget graph gets its own private pool. A
         # shared pool collided IPC registrations across budgets.
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), ar_ctx, torch.cuda.graph(graph):
+        with capture_session(graph), torch.inference_mode(), ar_ctx, torch.cuda.graph(
+            graph
+        ):
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer.copy_(output)
 
@@ -435,13 +436,11 @@ class EncoderCudaGraphWrapper:
             output_buffer=output_buffer,
         )
         logger.debug(
-            "Captured encoder cudagraph: modality=%s, budget=%d, "
-            "max_batch_size=%d, metadata_sequence_budget=%d, buffers=%s",
-            self.modality_name,
-            encoder_output_token_budget,
-            self.max_batch_size,
-            metadata_sequence_budget,
-            {k: (v.dtype, tuple(v.shape)) for k, v in metadata_buffers.items()},
+            f"Captured encoder cudagraph: modality={self.modality_name!s}, budget="
+            f"{encoder_output_token_budget:d}, "
+            f"max_batch_size={self.max_batch_size:d}, metadata_sequence_budget="
+            f"{metadata_sequence_budget:d}, buffers="
+            f"{ {k: (v.dtype, tuple(v.shape)) for k, v in metadata_buffers.items()}!s}",
         )
 
     def _smallest_fitting_budget(
@@ -568,51 +567,23 @@ class EncoderCudaGraphWrapper:
         per_item_encoder_output_tokens = batch.encoder_output_tokens
         per_item_metadata_sequences = batch.metadata_sequences
 
-        sorted_indices = sorted(
-            range(num_items), key=lambda i: per_item_encoder_output_tokens[i]
+        groups = pack_encoder_batches(
+            per_item_encoder_output_tokens,
+            per_item_metadata_sequences,
+            max_tokens=max_budget,
+            max_items=self.max_batch_size,
+            max_metadata_sequences=max_metadata_sequence_budget,
         )
-
-        batches: list[tuple[list[int], int | None]] = []
-        current_batch: list[int] = []
-        current_batch_encoder_output_tokens = 0
-        current_batch_metadata_sequences = 0
-        for orig_idx in sorted_indices:
-            item_encoder_output_tokens = per_item_encoder_output_tokens[orig_idx]
-            item_metadata_sequences = per_item_metadata_sequences[orig_idx]
-            if (
-                current_batch_encoder_output_tokens + item_encoder_output_tokens
-                <= max_budget
-                and len(current_batch) < self.max_batch_size
-                and current_batch_metadata_sequences + item_metadata_sequences
-                <= max_metadata_sequence_budget
-            ):
-                current_batch.append(orig_idx)
-                current_batch_encoder_output_tokens += item_encoder_output_tokens
-                current_batch_metadata_sequences += item_metadata_sequences
-            else:
-                if current_batch:
-                    batches.append(
-                        (
-                            current_batch,
-                            self._smallest_fitting_budget(
-                                current_batch_encoder_output_tokens,
-                                current_batch_metadata_sequences,
-                            ),
-                        )
-                    )
-                current_batch = [orig_idx]
-                current_batch_encoder_output_tokens = item_encoder_output_tokens
-                current_batch_metadata_sequences = item_metadata_sequences
-        if current_batch:
-            batches.append(
-                (
-                    current_batch,
-                    self._smallest_fitting_budget(
-                        current_batch_encoder_output_tokens,
-                        current_batch_metadata_sequences,
-                    ),
-                )
+        batches = [
+            (
+                indices,
+                self._smallest_fitting_budget(
+                    sum(per_item_encoder_output_tokens[i] for i in indices),
+                    sum(per_item_metadata_sequences[i] for i in indices),
+                ),
             )
+            for indices in groups
+        ]
 
         # Packing reorders; restore original order before return.
         outputs_by_orig_idx: dict[int, torch.Tensor] = {}

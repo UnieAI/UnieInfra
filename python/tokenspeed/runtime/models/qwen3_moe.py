@@ -77,6 +77,7 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
             )
         elif isinstance(self.mlp, Qwen3MLP):
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -91,8 +92,10 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
             layer_id=layer_id,
             is_moe=is_moe,
             prev_is_moe=_is_moe_layer(layer_id - 1, config),
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -100,7 +103,6 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -113,7 +115,6 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 cos_sin=cos_sin,
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
@@ -170,7 +171,6 @@ class Qwen3MoeModel(Qwen3Model):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if input_embeds is None:
@@ -184,7 +184,6 @@ class Qwen3MoeModel(Qwen3Model):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 cos_sin=None,
             )

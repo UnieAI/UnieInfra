@@ -40,21 +40,16 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
-    BatchTokenIDOutSlim,
     BlockReqInput,
     BlockReqType,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
-    ExpertDistributionReq,
-    ExpertDistributionReqOutput,
-    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -67,6 +62,7 @@ from tokenspeed.runtime.engine.io_struct import (
     IsSchedulerPausedReqOutput,
     IsSleepingReqInput,
     IsSleepingReqOutput,
+    LoadSnapshot,
     MsgpackDecoder,
     MsgpackEncoder,
     OpenSessionReqInput,
@@ -94,9 +90,10 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightsFromMooncakeReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    WatchLoadUpdateReq,
     ipc_message_union,
 )
 from tokenspeed.runtime.sampling.sampling_params import (
@@ -118,6 +115,16 @@ def _roundtrip(obj):
     enc = MsgpackEncoder()
     dec = MsgpackDecoder(ipc_message_union())
     return dec.decode(enc.encode(obj))
+
+
+def test_load_snapshot_round_trips_as_one_tagged_frame():
+    """The scheduler snapshot stays a standalone, single-frame IPC message."""
+    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 6, 1_000)
+
+    frames = MsgpackEncoder().encode(snapshot)
+
+    assert len(frames) == 1
+    assert _roundtrip(snapshot) == snapshot
 
 
 def _batch_token_id_out(**overrides) -> BatchTokenIDOut:
@@ -180,7 +187,12 @@ _MESSAGES = [
     UpdateWeightFromDiskReqInput(model_path="/m"),
     UpdateWeightFromDiskReqOutput(success=True, message="m", num_paused_requests=2),
     UpdateWeightsFromDistributedReqInput(
-        names=["w"], dtype_names=["bfloat16"], shapes=[[2, 2]]
+        names=["w"],
+        dtype_names=["bfloat16"],
+        shapes=[[2, 2]],
+        group_name="weight_update_group",
+        flush_cache=True,
+        weight_version=None,
     ),
     UpdateWeightsFromDistributedReqOutput(success=True, message=""),
     UpdateWeightsFromTensorReqInput(
@@ -193,6 +205,8 @@ _MESSAGES = [
     InitWeightsUpdateGroupReqOutput(success=True, message=""),
     DestroyWeightsUpdateGroupReqInput(),
     DestroyWeightsUpdateGroupReqOutput(success=True, message=""),
+    UpdateWeightsFromMooncakeReqInput(version=7, flush_cache=True, weight_version="7"),
+    UpdateWeightsFromMooncakeReqOutput(success=True, message=""),
     GetWeightsByNameReqInput(name="w"),
     GetWeightsByNameReqOutput(parameter=[1.0, 2.0]),
     ReleaseMemoryOccupationReqInput(tags=["weights"]),
@@ -205,8 +219,6 @@ _MESSAGES = [
     GetInternalStateReqOutput(internal_state={"k": 1}),
     SetInternalStateReq(server_args={"x": 2}),
     SetInternalStateReqOutput(updated=False, server_args={}),
-    ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD),
-    ExpertDistributionReqOutput(),
     ProfileReq(type=ProfileReqType.START_PROFILE, activities=["CPU"]),
     ProfileReqOutput(success=True, message="ok"),
     ConfigureLoggingReq(log_requests=True),
@@ -216,9 +228,7 @@ _MESSAGES = [
     HealthCheckOutput(),
     RpcReqInput(method="save", parameters={"p": 1}),
     RpcReqOutput(success=True, message=""),
-    GetLoadReqInput(),
     GetLoadReqOutput(dp_rank=1, num_reqs=2, num_waiting_reqs=1, num_pages=3),
-    WatchLoadUpdateReq(loads=[GetLoadReqOutput(dp_rank=0, num_reqs=5)]),
     BlockReqInput(type=BlockReqType.UNBLOCK),
     _batch_token_id_out(),
     BatchStrOut(
@@ -345,7 +355,7 @@ def test_small_tensor_is_inlined_as_raw_view_ext():
 
     # The tensor slot is (dtype, shape, Ext(CUSTOM_TYPE_RAW_VIEW, bytes)).
     raw = msgspec.msgpack.decode(frames[0], ext_hook=lambda code, data: (code, data))
-    mm = raw[-2]  # multimodal_inputs (validation_error is last)
+    mm = raw[-3]  # multimodal_inputs (then validation_error, data_parallel_rank)
     feature_slot = mm[0][0][4]
     dtype, shape, data = feature_slot
     assert dtype == "float32"
@@ -361,7 +371,7 @@ def test_large_tensor_rides_out_of_band_aux_frame():
     assert len(frames) == 2  # primary + one aux frame for the 2 KiB tensor
 
     raw = msgspec.msgpack.decode(frames[0], ext_hook=lambda code, data: (code, data))
-    dtype, shape, data = raw[-2][0][0][4]
+    dtype, shape, data = raw[-3][0][0][4]
     assert dtype == "bfloat16"
     assert shape == [4, 256]
     assert data == 1  # one-based aux frame index (frame 0 = primary buffer)
@@ -397,6 +407,7 @@ def test_mm_struct_field_order_is_pinned():
         "mrope_positions",
         "mrope_position_delta",
         "mrope_position_delta_scalar",
+        # Reserved wire slot (retired cache field); see MultimodalInputs.
         "mrope_position_delta_repeated_cache",
     ]
 

@@ -21,52 +21,112 @@
 import concurrent.futures
 import os
 import socket
+import struct
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import replace
+from itertools import chain, islice
 
 import numpy as np
-import numpy.typing as npt
 import requests
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
-    CachePDPageManifest,
-    cache_manifest_page_ids,
-    validate_cache_manifest_pair,
-    validate_cache_peer_layout,
+    CachePDBlockManifest,
+    CachePDLayerwiseBlockSelection,
+    CacheProducerSchedule,
+    CacheTransferContract,
+    validate_cache_manifest,
 )
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
 from tokenspeed.runtime.pd.mooncake.entities import (
     KVArgs,
     KVArgsRegisterInfo,
     KVManagerArgs,
-    TransferIndexResolution,
     TransferInfo,
     TransferKVChunk,
 )
+from tokenspeed.runtime.pd.mooncake.pack import (
+    PackedCopy,
+    PageFieldCopies,
+    PrefillPackScratch,
+    coalesce_transfer_blocks,
+    flatten_transfer_blocks,
+)
 from tokenspeed.runtime.pd.transfer_plan import (
-    BufferKind,
-    TransferFragment,
+    CachePageOwnerFilter,
+    CacheTransferFragment,
+    CacheTransferPlanner,
+    local_transfer_pages,
+    validate_rank_owner_filters,
 )
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
     FastQueue,
     StepCounter,
-    group_concurrent_contiguous,
 )
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import (
-    get_free_port,
     get_ip,
     get_local_ip_by_remote,
+    join_host_port,
 )
 
 logger = get_colorful_logger(__name__)
+
+# Application-side descriptor batching keeps heterogeneous-TP row fragments
+# bounded in Python memory. This is not a Mooncake backend limit.
+_TRANSFER_DESCRIPTOR_BATCH_SIZE = 4096
+
+
+def _strided_page_copies(
+    fragment: CacheTransferFragment,
+    *,
+    src_base: int,
+    dst_base: int,
+    src_page_stride: int,
+    dst_page_stride: int,
+    src_pages: np.ndarray,
+    dst_pages: np.ndarray,
+) -> Iterator[PackedCopy | tuple[int, int, int]]:
+    """Per-page copies of a fragment with several strided rows per page.
+
+    A contiguous destination packs the rows into one ``PackedCopy`` (or one
+    plain span when the source is contiguous too); otherwise every row is its
+    own descriptor. ``src_base``/``dst_base`` already include the fragment's
+    byte offsets within the field.
+    """
+    width = fragment.bytes_per_row
+    rows = fragment.rows_per_page
+    src_pitch = fragment.src_row_stride_bytes
+    dst_pitch = fragment.dst_row_stride_bytes
+    for src_page, dst_page in zip(src_pages.tolist(), dst_pages.tolist(), strict=True):
+        src_page_addr = src_base + src_page * src_page_stride
+        dst_page_addr = dst_base + dst_page * dst_page_stride
+        if dst_pitch == width:
+            if src_pitch == width:
+                yield (src_page_addr, dst_page_addr, width * rows)
+                continue
+            yield PackedCopy(
+                src=src_page_addr,
+                dst=dst_page_addr,
+                width=width,
+                src_pitch=src_pitch,
+                rows=rows,
+            )
+            continue
+        for row in range(rows):
+            yield (
+                src_page_addr + row * src_pitch,
+                dst_page_addr + row * dst_pitch,
+                width,
+            )
 
 
 class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
@@ -79,48 +139,25 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         self.transfer_infos: dict[int, dict[str, TransferInfo]] = {}
         self.decode_kv_args_table: dict[str, KVArgsRegisterInfo] = {}
-        self.start_prefill_thread()
-        self._register_to_bootstrap()
+        self.rejected_decode_sessions: dict[str, tuple[str, int]] = {}
         self.session_failures = defaultdict(int)
         self.failed_sessions: dict[str, float] = {}
         self.failed_session_ttl = max(
             envs.TOKENSPEED_DISAGGREGATION_FAILED_SESSION_TTL.get(), 0
         )
         self.session_lock = threading.Lock()
-        self.kv_layer_ids = list(
-            getattr(self.kv_args, "kv_layer_ids", None)
-            or range(len(self.kv_args.offsets))
-        )
-        self.state_layer_ids = list(getattr(self.kv_args, "state_layer_ids", []) or [])
-        layer_ids = self.kv_layer_ids + self.state_layer_ids
-        self.layer_num = (
-            (max(layer_ids) + 1) if layer_ids else len(self.kv_args.offsets)
-        )
-        self._kv_layer_to_index = {
-            layer_id: i
-            for i, layer_id in enumerate(self.kv_layer_ids[: len(self.kv_args.offsets)])
-        }
-        # Under the cache contract ``kv_args.offsets`` describes physical raw
-        # slabs (one per arena), not model layers, so the counts above collapse
-        # to the slab count. Recover the true attention-layer count from the
-        # ``layer.{N}.*`` field ids the contract carries so layerwise step-wait
-        # math gates on the right per-layer cache step.
-        if self.kv_args.cache_layout is not None:
-            layer_ids = {
-                layer_id
-                for group in self.kv_args.cache_layout.groups
-                for segment in group.transfer_segments
-                if (layer_id := self._segment_layer_id(segment.field_id)) is not None
-            }
-            if layer_ids:
-                self.layer_num = max(layer_ids) + 1
+        self.producer_schedule: CacheProducerSchedule | None = None
+        self.producer_step_count = 0
         self.layerwise_interval = 1
         self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
         self.step_counter = None
-        # room -> (bootstrap_token, spec_candidate_ids). Published after the prefill
-        # forward; the transfer thread reads it on the wait_for_bootstrap_token path.
+        # Bootstrap metadata is published after the final forward commits.
         self.prefill_metadata: dict[int, tuple[int, list[int] | None]] = {}
-        self.expired_prefill_metadata_rooms: set[int] = set()
+        self.cached_tokens: dict[int, int] = {}
+        # The bootstrap token's logprob, recorded by the control plane at the
+        # final chunk's commit (like cached_tokens) and shipped in the status
+        # message so the decode node's output logprobs start with it.
+        self.bootstrap_logprobs: dict[int, float] = {}
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
         cpu_count = os.cpu_count()
@@ -138,10 +175,19 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
         self.start_transfer_thread(transfer_thread_pool_size, transfer_queue_size)
         self.bootstrap_time_out = envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        # Publish this manager only after every field used by its bootstrap and
+        # transfer threads has been initialized.
+        self.start_prefill_thread()
+        self._register_to_bootstrap()
 
     def register_layerwise_step_counter(
         self, step_counter: StepCounter, interval: int
     ) -> None:
+        producer_schedule = self.kv_args.cache_producer_schedule
+        if producer_schedule is None:
+            raise ValueError("layerwise cache transfer requires a producer schedule")
+        self.producer_schedule = producer_schedule
+        self.producer_step_count = producer_schedule.step_count
         self.step_counter = step_counter
         self.layerwise_interval = max(int(interval), 1)
 
@@ -150,7 +196,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return 0
         cache_step, _ = self.step_counter.current_step()
         self.step_counter.advance_step(
-            delta_cache_step=self.layer_num,
+            delta_cache_step=self.producer_step_count,
             delta_aux_step=0,
         )
         return cache_step
@@ -162,24 +208,44 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         spec_candidate_ids: list[int] | None = None,
     ) -> None:
         with self.bootstrap_token_cond:
-            if room in self.expired_prefill_metadata_rooms:
-                self.expired_prefill_metadata_rooms.discard(room)
+            if self.request_status.get(room) in (None, TransferPoll.Failed):
                 logger.warning(
-                    "Dropping late prefill metadata for expired bootstrap_room=%s",
-                    room,
+                    "Dropping late prefill metadata for expired bootstrap_room="
+                    f"{room!s}",
                 )
                 return
-            self.prefill_metadata[room] = (
-                token,
-                spec_candidate_ids,
-            )
+            self.prefill_metadata[room] = (token, spec_candidate_ids)
             self.bootstrap_token_cond.notify_all()
 
-    def discard_expired_metadata_room(self, room: int) -> None:
-        """Best-effort cleanup of per-room metadata and expiry markers."""
+    def record_cached_tokens(self, room: int, cached_tokens: int) -> None:
+        """Publish committed prefix-hit usage before the final transfer is submitted."""
         with self.bootstrap_token_cond:
-            self.expired_prefill_metadata_rooms.discard(room)
+            if self.request_status.get(room) not in (None, TransferPoll.Failed):
+                self.cached_tokens[room] = cached_tokens
+
+    def record_bootstrap_logprob(self, room: int, logprob: float) -> None:
+        """Publish the bootstrap token's logprob before the final transfer is submitted."""
+        with self.bootstrap_token_cond:
+            if self.request_status.get(room) not in (None, TransferPoll.Failed):
+                self.bootstrap_logprobs[room] = logprob
+
+    def begin_room(self, room: int) -> None:
+        """Reset request metadata before publishing a room."""
+        with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
+            self.cached_tokens.pop(room, None)
+            self.bootstrap_logprobs.pop(room, None)
+        self.update_status(room, TransferPoll.Bootstrapping)
+
+    def discard_room(self, room: int) -> None:
+        """Drop all Prefill-manager state owned by one terminal request."""
+        self.transfer_infos.pop(room, None)
+        self.request_status.pop(room, None)
+        with self.bootstrap_token_cond:
+            self.prefill_metadata.pop(room, None)
+            self.cached_tokens.pop(room, None)
+            self.bootstrap_logprobs.pop(room, None)
+            self.bootstrap_token_cond.notify_all()
 
     def _wait_prefill_metadata(
         self,
@@ -194,23 +260,17 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         next_log_time = start_time + wait_log_interval
         with self.bootstrap_token_cond:
             while room not in self.prefill_metadata:
-                if self.request_status.get(room) == TransferPoll.Failed:
-                    self.expired_prefill_metadata_rooms.add(room)
+                if self.request_status.get(room) in (None, TransferPoll.Failed):
                     logger.warning(
-                        "Prefill metadata unavailable for failed bootstrap_room=%s; using fallback=%s",
-                        room,
-                        fallback_token,
+                        "Prefill metadata unavailable for failed "
+                        f"bootstrap_room={room!s}; using fallback={fallback_token!s}",
                     )
-                    return (
-                        fallback_token,
-                        fallback_candidate_ids,
-                    )
+                    return fallback_token, fallback_candidate_ids
                 now = time.monotonic()
                 if now >= next_log_time:
                     logger.debug(
-                        "Still waiting for prefill metadata for bootstrap_room=%s after %.2fs",
-                        room,
-                        now - start_time,
+                        "Still waiting for prefill metadata for "
+                        f"bootstrap_room={room!s} after {now - start_time:.2f}s",
                     )
                     next_log_time = now + wait_log_interval
                 self.bootstrap_token_cond.wait(timeout=0.01)
@@ -224,19 +284,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return False
         elapsed = time.monotonic() - failed_at
         logger.info(
-            "Session %s failed for %.2fs (TTL=%ds).",
-            mooncake_session_id,
-            elapsed,
-            self.failed_session_ttl,
+            f"Session {mooncake_session_id!s} failed for {elapsed:.2f}s (TTL="
+            f"{self.failed_session_ttl:d}s).",
         )
         if elapsed < self.failed_session_ttl:
             return True
         del self.failed_sessions[mooncake_session_id]
         logger.info(
-            "Session %s failed TTL expired (%.2fs >= %ds), reset.",
-            mooncake_session_id,
-            elapsed,
-            self.failed_session_ttl,
+            f"Session {mooncake_session_id!s} failed TTL expired ({elapsed:.2f}s >= "
+            f"{self.failed_session_ttl:d}s), reset.",
         )
         return False
 
@@ -247,685 +303,525 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return
         self.failed_sessions[mooncake_session_id] = time.monotonic()
         logger.warning(
-            "Session %s marked failed (reason=%s, ttl=%ds).",
-            mooncake_session_id,
-            reason,
-            self.failed_session_ttl,
+            f"Session {mooncake_session_id!s} marked failed (reason={reason!s}, ttl="
+            f"{self.failed_session_ttl:d}s).",
         )
 
     def _clear_failed_session(self, mooncake_session_id: str) -> None:
         if mooncake_session_id in self.failed_sessions:
             del self.failed_sessions[mooncake_session_id]
             logger.info(
-                "Session %s failed state cleared due to KVArgs registration.",
-                mooncake_session_id,
+                f"Session {mooncake_session_id!s} failed state cleared due to KVArgs "
+                "registration.",
             )
         if mooncake_session_id in self.session_failures:
             del self.session_failures[mooncake_session_id]
 
-    def resolve_transfer_indices(
-        self,
-        kv_chunk: TransferKVChunk,
-        req: TransferInfo,
-    ) -> TransferIndexResolution:
-        self._validate_cache_transfer(kv_chunk, req)
-        src_indices = kv_chunk.prefill_kv_indices
-        dst_indices = req.dst_kv_indices[kv_chunk.index_slice]
-
-        valid_len = min(len(src_indices), len(dst_indices))
-        # Fast path: empty transfer chunk. Avoid MLA assertions/index ops on empty payload.
-        if valid_len == 0:
-            empty = np.array([], dtype=np.int64)
-            return TransferIndexResolution(src_indices=empty, dst_indices=empty)
-
-        if valid_len < len(src_indices) or valid_len < len(dst_indices):
-            logger.warning(
-                "Mismatched transfer indices, truncating to %s (src=%s, dst=%s)",
-                valid_len,
-                len(src_indices),
-                len(dst_indices),
+    def get_decode_registration(self, req: TransferInfo) -> KVArgsRegisterInfo:
+        registration = self.decode_kv_args_table.get(req.mooncake_session_id)
+        if registration is None:
+            raise ValueError(
+                "CachePD request references an unregistered Decode session"
             )
-        src_indices = src_indices[:valid_len]
-        dst_indices = dst_indices[:valid_len]
+        if registration.transfer_owner_filters is None:
+            raise ValueError(
+                "CachePD request references a Decode session whose route was "
+                "never planned"
+            )
+        return registration
 
-        return TransferIndexResolution(src_indices, dst_indices)
-
-    def _validate_cache_transfer(
+    def _reject_decode_registration(
         self,
-        kv_chunk: TransferKVChunk,
-        req: TransferInfo,
+        *,
+        endpoint: str,
+        dst_port: int,
+        session_id: str,
+        reason: str,
     ) -> None:
-        layout = getattr(self.kv_args, "cache_layout", None)
-        cache_metadata_present = any(
-            value is not None
-            for value in (
-                kv_chunk.page_manifest,
-                req.page_manifest,
-                req.peer_cache_layout,
-            )
+        """Invalidate a rejected session and fail rooms that already reference it."""
+        affected_rooms = tuple(
+            room for room, infos in self.transfer_infos.items() if session_id in infos
         )
-        if layout is None:
-            if cache_metadata_present:
-                raise ValueError(
-                    "legacy Mooncake transfer received Paged cache metadata"
-                )
-            return
+        for room in affected_rooms:
+            self.abort_room(
+                room,
+                f"Decode session {session_id} registration rejected: {reason}",
+            )
+        self.decode_kv_args_table.pop(session_id, None)
+        self.rejected_decode_sessions[session_id] = (endpoint, dst_port)
 
-        if (
-            kv_chunk.page_manifest is None
-            or req.page_manifest is None
-            or req.peer_cache_layout is None
+    def _prepare_decode_registration(
+        self, registration: KVArgsRegisterInfo
+    ) -> KVArgsRegisterInfo:
+        """Validate and cache the route owned by this Prefill rank once."""
+        # Plan against the LOGICAL layout (full model): peer validation and
+        # fragment geometry must match what Decode sees on the wire. The
+        # field filter below keeps only fields this stage's physical arena
+        # actually holds, so local addressing never touches a dropped plane.
+        layout = getattr(self.kv_args, "wire_layout", None) or self.kv_args.cache_layout
+        peer_layout = registration.peer_cache_layout
+        prefill_tp_size = self.topology.tp_size
+        local_tp_rank = self.topology.tp_rank
+        planner = CacheTransferPlanner(
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=registration.decode_tp_size,
+            prefill_layout=layout,
+            decode_layout=peer_layout,
+            # Construction declares residency; transfer never infers model layers.
+            prefill_field_ids=frozenset(
+                self.kv_args.cache_fields_by_stage[self.topology.pp_rank]
+            ),
+        )
+        route = planner.plan_for_decode_rank(registration.decode_tp_rank)
+        expected_decode_ranks = planner.decode_ranks_by_prefill_rank[local_tp_rank]
+        if local_tp_rank in route.target_prefill_ranks:
+            # A KVP-sharded source is never idle: every rank of the chosen
+            # subgroup serves the decode rank with the blocks it owns.
+            fragments = route.fragments_by_prefill_rank[local_tp_rank]
+            owner_filters = route.owner_filters_by_prefill_rank[local_tp_rank]
+            is_dummy = False
+        elif registration.decode_tp_rank == 0 and not expected_decode_ranks:
+            fragments = ()
+            # A rendezvous-only rank sends nothing of any group.
+            owner_filters = dict.fromkeys(planner.sharded_group_ids)
+            is_dummy = True
+            expected_decode_ranks = frozenset({0})
+        else:
+            raise ValueError(
+                "CachePD Decode registration targets the wrong Prefill TP rank"
+            )
+        # The sender applies the route's owner-filter decisions as given, so
+        # they are checked against the local cache groups once, here.
+        validate_rank_owner_filters(
+            group_specs=self.kv_args.cache_layout.group_specs,
+            fragments=fragments,
+            owner_filters=owner_filters,
+        )
+        return replace(
+            registration,
+            transfer_fragments=fragments,
+            transfer_owner_filters=owner_filters,
+            is_dummy=is_dummy,
+            expected_decode_ranks=expected_decode_ranks,
+        )
+
+    def _validate_cache_room_fanout(self, reqs: tuple[TransferInfo, ...]) -> None:
+        """Require one complete, unique Decode-rank set for a Paged source."""
+        registrations = tuple(self.get_decode_registration(req) for req in reqs)
+        decode_tp_sizes = {reg.decode_tp_size for reg in registrations}
+        expected_rank_sets = {reg.expected_decode_ranks for reg in registrations}
+        if len(decode_tp_sizes) != 1 or len(expected_rank_sets) != 1:
+            raise ValueError("Cache-transfer room has inconsistent TP metadata")
+        expected_decode_ranks = next(iter(expected_rank_sets))
+        actual_decode_ranks = tuple(reg.decode_tp_rank for reg in registrations)
+        if len(reqs) != len(expected_decode_ranks) or set(actual_decode_ranks) != set(
+            expected_decode_ranks
         ):
             raise ValueError(
-                "Paged cache transfer is missing layout or manifest metadata"
-            )
-        if req.transfer_fragments:
-            raise ValueError(
-                "Paged cache raw-slab transfer requires an identity TP route"
-            )
-        if not kv_chunk.is_last:
-            raise ValueError(
-                "Paged cache transfer must be submitted as one final chunk"
-            )
-        if kv_chunk.index_slice.start not in (
-            None,
-            0,
-        ) or kv_chunk.index_slice.step not in (
-            None,
-            1,
-        ):
-            raise ValueError(
-                "Paged cache transfer page vector must start at offset zero"
+                "Cache-transfer room destination ranks disagree with the typed route plan"
             )
 
-        validate_cache_peer_layout(layout, req.peer_cache_layout)
-        validate_cache_manifest_pair(
-            kv_chunk.page_manifest,
-            req.page_manifest,
-            layout,
-            dst_num_pages_with_null=req.peer_cache_layout.num_pages_with_null,
-        )
-        expected_src = cache_manifest_page_ids(
-            kv_chunk.page_manifest,
-            layout=layout,
-            peer="source",
-        )
-        expected_dst = cache_manifest_page_ids(
-            req.page_manifest,
-            layout=layout,
-            num_pages_with_null=req.peer_cache_layout.num_pages_with_null,
-            peer="destination",
-        )
-        actual_src = tuple(int(page) for page in kv_chunk.prefill_kv_indices)
-        actual_dst = tuple(int(page) for page in req.dst_kv_indices)
-        if actual_src != expected_src or actual_dst != expected_dst:
-            raise ValueError("Paged cache manifest and Mooncake page vector disagree")
-        if kv_chunk.index_slice.stop != len(expected_src):
-            raise ValueError("Paged cache transfer page slice is incomplete")
+    def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
+        """WRITE descriptors in bounded batches, packing PackedCopy items per batch.
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
-        if not transfer_blocks:
-            return 0
-
-        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-        )
-
-    def send_kvcache(
-        self,
-        mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
-        dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
-        executor: concurrent.futures.ThreadPoolExecutor,
-        transfer_fragments: tuple[TransferFragment, ...] = (),
-        src_page_manifest: CachePDPageManifest | None = None,
-        dst_page_manifest: CachePDPageManifest | None = None,
-        dst_num_pages_with_null: int | None = None,
-        dst_page_zero_offsets: Mapping[tuple[str, str], int] | None = None,
-    ):
-        if (src_page_manifest is None) != (dst_page_manifest is None):
-            raise ValueError(
-                "Paged cache transfer requires both source and destination manifests"
-            )
-        if src_page_manifest is not None:
-            if dst_page_manifest is None:
-                raise ValueError(
-                    "Paged cache transfer requires both source and destination manifests"
+        A ``PageFieldCopies`` item is one page-gathered WRITE, expanded and
+        batched inside Mooncake; per-descriptor items (tuples, PackedCopy)
+        are collected and written through the packer path in between,
+        preserving order.
+        """
+        pending: list[object] = []
+        for item in transfer_blocks:
+            if isinstance(item, PageFieldCopies):
+                if pending:
+                    ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+                    pending = []
+                    if ret != 0:
+                        return ret
+                ret = self.engine.batch_transfer_sync_pages(
+                    mooncake_session_id,
+                    item.src_pages,
+                    item.dst_pages,
+                    item.fields,
+                    max_batch_size=_TRANSFER_DESCRIPTOR_BATCH_SIZE,
                 )
-            if dst_num_pages_with_null is None:
-                raise ValueError("Paged cache transfer requires destination capacity")
-            if transfer_fragments:
-                raise ValueError(
-                    "Paged cache raw-slab transfer cannot use TP transfer fragments"
-                )
-            transfer_blocks = self._cache_transfer_blocks(
-                dst_ptrs=dst_kv_ptrs,
-                src_indices=prefill_kv_indices,
-                dst_indices=dst_kv_indices,
-                src_manifest=src_page_manifest,
-                dst_manifest=dst_page_manifest,
-                dst_num_pages_with_null=dst_num_pages_with_null,
-                dst_page_zero_offsets=dst_page_zero_offsets,
+                if ret != 0:
+                    return ret
+                continue
+            pending.append(item)
+            if len(pending) >= _TRANSFER_DESCRIPTOR_BATCH_SIZE:
+                ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+                pending = []
+                if ret != 0:
+                    return ret
+        if pending:
+            return self._write_sge_batch(mooncake_session_id, pending, packer)
+        return 0
+
+    def _write_sge_batch(self, mooncake_session_id, pending, packer) -> int:
+        if packer is not None:
+            sges = packer.materialize(pending)
+        else:
+            sges = flatten_transfer_blocks(pending)
+        ret = 0
+        block_iter = iter(coalesce_transfer_blocks(sges))
+        while batch := tuple(islice(block_iter, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
+            src_addrs, dst_addrs, lengths = zip(*batch, strict=True)
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id,
+                list(src_addrs),
+                list(dst_addrs),
+                list(lengths),
             )
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
-        if dst_num_pages_with_null is not None:
-            raise ValueError("legacy Mooncake transfer received Paged cache capacity")
-        if dst_page_zero_offsets is not None:
-            raise ValueError("legacy Mooncake transfer received Paged cache offsets")
-
-        # Group by indices
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
-        )
-
-        # ``_layer_transfer_blocks`` indexes ``kv_args.offsets`` by its loop var,
-        # and ``offsets`` is keyed by KV-LAYER INDEX (one entry per attention/KV
-        # layer), not by global layer id. For hybrid models (e.g. Qwen3.5 GDN +
-        # attention) only the attention layers carry KV, so len(offsets) is the
-        # KV-layer count while ``self.layer_num`` is the (larger) global layer
-        # count -- using ``layer_num`` here over-runs ``offsets`` and IndexErrors.
-        # Iterate the full KV-index space instead (the layerwise path already
-        # maps global->KV index via ``_kv_layer_to_index`` before calling this).
-        transfer_blocks = self._layer_transfer_blocks(
-            dst_ptrs=dst_kv_ptrs,
-            src_blocks=prefill_kv_blocks,
-            dst_blocks=dst_kv_blocks,
-            begin_layer_id=0,
-            end_layer_id=len(self.kv_args.offsets),
-            transfer_fragments=transfer_fragments,
-        )
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
-
-    @staticmethod
-    def _segment_layer_id(field_id: str) -> int | None:
-        """Parse the model layer id out of a ``layer.{N}.<component>`` field id.
-
-        Returns ``None`` for fields that are not per-layer (no such fields exist
-        under current recipes, but the guard keeps layerwise filtering total)."""
-        parts = field_id.split(".", 2)
-        if len(parts) >= 2 and parts[0] == "layer" and parts[1].isdigit():
-            return int(parts[1])
-        return None
+            if ret != 0:
+                break
+        return ret
 
     def _cache_transfer_blocks(
         self,
         *,
-        dst_ptrs: list[int],
-        src_indices: npt.NDArray[np.int64],
-        dst_indices: npt.NDArray[np.int64],
-        src_manifest: CachePDPageManifest,
-        dst_manifest: CachePDPageManifest,
-        dst_num_pages_with_null: int,
-        dst_page_zero_offsets: Mapping[tuple[str, str], int] | None = None,
-        layer_range: tuple[int, int] | None = None,
-    ) -> list[tuple[int, int, int]]:
-        """Build (src, dst, nbytes) Mooncake blocks for one raw-slab transfer.
+        dst_ptr: int,
+        dst_tp_rank: int,
+        src_block_manifest: CachePDBlockManifest | None,
+        dst_block_manifest: CachePDBlockManifest,
+        transfer_fragments: tuple[CacheTransferFragment, ...] = (),
+        owner_filters: Mapping[str, CachePageOwnerFilter | None],
+        dst_cache_layout: CacheTransferContract,
+        block_selection: CachePDLayerwiseBlockSelection | None = None,
+        field_ids: frozenset[str] | None = None,
+    ) -> Iterator[PageFieldCopies | PackedCopy | tuple[int, int, int]]:
+        """Yield the copies that move this rank's part of one request's blocks.
 
-        ``layer_range`` restricts the emitted segments to fields whose parsed
-        ``layer.{N}`` id falls in ``[begin, end)`` — the layerwise path streams
-        one window per call as prefill finishes each layer group. ``None``
-        (the default) emits every segment for a whole-request transfer.
+        Each cache group yields one pages x fields grid (``PageFieldCopies``)
+        holding every copy with one contiguous span per page -- a whole field
+        on the empty-fragment route, or a fragment whose rows collapsed into
+        one -- so a sharded or pipeline-staged source still goes through the
+        page-gathered WRITE. Only a fragment with several strided rows per
+        page is emitted per page.
+
+        Args:
+            owner_filters: The registration route's decision for every
+                KVP-sharded group of the layout (``validate_rank_owner_filters``
+                checked it): the filter selecting the manifest blocks this
+                rank owns, copied from their local pages to the destination
+                blocks at the same manifest positions, or None when the route
+                carries no block of the group and nothing is sent for it.
+                Replicated groups are copied whole; their scheduler IDs are
+                already local pages.
         """
         layout = self.kv_args.cache_layout
-        if layout is None:
-            raise ValueError("legacy Mooncake transfer received Paged cache manifests")
-        validate_cache_manifest_pair(
-            src_manifest,
-            dst_manifest,
-            layout,
-            dst_num_pages_with_null=dst_num_pages_with_null,
-        )
-        needs_dst_offsets = any(group.transfer_segments for group in layout.groups)
-        if needs_dst_offsets and dst_page_zero_offsets is None:
-            raise ValueError(
-                "Paged cache segmented transfer requires destination page_zero_offsets"
-            )
 
-        transfer_blocks = []
-        page_offset = 0
-        for layout_group, src_group, dst_group in zip(
-            layout.groups,
-            src_manifest.groups,
-            dst_manifest.groups,
-            strict=True,
+        cache_fragments = tuple(transfer_fragments)
+        local_segments = {
+            (segment.group_id, segment.field_id): segment
+            for segment in layout.plan.fields
+        }
+        peer_segments = {
+            (segment.group_id, segment.field_id): segment
+            for segment in dst_cache_layout.plan.fields
+        }
+        fragments_by_group: dict[str, list[CacheTransferFragment]] = defaultdict(list)
+        for fragment in cache_fragments:
+            fragments_by_group[fragment.group_id].append(fragment)
+
+        # Resolve block ids directly from the validated manifest/selection. This
+        # leaves one authoritative representation of the request's block map.
+        group_transfers: list[tuple[CacheGroupSpec, np.ndarray, np.ndarray]] = []
+        source_groups = (
+            block_selection.groups
+            if block_selection is not None
+            else src_block_manifest.groups
+        )
+        for group_spec, src_group, dst_group in zip(
+            layout.group_specs, source_groups, dst_block_manifest.groups, strict=True
         ):
-            page_count = len(src_group.page_ids)
-            group_src_indices = src_indices[page_offset : page_offset + page_count]
-            group_dst_indices = dst_indices[page_offset : page_offset + page_count]
-            if (
-                tuple(int(page) for page in group_src_indices) != src_group.page_ids
-                or tuple(int(page) for page in group_dst_indices) != dst_group.page_ids
-            ):
-                raise ValueError(
-                    "Paged cache manifest and Mooncake page vector disagree"
+            source_block_ids = (
+                src_group.source_block_ids
+                if block_selection is not None
+                else src_group.block_ids
+            )
+            destination_block_ids = (
+                tuple(
+                    dst_group.block_ids[position]
+                    for position in src_group.destination_positions
                 )
-            if layout_group.transfer_segments:
-                assert dst_page_zero_offsets is not None
-                for segment in layout_group.transfer_segments:
-                    if layer_range is not None:
-                        layer_id = self._segment_layer_id(segment.field_id)
-                        if layer_id is None or not (
-                            layer_range[0] <= layer_id < layer_range[1]
-                        ):
-                            continue
-                    physical_slot = segment.physical_slot
-                    src_ptr = self.kv_args.kv_data_ptrs[physical_slot]
-                    dst_ptr = dst_ptrs[physical_slot]
-                    if (
-                        self.kv_args.kv_item_lens[physical_slot]
-                        != layout.physical_page_bytes
-                    ):
-                        raise ValueError(
-                            "Paged cache Mooncake parent size disagrees with layout"
-                        )
-                    key = (layout_group.group_id, segment.field_id)
-                    try:
-                        dst_page_zero_offset = dst_page_zero_offsets[key]
-                    except KeyError as exc:
-                        raise ValueError(
-                            "Paged cache destination is missing page_zero_offset for "
-                            f"group {layout_group.group_id!r} field "
-                            f"{segment.field_id!r}"
-                        ) from exc
-                    for src_page, dst_page in zip(
-                        group_src_indices, group_dst_indices, strict=True
-                    ):
-                        transfer_blocks.append(
+                if block_selection is not None
+                else dst_group.block_ids
+            )
+            if group_spec.shard_count > 1:
+                owner_filter = owner_filters[group_spec.group_id]
+                if owner_filter is None:
+                    continue
+                source_owner_rank = owner_filter.owner_rank
+            else:
+                source_owner_rank = 0
+            # KVP subgroups are aligned runs of consecutive attention-TP
+            # ranks, so the destination's owner coordinate is its TP rank
+            # modulo its group's shard count (1 for a replicated group).
+            src_pages, dst_pages = local_transfer_pages(
+                source_block_ids,
+                destination_block_ids,
+                group_id=group_spec.group_id,
+                source_layout=layout,
+                destination_layout=dst_cache_layout,
+                source_owner_rank=source_owner_rank,
+                destination_owner_rank=dst_tp_rank
+                % dst_cache_layout.shard_count(group_spec.group_id),
+            )
+            if src_pages.size:
+                group_transfers.append(
+                    (
+                        group_spec,
+                        src_pages,
+                        dst_pages,
+                    )
+                )
+
+        # Per-field constants are hoisted out of the page loops: a long
+        # prompt moves thousands of pages per field, and this generator runs
+        # on the transfer thread while holding the GIL the forward thread
+        # needs. Single-span copies never loop over pages at all: the pages x
+        # fields grid is expanded inside Mooncake.
+        src_ptr = self.kv_args.kv_data_ptr
+        for group_spec, src_pages, dst_pages in group_transfers:
+            field_rows: list[tuple[int, int, int, int, int]] = []
+            if cache_fragments:
+                for fragment in fragments_by_group.get(group_spec.group_id, ()):
+                    if field_ids is not None and fragment.field_id not in field_ids:
+                        continue
+                    key = (fragment.group_id, fragment.field_id)
+                    src_segment = local_segments[key]
+                    dst_segment = peer_segments[key]
+                    if field_ids is not None and src_segment.field_id not in field_ids:
+                        continue
+                    src_base = (
+                        layout.field_address(src_ptr, src_segment.field_id)
+                        + fragment.src_byte_offset
+                    )
+                    dst_base = (
+                        dst_cache_layout.field_address(dst_ptr, dst_segment.field_id)
+                        + fragment.dst_byte_offset
+                    )
+                    if fragment.rows_per_page == 1:
+                        field_rows.append(
                             (
-                                src_ptr
-                                + segment.page_zero_offset
-                                + int(src_page) * segment.page_stride_bytes,
-                                dst_ptr
-                                + dst_page_zero_offset
-                                + int(dst_page) * segment.page_stride_bytes,
-                                segment.payload_bytes,
+                                src_base,
+                                src_segment.page_stride_bytes,
+                                dst_base,
+                                dst_segment.page_stride_bytes,
+                                fragment.bytes_per_row,
                             )
                         )
-                page_offset += page_count
-                continue
-            src_blocks, dst_blocks = group_concurrent_contiguous(
-                group_src_indices, group_dst_indices
-            )
-            for physical_slot in layout_group.physical_slots:
-                src_ptr = self.kv_args.kv_data_ptrs[physical_slot]
-                dst_ptr = dst_ptrs[physical_slot]
-                item_len = self.kv_args.kv_item_lens[physical_slot]
-                if item_len != layout.physical_page_bytes:
-                    raise ValueError(
-                        "Paged cache Mooncake page size disagrees with layout"
+                        continue
+                    yield from _strided_page_copies(
+                        fragment,
+                        src_base=src_base,
+                        dst_base=dst_base,
+                        src_page_stride=src_segment.page_stride_bytes,
+                        dst_page_stride=dst_segment.page_stride_bytes,
+                        src_pages=src_pages,
+                        dst_pages=dst_pages,
                     )
-                for src_block, dst_block in zip(src_blocks, dst_blocks, strict=True):
-                    transfer_blocks.append(
+            else:
+                for src_segment in layout.fields_for_group(group_spec.group_id):
+                    if field_ids is not None and src_segment.field_id not in field_ids:
+                        continue
+                    dst_segment = peer_segments[
+                        (group_spec.group_id, src_segment.field_id)
+                    ]
+                    field_rows.append(
                         (
-                            src_ptr + int(src_block[0]) * item_len,
-                            dst_ptr + int(dst_block[0]) * item_len,
-                            len(src_block) * item_len,
+                            layout.field_address(src_ptr, src_segment.field_id),
+                            src_segment.page_stride_bytes,
+                            dst_cache_layout.field_address(
+                                dst_ptr, dst_segment.field_id
+                            ),
+                            dst_segment.page_stride_bytes,
+                            src_segment.payload_bytes,
                         )
                     )
-            page_offset += page_count
+            if field_rows:
+                yield PageFieldCopies(
+                    src_pages,
+                    dst_pages,
+                    np.asarray(field_rows, dtype=np.int64).reshape(-1, 5),
+                )
 
-        if page_offset != len(src_indices) or page_offset != len(dst_indices):
-            raise ValueError("Paged cache transfer page vector has trailing entries")
-        return transfer_blocks
-
-    def _layer_transfer_blocks(
+    def _wait_until_cache_step(
         self,
-        dst_ptrs: list[int],
-        src_blocks,
-        dst_blocks,
-        begin_layer_id: int,
-        end_layer_id: int,
-        transfer_fragments: tuple[TransferFragment, ...] = (),
-    ) -> list[tuple[int, int, int]]:
-        transfer_blocks = []
-        fragments_by_buffer: dict[int, list[TransferFragment]] = defaultdict(list)
-        for fragment in transfer_fragments:
-            if fragment.buffer_kind != BufferKind.MAMBA_STATE:
-                fragments_by_buffer[fragment.buffer_index].append(fragment)
-        has_fragment_plan = bool(transfer_fragments)
-
-        for layer_id in range(begin_layer_id, end_layer_id):
-            for ptr_offset in self.kv_args.offsets[layer_id]:
-                src_ptr = self.kv_args.kv_data_ptrs[ptr_offset]
-                dst_ptr = dst_ptrs[ptr_offset]
-                item_len = self.kv_args.kv_item_lens[ptr_offset]
-                buffer_fragments = fragments_by_buffer.get(ptr_offset, ())
-                if has_fragment_plan:
-                    for fragment in buffer_fragments:
-                        for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                            page_count = min(len(prefill_index), len(decode_index))
-                            if fragment.page_count is not None:
-                                page_count = min(page_count, fragment.page_count)
-                            for page_offset in range(page_count):
-                                src_addr = (
-                                    src_ptr
-                                    + int(prefill_index[page_offset])
-                                    * fragment.src_page_stride_bytes
-                                    + fragment.src_byte_offset
-                                )
-                                dst_addr = (
-                                    dst_ptr
-                                    + int(decode_index[page_offset])
-                                    * fragment.dst_page_stride_bytes
-                                    + fragment.dst_byte_offset
-                                )
-                                transfer_blocks.append(
-                                    (src_addr, dst_addr, fragment.bytes_per_page)
-                                )
-                    continue
-
-                for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                    src_addr = src_ptr + int(prefill_index[0]) * item_len
-                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                    length = item_len * len(prefill_index)
-                    transfer_blocks.append((src_addr, dst_addr, length))
-        return transfer_blocks
-
-    def _wait_until_cache_step(self, target_step: int) -> None:
+        target_step: int,
+        *,
+        room: int | None = None,
+        session_ids: tuple[str, ...] = (),
+    ) -> None:
         if self.step_counter is None:
+            if room is not None:
+                raise ValueError(
+                    "Cache-transfer layerwise transfer has no producer step counter"
+                )
             return
+        next_session_check = time.monotonic()
         while True:
+            if room is not None and self.request_status.get(room) in (
+                None,
+                TransferPoll.Failed,
+            ):
+                raise ValueError(
+                    f"Cache-transfer layerwise wait aborted for room {room}"
+                )
+            now = time.monotonic()
+            if session_ids and now >= next_session_check:
+                with self.session_lock:
+                    failed = any(
+                        self._is_session_failed(session_id)
+                        for session_id in session_ids
+                    )
+                if failed:
+                    raise ValueError(
+                        f"Cache-transfer layerwise peer failed for room {room}"
+                    )
+                next_session_check = now + 0.1
             ready_step = self.step_counter.query_ready_cache_step()
             if StepCounter.is_step_ready(ready_step, target_step):
                 return
             time.sleep(1e-4)
 
-    def send_mamba_cache(
+    @staticmethod
+    def _prime_transfer_blocks(transfer_blocks) -> Iterator:
+        """Start a lazy descriptor before any destination begins DMA."""
+        iterator = iter(transfer_blocks)
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return iter(())
+        return chain((first,), iterator)
+
+    def _send_cache_layerwise_fanout(
         self,
-        mooncake_session_id: str,
-        prefill_mamba_indices: npt.NDArray[np.int64] | None,
-        dst_state_data_ptrs: list[int],
-        dst_mamba_indices: npt.NDArray[np.int64] | None,
-        begin_layer_id: int | None = None,
-        end_layer_id: int | None = None,
-        transfer_fragments: tuple[TransferFragment, ...] = (),
-    ) -> int:
-        if self.kv_args.state_type != "mamba":
-            return 0
-        state_ptrs = self.kv_args.state_data_ptrs
-        state_item_lens = self.kv_args.state_item_lens
-        if (
-            not state_ptrs
-            or not dst_state_data_ptrs
-            or prefill_mamba_indices is None
-            or dst_mamba_indices is None
-        ):
-            return 0
-        if len(state_ptrs) != len(dst_state_data_ptrs):
-            logger.error(
-                "Mamba state tensor count mismatch: prefill=%d decode=%d",
-                len(state_ptrs),
-                len(dst_state_data_ptrs),
-            )
-            return -1
+        kv_chunk: TransferKVChunk,
+        reqs: tuple[TransferInfo, ...],
+        packer=None,
+    ) -> bool:
+        """Wait one producer interval, then fan it out to every Decode peer."""
+        block_selection = kv_chunk.cache_block_selection
 
-        if prefill_mamba_indices.shape != dst_mamba_indices.shape:
-            if prefill_mamba_indices.size == 1 and dst_mamba_indices.size > 1:
-                prefill_mamba_indices = np.full(
-                    dst_mamba_indices.shape,
-                    int(prefill_mamba_indices[0]),
-                    dtype=np.int64,
+        registered_reqs = []
+        for req in reqs:
+            with self.session_lock:
+                session_failed = self._is_session_failed(req.mooncake_session_id)
+            if session_failed:
+                self.abort_room(
+                    kv_chunk.room,
+                    "Decode instance could be dead, remote Mooncake session "
+                    f"{req.mooncake_session_id} is not alive",
                 )
-            else:
-                logger.error(
-                    "Mamba state slot count mismatch: prefill=%s decode=%s",
-                    prefill_mamba_indices.tolist(),
-                    dst_mamba_indices.tolist(),
-                )
-                return -1
+                return False
+            registration = self.get_decode_registration(req)
+            registered_reqs.append((req, registration))
 
-        state_items = list(
-            enumerate(zip(state_ptrs, dst_state_data_ptrs, state_item_lens))
-        )
-        if begin_layer_id is not None or end_layer_id is not None:
-            begin = 0 if begin_layer_id is None else begin_layer_id
-            end = self.layer_num if end_layer_id is None else end_layer_id
-            if len(self.state_layer_ids) != len(state_items):
-                logger.error(
-                    "Mamba state layer id count mismatch: ids=%d tensors=%d",
-                    len(self.state_layer_ids),
-                    len(state_items),
-                )
-                return -1
-            state_items = [
-                item
-                for item, layer_id in zip(state_items, self.state_layer_ids)
-                if begin <= layer_id < end
-            ]
-            if not state_items:
-                return 0
-
-        valid = (prefill_mamba_indices >= 0) & (dst_mamba_indices >= 0)
-        log_layerwise = getattr(self, "layerwise_debug", False)
-        if log_layerwise and begin_layer_id is not None and end_layer_id is not None:
-            logger.info(
-                "[layerwise_transfer] session=%s layers=[%d,%d) "
-                "send mamba tensors=%d bytes=%d",
-                mooncake_session_id,
-                begin_layer_id,
-                end_layer_id,
-                len(state_items),
-                sum(item_len for _, (_, _, item_len) in state_items) * int(valid.sum()),
-            )
-        if not valid.any():
-            return 0
-
-        src_indices = prefill_mamba_indices[valid]
-        dst_indices = dst_mamba_indices[valid]
-        src_blocks, dst_blocks = group_concurrent_contiguous(src_indices, dst_indices)
-        transfer_blocks = []
-        state_fragments_by_buffer: dict[int, list[TransferFragment]] = defaultdict(list)
-        for fragment in transfer_fragments:
-            if fragment.buffer_kind == BufferKind.MAMBA_STATE:
-                state_fragments_by_buffer[fragment.buffer_index].append(fragment)
-        has_state_fragment_plan = bool(state_fragments_by_buffer)
-
-        for state_index, (src_ptr, dst_ptr, item_len) in state_items:
-            buffer_fragments = state_fragments_by_buffer.get(state_index, ())
-            if has_state_fragment_plan:
-                for fragment in buffer_fragments:
-                    for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                        page_count = min(len(prefill_index), len(decode_index))
-                        if fragment.page_count is not None:
-                            page_count = min(page_count, fragment.page_count)
-                        for page_offset in range(page_count):
-                            src_addr = (
-                                src_ptr
-                                + int(prefill_index[page_offset])
-                                * fragment.src_page_stride_bytes
-                                + fragment.src_byte_offset
-                            )
-                            dst_addr = (
-                                dst_ptr
-                                + int(decode_index[page_offset])
-                                * fragment.dst_page_stride_bytes
-                                + fragment.dst_byte_offset
-                            )
-                            transfer_blocks.append(
-                                (src_addr, dst_addr, fragment.bytes_per_page)
-                            )
-                continue
-
-            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-
-        total_bytes = sum(length for _, _, length in transfer_blocks)
-        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
-        logger.debug(
-            "Transferred mamba cache for session=%s slots=%s blocks=%d bytes=%d ret=%s",
-            mooncake_session_id,
-            src_indices.tolist(),
-            len(transfer_blocks),
-            total_bytes,
-            ret,
-        )
-        return ret
-
-    def send_kvcache_layerwise(
-        self,
-        mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
-        dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
-        begin_cache_step: int,
-        interval: int,
-        dst_state_data_ptrs: list[int] | None = None,
-        prefill_mamba_indices: npt.NDArray[np.int64] | None = None,
-        dst_mamba_indices: npt.NDArray[np.int64] | None = None,
-        transfer_fragments: tuple[TransferFragment, ...] = (),
-        src_page_manifest: CachePDPageManifest | None = None,
-        dst_page_manifest: CachePDPageManifest | None = None,
-        dst_num_pages_with_null: int | None = None,
-        dst_page_zero_offsets: Mapping[tuple[str, str], int] | None = None,
-    ) -> int:
-        if self.kv_args.cache_layout is not None:
-            return self._cache_send_kvcache_layerwise(
-                mooncake_session_id,
-                prefill_kv_indices,
-                dst_kv_ptrs,
-                dst_kv_indices,
-                begin_cache_step,
-                interval,
-                src_page_manifest=src_page_manifest,
-                dst_page_manifest=dst_page_manifest,
-                dst_num_pages_with_null=dst_num_pages_with_null,
-                dst_page_zero_offsets=dst_page_zero_offsets,
-            )
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
-        )
-
-        interval = max(int(interval), 1)
-        log_layerwise = getattr(self, "layerwise_debug", False)
-        for begin_layer_id in range(0, self.layer_num, interval):
-            end_layer_id = min(begin_layer_id + interval, self.layer_num)
-            target_step = begin_cache_step + end_layer_id - 1
-            if log_layerwise:
+        producer_schedule = self.producer_schedule
+        if producer_schedule is None:
+            raise ValueError("layerwise cache transfer requires a producer schedule")
+        producer_step_count = producer_schedule.step_count
+        interval = max(int(kv_chunk.layerwise_interval), 1)
+        for begin_step in range(0, producer_step_count, interval):
+            end_step = min(begin_step + interval, producer_step_count)
+            target_step = (
+                kv_chunk.begin_cache_step + end_step - 1
+            ) % StepCounter.COUNT_NUM_MAX
+            if self.layerwise_debug:
                 logger.info(
-                    "[layerwise_transfer] session=%s layers=[%d,%d) wait_cache_step=%d pages=%d",
-                    mooncake_session_id,
-                    begin_layer_id,
-                    end_layer_id,
-                    target_step,
-                    len(prefill_kv_indices),
+                    f"[cache_layerwise_transfer] room={kv_chunk.room!s} "
+                    f"producer_steps=[{begin_step:d},{end_step:d}) "
+                    f"wait_cache_step={target_step:d} peers={len(reqs):d}",
                 )
-            self._wait_until_cache_step(target_step)
+            self._wait_until_cache_step(
+                target_step,
+                room=kv_chunk.room,
+                session_ids=tuple(req.mooncake_session_id for req in reqs),
+            )
 
-            transfer_blocks = []
-            if prefill_kv_blocks:
-                for global_layer_id in range(begin_layer_id, end_layer_id):
-                    kv_layer_index = self._kv_layer_to_index.get(global_layer_id)
-                    if kv_layer_index is None:
-                        continue
-                    transfer_blocks.extend(
-                        self._layer_transfer_blocks(
-                            dst_ptrs=dst_kv_ptrs,
-                            src_blocks=prefill_kv_blocks,
-                            dst_blocks=dst_kv_blocks,
-                            begin_layer_id=kv_layer_index,
-                            end_layer_id=kv_layer_index + 1,
-                            transfer_fragments=transfer_fragments,
-                        )
+            # Start every peer's lazy generator before transferring this interval.
+            prepared = []
+            for req, registration in registered_reqs:
+                assert req.block_manifest is not None
+                blocks = self._cache_transfer_blocks(
+                    dst_ptr=registration.dst_kv_ptr,
+                    dst_tp_rank=registration.decode_tp_rank,
+                    src_block_manifest=None,
+                    dst_block_manifest=req.block_manifest,
+                    transfer_fragments=registration.transfer_fragments,
+                    owner_filters=registration.transfer_owner_filters,
+                    dst_cache_layout=registration.peer_cache_layout,
+                    block_selection=block_selection,
+                    field_ids=producer_schedule.fields_in_range(begin_step, end_step),
+                )
+                prepared.append(
+                    (
+                        req,
+                        registration,
+                        self._prime_transfer_blocks(blocks),
+                        time.monotonic(),
                     )
-            if transfer_blocks:
-                if log_layerwise:
-                    total_bytes = sum(length for _, _, length in transfer_blocks)
-                    logger.info(
-                        "[layerwise_transfer] session=%s layers=[%d,%d) send kv blocks=%d bytes=%d",
-                        mooncake_session_id,
-                        begin_layer_id,
-                        end_layer_id,
-                        len(transfer_blocks),
-                        total_bytes,
-                    )
-                ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+                )
+
+            for req, registration, blocks, started_at in prepared:
+                ret = self._transfer_data(req.mooncake_session_id, blocks, packer)
                 if ret != 0:
-                    return ret
-
-            ret = self.send_mamba_cache(
-                mooncake_session_id,
-                prefill_mamba_indices,
-                dst_state_data_ptrs or [],
-                dst_mamba_indices,
-                begin_layer_id=begin_layer_id,
-                end_layer_id=end_layer_id,
-                transfer_fragments=transfer_fragments,
-            )
-            if ret != 0:
-                return ret
-            if log_layerwise:
-                logger.info(
-                    "[layerwise_transfer] session=%s layers=[%d,%d) done",
-                    mooncake_session_id,
-                    begin_layer_id,
-                    end_layer_id,
+                    with self.session_lock:
+                        self.session_failures[req.mooncake_session_id] += 1
+                        self._mark_session_failed(
+                            req.mooncake_session_id, reason="send_cache_layerwise"
+                        )
+                    peer = join_host_port(registration.endpoint, registration.dst_port)
+                    self.abort_room(
+                        kv_chunk.room,
+                        f"Failed to send cache layer interval of "
+                        f"{kv_chunk.room} to {peer}",
+                    )
+                    return False
+                self.kv_transfer_metrics.observe_kv_transfer_latency(
+                    time.monotonic() - started_at
                 )
-        return 0
 
-    def _cache_send_kvcache_layerwise(
-        self,
-        mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
-        dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
-        begin_cache_step: int,
-        interval: int,
-        *,
-        src_page_manifest: CachePDPageManifest | None,
-        dst_page_manifest: CachePDPageManifest | None,
-        dst_num_pages_with_null: int | None,
-        dst_page_zero_offsets: Mapping[tuple[str, str], int] | None,
-    ) -> int:
-        """Raw-slab layerwise transfer: ship each ``interval``-sized layer window
-        as soon as prefill has computed it, gated on the per-layer cache step.
+        if not kv_chunk.is_last:
+            return True
 
-        Same segment geometry as :meth:`_cache_transfer_blocks` (one whole-request
-        transfer), sliced by ``layer_range`` so a window's segments leave as their
-        layers finish instead of waiting for the whole forward pass."""
-        if src_page_manifest is None or dst_page_manifest is None:
-            raise ValueError("Paged cache layerwise transfer requires page manifests")
-        if dst_num_pages_with_null is None:
-            raise ValueError(
-                "Paged cache layerwise transfer requires destination capacity"
+        bootstrap_token, spec_candidate_ids = self._wait_prefill_metadata(
+            kv_chunk.room,
+            kv_chunk.bootstrap_token,
+            kv_chunk.spec_candidate_ids,
+        )
+        if self.check_status(kv_chunk.room) == TransferPoll.Failed:
+            return False
+        for req, registration in registered_reqs:
+            self.sync_status_to_decode_endpoint(
+                registration.endpoint,
+                registration.dst_port,
+                req.room,
+                TransferPoll.Success,
+                self._status_prefill_rank,
+                bootstrap_token=bootstrap_token,
+                spec_candidate_ids=spec_candidate_ids,
             )
+        # Publish terminal state only after all notifications have read usage;
+        # the control plane may discard room metadata as soon as Success is visible.
+        self.update_status(kv_chunk.room, TransferPoll.Success)
+        return True
 
-        interval = max(int(interval), 1)
-        log_layerwise = getattr(self, "layerwise_debug", False)
-        for begin_layer_id in range(0, self.layer_num, interval):
-            end_layer_id = min(begin_layer_id + interval, self.layer_num)
-            target_step = begin_cache_step + end_layer_id - 1
-            self._wait_until_cache_step(target_step)
-            transfer_blocks = self._cache_transfer_blocks(
-                dst_ptrs=dst_kv_ptrs,
-                src_indices=prefill_kv_indices,
-                dst_indices=dst_kv_indices,
-                src_manifest=src_page_manifest,
-                dst_manifest=dst_page_manifest,
-                dst_num_pages_with_null=dst_num_pages_with_null,
-                dst_page_zero_offsets=dst_page_zero_offsets,
-                layer_range=(begin_layer_id, end_layer_id),
-            )
-            if not transfer_blocks:
-                continue
-            if log_layerwise:
-                total_bytes = sum(length for _, _, length in transfer_blocks)
-                logger.info(
-                    "[layerwise_transfer] session=%s layers=[%d,%d) send blocks=%d bytes=%d",
-                    mooncake_session_id,
-                    begin_layer_id,
-                    end_layer_id,
-                    len(transfer_blocks),
-                    total_bytes,
-                )
-            ret = self._transfer_data(mooncake_session_id, transfer_blocks)
-            if ret != 0:
-                return ret
-        return 0
+    @property
+    def _status_prefill_rank(self) -> int:
+        """This rank's identity in Decode's completion-tracking rank space.
+
+        Without PP this is the intra-DP TP rank. With the prefill chunk
+        pipeline every stage sends its own layers' KV, so Decode must count
+        completions from pp*tp distinct sources: stage-major
+        ``pp_rank * tp_size + tp_rank`` keeps the space dense and collision
+        free.
+        """
+        pp_rank = getattr(self.topology, "pp_rank", 0)
+        if pp_rank == 0:
+            return self.topology.tp_rank
+        return pp_rank * self.topology.tp_size + self.topology.tp_rank
 
     def sync_status_to_decode_endpoint(
         self,
@@ -937,22 +833,34 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         bootstrap_token: int = -1,
         spec_candidate_ids: list[int] | None = None,
     ):
-        if ":" in remote:
-            remote = remote.split(":")[0]
         spec_candidate_payload = (
             np.asarray(spec_candidate_ids, dtype=np.int32).tobytes()
             if spec_candidate_ids is not None
             else b""
         )
-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-                str(bootstrap_token).encode("ascii"),
-                spec_candidate_payload,
-            ]
+        with self.bootstrap_token_cond:
+            cached_tokens = self.cached_tokens.get(room, 0)
+            bootstrap_logprob = self.bootstrap_logprobs.get(room)
+        # Optional trailing frame: the bootstrap logprob as an IEEE double
+        # (exact), empty when the prefill node has none for this request.
+        bootstrap_logprob_payload = (
+            struct.pack("<d", bootstrap_logprob)
+            if bootstrap_logprob is not None
+            else b""
         )
+        socket, lock = self._connect(f"tcp://{join_host_port(remote, dst_port)}")
+        with lock:
+            socket.send_multipart(
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                    str(bootstrap_token).encode("ascii"),
+                    spec_candidate_payload,
+                    str(cached_tokens).encode("ascii"),
+                    bootstrap_logprob_payload,
+                ]
+            )
 
     def abort_room(self, room: int, reason: str) -> None:
         """Notify the decode that a room failed before any KV transfer.
@@ -967,307 +875,313 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         the client gets an error instead of hanging. A room whose decode has not
         pre-allocated yet is only marked Failed locally (no endpoint to notify).
         """
+        # One failure counts once: a room already Failed (or already recorded,
+        # e.g. after a sender-side timeout) must not be re-incremented when
+        # later chunks of the same room funnel back here.
+        already_counted = self.room_status(room) == TransferPoll.Failed
+        if not already_counted:
+            with self.failure_lock:
+                already_counted = room in self.failure_records
+        if not already_counted:
+            self.kv_transfer_metrics.record_kv_transfer_failure()
         self.record_failure(room, reason)
         self.update_status(room, TransferPoll.Failed)
         for req in list(self.transfer_infos.get(room, {}).values()):
             if not req.is_dummy:
                 try:
+                    registration = self.decode_kv_args_table.get(
+                        req.mooncake_session_id
+                    )
+                    rejected = self.rejected_decode_sessions.get(
+                        req.mooncake_session_id
+                    )
+                    if registration is None and rejected is None:
+                        raise ValueError(
+                            "CachePD room references an unregistered Decode session"
+                        )
+                    endpoint, dst_port = (
+                        (registration.endpoint, registration.dst_port)
+                        if registration is not None
+                        else rejected
+                    )
                     self.sync_status_to_decode_endpoint(
-                        req.endpoint,
-                        req.dst_port,
+                        endpoint,
+                        dst_port,
                         req.room,
                         TransferPoll.Failed,
-                        self.attn_tp_rank,
+                        self._status_prefill_rank,
                     )
                 except Exception:
                     logger.exception(
                         "Failed to notify Decode about room-level transfer "
-                        "failure (room=%s endpoint=%s:%s)",
-                        room,
-                        req.endpoint,
-                        req.dst_port,
+                        f"failure (room={room!s} session={req.mooncake_session_id!s})",
                     )
         self.transfer_infos.pop(room, None)
 
     def transfer_worker(
-        self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
+        self,
+        queue: FastQueue,
+        _executor: concurrent.futures.ThreadPoolExecutor,
     ):
+        packer = None
+        engine = getattr(self, "engine", None)
+        if engine is not None and hasattr(engine, "register"):
+            gpu_id = getattr(getattr(self, "kv_args", None), "gpu_id", None)
+            packer = PrefillPackScratch(
+                engine, gpu_id=None if gpu_id is None else int(gpu_id)
+            )
         while True:
+            kv_chunk = queue.get()
             try:
-                kv_chunk = queue.get()
-                logger.debug(
-                    "[TRANSFER_WORKER] Got transfer request for room %s, is_last=%s, kv_indices_len=%s",
-                    kv_chunk.room,
-                    kv_chunk.is_last,
-                    len(kv_chunk.prefill_kv_indices),
-                )
-                reqs_to_be_processed = (
-                    self.transfer_infos[kv_chunk.room].values()
-                    if kv_chunk.room in self.transfer_infos
-                    else []
-                )
-                polls = []
-                dst_ranks_infos = []
-                for req in reqs_to_be_processed:
-                    if not req.is_dummy:
-                        # Early exit if the request has failed
+                reqs = tuple(self.transfer_infos.get(kv_chunk.room, {}).values())
+                if not reqs:
+                    raise ValueError("CachePD transfer room has no destinations")
+                if any(req.is_dummy for req in reqs):
+                    if kv_chunk.is_last and kv_chunk.room in self.request_status:
+                        self.update_status(kv_chunk.room, TransferPoll.Success)
+                        self.transfer_infos.pop(kv_chunk.room, None)
+                    continue
+
+                if kv_chunk.cache_block_selection is not None:
+                    self._send_cache_layerwise_fanout(kv_chunk, reqs, packer=packer)
+                    if kv_chunk.room not in self.request_status or self.check_status(
+                        kv_chunk.room
+                    ) in (TransferPoll.Success, TransferPoll.Failed):
+                        self.transfer_infos.pop(kv_chunk.room, None)
+                    continue
+                if kv_chunk.begin_cache_step is not None:
+                    raise ValueError(
+                        "CachePD producer-step transfer requires a layerwise selection"
+                    )
+
+                prepared = []
+                for req in reqs:
+                    with self.session_lock:
+                        if self._is_session_failed(req.mooncake_session_id):
+                            raise ValueError(
+                                f"Decode session {req.mooncake_session_id} is not alive"
+                            )
+                    registration = self.get_decode_registration(req)
+                    assert req.block_manifest is not None
+                    blocks = self._cache_transfer_blocks(
+                        dst_ptr=registration.dst_kv_ptr,
+                        dst_tp_rank=registration.decode_tp_rank,
+                        src_block_manifest=kv_chunk.block_manifest,
+                        dst_block_manifest=req.block_manifest,
+                        transfer_fragments=registration.transfer_fragments,
+                        owner_filters=registration.transfer_owner_filters,
+                        dst_cache_layout=registration.peer_cache_layout,
+                    )
+                    prepared.append(
+                        (
+                            req,
+                            registration,
+                            self._prime_transfer_blocks(blocks),
+                            time.monotonic(),
+                        )
+                    )
+
+                for req, registration, blocks, started_at in prepared:
+                    ret = self._transfer_data(req.mooncake_session_id, blocks, packer)
+                    if ret != 0:
                         with self.session_lock:
-                            if self._is_session_failed(req.mooncake_session_id):
-                                logger.info(
-                                    "Blocked transfer due to failed session (room=%s, session=%s).",
-                                    kv_chunk.room,
-                                    req.mooncake_session_id,
-                                )
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
-                                )
-                                self.update_status(kv_chunk.room, TransferPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    TransferPoll.Failed,
-                                    self.attn_tp_rank,
-                                )
-                                break
-                        try:
-                            resolved = self.resolve_transfer_indices(kv_chunk, req)
-                        except ValueError as exc:
-                            logger.exception(
-                                "Rejecting malformed transfer metadata for room=%s",
-                                kv_chunk.room,
+                            self.session_failures[req.mooncake_session_id] += 1
+                            self._mark_session_failed(
+                                req.mooncake_session_id, reason="send_kvcache"
                             )
-                            self.abort_room(
-                                kv_chunk.room,
-                                f"invalid transfer metadata: {exc}",
-                            )
-                            break
-
-                        logger.debug(
-                            "[TRANSFER_WORKER] Calling send_kvcache for room %s, session %s",
-                            kv_chunk.room,
-                            req.mooncake_session_id,
+                        peer = join_host_port(
+                            registration.endpoint, registration.dst_port
                         )
-                        tm_start = time.monotonic()
-                        prefill_metadata = None
-                        dst_kv_ptrs = self.decode_kv_args_table[
-                            req.mooncake_session_id
-                        ].dst_kv_ptrs
-                        dst_state_data_ptrs = self.decode_kv_args_table[
-                            req.mooncake_session_id
-                        ].dst_state_data_ptrs
-                        if kv_chunk.begin_cache_step is None:
-                            ret = self.send_kvcache(
-                                req.mooncake_session_id,
-                                resolved.src_indices,
-                                dst_kv_ptrs,
-                                resolved.dst_indices,
-                                executor,
-                                req.transfer_fragments,
-                                src_page_manifest=kv_chunk.page_manifest,
-                                dst_page_manifest=req.page_manifest,
-                                dst_num_pages_with_null=(
-                                    req.peer_cache_layout.num_pages_with_null
-                                    if req.peer_cache_layout is not None
-                                    else None
-                                ),
-                                dst_page_zero_offsets=(
-                                    req.peer_cache_layout.page_zero_offset_map()
-                                    if req.peer_cache_layout is not None
-                                    else None
-                                ),
-                            )
-                        else:
-                            ret = self.send_kvcache_layerwise(
-                                req.mooncake_session_id,
-                                resolved.src_indices,
-                                dst_kv_ptrs,
-                                resolved.dst_indices,
-                                kv_chunk.begin_cache_step,
-                                kv_chunk.layerwise_interval,
-                                dst_state_data_ptrs,
-                                kv_chunk.prefill_mamba_indices,
-                                req.dst_mamba_indices,
-                                req.transfer_fragments,
-                                src_page_manifest=kv_chunk.page_manifest,
-                                dst_page_manifest=req.page_manifest,
-                                dst_num_pages_with_null=(
-                                    req.peer_cache_layout.num_pages_with_null
-                                    if req.peer_cache_layout is not None
-                                    else None
-                                ),
-                                dst_page_zero_offsets=(
-                                    req.peer_cache_layout.page_zero_offset_map()
-                                    if req.peer_cache_layout is not None
-                                    else None
-                                ),
-                            )
-                        if ret == 0 and kv_chunk.is_last:
-                            if kv_chunk.wait_for_bootstrap_token:
-                                # The first decode/target-verify step consumes prefill's
-                                # sampled bootstrap token and spec candidates; publish
-                                # Success only after that metadata is ready.
-                                prefill_metadata = self._wait_prefill_metadata(
-                                    kv_chunk.room,
-                                    kv_chunk.bootstrap_token,
-                                    kv_chunk.spec_candidate_ids,
-                                )
-                            if kv_chunk.begin_cache_step is None:
-                                ret = self.send_mamba_cache(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_mamba_indices,
-                                    dst_state_data_ptrs,
-                                    req.dst_mamba_indices,
-                                    transfer_fragments=req.transfer_fragments,
-                                )
-                        logger.debug(
-                            "[TRANSFER_WORKER] send_kvcache returned %s for room %s",
-                            ret,
-                            kv_chunk.room,
-                        )
-                        if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self._mark_session_failed(
-                                        req.mooncake_session_id, reason="send_kvcache"
-                                    )
-                                    logger.error(
-                                        "Session %s failed.", req.mooncake_session_id
-                                    )
-                            self.record_failure(
-                                kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to {req.endpoint}:{req.dst_port}",
-                            )
-                            self.update_status(kv_chunk.room, TransferPoll.Failed)
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint,
-                                req.dst_port,
-                                req.room,
-                                TransferPoll.Failed,
-                                self.attn_tp_rank,
-                            )
-                            break
+                        raise RuntimeError(f"Mooncake transfer failed for {peer}")
+                    self.kv_transfer_metrics.observe_kv_transfer_latency(
+                        time.monotonic() - started_at
+                    )
 
-                        if kv_chunk.is_last:
-                            polls.append(True)
-                            dst_ranks_infos.append(
-                                (req.endpoint, req.dst_port, req.room)
-                            )
-
-                            # Only sync status when all the dst ranks have received the kvcache
-                            if len(polls) == req.required_dst_info_num:
-                                status = (
-                                    TransferPoll.Success
-                                    if all(polls)
-                                    else TransferPoll.Failed
-                                )
-                                self.update_status(req.room, status)
-                                # bootstrap_token is carried directly in the chunk (set by
-                                # DisaggPrefillExecutor._decode after prefill forward).
-                                if kv_chunk.wait_for_bootstrap_token:
-                                    if prefill_metadata is None:
-                                        prefill_metadata = self._wait_prefill_metadata(
-                                            kv_chunk.room,
-                                            kv_chunk.bootstrap_token,
-                                            kv_chunk.spec_candidate_ids,
-                                        )
-                                    bootstrap_token, spec_candidate_ids = (
-                                        prefill_metadata
-                                    )
-                                else:
-                                    bootstrap_token, spec_candidate_ids = (
-                                        kv_chunk.bootstrap_token,
-                                        kv_chunk.spec_candidate_ids,
-                                    )
-                                if self.check_status(req.room) == TransferPoll.Failed:
-                                    status = TransferPoll.Failed
-                                for endpoint, dst_port, room in dst_ranks_infos:
-                                    self.sync_status_to_decode_endpoint(
-                                        endpoint,
-                                        dst_port,
-                                        room,
-                                        status,
-                                        self.attn_tp_rank,
-                                        bootstrap_token=bootstrap_token,
-                                        spec_candidate_ids=spec_candidate_ids,
-                                    )
-                        elapsed_seconds = time.monotonic() - tm_start
-                        if self.kv_transfer_metrics:
-                            self.kv_transfer_metrics.observe_kv_transfer_latency(
-                                elapsed_seconds
-                            )
-                    else:
-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
-                        # Dummy request does not need to sync status to decode endpoint
-                        if kv_chunk.is_last and req.room in self.request_status:
-                            self.update_status(req.room, TransferPoll.Success)
-
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == TransferPoll.Success
-                ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
-
+                if not kv_chunk.is_last:
+                    continue
+                if kv_chunk.wait_for_bootstrap_token:
+                    bootstrap_token, spec_candidate_ids = self._wait_prefill_metadata(
+                        kv_chunk.room,
+                        kv_chunk.bootstrap_token,
+                        kv_chunk.spec_candidate_ids,
+                    )
+                else:
+                    bootstrap_token = kv_chunk.bootstrap_token
+                    spec_candidate_ids = kv_chunk.spec_candidate_ids
+                if self.check_status(kv_chunk.room) == TransferPoll.Failed:
+                    continue
+                for req in reqs:
+                    registration = self.get_decode_registration(req)
+                    self.sync_status_to_decode_endpoint(
+                        registration.endpoint,
+                        registration.dst_port,
+                        req.room,
+                        TransferPoll.Success,
+                        self._status_prefill_rank,
+                        bootstrap_token=bootstrap_token,
+                        spec_candidate_ids=spec_candidate_ids,
+                    )
+                self.update_status(kv_chunk.room, TransferPoll.Success)
+                self.transfer_infos.pop(kv_chunk.room, None)
             except Exception as exc:
-                raise RuntimeError(
-                    f"Transfer thread failed because of {exc}. Prefill instance "
-                    f"with bootstrap_port={self.bootstrap_port} is dead."
-                ) from exc
+                logger.exception(f"CachePD transfer failed for room={kv_chunk.room!s}")
+                self.abort_room(kv_chunk.room, f"CachePD transfer failed: {exc}")
+
+    def _handle_bootstrap_message(self, frames: list[bytes]) -> None:
+        """Consume one static registration or one manifest-only request."""
+        try:
+            room_header = frames[0].decode("ascii")
+        except (IndexError, UnicodeError):
+            logger.exception("Rejecting malformed Mooncake bootstrap message header")
+            return
+
+        if room_header == "None":
+            try:
+                registration = KVArgsRegisterInfo.from_zmq(frames)
+                registration = self._prepare_decode_registration(registration)
+            except (IndexError, UnicodeError, ValueError) as exc:
+                try:
+                    endpoint, dst_port, session_id = (
+                        KVArgsRegisterInfo.route_header_from_zmq(frames)
+                    )
+                    self._reject_decode_registration(
+                        endpoint=endpoint,
+                        dst_port=dst_port,
+                        session_id=session_id,
+                        reason=str(exc),
+                    )
+                except (IndexError, UnicodeError, ValueError):
+                    pass
+                logger.exception("Rejecting malformed CachePD Decode registration")
+                return
+            session_id = registration.mooncake_session_id
+            previous = self.decode_kv_args_table.get(session_id)
+            if previous is not None and previous != registration:
+                reason = "conflicting registration for an active CachePD session"
+                self._reject_decode_registration(
+                    endpoint=registration.endpoint,
+                    dst_port=registration.dst_port,
+                    session_id=session_id,
+                    reason=reason,
+                )
+                logger.error(
+                    "Rejecting conflicting CachePD registration for session="
+                    f"{session_id!s}",
+                )
+                return
+            self.decode_kv_args_table[session_id] = registration
+            self.rejected_decode_sessions.pop(session_id, None)
+            with self.session_lock:
+                self._clear_failed_session(session_id)
+            return
+
+        parsed_room = None
+        session_id = None
+        registration = None
+        try:
+            parsed_room, session_id = TransferInfo.route_header_from_zmq(frames)
+            transfer_info = TransferInfo.from_zmq(frames)
+            registration = self.get_decode_registration(transfer_info)
+            if transfer_info.is_dummy != registration.is_dummy:
+                raise ValueError("CachePD request kind disagrees with its registration")
+            if self.request_status.get(parsed_room) == TransferPoll.Failed:
+                self.sync_status_to_decode_endpoint(
+                    registration.endpoint,
+                    registration.dst_port,
+                    parsed_room,
+                    TransferPoll.Failed,
+                    self._status_prefill_rank,
+                )
+                return
+            if transfer_info.block_manifest is not None:
+                validate_cache_manifest(
+                    transfer_info.block_manifest,
+                    layout=registration.peer_cache_layout,
+                    peer="destination",
+                )
+            expected_fanout = len(registration.expected_decode_ranks)
+            candidate_infos = dict(self.transfer_infos.get(parsed_room, {}))
+            if session_id in candidate_infos:
+                raise ValueError("duplicate CachePD pre-allocation for Decode session")
+            candidate_infos[session_id] = transfer_info
+            if len(candidate_infos) > expected_fanout:
+                raise ValueError("pre-allocation exceeds destination fanout")
+            if len(candidate_infos) == expected_fanout:
+                self._validate_cache_room_fanout(tuple(candidate_infos.values()))
+        except (IndexError, UnicodeError, ValueError) as exc:
+            logger.exception(
+                f"Rejecting malformed pre-allocation metadata for room={room_header!s}",
+            )
+            if parsed_room is None:
+                return
+            try:
+                self.abort_room(
+                    parsed_room,
+                    f"invalid pre-allocation metadata: {exc}",
+                )
+            except Exception:
+                logger.exception(
+                    f"Could not abort malformed CachePD room={parsed_room!s}",
+                )
+            try:
+                if registration is None and session_id is not None:
+                    registration = self.decode_kv_args_table.get(session_id)
+                rejected = (
+                    self.rejected_decode_sessions.get(session_id)
+                    if registration is None and session_id is not None
+                    else None
+                )
+                if registration is None and rejected is None:
+                    raise ValueError("malformed request has no registered session")
+                endpoint, dst_port = (
+                    (registration.endpoint, registration.dst_port)
+                    if registration is not None
+                    else rejected
+                )
+                self.sync_status_to_decode_endpoint(
+                    endpoint,
+                    dst_port,
+                    parsed_room,
+                    TransferPoll.Failed,
+                    self._status_prefill_rank,
+                )
+            except Exception:
+                logger.exception(
+                    f"Could not notify malformed Decode peer for room={parsed_room!s}",
+                )
+            return
+
+        self.transfer_infos[parsed_room] = candidate_infos
+        # A transfer worker can fail and remove the room after the precheck but
+        # before this bootstrap-thread commit.  Do not let that interleaving
+        # resurrect destination state for a sticky-Failed room.
+        if self.request_status.get(parsed_room) == TransferPoll.Failed:
+            self.transfer_infos.pop(parsed_room, None)
+            self.sync_status_to_decode_endpoint(
+                registration.endpoint,
+                registration.dst_port,
+                parsed_room,
+                TransferPoll.Failed,
+                self._status_prefill_rank,
+            )
+            return
+        complete = len(candidate_infos) == expected_fanout
+        if complete:
+            self.update_status(parsed_room, TransferPoll.Bootstrapped)
 
     def start_prefill_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.bind_server_socket(get_local_ip_by_remote())
 
         def bootstrap_thread():
-            """This thread recvs pre-alloc notification from the decode engine"""
-            # TransferPoll.Bootstrapping -> TransferPoll.WaitingForInput
+            """Receive registrations and pre-allocation manifests from Decode."""
             while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
-                room = waiting_req_bytes[0].decode("ascii")
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                logger.info(
-                    "[Prefill bootstrap_thread] recv multipart: room=%s session_id=%s",
-                    room,
-                    mooncake_session_id,
-                )
-                if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    with self.session_lock:
-                        self._clear_failed_session(mooncake_session_id)
-                    logger.info(
-                        "[Prefill bootstrap_thread] registered kv_args from decode session=%s",
-                        mooncake_session_id,
-                    )
-                    continue
-                else:
-                    required_dst_info_num = int(waiting_req_bytes[6].decode("ascii"))
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.info(
-                        "[Prefill bootstrap_thread] pre-alloc received: room=%d session=%s got=%d/%d, status -> %s",
-                        room,
-                        mooncake_session_id,
-                        len(self.transfer_infos[room]),
-                        required_dst_info_num,
-                        (
-                            "Bootstrapped"
-                            if len(self.transfer_infos[room]) == required_dst_info_num
-                            else "waiting more"
-                        ),
-                    )
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.update_status(room, TransferPoll.Bootstrapped)
+                frames = self.server_socket.recv_multipart()
+                try:
+                    self._handle_bootstrap_message(frames)
+                except Exception:
+                    # A malformed peer must never terminate the process-wide
+                    # bootstrap worker and strand every later request.
+                    logger.exception("Unexpected CachePD bootstrap message failure")
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -1291,28 +1205,23 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def add_transfer_request(
         self,
         bootstrap_room: int,
-        kv_indices: npt.NDArray[np.int64],
-        index_slice: slice,
         is_last: bool,
-        aux_index: int | None = None,
         bootstrap_token: int = -1,
         begin_cache_step: int | None = None,
         layerwise_interval: int = 1,
         wait_for_bootstrap_token: bool = False,
-        mamba_indices: npt.NDArray[np.int64] | None = None,
         spec_candidate_ids: list[int] | None = None,
-        page_manifest: CachePDPageManifest | None = None,
+        block_manifest: CachePDBlockManifest | None = None,
+        cache_block_selection: CachePDLayerwiseBlockSelection | None = None,
     ):
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             raise RuntimeError("Transfer requests can only be added in prefill mode.")
-        if is_last and aux_index is None:
-            raise ValueError("aux_index must be set for the last transfer chunk.")
         if (
             bootstrap_room not in self.request_status
             or self.check_status(bootstrap_room) == TransferPoll.Failed
         ):
             logger.debug(
-                "Request with bootstrap_room=%s already failed", bootstrap_room
+                f"Request with bootstrap_room={bootstrap_room!s} already failed",
             )
             return
 
@@ -1326,44 +1235,22 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
         dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
+        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
                 is_last=is_last,
-                prefill_aux_index=aux_index,
                 bootstrap_token=bootstrap_token,
                 begin_cache_step=begin_cache_step,
                 layerwise_interval=layerwise_interval,
                 wait_for_bootstrap_token=wait_for_bootstrap_token,
-                prefill_mamba_indices=mamba_indices,
                 spec_candidate_ids=spec_candidate_ids,
-                page_manifest=page_manifest,
+                block_manifest=block_manifest,
+                cache_block_selection=cache_block_selection,
             )
         )
-
-    def receive_decode_prefix_info(self, bootstrap_room: int) -> int:
-        """Receive decode prefix info from decode side"""
-        # In mooncake implementation, decode_prefix_len is handled via ZMQ messages
-        # Check the stored transfer info for this room
-        if bootstrap_room in self.transfer_infos:
-            for transfer_info in self.transfer_infos[bootstrap_room].values():
-                if (
-                    hasattr(transfer_info, "decode_prefix_len")
-                    and transfer_info.decode_prefix_len > 0
-                ):
-                    logger.debug(
-                        "Found decode_prefix_len=%s for room %s",
-                        transfer_info.decode_prefix_len,
-                        bootstrap_room,
-                    )
-                    return transfer_info.decode_prefix_len
-        logger.debug("No decode_prefix_len found for room %s, using 0", bootstrap_room)
-        return 0
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
@@ -1372,24 +1259,22 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         else:
             ip_address = get_ip()
 
-        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
-        url = f"http://{bootstrap_server_url}/route"
+        url = f"http://{join_host_port(ip_address, self.bootstrap_port)}/route"
         payload = {
             "role": "Prefill",
-            "world_size": self.world_size,
-            "dp_size": self.dp_size,
+            "world_size": self.topology.world_size,
+            "dp_size": self.topology.dp_size,
+            "pp_size": self.topology.pp_size,
+            "cache_fields_by_stage": self.kv_args.cache_fields_by_stage,
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
-            "engine_rank": self.kv_args.engine_rank,
-            "kv_item_lens": self.kv_args.kv_item_lens,
-            "kv_unit_lens": getattr(self.kv_args, "kv_unit_lens", []),
-            "state_item_lens": self.kv_args.state_item_lens,
-            "state_unit_lens": getattr(self.kv_args, "state_unit_lens", []),
-        }
-        if self.kv_args.cache_layout is not None:
-            payload["cache_layout"] = (
-                self.kv_args.cache_layout.peer.to_wire_bytes().decode("ascii")
+            "engine_rank": self.topology.global_rank,
+            "cache_layout": (
+                getattr(self.kv_args, "wire_layout", None) or self.kv_args.cache_layout
             )
+            .to_wire_bytes()
+            .decode("ascii"),
+        }
 
         try:
             response = requests.put(url, json=payload, timeout=5)
@@ -1397,13 +1282,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 logger.debug("Prefill successfully registered to bootstrap server.")
             else:
                 logger.error(
-                    "Prefill instance failed to connect to bootstrap server: %s, %s",
-                    response.status_code,
-                    response.text,
+                    "Prefill instance failed to connect to bootstrap server: "
+                    f"{response.status_code!s}, {response.text!s}",
                 )
         except Exception as exc:
             logger.error(
-                "Prefill instance failed to register with bootstrap server: %s", exc
+                f"Prefill instance failed to register with bootstrap server: {exc!s}",
             )
 
 

@@ -26,23 +26,23 @@
 #include <vector>
 
 #include "cache/core/cache_types.h"
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 
 namespace tokenspeed {
 
 struct SchedulerConfig;
 
-// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.block_size.
-std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
+// One CacheGroupSpec per config cache_group (group_id = index); all groups share config.prefix_granularity.
+// Pure translation: the caller must have accepted `config` through
+// SchedulerConfig::Validate() first, which is what makes every field read here
+// (packing, block granularity, a sliding group's window) well-formed.
+std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
-std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t page_size, std::int32_t promotion_boundary_tokens);
+void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
-void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
-
-// One row per config group_id. Each manager resolves the group's LCM placement
+// One row per config group_id. Each group allocator resolves the LCM placement
 // to the kernel-visible page id.
-std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
+std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const CacheCoordinator& coordinator,
                                                                   const std::vector<BlockTable>& tables,
                                                                   std::span<const std::string> group_ids);
 

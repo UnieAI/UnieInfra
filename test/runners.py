@@ -31,7 +31,6 @@ from test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 
@@ -52,8 +51,6 @@ with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
     long_prompt = f.read()
 DEFAULT_PROMPTS.append(long_prompt)
 
-NUM_TOP_LOGPROBS = 5
-
 
 def get_dtype_str(torch_dtype):
     if torch_dtype is torch.float16:
@@ -64,19 +61,6 @@ def get_dtype_str(torch_dtype):
         return "bfloat16"
     else:
         raise NotImplementedError()
-
-
-def get_top_logprobs(logits, k):
-    logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
-    del logits
-    return torch.topk(logprobs, k=k, dim=-1).values
-
-
-def get_token_ids_logprobs(logits, token_ids):
-    logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
-    del logits
-    logprobs = logprobs[..., token_ids]
-    return logprobs
 
 
 @dataclass
@@ -372,7 +356,7 @@ class RTRunner:
         chunked_prefill_size: Optional[int] = None,
         max_model_len: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
-        block_size: Optional[int] = 64,
+        prefix_granularity: Optional[int] = 64,
         data_parallel_size: int = 1,
         tokenizer: Optional[str] = None,
         gpu_memory_utilization: float = 0.65,
@@ -425,7 +409,7 @@ class RTRunner:
             chunked_prefill_size=chunked_prefill_size,
             max_model_len=max_model_len,
             max_total_tokens=max_total_tokens,
-            block_size=block_size,
+            prefix_granularity=prefix_granularity,
             data_parallel_size=data_parallel_size,
             tokenizer=tokenizer,
             disable_overlap_schedule=disable_overlap_schedule,

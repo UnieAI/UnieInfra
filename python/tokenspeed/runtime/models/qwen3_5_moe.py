@@ -23,12 +23,14 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
 )
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
@@ -39,11 +41,12 @@ from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextC
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -59,10 +62,11 @@ from tokenspeed.runtime.layers.moe.utils import (
     use_deepep_low_latency,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
+from tokenspeed.runtime.utils.env import envs
 
 _is_blackwell = current_platform().is_blackwell
 
@@ -77,6 +81,31 @@ def _is_moe_layer(layer_id: int, config) -> bool:
     return config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
 
 
+_GATE_UP_CHECKPOINT_MEMBERS = ("gate_proj", "up_proj")
+
+
+def _gate_up_quant_config(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> QuantizationConfig | None:
+    """Drop the quant config when the checkpoint keeps this MLP's weights bf16.
+
+    Args:
+        quant_config: Quantization config the caller would otherwise pass.
+        prefix: Full runtime prefix of the fused ``gate_up_proj`` module.
+
+    Returns:
+        ``None`` when either checkpoint member is excluded, else ``quant_config``.
+    """
+    if not isinstance(quant_config, Nvfp4Config) or not prefix:
+        return quant_config
+    parent = prefix.rpartition(".")[0]
+    for member in _GATE_UP_CHECKPOINT_MEMBERS:
+        member_prefix = f"{parent}.{member}" if parent else member
+        if should_exclude_quant_module(member_prefix, quant_config.exclude_modules):
+            return None
+    return quant_config
+
+
 class Qwen3_5MoeMLP(nn.Module):
     def __init__(
         self,
@@ -88,6 +117,8 @@ class Qwen3_5MoeMLP(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         replicate_weights: bool = False,
+        *,
+        parallelism: Literal["dense", "moe_shared"],
     ) -> None:
         """Gated MLP used for the dense and shared-expert paths.
 
@@ -109,10 +140,20 @@ class Qwen3_5MoeMLP(nn.Module):
         """
         super().__init__()
         self.mapping = mapping
-        if mapping.dense.has_tp and not replicate_weights:
+        gate_up_quant_config = _gate_up_quant_config(
+            quant_config, add_prefix("gate_up_proj", prefix)
+        )
+        if parallelism == "moe_shared":
+            tp_size = mapping.moe.tp_ep_size
+            tp_rank = mapping.moe.tp_ep_rank
+            tp_group = mapping.moe.tp_ep_group
+        elif parallelism == "dense":
             tp_size = mapping.dense.tp_size
             tp_rank = mapping.dense.tp_rank
             tp_group = mapping.dense.tp_group
+        else:
+            raise ValueError(f"Unsupported MLP parallelism: {parallelism}")
+        if tp_size > 1 and not replicate_weights:
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size,
                 [intermediate_size] * 2,
@@ -120,7 +161,7 @@ class Qwen3_5MoeMLP(nn.Module):
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 tp_group=tp_group,
-                quant_config=quant_config,
+                quant_config=gate_up_quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
             )
             self.down_proj = RowParallelLinear(
@@ -139,7 +180,7 @@ class Qwen3_5MoeMLP(nn.Module):
                 hidden_size,
                 intermediate_size * 2,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=gate_up_quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
             )
             self.down_proj = ReplicatedLinear(
@@ -166,6 +207,13 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj.interleave_linear_and_gate = (
             self._use_nvfp4_gemm_swiglu_nvfp4_quant
         )
+        # Dynamic-activation MXFP4 projections fuse SiLU-and-mul into the
+        # gate_up GEMM epilogue; down_proj quantizes that output on load.
+        self._use_mxfp4_swiglu = isinstance(
+            self.gate_up_proj.quant_method, Mxfp4LinearMethod
+        ) and isinstance(self.down_proj.quant_method, Mxfp4LinearMethod)
+        if self._use_mxfp4_swiglu:
+            self.gate_up_proj.quant_method.enable_swiglu(self.gate_up_proj)
 
     def _uses_deep_gemm_fp8_mlp(self) -> bool:
         """Whether both projections can consume packed UE8M0 activations."""
@@ -175,14 +223,24 @@ class Qwen3_5MoeMLP(nn.Module):
             and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
         )
 
+    def nvfp4_global_scale(self) -> torch.Tensor | None:
+        """The global scale gate_up_proj quantizes its input to NVFP4 with, if it does."""
+        return self.gate_up_proj.quant_method.nvfp4_global_scale(self.gate_up_proj)
+
     def forward(self, x):
+        return self.forward_prequantized(x, None)
+
+    def forward_prequantized(
+        self, x: torch.Tensor, x_nvfp4: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> torch.Tensor:
+        """``forward(x)``, taking gate_up_proj's NVFP4 input from its producer when given."""
         if x.shape[0] == 0:
             return x
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
-            x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x,
-                self.gate_up_proj.input_scale_inv,
-                enable_pdl=pdl_enabled(),
+            x_fc1_fp4, x_fc1_scale = (
+                fp4_quantize(x, self.gate_up_proj.input_scale_inv)
+                if x_nvfp4 is None
+                else x_nvfp4
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,
@@ -191,16 +249,16 @@ class Qwen3_5MoeMLP(nn.Module):
                 self.gate_up_proj.weight_scale_swiglu_interleaved,
                 self.gate_up_proj.alpha,
                 self.down_proj.input_scale_inv,
-                enable_pdl=pdl_enabled(),
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
-        gate_up, _ = self.gate_up_proj(x)
+        if self._use_mxfp4_swiglu:
+            x = self.gate_up_proj.quant_method.apply_swiglu(self.gate_up_proj, x)
+            x, _ = self.down_proj(x)
+            return x
+        gate_up, _ = self.gate_up_proj(x if x_nvfp4 is None else x_nvfp4)
         if self._uses_deep_gemm_fp8_mlp():
-            x_fp8, x_scale = fused_swiglu_fp8_ue8m0(
-                gate_up,
-                enable_pdl=pdl_enabled(),
-            )
+            x_fp8, x_scale = fused_swiglu_fp8_ue8m0(gate_up)
             if isinstance(self.down_proj, RowParallelLinear):
                 x, _ = self.down_proj(x_fp8, x_scale)
             else:
@@ -247,6 +305,8 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             layer_id=layer_index,
             is_moe=True,
             prev_is_moe=_is_moe_layer(layer_index - 1, config),
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
 
         if self.tp_size > config.num_experts:
@@ -264,8 +324,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.num_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            num_experts=config.num_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -303,11 +362,16 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 # shared_expert_intermediate_size imposes under block-quantized
                 # FP8 (a shard must stay >= the quantization block).
                 replicate_weights=self.use_deepep,
+                parallelism="moe_shared",
             )
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
         else:
             self.shared_expert = None
             self.shared_expert_gate = None
+
+    def nvfp4_global_scale(self) -> torch.Tensor | None:
+        """None: the experts quantize their own inputs, so no producer applies a scale."""
+        return None
 
     def get_moe_routed_weights(self):
         """Return routed expert weights excluding auxiliary shared parameters."""

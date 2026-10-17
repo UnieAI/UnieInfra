@@ -55,7 +55,7 @@ BLOCK_M = 64
 # ---- Decode-specialised stage-1 config -------------------------------------
 # Decode schedule: small M tile, large K tile, single LDS buffer -> minimal
 # resource -> max occupancy, plus split-K for extra CTAs. Tuned on MI355X DSv3.
-DECODE_MAX_M = 16  # auto-enable the decode path at/below this M
+DECODE_MAX_M = 32  # auto-enable the decode path at/below this M
 WARP_DECODE_MAX_M = 8  # warp-GEMV decode wins at/below this M; above it the
 # split-K + reduce decode path is (marginally) faster
 DECODE_BLOCK_M = 32  # sort + stage tile M
@@ -64,13 +64,19 @@ DECODE_S1_BLOCK_K = 128  # stage-1 K tile
 DECODE_S1_NBUF = 1  # single LDS buffer
 
 
-def _decode_split_k(num_tokens: int) -> int:
+def _decode_split_k(num_tokens: int, num_k_tiles: int) -> int:
     """Decode split-K factor for the stage-1 tile (K=128 -> 56 K-tiles).
-    Tuned: more splits at tiny M for occupancy, fewer as M grows."""
+    Tuned: more splits at tiny M for occupancy, fewer as M grows. Clamped to
+    a divisor of ``num_k_tiles``, as the split-K kernel requires."""
     if num_tokens <= 4:
-        return 4
-    if num_tokens <= 8:
-        return 2
+        want = 4
+    elif num_tokens <= 8:
+        want = 2
+    else:
+        return 1
+    for sk in (4, 2):
+        if sk <= want and num_k_tiles % sk == 0:
+            return sk
     return 1
 
 
@@ -84,6 +90,8 @@ def gluon_bf16_moe(
     split_k: int | None = None,
     decode: bool | None = None,
     warp_decode: bool | None = None,
+    expert_start: int = 0,
+    expert_parallel: bool = False,
 ) -> torch.Tensor:
     """Compute the fused bf16 MoE FFN and return ``(num_tokens, D)`` bf16.
 
@@ -115,6 +123,8 @@ def gluon_bf16_moe(
         decode = num_tokens <= DECODE_MAX_M
     if warp_decode is None:
         warp_decode = decode and num_tokens <= WARP_DECODE_MAX_M and I_r % 256 == 0
+    if expert_start:
+        warp_decode = False
     if decode:
         block_m = DECODE_BLOCK_M
 
@@ -138,11 +148,15 @@ def gluon_bf16_moe(
         # sync-free, atomic-free single-workgroup align (outputs sized at the
         # fixed decode upper bound; stages early-out on the padded tail).
         sorted_token_ids, sorted_expert_ids, sorted_weights, num_valid = (
-            moe_align_block_size_fused(topk_ids, topk_weights, E, block_m)
+            moe_align_block_size_fused(
+                topk_ids, topk_weights, E, block_m, expert_start=expert_start
+            )
         )
     else:
         sorted_token_ids, sorted_expert_ids, sorted_weights, num_valid = (
-            moe_align_block_size_device(topk_ids, topk_weights, E, block_m)
+            moe_align_block_size_device(
+                topk_ids, topk_weights, E, block_m, expert_start=expert_start
+            )
         )
 
     # empty() is safe: stage 1 writes every inter row (one per (token, slot))
@@ -152,7 +166,11 @@ def gluon_bf16_moe(
     )
     if decode:
         # decode stage 1 (small M/N, K=128, single LDS buffer) + split-K.
-        sk = split_k if split_k is not None else _decode_split_k(num_tokens)
+        sk = (
+            split_k
+            if split_k is not None
+            else _decode_split_k(num_tokens, D // DECODE_S1_BLOCK_K)
+        )
         invoke_stage1_splitk(
             hidden_states,
             w1,
@@ -177,10 +195,12 @@ def gluon_bf16_moe(
             inter,
             topk,
             BLOCK_M=block_m,
+            BLOCK_N=128 if I_r % 128 == 0 else 64,
             split_k=split_k,
         )
 
-    out = torch.empty(
+    output_factory = torch.zeros if expert_parallel else torch.empty
+    out = output_factory(
         (num_tokens, D), dtype=torch.bfloat16, device=hidden_states.device
     )
     invoke_stage2(
@@ -193,5 +213,6 @@ def gluon_bf16_moe(
         out,
         topk,
         BLOCK_M=block_m,
+        expert_parallel=expert_parallel,
     )
     return out

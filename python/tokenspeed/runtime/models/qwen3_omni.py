@@ -53,7 +53,7 @@ from tokenspeed.runtime.multimodal.embedder import (
     pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    EncoderCudaGraphWrapper,
+    EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
 )
 from tokenspeed.runtime.multimodal.inputs import (
@@ -68,6 +68,24 @@ logger = logging.getLogger(__name__)
 
 def _get_thinker_config(config):
     return getattr(config, "thinker_config", config)
+
+
+def _ensure_layer_types(text_config) -> None:
+    """Give the thinker text config the ``layer_types`` the Qwen3 attention reads.
+
+    ``Qwen3OmniMoeTextConfig`` declares none; derive them as ``Qwen3Config``
+    does, with sliding attention only where ``use_sliding_window`` enables it.
+    """
+    if getattr(text_config, "layer_types", None) is not None:
+        return
+    sliding = getattr(text_config, "use_sliding_window", False) and (
+        getattr(text_config, "sliding_window", None) is not None
+    )
+    max_window_layers = getattr(text_config, "max_window_layers", 0)
+    text_config.layer_types = [
+        "sliding_attention" if sliding and i >= max_window_layers else "full_attention"
+        for i in range(text_config.num_hidden_layers)
+    ]
 
 
 def _shared_vision_config(vision_config) -> Qwen3VLVisionConfig:
@@ -109,7 +127,6 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
@@ -129,14 +146,15 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 cos_sin=None,
             )
             if layer_idx < num_deepstack and input_deepstack_embeds.numel() > 0:
                 start = layer_idx * hidden_size
-                hidden_states.add_(
-                    input_deepstack_embeds[:, start : start + hidden_size]
+                # Add to the residual: under all-reduce fusion hidden_states is
+                # this rank's partial sum, which the next layer reduces.
+                residual = (
+                    residual + input_deepstack_embeds[:, start : start + hidden_size]
                 )
 
         if not ctx.forward_mode.is_idle():
@@ -162,6 +180,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         self.omni_config = config
         self.thinker_config = _get_thinker_config(config)
         text_config = self.thinker_config.text_config
+        _ensure_layer_types(text_config)
         super().__init__(config=text_config, mapping=mapping, quant_config=quant_config)
 
         self.is_multimodal_active = is_multimodal_active
@@ -291,7 +310,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         *,
         max_metadata_sequences_per_batch: int | None = None,
         metadata_sequence_budget_from_encoder_output_budget: bool = False,
-    ) -> EncoderCudaGraphWrapper:
+    ) -> EncoderForwardStepRunner:
         adapter = VisionEncoderCudaGraphAdapter(
             tower=self.visual,
             pre_encode=self.pre_encode,
@@ -303,7 +322,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             capture_tp_size=mapping.vision.tp_size,
             capture_tp_group=mapping.vision.tp_group,
         )
-        return EncoderCudaGraphWrapper(
+        return EncoderForwardStepRunner(
             adapter=adapter,
             budget_range=(64, 4096),
             max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
@@ -333,7 +352,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -350,7 +368,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             or not multimodal_context.has_extend_inputs()
             or ctx.forward_mode.is_decode_or_idle()
         ):
-            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
+            return super().forward(ctx, input_ids, positions, **kwargs)
 
         input_embeds, model_kwargs = self.multimodal_embedder.apply(
             input_ids=input_ids,
@@ -363,7 +381,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )
@@ -436,7 +453,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                     continue
                 name = self._map_visual_weight(name)
                 if name not in params:
-                    logger.warning("Parameter %s not found in Qwen3-Omni", name)
+                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
                     continue
                 param = params[name]
                 loader = getattr(param, "weight_loader", default_weight_loader)
@@ -449,7 +466,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                     continue
                 loaded_name = self.audio_tower.load_weight(name, loaded_weight)
                 if loaded_name is None:
-                    logger.warning("Parameter %s not found in Qwen3-Omni", name)
+                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
                 else:
                     loaded.add(f"audio_tower.{loaded_name}")
                 continue
@@ -489,7 +506,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                 if name.endswith(ignore_suffixes) and name not in params:
                     continue
                 if name not in params:
-                    logger.warning("Parameter %s not found in Qwen3-Omni", name)
+                    logger.warning(f"Parameter {name!s} not found in Qwen3-Omni")
                     continue
                 param = params[name]
                 loader = getattr(param, "weight_loader", default_weight_loader)

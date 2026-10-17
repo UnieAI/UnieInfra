@@ -27,6 +27,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import warnings
 from collections.abc import Callable
 from typing import Any
@@ -45,14 +46,16 @@ from transformers.utils import cached_file
 
 from tokenspeed.runtime.configs import (
     DeepseekV4Config,
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
     InklingMMConfig,
     InklingModelConfig,
     KimiK2Config,
     KimiK3Config,
     KimiK3DSparkConfig,
     KimiK25Config,
-    MiniMaxM2Config,
     MiniMaxM3Config,
+    MuseSparkConfig,
     Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -60,19 +63,36 @@ from tokenspeed.runtime.configs import (
     Qwen3ASRConfig,
     Qwen3Config,
     Qwen3MoeConfig,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.configs.beam_config import BeamConfig
+from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
+from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
+from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
+from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
+from tokenspeed.runtime.hf_hub_retry import call_with_hf_rate_limit_retry
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
+_HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
+_TURN_FINAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|eot|>")
+logger = logging.getLogger(__name__)
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    BeamConfig.model_type: BeamConfig,
+    Dots3NoteConfig.model_type: Dots3NoteConfig,
     Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
     DeepseekV4Config.model_type: DeepseekV4Config,
+    DeepseekV41Config.model_type: DeepseekV41Config,
+    DeepseekV41TextConfig.model_type: DeepseekV41TextConfig,
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig.model_type: Qwen3_5MoeTextConfig,
-    MiniMaxM2Config.model_type: MiniMaxM2Config,
+    Qwen4ExpConfig.model_type: Qwen4ExpConfig,
+    Qwen4ExpTextConfig.model_type: Qwen4ExpTextConfig,
     MiniMaxM3Config.model_type: MiniMaxM3Config,
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
@@ -80,9 +100,59 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
+    Glm53FlashConfig.model_type: Glm53FlashConfig,
+    NemotronHConfig.model_type: NemotronHConfig,
+    NemotronHOmniConfig.model_type: NemotronHOmniConfig,
+    MuseSparkConfig.model_type: MuseSparkConfig,
+    "glm5_next": Glm53FlashConfig,
 }
 
-_DEEPSEEK_V4_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_v4_encoding"
+# Config classes for checkpoints identified by architecture rather than
+# ``model_type`` (a plugin checkpoint's config.json may carry none). Filled by
+# ``tokenspeed.runtime.plugins.registry.register_config``.
+_ARCHITECTURE_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
+
+
+def _resolve_registered_config(
+    raw_config: dict[str, Any],
+) -> type[PretrainedConfig] | None:
+    """Return the registered config class for a raw ``config.json``, if any.
+
+    ``model_type`` wins; a config without a registered type falls back to its
+    first ``architectures`` entry.
+    """
+    model_type = raw_config.get("model_type", "llama")
+    if model_type in _CONFIG_REGISTRY:
+        return _CONFIG_REGISTRY[model_type]
+    architectures = raw_config.get("architectures") or ()
+    if architectures:
+        return _ARCHITECTURE_CONFIG_REGISTRY.get(architectures[0])
+    return None
+
+
+_GLM53_FLASH_ARCHITECTURE_ALIASES = {
+    "Glm5NextForConditionalGeneration": "Glm53FlashForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN": (
+        "Glm53FlashForConditionalGenerationNextN"
+    ),
+}
+
+
+def _snapshot_commit_hash(snapshot_path: str) -> str | None:
+    """Extract an immutable commit from a standard HF snapshot path.
+
+    Args:
+        snapshot_path: Local snapshot directory returned by ``snapshot_download``.
+
+    Returns:
+        The 40-character lowercase commit hash, or ``None`` for a nonstandard
+        cache layout.
+    """
+    candidate = os.path.basename(os.path.normpath(snapshot_path))
+    return candidate if _HF_COMMIT_HASH_RE.fullmatch(candidate) else None
+
+
+_DEEPSEEK_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_encoding"
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
@@ -100,6 +170,15 @@ def resolve_architecture(config: PretrainedConfig) -> str:
     if archs:
         return archs[0]
     return type(config).__name__
+
+
+def model_loader_architectures(config: PretrainedConfig) -> list[str]:
+    """The architecture names the model loader resolves, in its order.
+
+    Plugin profile resolution walks the same list, so a profile always
+    describes the class that is actually built.
+    """
+    return list(getattr(config, "architectures", None) or [])
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -187,6 +266,25 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     config.__dict__["architectures"] = list(raw_archs)
 
 
+def _normalize_glm53_flash_metadata(config: PretrainedConfig) -> None:
+    """Collapse legacy checkpoint names at the config-loading boundary."""
+    architectures = getattr(config, "architectures", None) or []
+    if not (
+        isinstance(config, Glm53FlashConfig)
+        or any(arch in _GLM53_FLASH_ARCHITECTURE_ALIASES for arch in architectures)
+    ):
+        return
+
+    config.model_type = Glm53FlashConfig.model_type
+    config.__dict__["architectures"] = [
+        _GLM53_FLASH_ARCHITECTURE_ALIASES.get(arch, arch) for arch in architectures
+    ]
+    for nested_name in ("text_config", "vision_config"):
+        nested = getattr(config, nested_name, None)
+        if nested is not None:
+            nested.model_type = type(nested).model_type
+
+
 def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
     if raw_config.get("architectures") != ["GlmMoeDsaForCausalLM"]:
         return
@@ -213,6 +311,31 @@ def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> N
             setattr(config, key, raw_config[key])
 
 
+def _restore_raw_dflash_fields(config: PretrainedConfig, raw_config: dict) -> None:
+    """Re-assert a DFLASH/DSpark draft's sliding window.
+
+    ``Qwen3DSparkModel`` parses as ``Qwen3Config``, which nulls
+    ``sliding_window`` unless ``use_sliding_window`` is set -- a flag these
+    checkpoints never write, since they carry the window in ``dflash_config``.
+    """
+    dflash_config = raw_config.get("dflash_config")
+    if not isinstance(dflash_config, dict):
+        return
+    if getattr(config, "sliding_window", None) is not None:
+        return
+
+    sliding_window = raw_config.get("sliding_window")
+    if sliding_window is None and dflash_config.get("use_swa"):
+        sliding_window = dflash_config.get("swa_window_size")
+    if sliding_window is None:
+        return
+
+    config.sliding_window = int(sliding_window)
+    if hasattr(config, "use_sliding_window"):
+        # transformers gates the window on this flag; keep the two consistent.
+        config.use_sliding_window = True
+
+
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -222,40 +345,111 @@ def get_config(
     speculative_algorithm: str | None = None,
     **kwargs,
 ):
-    if os.path.isdir(model):
-        model_path = model
-    else:
+    """Load one config from one revision-pinned metadata snapshot.
+
+    Remote repositories are resolved under the TokenSpeed cross-process lock.
+    Ordinary configs parse from that immutable local snapshot. Custom config
+    code parses from the original repo at the snapshot's immutable commit,
+    still under the lock. This avoids an unlocked second Hub/cache lookup
+    racing across tensor-parallel worker processes.
+    """
+
+    def load_raw_config(model_path: str) -> dict[str, Any]:
+        try:
+            with open(os.path.join(model_path, "config.json")) as file:
+                return json.load(file)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"Config file not found in {model}. Please check the path."
+            )
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"Failed to decode JSON from config file in {model}. "
+                "Please ensure the file is valid JSON."
+            )
+
+    config = None
+    raw_config = None
+    is_remote_model = not os.path.isdir(model)
+    if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
+        def download_metadata() -> str:
+            return snapshot_download(
+                model,
+                revision=revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
+
         with get_lock(model):
-            model_path = snapshot_download(
-                model, ignore_patterns=["*.pt", "*.safetensors", "*.bin"]
+            model_path = call_with_hf_rate_limit_retry(
+                f"downloading metadata of {model}",
+                download_metadata,
             )
+            raw_config = load_raw_config(model_path)
 
-    try:
-        with open(os.path.join(model_path, "config.json")) as file:
-            raw_config = json.load(file)
-    except FileNotFoundError:
-        raise RuntimeError(f"Config file not found in {model}. Please check the path.")
-    except json.JSONDecodeError:
-        raise RuntimeError(
-            f"Failed to decode JSON from config file in {model}. Please ensure the file is valid JSON."
-        )
+            # Local snapshot parsing is mandatory for ordinary configs: a
+            # second remote config lookup can silently construct defaults (as
+            # in GB200 run 31909404825). Custom AutoConfig code is the sole
+            # exception because Transformers 5.12 resolves its relative
+            # imports incorrectly from symlink-backed local snapshots. Keep
+            # that remote-code load revision-pinned and inside the same lock.
+            if _resolve_registered_config(raw_config) is None and trust_remote_code:
+                snapshot_revision = _snapshot_commit_hash(model_path)
+                if snapshot_revision is not None:
+                    # Keep the lock while Transformers copies executable code
+                    # into transformers_modules. Remote code must not call
+                    # get_config/get_tokenizer recursively for this repo: the
+                    # host-local FileLock is intentionally non-reentrant.
+                    def load_remote_code_config():
+                        return AutoConfig.from_pretrained(
+                            model,
+                            trust_remote_code=True,
+                            revision=snapshot_revision,
+                            **kwargs,
+                        )
 
-    if raw_config.get("model_type", "llama") in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[raw_config["model_type"]]
-        config = config_class.from_pretrained(model, revision=revision)
-        setattr(config, "_name_or_path", model)
+                    # Guard, not retry coverage: Transformers converts hub
+                    # HTTP errors into OSError inside from_pretrained, which
+                    # call_with_hf_rate_limit_retry does not catch. The real
+                    # protection is the snapshot_revision pin: the retried
+                    # snapshot_download above already cached every non-weight
+                    # file, so the remote-code load resolves from the local
+                    # cache without new hub requests.
+                    config = call_with_hf_rate_limit_retry(
+                        f"loading remote-code config of {model}",
+                        load_remote_code_config,
+                    )
+                else:
+                    logger.warning(
+                        "Cannot derive an immutable Hugging Face commit from "
+                        f"{model_path!s}; "
+                        "parsing custom config code from the local snapshot. "
+                        "Remote-code sibling imports may fail in this layout.",
+                    )
     else:
-        try:
+        model_path = model
+
+    if raw_config is None:
+        raw_config = load_raw_config(model_path)
+
+    if config is None:
+        config_class = _resolve_registered_config(raw_config)
+        if config_class is not None:
+            config = config_class.from_pretrained(model_path)
+        else:
             config = AutoConfig.from_pretrained(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                model_path, trust_remote_code=trust_remote_code, **kwargs
             )
-        except ValueError as e:
-            raise e
+
+    # Keep user-facing diagnostics and downstream cache keys stable even though
+    # parsing is deliberately pinned to the immutable local snapshot.
+    config._name_or_path = model
 
     _materialize_architectures(config, raw_config)
+    _normalize_glm53_flash_metadata(config)
     _restore_raw_glm_dsa_fields(config, raw_config)
+    _restore_raw_dflash_fields(config, raw_config)
 
     # extract 'text_config'
     text_config = get_hf_text_config(config)
@@ -285,20 +479,33 @@ def get_config(
     if (
         is_draft_worker
         and config.architectures
+        and config.architectures[0]
+        in ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+    ):
+        config.architectures[0] = "Qwen4ExpForCausalLMNextN"
+        text_config.num_hidden_layers = 1
+        text_config.layer_types = ["full_attention"]
+        text_config.ple_layer_ids = []
+
+    if (
+        is_draft_worker
+        and config.architectures
         and "NextN" not in config.architectures[0]
+        and "MTP" not in config.architectures[0]
         and "Eagle" not in config.architectures[0]
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
     ):
-        if (
-            speculative_algorithm == "DSPARK"
-            and config.architectures[0] == "DeepseekV4ForCausalLM"
+        if speculative_algorithm == "DSPARK" and config.architectures[0] in (
+            "DeepseekV4ForCausalLM",
+            "DeepseekV41ForCausalLM",
         ):
-            config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
-        elif config.architectures[0] == "MiniMaxM2ForCausalLM":
-            config.architectures[0] = "LlamaForCausalLMEagle3"
+            config.architectures[0] += "DSpark"
         else:
             config.architectures[0] += "NextN"
+
+    if text_config.architectures == ["Dots3NoteForCausalLMNextN"]:
+        config = text_config = text_config.for_mtp()
 
     if text_config.architectures == ["LlamaForCausalLMNextN"]:
         text_config.num_hidden_layers = 1
@@ -307,6 +514,8 @@ def get_config(
         text_config.update(model_override_args)
 
     if resolve_architecture(config) in [
+        "DeepseekV41ForCausalLM",
+        "DeepseekV41ForCausalLMDSpark",
         "Gemma4ForConditionalGeneration",
         "Gemma4Config",
         "KimiK25ForConditionalGeneration",
@@ -314,11 +523,17 @@ def get_config(
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
         "KimiK3Config",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
+        "Glm53FlashConfig",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5ForConditionalGenerationNextN",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMNextN",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationNextN",
         "InklingMMConfig",
@@ -327,10 +542,26 @@ def get_config(
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronHOmniConfig",
     ]:
+        if config is text_config:
+            return config
         config.text_config = text_config
         return config
 
+    # Plugin VLMs own their composite config just like the built-in wrappers.
+    # Keep model-specific configuration out of this architecture allowlist.
+    from tokenspeed.runtime.plugins.registry import registered_model
+
+    entry = registered_model(resolve_architecture(config))
+    if entry is not None:
+        if entry.cls.model_profile(config).is_multimodal:
+            return config
+        # A composite checkpoint can register a text-only draft. Keep its
+        # selected entry architecture when returning the language config.
+        if config is not text_config:
+            text_config.architectures = list(config.architectures)
     return text_config
 
 
@@ -341,9 +572,26 @@ def get_generation_config(
     revision: str | None = None,
     **kwargs,
 ):
+    """Load generation metadata from one revision-pinned local snapshot."""
     try:
+        model_path = model
+        if not os.path.isdir(model):
+            from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+            def download_generation_config() -> str:
+                return snapshot_download(
+                    model,
+                    revision=revision,
+                    ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                )
+
+            with get_lock(model):
+                model_path = call_with_hf_rate_limit_retry(
+                    f"downloading generation config of {model}",
+                    download_generation_config,
+                )
         return GenerationConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            model_path, trust_remote_code=trust_remote_code, **kwargs
         )
     except OSError:
         logging.debug("model doesn't have generation_config.json")
@@ -393,30 +641,11 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
-# Architectures for which ``tokenizer.json`` encodes the exact pre-tokenizer
-# / normalizer the model was trained with, and whose AutoTokenizer defaults
-# diverge from that. Kimi-K2.5 ships a custom ``TikTokenTokenizer`` via
-# ``trust_remote_code`` that AutoTokenizer already handles correctly, so this
-# verbatim tokenizer path must stay architecture-gated.
-_VERBATIM_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
-    {
-        "MiniMaxM2ForCausalLM",
-    }
-)
 _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
     {
         "DeepseekV4ForCausalLM",
     }
 )
-
-
-def prefers_verbatim_fast_tokenizer(architectures: list[str] | None) -> bool:
-    """True if the model's architectures warrant bypassing AutoTokenizer and
-    loading ``PreTrainedTokenizerFast`` from ``tokenizer.json`` verbatim.
-    """
-    if not architectures:
-        return False
-    return any(arch in _VERBATIM_TOKENIZER_ARCHITECTURES for arch in architectures)
 
 
 def prefers_deepseek_v4_tokenizer(architectures: list[str] | None) -> bool:
@@ -433,6 +662,10 @@ def _find_deepseek_v4_encoding_file(
         encoding_path = os.path.join(tokenizer_name, "encoding", "encoding_dsv4.py")
         if os.path.exists(encoding_path):
             return encoding_path
+        raise RuntimeError(
+            "DeepSeek V4 tokenizer mode requires "
+            f"`encoding/encoding_dsv4.py` in {tokenizer_name}."
+        )
 
     try:
         encoding_path = cached_file(
@@ -462,12 +695,20 @@ def _load_deepseek_v4_encode_messages(
     tokenizer_name: str,
     tokenizer_revision: str | None,
 ) -> Callable[..., str]:
-    encoding_path = _find_deepseek_v4_encoding_file(tokenizer_name, tokenizer_revision)
+    return _load_deepseek_encode_messages(
+        _find_deepseek_v4_encoding_file(tokenizer_name, tokenizer_revision)
+    )
+
+
+def _load_deepseek_encode_messages(encoding_path: str) -> Callable[..., str]:
+    """Load a standalone encoder from the already resolved checkpoint snapshot."""
+    if not os.path.isfile(encoding_path):
+        raise RuntimeError(f"DeepSeek tokenizer requires {encoding_path}.")
     spec = importlib.util.spec_from_file_location(
-        _DEEPSEEK_V4_ENCODING_MODULE_NAME, encoding_path
+        _DEEPSEEK_ENCODING_MODULE_NAME, encoding_path
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load DeepSeek V4 encoding from {encoding_path}")
+        raise RuntimeError(f"Unable to load DeepSeek encoding from {encoding_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     encode_messages = getattr(module, "encode_messages", None)
@@ -480,18 +721,53 @@ def _wrap_deepseek_v4_tokenizer(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     encode_messages: Callable[..., str],
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
-    """Attach DeepSeek V4's model-provided chat encoder to a HF tokenizer.
+    """Attach DeepSeek V4's model-provided chat encoder to a HF tokenizer."""
+    return _wrap_deepseek_tokenizer(tokenizer, encode_messages, is_v41=False)
 
-    This loads the official encoder from the checkpoint instead of vendoring it
-    in TokenSpeed.
+
+def _validate_deepseek_v41_text_content(content: Any) -> None:
+    """Reject media, including nested tool-result blocks, before prompt encoding."""
+    error = "DeepSeek V4.1 tokenizer supports text-only messages; media content is not supported."
+    if content is None:
+        return
+    if isinstance(content, str):
+        if "<｜deepseek_image｜>" in content:
+            raise ValueError(error)
+        return
+    if not isinstance(content, list):
+        raise ValueError(error)
+    for block in content:
+        if not isinstance(block, dict):
+            raise ValueError(error)
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            _validate_deepseek_v41_text_content(block["text"])
+        elif block.get("type") == "tool_result":
+            _validate_deepseek_v41_text_content(block.get("content"))
+        else:
+            raise ValueError(error)
+
+
+def _wrap_deepseek_tokenizer(
+    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
+    encode_messages: Callable[..., str],
+    *,
+    is_v41: bool,
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+    """Attach the checkpoint encoder without changing the backend vocabulary.
+
+    V4.1 accepts text-only messages and passes numeric reasoning budgets and
+    low/high/max aliases unchanged to encoding/encoding.py. V4 retains its
+    high/max filtering and legacy vocabulary bookkeeping.
     """
-
-    dsv4_tokenizer = copy.copy(tokenizer)
+    wrapped_tokenizer = copy.copy(tokenizer)
     added_vocab = tokenizer.get_added_vocab()
-    added_vocab_size = len(added_vocab)
-    tokenizer_vocab_size = tokenizer.vocab_size
+    # V4.1's added tokens overlap its base vocabulary. Double-counting them
+    # changes Engram's compressed token map and therefore its n-gram hashes.
+    tokenizer_vocab_size = (
+        len(tokenizer) if is_v41 else tokenizer.vocab_size + len(added_vocab)
+    )
 
-    class _DeepseekV4Tokenizer(tokenizer.__class__):  # type: ignore
+    class _DeepseekTokenizer(tokenizer.__class__):  # type: ignore
         def apply_chat_template(
             self,
             messages: list[dict[str, Any]],
@@ -507,7 +783,11 @@ def _wrap_deepseek_v4_tokenizer(
                 conversation.insert(0, {"role": "system", "tools": tools})
 
             reasoning_effort = kwargs.get("reasoning_effort")
-            if reasoning_effort not in ("max", "high"):
+            if is_v41:
+                for message in conversation:
+                    for key in ("content", "content_blocks", "reasoning_content"):
+                        _validate_deepseek_v41_text_content(message.get(key))
+            elif reasoning_effort not in ("max", "high"):
                 reasoning_effort = None
 
             prompt = encode_messages(
@@ -542,14 +822,15 @@ def _wrap_deepseek_v4_tokenizer(
             return len(self.encode(""))
 
         def __len__(self) -> int:
-            return tokenizer_vocab_size + added_vocab_size
+            return tokenizer_vocab_size
 
         def get_added_vocab(self) -> dict[str, int]:
             return added_vocab.copy()
 
-    _DeepseekV4Tokenizer.__name__ = f"DSV4{tokenizer.__class__.__name__}"
-    dsv4_tokenizer.__class__ = _DeepseekV4Tokenizer
-    return dsv4_tokenizer
+    version = "DSV41" if is_v41 else "DSV4"
+    _DeepseekTokenizer.__name__ = f"{version}{tokenizer.__class__.__name__}"
+    wrapped_tokenizer.__class__ = _DeepseekTokenizer
+    return wrapped_tokenizer
 
 
 def get_tokenizer(
@@ -558,115 +839,183 @@ def get_tokenizer(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: str | None = None,
+    revision: str | None = None,
     architectures: list[str] | None = None,
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Gets a tokenizer for the given model name via Huggingface.
 
-    ``architectures`` is the model's ``config.architectures`` list (caller
-    should pass it when available). It gates whether we bypass AutoTokenizer
-    and load ``PreTrainedTokenizerFast`` from ``tokenizer.json`` verbatim —
-    needed for a small set of models (e.g. MiniMax-M2) whose AutoTokenizer
-    defaults diverge from training. Models with custom tokenizer classes
-    loaded via ``trust_remote_code`` (e.g. Kimi-K2.5's ``TikTokenTokenizer``)
-    must NOT go through the verbatim path; leaving ``architectures`` as None
-    (the default) keeps the safe AutoTokenizer-only behavior.
+    Remote tokenizers are downloaded once under the TokenSpeed cross-process
+    lock. Ordinary tokenizers parse from that local snapshot. Custom tokenizer
+    code parses from the original repo at the snapshot's immutable commit,
+    while still holding the lock, so Transformers can resolve sibling imports.
+
+    ``architectures`` is the model's ``config.architectures`` list. Callers
+    should pass it when available so model-specific tokenizer handling can be
+    selected. DeepseekV41ForCausalLM in auto mode uses the snapshot's standalone
+    ``encoding/encoding.py`` and requires ``trust_remote_code=True`` even for
+    local checkpoints. Its chat wrapper supports text only; media is rejected.
+
+    ``revision`` is the production-facing alias for ``tokenizer_revision``.
+    When both are provided they must name the same snapshot.
     """
+    if tokenizer_revision is not None and revision is not None:
+        if tokenizer_revision != revision:
+            raise ValueError(
+                f"tokenizer_revision ({tokenizer_revision!r}) and revision "
+                f"({revision!r}) must match when both are set."
+            )
+    elif tokenizer_revision is None:
+        tokenizer_revision = revision
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
 
+    use_v41_encoder = tokenizer_mode == "auto" and any(
+        arch in ("DeepseekV41ForCausalLM", "DeepseekV41ForCausalLMDSpark")
+        for arch in (architectures or [])
+    )
+    if use_v41_encoder and not trust_remote_code:
+        raise ValueError(
+            "DeepSeek V4.1 requires executing the checkpoint's encoding/encoding.py. "
+            "Set trust_remote_code=True or use --trust-remote-code."
+        )
+
+    tokenizer_path = tokenizer_name
+    tokenizer = None
+
+    def load_tokenizer(
+        auto_tokenizer_target: str,
+        auto_tokenizer_revision: str | None = None,
+    ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+        auto_tokenizer_kwargs = dict(kwargs)
+        if auto_tokenizer_revision is not None:
+            auto_tokenizer_kwargs["revision"] = auto_tokenizer_revision
+
+        try:
+            loaded_tokenizer = AutoTokenizer.from_pretrained(
+                auto_tokenizer_target,
+                *args,
+                trust_remote_code=trust_remote_code,
+                clean_up_tokenization_spaces=False,
+                **auto_tokenizer_kwargs,
+            )
+        except TypeError as e:
+            # The LLaMA tokenizer causes a protobuf error in some environments.
+            err_msg = (
+                "Failed to load the tokenizer. If you are using a LLaMA V1 model "
+                f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
+                "original tokenizer."
+            )
+            raise RuntimeError(err_msg) from e
+        except ValueError as e:
+            # If the error pertains to the tokenizer class not existing or not
+            # currently being imported, suggest using --trust-remote-code.
+            if not trust_remote_code and (
+                "does not exist or is not currently imported." in str(e)
+                or "requires you to execute the tokenizer file" in str(e)
+            ):
+                err_msg = (
+                    "Failed to load the tokenizer. If the tokenizer is a custom "
+                    "tokenizer not yet available in the HuggingFace transformers "
+                    "library, consider setting `trust_remote_code=True` in LLM "
+                    "or using the `--trust-remote-code` flag in the CLI."
+                )
+                raise RuntimeError(err_msg) from e
+            raise
+
+        if not isinstance(loaded_tokenizer, PreTrainedTokenizerFast):
+            warnings.warn(
+                "Using a slow tokenizer. This might cause a significant "
+                "slowdown. Consider using a fast tokenizer instead."
+            )
+
+        if use_v41_encoder:
+            loaded_tokenizer = _wrap_deepseek_tokenizer(
+                loaded_tokenizer,
+                _load_deepseek_encode_messages(
+                    os.path.join(tokenizer_path, "encoding", "encoding.py")
+                ),
+                is_v41=True,
+            )
+        elif tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
+            loaded_tokenizer = _wrap_deepseek_v4_tokenizer(
+                loaded_tokenizer,
+                _load_deepseek_v4_encode_messages(tokenizer_path, tokenizer_revision),
+            )
+        return loaded_tokenizer
+
     if not os.path.isdir(tokenizer_name):
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-        with get_lock(tokenizer_name):
-            snapshot_download(
+        def download_tokenizer_files() -> str:
+            return snapshot_download(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
             )
 
-    fast_tokenizer = None
-    if (
-        tokenizer_mode != "slow"
-        and kwargs.get("use_fast", True)
-        and prefers_verbatim_fast_tokenizer(architectures)
-    ):
-        try:
-            fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                tokenizer_name,
-                *args,
-                revision=tokenizer_revision,
-                clean_up_tokenization_spaces=False,
+        with get_lock(tokenizer_name):
+            tokenizer_path = call_with_hf_rate_limit_retry(
+                f"downloading tokenizer files of {tokenizer_name}",
+                download_tokenizer_files,
             )
-        except Exception:
-            fast_tokenizer = None
+            snapshot_revision = _snapshot_commit_hash(tokenizer_path)
+            if trust_remote_code and snapshot_revision is not None:
+                # Same guard as the remote-code config load in get_config:
+                # hub errors inside the reload surface as OSError and are not
+                # retried; the snapshot_revision pin makes the reload resolve
+                # from the local cache filled (and 429-retried) above.
+                tokenizer = call_with_hf_rate_limit_retry(
+                    f"loading remote-code tokenizer of {tokenizer_name}",
+                    lambda: load_tokenizer(tokenizer_name, snapshot_revision),
+                )
+            elif trust_remote_code:
+                logger.warning(
+                    "Cannot derive an immutable Hugging Face commit from "
+                    f"{tokenizer_path!s}; "
+                    "parsing custom tokenizer code from the local snapshot. "
+                    "Remote-code sibling imports may fail in this layout.",
+                )
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            tokenizer_revision=tokenizer_revision,
-            clean_up_tokenization_spaces=False,
-            **kwargs,
-        )
-    except TypeError as e:
-        # The LLaMA tokenizer causes a protobuf error in some environments.
-        err_msg = (
-            "Failed to load the tokenizer. If you are using a LLaMA V1 model "
-            f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
-            "original tokenizer."
-        )
-        raise RuntimeError(err_msg) from e
-    except ValueError as e:
-        # If the error pertains to the tokenizer class not existing or not
-        # currently being imported, suggest using the --trust-remote-code flag.
-        if not trust_remote_code and (
-            "does not exist or is not currently imported." in str(e)
-            or "requires you to execute the tokenizer file" in str(e)
-        ):
-            err_msg = (
-                "Failed to load the tokenizer. If the tokenizer is a custom "
-                "tokenizer not yet available in the HuggingFace transformers "
-                "library, consider setting `trust_remote_code=True` in LLM "
-                "or using the `--trust-remote-code` flag in the CLI."
-            )
-            raise RuntimeError(err_msg) from e
-        else:
-            raise e
+    if tokenizer is None:
+        tokenizer = load_tokenizer(tokenizer_path)
 
-    # Swap in the fast tokenizer, carrying over chat_template from
-    # tokenizer_config.json if tokenizer.json doesn't have one.
-    if fast_tokenizer is not None and fast_tokenizer is not tokenizer:
-        if getattr(tokenizer, "chat_template", None) and not getattr(
-            fast_tokenizer, "chat_template", None
-        ):
-            fast_tokenizer.chat_template = tokenizer.chat_template
-        tokenizer = fast_tokenizer
-
-    if not isinstance(tokenizer, PreTrainedTokenizerFast):
-        warnings.warn(
-            "Using a slow tokenizer. This might cause a significant "
-            "slowdown. Consider using a fast tokenizer instead."
-        )
-
-    if tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
-        tokenizer = _wrap_deepseek_v4_tokenizer(
-            tokenizer,
-            _load_deepseek_v4_encode_messages(tokenizer_name, tokenizer_revision),
-        )
-
-    attach_additional_stop_token_ids(tokenizer)
+    tokenizer.name_or_path = tokenizer_name
+    if isinstance(getattr(tokenizer, "init_kwargs", None), dict):
+        tokenizer.init_kwargs["name_or_path"] = tokenizer_name
+    reconcile_special_tokens(tokenizer)
     return tokenizer
 
 
-def attach_additional_stop_token_ids(tokenizer):
-    # Special handling for stop token <|eom_id|> generated by llama 3 tool use.
-    if "<|eom_id|>" in tokenizer.get_added_vocab():
-        tokenizer.additional_stop_token_ids = set(
-            [tokenizer.get_added_vocab()["<|eom_id|>"]]
-        )
-    else:
-        tokenizer.additional_stop_token_ids = None
+def reconcile_special_tokens(tokenizer):
+    """Bring the tokenizer's special-token bookkeeping into the state the engine
+    expects: register tokens flagged special but absent from all_special_ids,
+    then derive the extra stop ids from the added vocabulary."""
+    # Some custom tokenizers (e.g. Kimi-K3's TikTokenTokenizer) flag tokens as
+    # special in added_tokens_decoder but never add them to all_special_ids, so
+    # skip_special_tokens cannot strip them and they leak into decoded output.
+    atd = getattr(tokenizer, "added_tokens_decoder", None)
+    if atd:
+        existing_ids = set(tokenizer.all_special_ids)
+        missing = [
+            tok
+            for tid, tok in atd.items()
+            if getattr(tok, "special", False) and tid not in existing_ids
+        ]
+        if missing:
+            tokenizer.add_special_tokens(
+                {"additional_special_tokens": missing},
+                replace_extra_special_tokens=False,
+            )
+
+    # Turn-final markers resolve by name; Muse's <|eom|> only ends a channel, not the turn.
+    added_vocab = tokenizer.get_added_vocab()
+    stop_ids = {
+        added_vocab[token]
+        for token in _TURN_FINAL_STOP_TOKEN_TEXTS
+        if token in added_vocab
+    }
+    tokenizer.additional_stop_token_ids = stop_ids or None

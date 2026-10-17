@@ -20,22 +20,26 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
+from tokenspeed_kernel.ops.attention.prologue import (
+    HeadKVCache,
+    MXFP8Scales,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     quantize_store_kv_mxfp8,
     store_kv_cache,
-    store_sf_interleaved,
 )
 
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    MXFP8_KV_SCALE_TILE_TOKENS,
+    MXFP8_SCALE_BLOCK_SIZE,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
-from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -43,47 +47,30 @@ logger = get_colorful_logger(__name__)
 GB = 1024 * 1024 * 1024
 
 
+def _head_rows_are_never_masked(write_mask: torch.Tensor | None) -> None:
+    if write_mask is not None:
+        raise ValueError("head caches are never sharded; the prologue writes every row")
+
+
 class MHATokenToKVPool(CachePool):
     def __init__(
         self,
-        size: int,
+        arena: CacheArena,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
         layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        page_size: int,
         rank: int,
         *,
-        memory_plan: CacheMemoryPlan,
-        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
-        token_capacity: int | None = None,
-        layer_types: tuple[str, ...] = (),
-        layer_group_ids: tuple[str, ...] = (),
-        pd_disaggregation_enabled: bool = False,
         layer_kv_head_counts: tuple[int, ...] | None = None,
-        layer_kv_head_dims: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,
-        backing_pool: CachePool | None = None,
     ):
         super().__init__(
-            size,
+            arena,
             dtype,
-            device,
-            page_size,
             rank,
-            memory_plan,
-            paged_cache_group_specs=paged_cache_group_specs,
-            token_capacity=token_capacity,
-            backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
-        )
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
         )
 
         self.head_num = head_num
@@ -105,113 +92,18 @@ class MHATokenToKVPool(CachePool):
         self._kv_alloc_head_count = (
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
-        # Per-layer head_dim, for a model whose layers disagree about it.
-        # `head_dim` remains the ALLOCATION width; this is what a given layer
-        # actually stores per head. gemma-4: 512 on its ten global layers
-        # against an allocation of 256.
-        self._layer_kv_head_dims = (
-            tuple(int(d) for d in layer_kv_head_dims) if layer_kv_head_dims else None
-        )
-        if self._layer_kv_head_dims is not None:
-            if self._layer_kv_head_counts is None:
-                raise ValueError(
-                    "layer_kv_head_dims requires layer_kv_head_counts: without "
-                    "the counts a layer is sized at the allocation head count "
-                    "against its own head_dim, which overruns its field"
-                )
-            if len(self._layer_kv_head_dims) != len(self._layer_kv_head_counts):
-                raise ValueError(
-                    "layer_kv_head_dims and layer_kv_head_counts must have the "
-                    f"same length ({len(self._layer_kv_head_dims)} != "
-                    f"{len(self._layer_kv_head_counts)})"
-                )
-        self._layer_types = tuple(layer_types or ())
-        # Physical group id per layer, from the cache recipe
-        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
-        # groups are published from.
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        if len(self.layer_cache_group_ids) != layer_num:
-            raise ValueError(
-                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
-                f"entries but the pool has {layer_num} layers; the cache "
-                "recipe must supply one group id per layer "
-                "(CachePoolSpec.layer_group_ids)"
-            )
-        self._create_buffers()
-
-        # Print the RESOLVED per-layer geometry, not the requested one. A pool
-        # that quietly fell back to one geometry is indistinguishable at every
-        # other observation point from one that never needed per-layer widths,
-        # and on gemma-4 the difference is fluent nonsense.
-        if self._layer_kv_head_dims is not None:
-            widths = {
-                (h, d)
-                for h, d in zip(self._layer_kv_head_counts, self._layer_kv_head_dims)
-            }
-            logger.info(
-                "KV geometry: allocation %d heads x %d, per-layer widths %s",
-                self.head_num,
-                self.head_dim,
-                sorted(f"{h}x{d}" for h, d in widths),
-            )
-        elif self._layer_kv_head_counts is not None:
-            logger.info(
-                "KV geometry: allocation %d heads x %d, per-layer head counts %s "
-                "(one head_dim)",
-                self.head_num,
-                self.head_dim,
-                sorted(set(self._layer_kv_head_counts)),
-            )
-        else:
-            logger.info(
-                "KV geometry: allocation %d heads x %d, uniform across layers",
-                self.head_num,
-                self.head_dim,
-            )
+        self._bind_layer_planes()
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
-            "KV Cache is allocated. K size: %.2f GB, V size: %.2f GB.",
-            k_size / GB,
-            v_size / GB,
+            f"KV Cache is allocated. K size: {k_size / GB:.2f} GB, V size: "
+            f"{v_size / GB:.2f} GB.",
         )
 
-    def _field_layer_id(self, layer_id: int) -> int:
-        """Map this compute view's local layer id into the merged plan."""
-        return self._field_layer_offset + layer_id
-
-    def _create_kv_buffers(self):
-        self.k_buffer = [
-            self.field(
-                f"layer.{self._field_layer_id(layer_id)}.k", self.store_dtype
-            ).view(-1, self.head_num, self.head_dim)
-            for layer_id in range(self.layer_num)
-        ]
-        self.v_buffer = [
-            self.field(
-                f"layer.{self._field_layer_id(layer_id)}.v", self.store_dtype
-            ).view(-1, self.head_num, self.head_dim)
-            for layer_id in range(self.layer_num)
-        ]
-        aliased = len({buffer.data_ptr() for buffer in self.k_buffer}) < len(
-            self.k_buffer
-        ) or len({buffer.data_ptr() for buffer in self.v_buffer}) < len(self.v_buffer)
-        if aliased and self._pd_disaggregation_enabled:
-            raise RuntimeError(
-                "aliased MHA cache layout is incompatible with PD "
-                "disaggregation: per-layer registrations would transfer the "
-                "same bytes more than once. Set disaggregation_mode='null'."
-            )
-        logger.info(
-            "KV layout: one buffer with %d per-layer K/V views",
-            self.layer_num,
-        )
-
-    def _create_buffers(self):
-        # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
-        # after wake (paging overwrites; clear_kv_buffers zeros the remapped pages).
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._create_kv_buffers()
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        "k": "k_buffer",
+        "v": "v_buffer",
+    }
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -224,76 +116,20 @@ class MHATokenToKVPool(CachePool):
         v_size_bytes = sum(t.nbytes for t in v_caches.values())
         return k_size_bytes, v_size_bytes
 
-    # for disagg
-    def get_contiguous_buf_infos(self):
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
-        kv_data_ptrs = [
-            self._get_key_buffer(i).data_ptr() for i in range(self.layer_num)
-        ] + [self._get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [
-            self._get_key_buffer(i).nbytes for i in range(self.layer_num)
-        ] + [self._get_value_buffer(i).nbytes for i in range(self.layer_num)]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def get_contiguous_buf_unit_lens(self):
-        key_units = [
-            self._get_key_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
-        ]
-        value_units = [
-            self._get_value_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
-        ]
-        return key_units + value_units
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        return [
-            [start_idx + i * self.layer_num + layer_id for i in range(2)]
-            for layer_id in range(self.layer_num)
-        ]
-
-    def _layer_kv_dim(self, layer_id: int) -> int:
-        """This layer's head_dim; the allocation's when they all share one."""
-        dims = self._layer_kv_head_dims
-        return self.head_dim if dims is None else dims[layer_id]
-
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Per-layer token-row view over one byte-uniform cache field.
 
-        Fields are allocated ``(rows, head_num, head_dim)`` at the widest
-        layer; a narrower layer reinterprets the same bytes as more rows of its
-        OWN geometry, so one row is always exactly one token of that layer.
-
-        The head_dim has to come from the layer, not from the allocation. It
-        did not, and gemma-4 is the model that shows why: its ten global layers
-        are 4 heads x 512 = 2,048 elements per token against a 16 x 256 = 4,096
-        allocation, so the row is half the allocation -- while the head count
-        alone says a quarter. Every one of their tokens was written and read at
-        half stride. The 50 sliding layers, which share the allocation
-        geometry, were correct throughout, so the engine answered in fluent
-        nonsense rather than failing.
-
-        Args:
-            buf: The layer's field, viewed at the allocation geometry.
-            layer_id: Local layer id in this compute view.
-
-        Returns:
-            ``buf`` when this layer is the allocation geometry, else a view of
-            the same bytes as ``(-1, heads_l, dim_l)``.
+        A layer serving fewer heads than the field's planned head count
+        reinterprets the same bytes as proportionally more rows of
+        ``heads_l`` heads; a field planned at the layer's own head count is
+        served as is.
         """
         if self._layer_kv_head_counts is None:
             return buf
         heads_l = self._layer_heads_per_rank(layer_id)
-        dim_l = self._layer_kv_dim(layer_id)
-        if heads_l == self.head_num and dim_l == self.head_dim:
+        if heads_l == self.head_num:
             return buf
-        return buf.reshape(-1, heads_l, dim_l)
+        return buf.reshape(-1, heads_l, self.head_dim)
 
     def _layer_heads_per_rank(self, layer_id: int) -> int:
         counts = self._layer_kv_head_counts
@@ -342,21 +178,28 @@ class MHATokenToKVPool(CachePool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> HeadKVCache:
+        """Where the attention prologue writes this layer's K/V rows."""
+        _head_rows_are_never_masked(write_mask)
+        k_cache, v_cache = self.get_kv_buffer(layer_id)
+        return HeadKVCache(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scales=None,
+            slots=slots,
+        )
+
     def set_kv_buffer(
         self,
         layer: PagedAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float | None = None,
-        v_scale: float | None = None,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -369,7 +212,6 @@ class MHATokenToKVPool(CachePool):
             self._layer_row_view(self.k_buffer[layer_id], layer_id),
             self._layer_row_view(self.v_buffer[layer_id], layer_id),
             loc,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -377,72 +219,100 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     """MHA KV pool storing MXFP8 block-scaled FP8 (data + UE8M0 scales).
 
     Data buffers hold float8_e4m3fn; scale buffers hold one float8_e8m0fnu
-    per 32 elements of head_dim. ``set_kv_buffer`` expects PRE-QUANTIZED
-    K/V plus per-token scale tensors (producer: ``quantize_mxfp8``); the
-    bf16 per-tensor-scale paths of the base class do not apply.
+    per 32 elements of head_dim. ``set_kv_buffer`` quantizes K/V rows and
+    stores their scales, as the attention prologue does through
+    ``kv_write_target``.
 
-    Scale layout follows what the FA4 blockscaled kernel consumes:
-    page_size 128 stores scales interleaved in the BlockScaledBasicChunk
-    atom ([num_pages, heads, 32, 4, 4], written via
-    ``store_sf_interleaved``); any other page size stores them flat
-    ([slots, heads, head_dim // 32]).
+    Scales live in the page-major interleaved layout the FA4 blockscaled
+    kernel consumes -- ``(num_pages, heads, page_tokens // 128, 32, sf, sf)``
+    BlockScaledBasicChunk atoms written by ``quantize_store_kv_mxfp8`` -- the
+    one shape ``plan.mxfp8_kv_scale_fields`` declares.
 
     When the plan aliases fields, data and scale views remain layer-local
     Python objects while addressing the same physical bytes.
     """
 
-    MXFP8_SCALE_BLOCK_SIZE = 32
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        **MHATokenToKVPool.layer_plane_bindings,
+        "k_scale": "k_scale_buffer",
+        "v_scale": "v_scale_buffer",
+    }
 
-    def _create_buffers(self):
-        assert self.head_dim % self.MXFP8_SCALE_BLOCK_SIZE == 0
+    def _bind_layer_planes(self) -> None:
+        if self.head_dim % MXFP8_SCALE_BLOCK_SIZE:
+            raise ValueError(
+                f"MXFP8 head_dim must be divisible by {MXFP8_SCALE_BLOCK_SIZE}"
+            )
+        # These writes go through dtype-aware kernels, so the fp8 view the
+        # plan hands out is the one to keep for input reinterpretation too.
         self.store_dtype = torch.float8_e4m3fn
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._create_kv_buffers()
-            self.k_scale_buffer = [
-                self.field(
-                    f"layer.{self._field_layer_id(layer_id)}.k_scale",
-                    torch.float8_e8m0fnu,
-                )
-                for layer_id in range(self.layer_num)
-            ]
-            self.v_scale_buffer = [
-                self.field(
-                    f"layer.{self._field_layer_id(layer_id)}.v_scale",
-                    torch.float8_e8m0fnu,
-                )
-                for layer_id in range(self.layer_num)
-            ]
+        super()._bind_layer_planes()
+        for layer_id in range(self.layer_num):
+            for plane in (self.k_scale_buffer[layer_id], self.v_scale_buffer[layer_id]):
+                if plane is not None:
+                    self._check_scale_plane(plane, layer_id)
+
+    def _check_scale_plane(self, plane: torch.Tensor, layer_id: int) -> None:
+        """Reject a scale plane the layer's interleaved view cannot factor."""
+        sf_dim = self.head_dim // MXFP8_SCALE_BLOCK_SIZE
+        heads_l = self._layer_heads_per_rank(layer_id)
+        if (
+            plane.ndim != 6
+            or plane.shape[3:] != (32, sf_dim, sf_dim)
+            or (plane.shape[1] * plane.shape[2]) % heads_l
+        ):
+            raise ValueError(
+                f"layer {layer_id} mxfp8 scale plane {tuple(plane.shape)} is not "
+                f"the interleaved (pages, heads, tiles, 32, {sf_dim}, {sf_dim}) "
+                f"layout for {heads_l} served heads"
+            )
 
     def _layer_page_tokens(self, layer_id: int) -> int:
-        """Tokens represented by one page id for this layer."""
-        # Byte-uniform slots factor one id through the layer's WIDTH, not its
-        # head count: the two differ whenever head_dim varies per layer, and
-        # using the count alone is the same mistake _layer_row_view carried.
+        """Tokens one page id spans in this layer's view.
+
+        The plan fixes how many head columns and 128-token tiles a page
+        holds; a layer serving fewer heads than its planned columns folds
+        the spare columns into further token rows of the same page.
+        """
+        planned_heads, planned_tiles = self.k_scale_buffer[layer_id].shape[1:3]
         heads_l = self._layer_heads_per_rank(layer_id)
-        dim_l = self._layer_kv_dim(layer_id)
-        return self.page_size * self.head_num * self.head_dim // (heads_l * dim_l)
+        return planned_heads * planned_tiles * MXFP8_KV_SCALE_TILE_TOKENS // heads_l
 
     def _layer_scale_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """(num_ids, heads_l, k_l, 32, 4, 4) view over a layer's SF slots
+        """(num_ids, heads_l, k_l, 32, sf, sf) view over a layer's SF slots
         (the paged interleaved layout the blockscaled kernels consume)."""
         heads_l = self._layer_heads_per_rank(layer_id)
-        k_l = self._layer_page_tokens(layer_id) // 128
-        sf_dim = self.head_dim // self.MXFP8_SCALE_BLOCK_SIZE
+        k_l = self._layer_page_tokens(layer_id) // MXFP8_KV_SCALE_TILE_TOKENS
+        sf_dim = self.head_dim // MXFP8_SCALE_BLOCK_SIZE
         return buf.view(buf.shape[0], heads_l, k_l, 32, sf_dim, sf_dim)
 
     def get_kv_scale_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """(k_scale, v_scale) buffers for the blockscaled attention kernel.
-
-        Returns the per-layer scale views consumed by the attention kernel.
-        """
+        """(k_scale, v_scale) views for the blockscaled attention kernel."""
         k_sf = self.k_scale_buffer[layer_id]
         v_sf = self.v_scale_buffer[layer_id]
-        if self._layer_kv_head_counts is not None:
-            return (
-                self._layer_scale_view(k_sf, layer_id),
-                self._layer_scale_view(v_sf, layer_id),
-            )
-        return k_sf, v_sf
+        if k_sf is None or v_sf is None:
+            raise ValueError(f"layer {layer_id} is a state layer; it has no KV scales")
+        return (
+            self._layer_scale_view(k_sf, layer_id),
+            self._layer_scale_view(v_sf, layer_id),
+        )
+
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> HeadKVCache:
+        """Where the attention prologue writes this layer's K/V rows and scales."""
+        _head_rows_are_never_masked(write_mask)
+        k_cache, v_cache = self.get_kv_buffer(layer_id)
+        return HeadKVCache(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scales=MXFP8Scales(
+                k=self.k_scale_buffer[layer_id],
+                v=self.v_scale_buffer[layer_id],
+                page_tokens=self._layer_page_tokens(layer_id),
+            ),
+            slots=slots,
+        )
 
     def set_kv_buffer(
         self,
@@ -450,93 +320,22 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: torch.Tensor | None = None,
-        v_scale: torch.Tensor | None = None,
-        layer_id_override: int | None = None,
     ):
-        assert (
-            cache_k.dtype == self.store_dtype
-        ), "MXFP8 pool expects pre-quantized fp8 K (see quantize_mxfp8)"
-        assert (
-            k_scale is not None and v_scale is not None
-        ), "MXFP8 pool requires per-token e8m0 scale tensors"
-        layer_id = (
-            layer_id_override if layer_id_override is not None else layer.layer_id
-        )
-        # Byte views: triton can't mask-fill fp8; locs are per-layer view rows (target the served view)
-        store_kv_cache(
-            cache_k.view(torch.uint8),
-            cache_v.view(torch.uint8),
-            self._layer_row_view(self.k_buffer[layer_id], layer_id).view(torch.uint8),
-            self._layer_row_view(self.v_buffer[layer_id], layer_id).view(torch.uint8),
-            loc,
-            enable_pdl=pdl_enabled(),
-        )
-        if self._layer_kv_head_counts is not None:
-            page_tokens = self._layer_page_tokens(layer_id)
-            store_sf_interleaved(
-                k_scale,
-                self.k_scale_buffer[layer_id],
-                loc,
-                page_size=page_tokens,
-                enable_pdl=pdl_enabled(),
-            )
-            store_sf_interleaved(
-                v_scale,
-                self.v_scale_buffer[layer_id],
-                loc,
-                page_size=page_tokens,
-                enable_pdl=pdl_enabled(),
-            )
-        elif self.page_size == 128:
-            store_sf_interleaved(
-                k_scale, self.k_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
-            )
-            store_sf_interleaved(
-                v_scale, self.v_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
-            )
-        else:
-            self.k_scale_buffer[layer_id][loc] = k_scale
-            self.v_scale_buffer[layer_id][loc] = v_scale
-
-    def quantize_and_set_kv_buffer(
-        self,
-        layer: PagedAttention,
-        loc: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer_id_override: int | None = None,
-    ) -> bool:
-        """Fused per-token quantize + data store + SF scatter (one launch).
-
-        Bit-identical to quantize_mxfp8 + set_kv_buffer (parity-tested) and
-        keeps the store inside the PDL chain. Returns False when the layout
-        has no interleaved-SF path (page not a 128 multiple) — the caller
-        falls back to the split path.
-        """
-        layer_id = (
-            layer_id_override if layer_id_override is not None else layer.layer_id
-        )
-        if self._layer_kv_head_counts is not None:
-            page_tokens = self._layer_page_tokens(layer_id)
-        elif self.page_size == 128:
-            page_tokens = 128
-        else:
-            return False
-        if self.head_dim != 128:
-            return False
+        """Quantize K/V rows to MXFP8 and scatter them with their block scales."""
+        layer_id = layer.layer_id
+        # Locs are per-layer view rows: target the served view
+        k_rows = self._layer_row_view(self.k_buffer[layer_id], layer_id)
+        v_rows = self._layer_row_view(self.v_buffer[layer_id], layer_id)
         quantize_store_kv_mxfp8(
-            k,
-            v,
-            self._layer_row_view(self.k_buffer[layer_id], layer_id),
-            self._layer_row_view(self.v_buffer[layer_id], layer_id),
+            cache_k.view(-1, *k_rows.shape[1:]),
+            cache_v.view(-1, *v_rows.shape[1:]),
+            k_rows,
+            v_rows,
             self.k_scale_buffer[layer_id],
             self.v_scale_buffer[layer_id],
             loc,
-            page_tokens=page_tokens,
-            enable_pdl=pdl_enabled(),
+            page_tokens=self._layer_page_tokens(layer_id),
         )
-        return True
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()

@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2024, Tri Dao
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,534 +23,455 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton kernels for short causal convolution (sconv).
 
-Two kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`,
-split by forward family — each hard-codes its state source so neither
-carries the other's paths:
+"""Triton convolution solutions.
 
-- ``_inkling_ring_sconv_prefill_kernel``: varlen extend chunks. Pre-chunk
-  conv taps read the PAGED checkpoint at the chunk-start boundary (extends
-  always start on an aligned boundary; zeros when the request has no
-  prefix); the ring is never read. Persists the last
-  ``min(chunk_len + (W-1), R)`` positions to the ring — the chunk rows plus
-  the checkpoint window itself, one writer per row via the
-  ``pos >= through - R`` gate — and publishes the conv window at every
-  covered boundary.
-- ``_inkling_ring_sconv_decode_kernel``: fixed-shape decode/verify/lookback
-  chunks (uniform tokens per request). Pre-chunk taps read the RING; the
-  paged cache is never read. Persists every chunk row (the wrapper asserts
-  the uniform chunk fits ``R - (W - 1)``, so writes never alias another
-  request's taps) and publishes the at-most-one covered boundary.
-
-Both publish unconditionally (there is no non-paged mode); the publish body
-sits behind a tile-uniform early-exit so tiles covering no boundary skip it.
-The ring row of absolute position ``p`` is ``p % R``; positions derive from
-the through-chunk ``seq_lens``, there is no stored cursor, and rejected
-speculative rows are overwritten when their positions recur.
-
-Both kernels take explicit strides for the conv ring so channel-sliced views
-(``ring[:, :, off:off + D]``) work without a copy. ``PAD_SLOT_ID`` (-1) rows
-never read from or write to a real slot.
-
-No autotuning is used: block configurations come from static heuristics so
-the kernels stay CUDA-graph friendly.
-
-Weight taps are loaded once as a 2D ``[BLOCK_D, W_POW2]`` tile and selected
-per tap with an equality reduction instead of ``W`` separate 1D gathers at
-constant offsets ``0..W-1``: the separate-gather pattern miscompiles on the
-current tokenspeed_triton release (wrong values with ``num_warps > 1`` when
-the compiler merges the strided gathers).
+``triton_causal_conv1d_prefill`` runs varlen prefill chunks and
+``triton_causal_conv1d_update`` decode, chain verify and draft-tree steps;
+both are registered leaves of the ``conv`` family's
+``causal_conv1d_prefill`` / ``causal_conv1d_update`` modes, selected through
+``tokenspeed_kernel.ops.conv``. The DFlash2 grouped conv and the sconv
+kernels are re-exported for the conv package entry points.
 """
 
-from __future__ import annotations
-
-from tokenspeed_kernel._triton import tl, triton
+import torch
+from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    CausalConv1dPrefillMetadata,
+)
+from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
+    PAD_SLOT_ID,
+    _causal_conv1d_fwd_kernel,
+    _causal_conv1d_tree_update,
+    _causal_conv1d_update_kernel,
+)
+from tokenspeed_kernel.ops.conv._triton.grouped import dflash2_grouped_conv
+from tokenspeed_kernel.ops.conv._triton.sconv import (
+    _inkling_ring_sconv_decode_kernel,
+    _inkling_ring_sconv_prefill_kernel,
+    select_prefill_config,
+)
+from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
+    "PAD_SLOT_ID",
+    "_inkling_ring_sconv_decode_kernel",
+    "_inkling_ring_sconv_prefill_kernel",
+    "dflash2_grouped_conv",
     "select_prefill_config",
+    "triton_causal_conv1d_prefill",
+    "triton_causal_conv1d_update",
 ]
 
+_CONV_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
 
-@triton.jit
-def _load_weight_taps(
-    weight_ptr,
-    d_off,
-    d_mask,
-    stride_w_d,
-    stride_w_w,
-    W: tl.constexpr,
-    W_POW2: tl.constexpr,
+
+@register_kernel(
+    "conv",
+    "causal_conv1d_prefill",
+    name="triton_causal_conv1d_prefill",
+    solution="triton",
+    signatures=format_signatures("x", "dense", _CONV_DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_causal_conv1d_prefill(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
 ):
-    """Load all ``W`` taps for a channel block as one ``[BLOCK_D, W_POW2]`` tile."""
-    w_off = tl.arange(0, W_POW2)
-    return tl.load(
-        weight_ptr + d_off[:, None] * stride_w_d + w_off[None, :] * stride_w_w,
-        mask=d_mask[:, None] & (w_off[None, :] < W),
-        other=0,
-    ).to(tl.float32)
+    """support varlen + continuous batching when x is 2D tensor
 
+    x: (dim,cu_seq_len)
+        cu_seq_len = total tokens of all seqs in that batch
+        sequences are concatenated from left to right for varlen
+    weight: (dim, width)
+    conv_states: (...,dim,width - 1) itype
+        updated inplace if provided
+        [it use `cache_indices` to get the index to the cache of conv_state for that sequence
 
-@triton.jit
-def _select_weight_tap(w_all, iw: tl.constexpr, W_POW2: tl.constexpr):
-    """Extract tap ``iw`` (a ``[BLOCK_D]`` vector) from the 2D weight tile."""
-    w_off = tl.arange(0, W_POW2)
-    return tl.sum(tl.where(w_off[None, :] == iw, w_all, 0.0), axis=1)
+        conv_state[cache_indices[i]] for seq-i - to be used as initial_state when has_initial_state[i] = True
+             and after that conv_state[cache_indices[i]] need to be shift-left and updated with values from 'x'
+        ]
+    query_start_loc: (batch + 1) int32
+        The cumulative sequence lengths of the sequences in
+        the batch, used to index into sequence. prepended by 0.
+        if
+        x = [5, 1, 1, 1] <- continuous batching (batch=4)
+        then
+        query_start_loc = [0, 5, 6, 7, 8] <- the starting index of the next sequence; while the last value is
+           the ending index of the last sequence
+        [length(query_start_loc)-1 == batch]
+        for example: query_start_loc = torch.Tensor([0,10,16,17]),
+        x.shape=(dim,17)
+    cache_indices: (batch)  int32
+        indicates the corresponding state index,
+        like so: conv_state = conv_states[cache_indices[batch_id]]
+    has_initial_state: (batch) bool
+        indicates whether should the kernel take the current state as initial
+        state for the calculations
+        [single boolean for each sequence in the batch: True or False]
+    bias: (dim,)
+    activation: either None or "silu" or "swish" or True
+    pad_slot_id: int
+        if cache_indices is passed, lets the kernel identify padded
+        entries that will not be processed,
+        for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
+        in this case, the kernel will not process entries at
+        indices 0 and 3
+    prefill_metadata: CausalConv1dPrefillMetadata
+        Read-only program mapping built once with this forward's sequence
+        boundaries and shared by all recurrent-attention layers.
 
-
-# -----------------------------------------------------------------------------
-# The sconv compute kernels: ring-addressed state, split by forward family
-# -----------------------------------------------------------------------------
-
-
-@triton.jit
-def _inkling_ring_sconv_decode_kernel(
-    x_ptr,  # [T, D]
-    weight_ptr,  # [D, W]
-    conv_cache_ptr,  # [num_slots, R, D] ring
-    cu_seqlens_ptr,  # [B+1] int32
-    seq_idx_ptr,  # [T] int32
-    cache_indices_ptr,  # [B] int32
-    has_initial_state_ptr,  # [B] bool
-    y_ptr,  # [T, D]
-    seq_lens_ptr,  # [B] int32 lengths THROUGH the chunk
-    block_table_ptr,  # [B, num_blocks] int32, the stream's conv group
-    ckpt_a_ptr,  # [pages, W-1, a_width] checkpoint field
-    ckpt_b_ptr,  # second field for d >= a_width (fused K+V), or ckpt_a
-    stride_x_t,
-    stride_x_d,
-    stride_y_t,
-    stride_y_d,
-    stride_w_d,
-    stride_w_w,
-    stride_c_slot,
-    stride_c_w,
-    stride_c_d,
-    stride_bt_b,
-    stride_bt_c,
-    stride_a_page,
-    stride_a_w,
-    stride_a_c,
-    stride_b_page,
-    stride_b_w,
-    stride_b_c,
-    a_width,
-    num_blocks,
-    T,
-    D,
-    USE_SILU: tl.constexpr,
-    USE_RESIDUAL: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    R: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    W: tl.constexpr,
-    W_POW2: tl.constexpr,
-):
-    """Decode/verify/lookback sconv: ring taps, write-all, one boundary.
-
-    Chunks are uniform per request (1 / K / K + D tokens) and fit
-    ``R - (W - 1)``, so every chunk row persists at its position's ring row
-    with no aliasing (the wrapper asserts the bound). Pre-chunk taps read
-    the request's ring; the paged cache is never read. A token whose
-    absolute length is page-aligned publishes the conv window at that
-    boundary's page — accept-independent, healed by overwrite.
+    out: same shape as `x`
     """
-    t_off = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
-    d_off = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    t_mask = t_off < T
-    d_mask = d_off < D
-    td_mask = t_mask[:, None] & d_mask[None, :]
+    enable_pdl = pdl_enabled()
+    if isinstance(activation, bool) and activation:
+        activation = "silu"
 
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+    out = torch.empty_like(x)
+    batch_ptr = prefill_metadata.batch_indices
+    token_chunk_offset_ptr = prefill_metadata.chunk_offsets
+    if batch_ptr.device != x.device or token_chunk_offset_ptr.device != x.device:
+        raise ValueError("convolution metadata must be on the input device")
+    if batch_ptr.numel() == 0:
+        return out
 
-    si = tl.load(seq_idx_ptr + t_off, mask=t_mask, other=0).to(tl.int64)
-    bos = tl.load(cu_seqlens_ptr + si, mask=t_mask, other=0).to(tl.int64)
-    eos = tl.load(cu_seqlens_ptr + si + 1, mask=t_mask, other=0).to(tl.int32)
-    through = tl.load(seq_lens_ptr + si, mask=t_mask, other=0).to(tl.int32)
-    ci = tl.load(cache_indices_ptr + si, mask=t_mask, other=-1)
-    has_state = tl.load(has_initial_state_ptr + si, mask=t_mask, other=0)
-    # PAD_SLOT_ID = -1 (can't reference a Python global inside @jit)
-    use_cache = (ci != -1) & (has_state != 0)
-    safe_ci = tl.maximum(ci, 0).to(tl.int64)
+    is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
+    dim, cu_seqlen = x.shape
+    _, width = weight.shape
+    state_len = width - 1
+    np2_statelen = triton.next_power_of_2(state_len)
 
-    bos32 = bos.to(tl.int32)
-    chunk_len = eos - bos32
-    pre_len = through - chunk_len  # absolute position of chunk row 0
-
-    w_all = _load_weight_taps(
-        weight_ptr, d_off, d_mask, stride_w_d, stride_w_w, W, W_POW2
-    )
-    cache_base = (
-        conv_cache_ptr + safe_ci[:, None] * stride_c_slot + d_off[None, :] * stride_c_d
-    )
-
-    acc = tl.zeros([BLOCK_T, BLOCK_D], dtype=tl.float32)
-    t64 = t_off.to(tl.int64)
-
-    # Keep tap W-1 in-loop: a split unconditional load miscompiles tokenspeed_triton (num_warps>1).
-    for iw in tl.static_range(W):
-        shifted_t = t64 - (W - 1) + iw
-        in_x = (shifted_t >= bos) & t_mask
-        x_val = tl.load(
-            x_ptr + shifted_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-            mask=in_x[:, None] & d_mask[None, :],
-            other=0,
+    padded_batch = query_start_loc.size(0) - 1
+    stride_x_seq = 0
+    stride_x_dim = x.stride(0)
+    stride_x_token = x.stride(1)
+    stride_w_dim = weight.stride(0)
+    stride_w_width = weight.stride(1)
+    stride_istate_seq = 0
+    stride_istate_dim = 0
+    stride_istate_token = 0
+    num_cache_lines = 0
+    if conv_states is not None:
+        # 1. conv_states is used to replaced initial_states
+        # 2. conv_states serve as a cache with num cache lines can be larger than batch size
+        # 3. mapping from sequence x[idx] to a cache line at index as specified via cache_indices[idx]
+        # 4. computation can be skipped if cache_indices[idx] == pad_slot_id
+        num_cache_lines = conv_states.size(0)
+        assert (
+            num_cache_lines == conv_states.shape[0]
+            and dim == conv_states.shape[1]
+            and width - 1 <= conv_states.shape[2]
         )
-        tap_pos = pre_len + (shifted_t - bos).to(tl.int32)
-        in_ring = (shifted_t < bos) & (tap_pos >= 0) & use_cache & t_mask
-        tap_row = (tl.maximum(tap_pos, 0) % R).to(tl.int64)
-        p_val = tl.load(
-            cache_base + tap_row[:, None] * stride_c_w,
-            mask=in_ring[:, None] & d_mask[None, :],
-            other=0,
-        )
-        w_val = _select_weight_tap(w_all, iw, W_POW2)
-        v = tl.where(in_x[:, None], x_val.to(tl.float32), p_val.to(tl.float32))
-        acc += v * w_val[None, :]
-
-    if USE_SILU:
-        acc = acc * tl.sigmoid(acc)
-
-    xv = tl.load(
-        x_ptr + t64[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-        mask=td_mask,
-        other=0,
-    )
-    if USE_RESIDUAL:
-        acc += xv.to(tl.float32)
-
-    tl.store(
-        y_ptr + t64[:, None] * stride_y_t + d_off[None, :] * stride_y_d,
-        acc.to(y_ptr.dtype.element_ty),
-        mask=td_mask,
-    )
-
-    # Every chunk row persists (the wrapper asserts the uniform chunk fits
-    # R - (W - 1), so writes never alias another request's tap reads).
-    pos = through - eos + t_off  # 0-based absolute position of token t
-    do_write = t_mask & (ci != -1)
-    ring_row = (tl.maximum(pos, 0) % R).to(tl.int64)
-    tl.store(
-        cache_base + ring_row[:, None] * stride_c_w,
-        xv.to(conv_cache_ptr.dtype.element_ty),
-        mask=do_write[:, None] & d_mask[None, :],
-    )
-
-    # Absolute length after this token (int32: lengths fit); pad rows
-    # carry stale lengths, so gate on the slot BEFORE the alignment test.
-    abs_len = pos + 1
-    valid_tok = t_mask & (ci != -1)
-    is_boundary = valid_tok & (abs_len > 0) & (abs_len % PAGE_SIZE == 0)
-    # Boundaries are one token in PAGE_SIZE: skip the whole publish body
-    # unless this tile actually holds one (tile-uniform branch).
-    if tl.max(is_boundary.to(tl.int32), axis=0) > 0:
-        blk = (abs_len // PAGE_SIZE - 1).to(tl.int64)
-        blk_ok = is_boundary & (blk >= 0) & (blk < num_blocks)
-        page = tl.load(
-            block_table_ptr + si * stride_bt_b + blk * stride_bt_c,
-            mask=blk_ok,
-            other=0,
-        ).to(tl.int64)
-        pub = blk_ok & (page > 0)
-        use_a = d_off < a_width
-        col_b = tl.maximum(d_off - a_width, 0)
-        for w in tl.static_range(W - 1):
-            src_t = t64 - (W - 2) + w
-            in_x2 = src_t >= bos
-            x_row = tl.load(
-                x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-                mask=(pub & in_x2)[:, None] & d_mask[None, :],
-                other=0,
-            )
-            src_pos = pre_len + (src_t - bos).to(tl.int32)
-            in_ring2 = (src_t < bos) & (src_pos >= 0) & use_cache
-            src_row = (tl.maximum(src_pos, 0) % R).to(tl.int64)
-            p_row = tl.load(
-                cache_base + src_row[:, None] * stride_c_w,
-                mask=(pub & in_ring2)[:, None] & d_mask[None, :],
-                other=0,
-            )
-            val = tl.where(in_x2[:, None], x_row.to(tl.float32), p_row.to(tl.float32))
-            tl.store(
-                ckpt_a_ptr
-                + page[:, None] * stride_a_page
-                + w * stride_a_w
-                + d_off[None, :] * stride_a_c,
-                val.to(ckpt_a_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & use_a[None, :],
-            )
-            tl.store(
-                ckpt_b_ptr
-                + page[:, None] * stride_b_page
-                + w * stride_b_w
-                + col_b[None, :] * stride_b_c,
-                val.to(ckpt_b_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
-            )
-
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _inkling_ring_sconv_prefill_kernel(
-    x_ptr,  # [T, D]
-    weight_ptr,  # [D, W]
-    conv_cache_ptr,  # [num_slots, R, D] ring
-    cu_seqlens_ptr,  # [B+1] int32
-    seq_idx_ptr,  # [T] int32
-    cache_indices_ptr,  # [B] int32
-    has_initial_state_ptr,  # [B] bool
-    y_ptr,  # [T, D]
-    seq_lens_ptr,  # [B] int32 lengths THROUGH the chunk
-    block_table_ptr,  # [B, num_blocks] int32, the stream's conv group
-    ckpt_a_ptr,  # [pages, W-1, a_width] checkpoint field
-    ckpt_b_ptr,  # second field for d >= a_width (fused K+V), or ckpt_a
-    stride_x_t,
-    stride_x_d,
-    stride_y_t,
-    stride_y_d,
-    stride_w_d,
-    stride_w_w,
-    stride_c_slot,
-    stride_c_w,
-    stride_c_d,
-    stride_bt_b,
-    stride_bt_c,
-    stride_a_page,
-    stride_a_w,
-    stride_a_c,
-    stride_b_page,
-    stride_b_w,
-    stride_b_c,
-    a_width,
-    num_blocks,
-    T,
-    D,
-    USE_SILU: tl.constexpr,
-    USE_RESIDUAL: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    R: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    W: tl.constexpr,
-    W_POW2: tl.constexpr,
-):
-    """Prefill/extend sconv: checkpoint taps, gated write, all boundaries.
-
-    Extend chunks always start on an aligned boundary, so pre-chunk taps
-    read the PAGED checkpoint window at ``pre_len`` (zeros when the request
-    has no prefix or the entry is a hole); the ring is never read. The last
-    ``min(chunk_len + (W - 1), R)`` positions persist to the ring — chunk
-    rows from ``x`` plus the checkpoint window itself (materialized by the
-    request's first-token lane), one writer per row via the
-    ``pos >= through - R`` gate. Every covered boundary publishes its conv
-    window; boundaries are >= PAGE_SIZE past the aligned chunk start, so
-    publish sources are always in-chunk ``x`` rows.
-    """
-    t_off = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
-    d_off = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    t_mask = t_off < T
-    d_mask = d_off < D
-    td_mask = t_mask[:, None] & d_mask[None, :]
-
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-
-    si = tl.load(seq_idx_ptr + t_off, mask=t_mask, other=0).to(tl.int64)
-    bos = tl.load(cu_seqlens_ptr + si, mask=t_mask, other=0).to(tl.int64)
-    eos = tl.load(cu_seqlens_ptr + si + 1, mask=t_mask, other=0).to(tl.int32)
-    through = tl.load(seq_lens_ptr + si, mask=t_mask, other=0).to(tl.int32)
-    ci = tl.load(cache_indices_ptr + si, mask=t_mask, other=-1)
-    has_state = tl.load(has_initial_state_ptr + si, mask=t_mask, other=0)
-    # PAD_SLOT_ID = -1 (can't reference a Python global inside @jit)
-    use_cache = (ci != -1) & (has_state != 0)
-    safe_ci = tl.maximum(ci, 0).to(tl.int64)
-
-    bos32 = bos.to(tl.int32)
-    chunk_len = eos - bos32
-    pre_len = through - chunk_len  # aligned chunk-start boundary (0 = cold)
-
-    # The chunk-start boundary's page: the tap (and restore) source.
-    blk0 = (pre_len // PAGE_SIZE - 1).to(tl.int64)
-    blk0_ok = use_cache & t_mask & (pre_len > 0) & (blk0 >= 0) & (blk0 < num_blocks)
-    page0 = tl.load(
-        block_table_ptr + si * stride_bt_b + tl.maximum(blk0, 0) * stride_bt_c,
-        mask=blk0_ok,
-        other=0,
-    ).to(tl.int64)
-    ckpt_ok = blk0_ok & (page0 > 0)
-    use_a = d_off < a_width
-    col_b = tl.maximum(d_off - a_width, 0)
-
-    w_all = _load_weight_taps(
-        weight_ptr, d_off, d_mask, stride_w_d, stride_w_w, W, W_POW2
-    )
-    cache_base = (
-        conv_cache_ptr + safe_ci[:, None] * stride_c_slot + d_off[None, :] * stride_c_d
-    )
-
-    acc = tl.zeros([BLOCK_T, BLOCK_D], dtype=tl.float32)
-    t64 = t_off.to(tl.int64)
-
-    # Only the tile holding a chunk's first W-1 tokens has pre-chunk taps;
-    # every other tile takes the pure-x fast path (tile-uniform branch, so
-    # the checkpoint machinery costs interior tiles nothing).
-    has_prechunk = tl.max((t_mask & ((t64 - bos) < (W - 1))).to(tl.int32), axis=0) > 0
-    # Keep tap W-1 in-loop: a split unconditional load miscompiles tokenspeed_triton (num_warps>1).
-    if has_prechunk:
-        for iw in tl.static_range(W):
-            shifted_t = t64 - (W - 1) + iw
-            in_x = (shifted_t >= bos) & t_mask
-            x_val = tl.load(
-                x_ptr + shifted_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-                mask=in_x[:, None] & d_mask[None, :],
-                other=0,
-            )
-            # Pre-chunk taps: checkpoint window row j at the chunk-start
-            # page. No `other` filler (an int cannot cast to fp8 sources);
-            # masked-off lanes are discarded by the selects below.
-            j = (shifted_t - bos + (W - 1)).to(tl.int64)
-            in_ck = (shifted_t < bos) & ckpt_ok
-            a_val = tl.load(
-                ckpt_a_ptr
-                + page0[:, None] * stride_a_page
-                + j[:, None] * stride_a_w
-                + d_off[None, :] * stride_a_c,
-                mask=in_ck[:, None] & d_mask[None, :] & use_a[None, :],
-            )
-            b_val = tl.load(
-                ckpt_b_ptr
-                + page0[:, None] * stride_b_page
-                + j[:, None] * stride_b_w
-                + col_b[None, :] * stride_b_c,
-                mask=in_ck[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
-            )
-            ck_val = tl.where(
-                use_a[None, :], a_val.to(tl.float32), b_val.to(tl.float32)
-            )
-            ck_val = tl.where(in_ck[:, None] & d_mask[None, :], ck_val, 0.0)
-            w_val = _select_weight_tap(w_all, iw, W_POW2)
-            v = tl.where(in_x[:, None], x_val.to(tl.float32), ck_val)
-            acc += v * w_val[None, :]
-            if iw < W - 1:
-                # Fused restore: the request's first-token lane materializes
-                # the checkpoint window into the ring so later decode rounds
-                # can rewind past the boundary. Gated to the last R
-                # positions — one writer per row beside the chunk stores.
-                tap_pos = pre_len - (W - 1) + iw
-                do_restore = (
-                    (t64 == bos) & in_ck & (tap_pos >= through - R) & (tap_pos >= 0)
-                )
-                restore_row = (tl.maximum(tap_pos, 0) % R).to(tl.int64)
-                tl.store(
-                    cache_base + restore_row[:, None] * stride_c_w,
-                    ck_val.to(conv_cache_ptr.dtype.element_ty),
-                    mask=do_restore[:, None] & d_mask[None, :],
-                )
+        stride_istate_seq = conv_states.stride(0)
+        stride_istate_dim = conv_states.stride(1)
+        stride_istate_token = conv_states.stride(2)
+    if out.dim() == 2:
+        stride_o_seq = 0
+        stride_o_dim = out.stride(0)
+        stride_o_token = out.stride(1)
     else:
-        # Interior tiles: every tap of every lane is an in-chunk x row.
-        for iw in tl.static_range(W):
-            shifted_t = t64 - (W - 1) + iw
-            x_val = tl.load(
-                x_ptr + shifted_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-                mask=td_mask,
-                other=0,
-            )
-            w_val = _select_weight_tap(w_all, iw, W_POW2)
-            acc += x_val.to(tl.float32) * w_val[None, :]
+        stride_o_seq = out.stride(0)
+        stride_o_dim = out.stride(1)
+        stride_o_token = out.stride(2)
 
-    if USE_SILU:
-        acc = acc * tl.sigmoid(acc)
+    if validate_data:
+        assert x.dim() == 2
+        assert query_start_loc is not None
+        assert query_start_loc.dim() == 1
+        assert x.stride(0) == 1 or x.stride(1) == 1
+        if bias is not None:
+            assert bias.dim() == 1
+            assert dim == bias.size(0)
+        if cache_indices is not None:
+            assert cache_indices.dim() == 1
+            assert padded_batch == cache_indices.size(0)
+        if has_initial_state is not None:
+            assert has_initial_state.size() == (padded_batch,)
+            assert (
+                conv_states is not None
+            ), "ERROR: `has_initial_state` is used, which needs also `conv_states`"
+        assert weight.stride(1) == 1
+        assert (dim, width) == weight.shape
+        assert is_channel_last, "Need to run in channel-last layout"
 
-    xv = tl.load(
-        x_ptr + t64[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-        mask=td_mask,
-        other=0,
+    grid = (batch_ptr.numel(), triton.cdiv(dim, 256))
+    _causal_conv1d_fwd_kernel[grid](
+        # Pointers to matrices
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+        batch_ptr,
+        token_chunk_offset_ptr,
+        out,
+        # Matrix dimensions
+        dim,
+        cu_seqlen,
+        num_cache_lines,
+        # stride
+        stride_x_seq,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_istate_seq,
+        stride_istate_dim,
+        stride_istate_token,
+        stride_o_seq,
+        stride_o_dim,
+        stride_o_token,
+        # others
+        pad_slot_id,
+        # META
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        HAS_INITIAL_STATES=has_initial_state is not None,
+        HAS_CACHE=conv_states is not None,
+        IS_CONTINUOUS_BATCHING=cache_indices is not None,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        NP2_STATELEN=np2_statelen,
+        BLOCK_M=prefill_metadata.block_m,
+        BLOCK_N=256,
+        num_stages=2,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
-    if USE_RESIDUAL:
-        acc += xv.to(tl.float32)
-
-    tl.store(
-        y_ptr + t64[:, None] * stride_y_t + d_off[None, :] * stride_y_d,
-        acc.to(y_ptr.dtype.element_ty),
-        mask=td_mask,
-    )
-
-    # Ring persistence, gated to the last R positions: one writer per row
-    # regardless of chunk length (no epilogue, no aliasing — this kernel
-    # never reads the ring).
-    pos = through - eos + t_off  # 0-based absolute position of token t
-    do_write = t_mask & (ci != -1) & (pos >= through - R)
-    ring_row = (tl.maximum(pos, 0) % R).to(tl.int64)
-    tl.store(
-        cache_base + ring_row[:, None] * stride_c_w,
-        xv.to(conv_cache_ptr.dtype.element_ty),
-        mask=do_write[:, None] & d_mask[None, :],
-    )
-
-    # Publish every covered boundary. Boundaries sit >= PAGE_SIZE past the
-    # aligned chunk start, so the W-1 window rows are always in-chunk.
-    abs_len = pos + 1
-    valid_tok = t_mask & (ci != -1)
-    is_boundary = valid_tok & (abs_len > 0) & (abs_len % PAGE_SIZE == 0)
-    if tl.max(is_boundary.to(tl.int32), axis=0) > 0:
-        blk = (abs_len // PAGE_SIZE - 1).to(tl.int64)
-        blk_ok = is_boundary & (blk >= 0) & (blk < num_blocks)
-        page = tl.load(
-            block_table_ptr + si * stride_bt_b + blk * stride_bt_c,
-            mask=blk_ok,
-            other=0,
-        ).to(tl.int64)
-        pub = blk_ok & (page > 0)
-        for w in tl.static_range(W - 1):
-            src_t = t64 - (W - 2) + w
-            x_row = tl.load(
-                x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-                mask=pub[:, None] & d_mask[None, :],
-                other=0,
-            )
-            val = x_row.to(tl.float32)
-            tl.store(
-                ckpt_a_ptr
-                + page[:, None] * stride_a_page
-                + w * stride_a_w
-                + d_off[None, :] * stride_a_c,
-                val.to(ckpt_a_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & use_a[None, :],
-            )
-            tl.store(
-                ckpt_b_ptr
-                + page[:, None] * stride_b_page
-                + w * stride_b_w
-                + col_b[None, :] * stride_b_c,
-                val.to(ckpt_b_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
-            )
-
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
+    return out
 
 
-def select_prefill_config(T: int, D: int) -> tuple[int, int, int, int]:
-    """Select ``(BLOCK_T, BLOCK_D, num_warps, num_stages)`` for prefill.
-
-    Static heuristic (no autotune) so the kernel stays CUDA-graph friendly.
-    Swept on B200 across (T, D) in {512..8192} x {512, 6144}: a 32x128 tile
-    with 8 warps wins or ties everywhere (D is the contiguous axis, so the
-    wider channel block doubles the burst size; 4096x6144 drops 66 -> 56 us,
-    8192x6144 130 -> 110 us, small shapes improve slightly).
-
-    Args:
-        T: Total number of packed tokens.
-        D: Number of channels.
-
-    Returns:
-        Tuple ``(BLOCK_T, BLOCK_D, num_warps, num_stages)``.
+@register_kernel(
+    "conv",
+    "causal_conv1d_update",
+    name="triton_causal_conv1d_update",
+    solution="triton",
+    signatures=format_signatures("x", "dense", _CONV_DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    cache_seqlens: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    intermediate_conv_window: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    *,
+    parent_indices: torch.Tensor | None,
+):
     """
-    del T, D
-    return 32, 128, 8, 3
+    x: (batch, dim) or (batch, dim, seqlen)
+        [shape=2: single token prediction]
+        [shape=3: single or multiple tokens prediction]
+    conv_state: (..., dim, state_len), where state_len >= width - 1
+    weight: (dim, width)
+    bias: (dim,)
+    cache_seqlens: (batch,), dtype int32.
+        If not None, the conv_state is treated as a circular buffer.
+        The conv_state will be updated by copying x to the conv_state
+        starting at the index
+        @cache_seqlens % state_len.
+    conv_state_indices: (batch,), dtype int32
+        If not None, the conv_state is a larger tensor along the batch dim,
+        and we are selecting the batch coords specified by conv_state_indices.
+        Useful for a continuous batching scenario.
+    pad_slot_id: int
+            if cache_indices is passed, lets the kernel identify padded
+            entries that will not be processed,
+            for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
+            in this case, the kernel will not process entries at
+            indices 0 and 3
+    parent_indices: (batch, seqlen), dtype int32; requires
+        conv_state_indices and int32 output_state_indices. Draft trees: token t's
+        window ends at token parent_indices[b, t] (the initial window when
+        negative) instead of token t - 1.
+    out: (batch, dim) or (batch, dim, seqlen)
+    """
+    enable_pdl = pdl_enabled()
+    if parent_indices is not None:
+        tree_tables_ok = (
+            conv_state_indices is not None
+            and output_state_indices is not None
+            and parent_indices.shape == output_state_indices.shape
+            and conv_state_indices.shape == parent_indices.shape[:1]
+            and {
+                parent_indices.dtype,
+                output_state_indices.dtype,
+                conv_state_indices.dtype,
+            }
+            == {torch.int32}
+        )
+        chain_only_options = (
+            num_accepted_tokens is not None
+            or cache_seqlens is not None
+            or intermediate_conv_window is not None
+            or pad_slot_id != PAD_SLOT_ID
+            or validate_data
+        )
+        if not tree_tables_ok or chain_only_options:
+            raise ValueError(
+                "parent_indices needs int32 conv_state_indices (batch,) and "
+                "output_state_indices of its shape, and none of num_accepted_tokens, "
+                "cache_seqlens, intermediate_conv_window, pad_slot_id, validate_data"
+            )
+    if validate_data:
+        assert cache_seqlens is None
+        assert pad_slot_id is not None
+        assert x.stride(1) == 1
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+    if parent_indices is not None:
+        return _causal_conv1d_tree_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            output_state_indices,
+            parent_indices,
+        )
+    unsqueeze = x.dim() == 2
+    if unsqueeze:
+        # make it (batch, dim, seqlen) with seqlen == 1
+        x = x.unsqueeze(-1)
+    batch, dim, seqlen = x.shape
+    _, width = weight.shape
+    # conv_state: (..., dim, state_len), where state_len >= width - 1
+    num_cache_lines, _, state_len = conv_state.size()
+
+    if validate_data:
+        assert dim == weight.size(0)
+        assert (
+            conv_state.stride(-2) == 1
+        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+        assert state_len >= width - 1
+        # when above happens, we don't shift-left to keep any records in conv_state
+        assert dim == conv_state.size(1)
+        if conv_state_indices is None:
+            assert conv_state.size(0) >= batch
+        else:
+            assert (batch,) == conv_state_indices.shape
+
+        assert num_cache_lines >= batch
+        assert weight.stride(1) == 1  # Need this
+        assert cache_seqlens is None
+
+    out = x
+    stride_w_dim, stride_w_width = weight.stride()
+
+    stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
+
+    stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
+    stride_state_indices = (
+        conv_state_indices.stride(0) if conv_state_indices is not None else 0
+    )
+    if output_state_indices is not None or intermediate_conv_window is not None:
+        state_len = width - 1
+    else:
+        state_len = width - 1 + (seqlen - 1)  # effective state_len needed
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    def grid(META):
+        return (
+            batch,
+            triton.cdiv(dim, META["BLOCK_N"]),
+        )
+
+    # prepare intermediate buffer strides if provided
+    if intermediate_conv_window is not None:
+        stride_inter_seq, stride_inter_step, stride_inter_dim, stride_inter_win = (
+            intermediate_conv_window.stride(0),
+            intermediate_conv_window.stride(1),
+            intermediate_conv_window.stride(2),
+            intermediate_conv_window.stride(3),
+        )
+    else:
+        stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+    if output_state_indices is not None:
+        stride_output_state_indices_seq, stride_output_state_indices_step = (
+            output_state_indices.stride(0),
+            output_state_indices.stride(1),
+        )
+    else:
+        stride_output_state_indices_seq = stride_output_state_indices_step = 0
+
+    _causal_conv1d_update_kernel[grid](
+        # Pointers to matrices
+        x,
+        weight,
+        bias,
+        conv_state,
+        cache_seqlens,
+        conv_state_indices,
+        num_accepted_tokens,
+        intermediate_conv_window if intermediate_conv_window is not None else x,
+        output_state_indices if output_state_indices is not None else x,
+        out,
+        # Matrix dimensions
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        num_cache_lines,
+        # stride
+        stride_x_seq,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_istate_seq,
+        stride_istate_dim,
+        stride_istate_token,
+        stride_state_indices,
+        stride_inter_seq,
+        stride_inter_step,
+        stride_inter_dim,
+        stride_inter_win,
+        stride_output_state_indices_seq,
+        stride_output_state_indices_step,
+        stride_o_seq,
+        stride_o_dim,
+        stride_o_token,
+        # others
+        pad_slot_id,
+        # META
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
+        IS_SPEC_DECODING=num_accepted_tokens is not None,
+        NP2_STATELEN=np2_statelen,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        BLOCK_N=256,
+        SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    if unsqueeze:
+        out = out.squeeze(-1)
+    return out

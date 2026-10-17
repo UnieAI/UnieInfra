@@ -44,6 +44,7 @@ public:
     std::span<const CacheBlockRef> Blocks() const noexcept { return blocks_; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t AvailableTokens() const { return available_tokens_; }
+    std::int32_t ReclaimedPrefixBlocks() const { return reclaimed_prefix_blocks_; }
 
     CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
@@ -51,16 +52,23 @@ public:
     }
 
 private:
-    friend class KvCacheManager;
+    // The allocator is the only component that changes a table; anything
+    // else that needs to write blocks (publishing them to a prefix index)
+    // receives a window from it.
+    friend class GroupAllocator;
 
     std::vector<CacheBlockRef> blocks_{};
     // Unconsumed capacity at the logical tail. This may span multiple blocks
     // when admission preallocates a later decode/MTP step.
     std::int32_t available_tokens_{0};
+    // Slots below this monotonic frontier have already released their request
+    // ownership. A sliding group's table keeps a null hole at every slid-out
+    // slot, so reclaim cannot infer this frontier from the first null slot.
+    std::int32_t reclaimed_prefix_blocks_{0};
 };
 
 // LCM ownership ids for scheduler accounting/debugging. Kernel-facing page
-// tables must instead go through KvCacheManager::BlockTablePageIds().
+// tables must instead go through GroupAllocator::BlockTablePageIds().
 inline std::vector<std::int32_t> BlockTableLcmBlockIds(const BlockTable& table) {
     std::vector<std::int32_t> ids;
     ids.reserve(static_cast<std::size_t>(table.NumBlocks()));

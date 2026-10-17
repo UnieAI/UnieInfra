@@ -21,9 +21,13 @@
 """Routing ops: routing_flash (softmax + topk with correction bias)."""
 
 import functools
+import logging
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
+
+logger = logging.getLogger(__name__)
 
 
 @functools.cache
@@ -40,6 +44,18 @@ def _load_routing_module():
     return tvm_ffi.load_module(str(so_path))
 
 
+def routing_available() -> bool:
+    so_path = Path(__file__).parent / "objs" / "routing" / "routing.so"
+    if not so_path.exists():
+        return False
+    try:
+        _load_routing_module()
+    except (ImportError, OSError, RuntimeError) as error:
+        logger.warning(f"Failed to load CUDA routing library {so_path}: {error}")
+        return False
+    return True
+
+
 def routing_flash(
     input: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -48,7 +64,9 @@ def routing_flash(
     num_experts_real: int,
     scaling_factor: float,
     renorm: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_routing_module().softmax_topk_flash(
         input,
         correction_bias,
@@ -57,6 +75,7 @@ def routing_flash(
         int(num_experts_real),
         float(scaling_factor),
         bool(renorm),
+        bool(enable_pdl),
     )
 
 
@@ -67,7 +86,10 @@ def softplus_sqrt_topk_flash(
     topk_weights: torch.Tensor,
     scaling_factor: float,
     renorm: bool = False,
+    *,
+    enable_pdl: bool,
 ) -> None:
+    """Select routes using the explicitly supplied PDL launch policy."""
     _load_routing_module().softplus_sqrt_topk_flash(
         input,
         correction_bias,
@@ -75,6 +97,7 @@ def softplus_sqrt_topk_flash(
         topk_weights,
         bool(renorm),
         float(scaling_factor),
+        bool(enable_pdl),
     )
 
 
@@ -86,7 +109,10 @@ def hash_softplus_sqrt_topk_flash(
     topk_weights: torch.Tensor,
     scaling_factor: float,
     renorm: bool = False,
+    *,
+    enable_pdl: bool,
 ) -> None:
+    """Select routes using the explicitly supplied PDL launch policy."""
     _load_routing_module().hash_softplus_sqrt_topk_flash(
         input,
         input_ids,
@@ -95,4 +121,5 @@ def hash_softplus_sqrt_topk_flash(
         topk_weights,
         bool(renorm),
         float(scaling_factor),
+        bool(enable_pdl),
     )

@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
+from tokenspeed_kernel.ops.sampling.triton import verify_tree
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -34,14 +35,14 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
-
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 def _verify_chain_greedy_torch(
@@ -71,7 +72,8 @@ def _verify_chain_greedy_torch(
 
     # Fill all of `predicts` with target_predict; slots outside the accepted
     # prefix are harmless because accept_index keeps them at -1 and callers
-    # mask on that. Matches the CUDA kernel's observable state.
+    # mask on that. The CUDA kernel writes only the accepted prefix and the
+    # bonus slot, leaving the rest as the caller passed them in.
     predicts.copy_(target_predict.reshape(-1).to(torch.int32))
 
     device = candidates.device
@@ -91,7 +93,6 @@ def _verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
-    enable_pdl: bool = False,
 ) -> None:
 
     # Prefer the CUDA kernel when available AND the tensors are on CUDA.
@@ -105,7 +106,6 @@ def _verify_chain_greedy(
             target_predict=target_predict,
             batch_size=batch_size,
             num_draft_tokens=num_draft_tokens,
-            enable_pdl=enable_pdl,
         )
         return
 
@@ -131,6 +131,9 @@ class GreedySamplingBackend(SamplingBackend):
     supported. Intended as the default backend and as a fallback when
     flashinfer is unavailable."""
 
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
+    supports_tree_verify = True
+
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
@@ -145,21 +148,10 @@ class GreedySamplingBackend(SamplingBackend):
         self._sample_token_buf = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
-        self._predict_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        # Flat layout so [:bs * n].view(bs, n) is contiguous for any bs/n
-        # (required by maybe_broadcast / NCCL).
-        self._accept_index_buf = torch.zeros(
-            (config.max_bs * config.max_draft_tokens_per_req,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._accept_length_buf = torch.zeros(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
+
+    def reads_only_argmax(self) -> bool:
+        # Logprobs read the full distribution.
+        return not self.config.enable_output_logprobs
 
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
@@ -177,7 +169,10 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
         bs = logits.shape[0]
-        tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
+        if logits_output.next_token_ids is not None:
+            tokens = self._sample_token_buf[:bs].copy_(logits_output.next_token_ids)
+        else:
+            tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
 
         # TP-rank sync (rank 0 wins), mirrors FlashInferSamplingBackend.sample.
         # All-gathered logits are not bit-identical across ranks, so per-rank
@@ -186,8 +181,8 @@ class GreedySamplingBackend(SamplingBackend):
         self.maybe_broadcast(tokens)
 
         if self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, tokens
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, tokens, logprob_order=self.config.logprob_order
             )
 
         return tokens, self._ones_buf[:bs]
@@ -198,6 +193,8 @@ class GreedySamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         bs = candidates.shape[0]
@@ -220,31 +217,63 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = (
+            logits_output.next_token_ids
+            if logits_output.next_token_ids is not None
+            else sampling_argmax(logits)
+        ).reshape(bs, num_tokens_per_req)
 
-        _verify_chain_greedy(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates.to(torch.int32),
-            target_predict=target_predict,
-            batch_size=bs,
-            num_draft_tokens=num_tokens_per_req,
-            enable_pdl=pdl_enabled(),
-        )
+        if tree is not None:
+            # The accepted path rides in accept_index so the TP broadcast below carries it.
+            verify_tree(
+                predict,
+                accept_length,
+                accept_index,
+                candidates.to(torch.int32),
+                tree.parents,
+                target_predict.view(-1),
+            )
+        else:
+            _verify_chain_greedy(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates.to(torch.int32),
+                target_predict=target_predict,
+                batch_size=bs,
+                num_draft_tokens=num_tokens_per_req,
+            )
+            # Retain normal verification cost before forcing benchmark acceptance.
+            if self.config.synthetic_acceptance_length is not None:
+                lengths = self.synthetic_lengths(
+                    candidates, sampling_info.batch_row_offset
+                )
+                target_tokens = target_predict.gather(
+                    1, (lengths - 1).long()[:, None]
+                ).squeeze(1)
+                self.write_synthetic_outputs(
+                    candidates,
+                    target_tokens,
+                    lengths,
+                    predict,
+                    accept_index,
+                    accept_length,
+                )
 
-        accept_length += 1
+            accept_length += 1
 
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length
         # divergence (logits not bit-identical across ranks) desyncs batch
-        # composition and deadlocks the model all-reduce. Buffers are laid out
-        # flat so these views are NCCL-contiguous.
-        self.maybe_broadcast(predict, accept_index, accept_length)
+        # composition and deadlocks the model all-reduce.
+        self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, predict
+            if tree is not None:
+                # predict is packed along the path; score it against the path's own rows.
+                logits = logits.index_select(0, accepted_path_rows(accept_index))
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, predict, logprob_order=self.config.logprob_order
             )
 
         return predict, accept_length

@@ -23,6 +23,9 @@ from dataclasses import dataclass
 import torch
 import torch.distributed
 
+from tokenspeed.runtime.distributed.comm_backend import set_global_backend
+from tokenspeed.runtime.distributed.comm_backend.emulated import EmulatedRankBackend
+from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -69,6 +72,11 @@ class DistributedConfig:
 
     # Network configuration
     nccl_port: int
+
+    # Run this rank alone, with local stand-ins for its collectives
+    # (--emulate-rank-zero).
+    emulate_rank_zero: bool
+
     dist_init_addr: str | None = None
     distributed_timeout_seconds: int = 1800
 
@@ -110,6 +118,7 @@ class DistributedConfig:
             moe_ep_size=mapping.moe.ep_size,
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
+            emulate_rank_zero=server_args.emulate_rank_zero,
             dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
@@ -130,8 +139,8 @@ class DistributedInitializer:
     def initialize(config: DistributedConfig) -> float:
         torch.get_device_module(config.device).set_device(config.gpu_id)
         logger.info(
-            "Init torch distributed begin. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init torch distributed begin. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         if config.device == "cuda":
             maybe_set_numa_aware_cpu_affinity(config.gpu_id)
@@ -139,6 +148,8 @@ class DistributedInitializer:
         # Determine backend
         if config.device == "cuda":
             backend = "nccl"
+        elif config.device == "npu":
+            backend = "hccl"
         else:
             raise ValueError(f"Unsupported device: {config.device}")
 
@@ -151,30 +162,63 @@ class DistributedInitializer:
         # Pass the device so PyTorch binds the process group to it (eager NCCL
         # init) instead of inferring it later — this also mutes the c10d
         # "barrier(): using the device under current context" warning.
-        device_id = torch.device(config.device, config.gpu_id)
-
-        # Initialize distributed via the mapping-based process group manager
-        pg_manager.init_distributed(
-            config.mapping,
-            backend=backend,
-            distributed_init_method=dist_init_method,
-            timeout=config.distributed_timeout_seconds,
-            device_id=device_id,
+        device_id = (
+            None if backend == "hccl" else torch.device(config.device, config.gpu_id)
         )
+
+        if config.emulate_rank_zero:
+            pg_manager.init_emulated_rank_zero(
+                backend=backend,
+                distributed_init_method=dist_init_method,
+                timeout=config.distributed_timeout_seconds,
+                device_id=device_id,
+            )
+            set_global_backend(EmulatedRankBackend(rank=config.mapping.rank))
+        else:
+            # Initialize distributed via the mapping-based process group manager
+            pg_manager.init_distributed(
+                config.mapping,
+                backend=backend,
+                distributed_init_method=dist_init_method,
+                timeout=config.distributed_timeout_seconds,
+                device_id=device_id,
+            )
         pg_manager.init_process_group(config.mapping.world_group)
+        pg_manager.init_process_group(config.mapping.attn.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
+        # The KVP group is the group the DCP decode collectives address; a
+        # group of one still is. init_process_group is idempotent and handles
+        # size 1.
+        pg_manager.init_process_group(config.mapping.attn.kvp_group)
+        if config.mapping.attn.has_kvp:
+            pg_manager.init_process_group(
+                config.mapping.attn.kvp_group,
+                backend=backend,
+                name=KVP_HISTORY_GROUP_NAME,
+            )
+        # The query-context-parallel group of a sharded extend; equal to the
+        # attention TP group while qcp == tp, so this is idempotent there.
+        pg_manager.init_process_group(config.mapping.attn.qcp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
+        # No-op at the default linear_attn.tp == attn.tp (same group,
+        # idempotent).
+        pg_manager.init_process_group(config.mapping.linear_attn.tp_group)
+        # Head-sharded attention projections and the vocab-sharded LM head
+        # under attention DP; both default to groups created above.
+        pg_manager.init_process_group(config.mapping.attn.head_tp_group)
+        pg_manager.init_process_group(config.mapping.lm_head.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+        if config.mapping.has_pp:
+            # Cross-stage group for hidden-state P2P (nccl) and small control
+            # broadcasts like the sampled first token (gloo).
+            pg_manager.init_process_group(config.mapping.pp_group)
 
-        # Register the trtllm one-shot all-reduce workspaces for the TP
-        # groups. AutoBackend routes small SUM all-reduces (<= 2 MB payload,
-        # i.e. the per-step decode reductions) through them; larger payloads
-        # and every other op keep using NCCL. Without this the one-shot
-        # backend is never armed and raw all_reduce callers (e.g. models whose
-        # comm cannot fuse into a norm) pay ring latency per layer.
-        # Unconditional: --force-deterministic-rsag is the escape hatch, and
-        # it overrides at dispatch (auto.py) rather than at registration.
+        from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+        gather_fabric_map()
+
+        # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
         if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
@@ -183,7 +227,7 @@ class DistributedInitializer:
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
             if trtllm_ar is not None:
-                # One-shot serves <= 2 MB only; a small token window bounds the IPC workspace (else NCCL).
+                # One-shot window; configure_group widens cross-node groups.
                 max_oneshot_tokens = max(
                     1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
                 )
@@ -199,21 +243,19 @@ class DistributedInitializer:
                             hidden_dim=config.hidden_size,
                         )
                         logger.info(
-                            "trtllm one-shot all-reduce for group %s: %s",
-                            group,
-                            "enabled" if ok else "unavailable (NCCL fallback)",
+                            f"trtllm one-shot all-reduce for group {group!s}: "
+                            f"{('enabled' if ok else 'unavailable (NCCL fallback)')!s}",
                         )
 
         logger.info(
-            "Init comm buff end. Avail mem=%.4f GB",
-            get_available_gpu_memory(config.device, config.gpu_id),
+            "Init comm buff end. Avail mem="
+            f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
         )
         mapping = config.mapping
         logger.info(
-            "Current Process distributed state:  global rank: %s  attn_tp_rank: %s  attn_dp_rank: %s",
-            mapping.rank,
-            mapping.attn.tp_rank,
-            mapping.attn.dp_rank,
+            f"Current Process distributed state:  global rank: {mapping.rank!s}  "
+            f"attn_tp_rank: {mapping.attn.tp_rank!s}  attn_dp_rank: "
+            f"{mapping.attn.dp_rank!s}",
         )
 
         # One reading, then reduce it. This used to take the collective MIN

@@ -18,14 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Composite attention configuration.
+
+``AttnConfig`` carries the model-wide serving facts (device, cache precision,
+paging, capacity, speculative shape) and a tuple of attention components.
+Each component is an ``AttnComponentSpec`` subclass owning one mechanism's
+kernel choice, head geometry, per-layer vectors, and parallel width;
+``SoftmaxAttnConfig`` is the softmax-family base (MHA/MLA/DSA/MSA), the
+counterpart of ``LinearAttnConfig``'s recurrent state.
+
+The softmax component is unique per model (validated at construction) and
+addressed by type: ``config.component(SoftmaxAttnConfig)``. Backends receive
+their component explicitly: ``Backend(config, spec)``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar, TypeVar
 
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
 
 def resolve_speculative_num_tokens(
@@ -43,10 +61,44 @@ def resolve_speculative_num_tokens(
     return width
 
 
+def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
+    """A draft that proposes a whole block in one forward and writes its KV at
+    the target's cache locations (DFLASH / DSPARK)."""
+    return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
+
+
+def resolve_cache_layer_types(
+    hf_config,
+    *,
+    num_layers: int,
+    is_draft: bool,
+    draft_block_decode: bool,
+) -> tuple[str, ...]:
+    """Per-layer cache-group labels of one model side, read once for all
+    softmax families.
+
+    ``cache_layer_types`` wins over ``layer_types``: it can carry labels
+    outside transformers' ``ALLOWED_LAYER_TYPES`` (Inkling's sliding
+    sub-groups). Target-stack labels that do not fit a draft's depth are
+    dropped so the recipe resolves the draft to full history. A block drafter
+    writes at the target's cache locations, so its storage IS the target's
+    full-history group whatever compute mask its layers apply: the label
+    vector says so explicitly instead of losing the labels.
+    """
+    layer_types = tuple(
+        getattr(hf_config, "cache_layer_types", None)
+        or getattr(hf_config, "layer_types", None)
+        or ()
+    )
+    if draft_block_decode:
+        return (FULL_ATTENTION,) * num_layers
+    if is_draft and layer_types and len(layer_types) != num_layers:
+        return ()
+    return layer_types
+
+
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
-    if kv_cache_dtype_str == "auto":
-        return torch.bfloat16
-    elif kv_cache_dtype_str == "bfloat16":
+    if kv_cache_dtype_str == "auto" or kv_cache_dtype_str == "bfloat16":
         return torch.bfloat16
     elif kv_cache_dtype_str in ("fp8", "fp8_e4m3"):
         return torch.float8_e4m3fn
@@ -58,27 +110,84 @@ def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
 
 
 @dataclass(kw_only=True)
-class BaseAttnConfig:
-    device: str
-    backend_name: str
+class AttnComponentSpec:
+    """One attention mechanism's boot-constant facts.
+
+    Subclasses are the identity; a mixed full+sliding softmax model stays ONE
+    component carrying its per-layer vectors.
+    """
+
+    # The compute backend requested for this component; None lets the backend
+    # registry pick the component's default.
+    backend_name: str | None = None
+
+
+@dataclass(kw_only=True)
+class SoftmaxAttnConfig(AttnComponentSpec):
+    """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
+
+    is_dsa: ClassVar[bool] = False
+
     num_attention_heads: int
     num_kv_heads: int
     head_dim: int
     attn_tp_size: int
+    # Per-layer cache-group labels (the storage vocabulary of
+    # recipes/spec.py, NOT the checkpoint's compute labels), consumed only by
+    # the cache recipes; empty -> single full-history group. A layer's
+    # compute mask lives on its PagedAttention (sliding_window_size).
+    cache_layer_types: tuple[str, ...] = ()
+    # Sliding window for per-layer cache recipes. Recipes that declare whole
+    # groups, such as DeepSeek V4.1, put their windows on those groups.
+    sliding_window_tokens: int | tuple[int | None, ...] | None = None
+
+    @classmethod
+    def generate(
+        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
+    ) -> AttnConfig:
+        raise NotImplementedError("Not Implemented!")
+
+    def cache_cell_size(self, config: AttnConfig) -> int:
+        """Per-token cache bytes of this component's dominant field.
+
+        A per-TOKEN concept, hence softmax-family only: linear-attention
+        state is fixed-size per request, sized via its shape properties.
+        Takes the ``AttnConfig`` for the model-wide facts (cache dtype,
+        quant method) that deliberately do not live on the spec.
+        """
+        raise NotImplementedError("Not Implemented!")
+
+
+@dataclass(kw_only=True)
+class AttnConfig:
+    """The model's attention configuration: model-wide facts + components.
+
+    Exactly one component is the softmax family (validated below); extra
+    components (linear attention) ride alongside as peers. Built exclusively
+    by ``registry._create_attn_config`` — one construction seam.
+    """
+
+    device: str
     dtype: torch.dtype
     kv_cache_dtype: torch.dtype
-    # Tokens covered by one page as seen by the attention kernel.
-    page_size: int
+    kv_cache_quant_method: str
+    # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
+    kv_cache_mxfp8: bool = False
+    # Scheduler prefix granularity (CLI --block-size): the identity axis.
+    prefix_granularity: int
+    # Tokens covered by one attention-kernel page. None picks the backend's
+    # per-kernel default (flexible kernels use the prefix granularity;
+    # fixed-page kernels use their own constant).
+    kernel_page_size: int | None = None
     # Physical per-request KV extent: the model's logical context_len plus
     # ServerArgs.spec_context_pad (spec verify overshoot for a finished request
     # lingering one overlap step). Backends size page tables and clamp seq_lens
     # against this; user-facing limits stay on the logical context_len.
     context_len: int
     max_bs: int
-    max_graph_bs: int
-    kv_cache_quant_method: str
-    # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
-    kv_cache_mxfp8: bool = False
+    # True iff server_args.disaggregation_mode != "null"; cache recipes use
+    # it to stamp transfer policies onto the cache group specs.
+    pd_disaggregation_enabled: bool = False
     speculative_num_steps: int = 0
     speculative_num_draft_tokens: int = 1
     is_draft: bool = False
@@ -86,12 +195,140 @@ class BaseAttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
+    # of attention TP): one topology for target and continuation/MTP views;
+    # KVP does not add ranks. Decode attends the owned pages and merges the
+    # partials by LSE (DCP).
+    kvp_size: int = 1
+    kvp_rank: int = 0
+    kvp_group: tuple[int, ...] = (0,)
+    # Query context parallelism: the extend rows this rank computes are a
+    # contiguous shard of the chunk; the group is the attention TP group.
+    qcp_size: int = 1
+    qcp_rank: int = 0
+    qcp_group: tuple[int, ...] = (0,)
+    components: tuple[AttnComponentSpec, ...]
 
-    @classmethod
-    def generate(
-        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
-    ):
-        raise NotImplementedError("Not Implemented!")
+    def __post_init__(self):
+        softmax_components = [
+            c for c in self.components if isinstance(c, SoftmaxAttnConfig)
+        ]
+        if len(softmax_components) != 1:
+            raise ValueError(
+                "AttnConfig requires exactly one softmax-family component, got "
+                f"{[type(c).__name__ for c in self.components] or 'none'}"
+            )
+        if self.qcp_size > 1:
+            softmax = softmax_components[0]
+            # The gathered-history extend arm exists on the GPU DSA leaf only;
+            # every other leaf rejects a query shard at its metadata build.
+            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+                raise ValueError(
+                    "query context parallelism requires GPU DSA attention; "
+                    f"got {softmax.backend_name!r}"
+                )
+            if torch.device(self.device).type != "cuda":
+                raise ValueError("GPU DSA query context parallelism requires CUDA")
+            # The sharded KV write gathers the rotated latent and stores it
+            # with latent_store, which writes native (bf16) rows only.
+            if (
+                self.kv_cache_dtype is not torch.bfloat16
+                or self.kv_cache_mxfp8
+                or self.kv_cache_quant_method != "none"
+            ):
+                raise ValueError(
+                    "query context parallelism requires a bf16 KV cache; got "
+                    f"{self.kv_cache_dtype} (mxfp8={self.kv_cache_mxfp8}, quant "
+                    f"method {self.kv_cache_quant_method!r})"
+                )
+        if self.kvp_size > 1:
+            softmax = softmax_components[0]
+            if softmax.backend_name == "flashmla":
+                if torch.device(self.device).type != "cuda":
+                    raise ValueError("FlashMLA DCP decode requires CUDA")
+            elif softmax.backend_name == "tokenspeed_mla":
+                pass
+            elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
+                device_type = torch.device(self.device).type
+                if device_type not in ("cuda", "npu"):
+                    raise ValueError("DSA DCP decode requires CUDA or Ascend NPU")
+                if device_type == "cuda" and self.draft_block_decode:
+                    raise ValueError(
+                        "GPU DSA DCP decode does not yet support non-causal "
+                        "block drafts"
+                    )
+            elif softmax.backend_name == "hybrid_linear_attn":
+                # The registry resolves the user's full-attention leaf after
+                # composing the hybrid components, and validates it before
+                # cache allocation. The composite name is not a capability.
+                pass
+            else:
+                raise ValueError(
+                    "--kv-parallel-size > 1 (DCP decode) currently requires "
+                    "DSA, FlashMLA or CuTe MLA attention"
+                )
+
+    def component(self, cls: type[ComponentT]) -> ComponentT | None:
+        """The first component that is a ``cls``, or None.
+
+        The one generic accessor — ``config.component(LinearAttnConfig)``;
+        new component classes need no change here.
+        """
+        for component in self.components:
+            if isinstance(component, cls):
+                return component
+        return None
 
     def cache_cell_size(self) -> int:
-        raise NotImplementedError("Not Implemented!")
+        return self.component(SoftmaxAttnConfig).cache_cell_size(self)
+
+
+def model_wide_kwargs(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    is_draft: bool,
+    *,
+    kv_cache_dtype: torch.dtype,
+    kv_cache_mxfp8: bool = False,
+    draft_block_decode: bool = False,
+    speculative_num_draft_tokens: int | None = None,
+) -> dict:
+    """The AttnConfig fields shared by every family's generate().
+
+    The softmax family passes in the facts its policies decide (cache dtype,
+    block-decode mode, and — for families that bypass the DSpark width
+    convention — the raw speculative width).
+    """
+    kwargs = dict(
+        device=server_args.device,
+        dtype=model_config.dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_mxfp8=kv_cache_mxfp8,
+        kv_cache_quant_method=server_args.kv_cache_quant_method,
+        prefix_granularity=server_args.prefix_granularity,
+        context_len=model_config.context_len + server_args.spec_context_pad,
+        max_bs=server_args.max_num_seqs
+        // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
+        pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
+        is_draft=is_draft,
+        draft_block_decode=draft_block_decode,
+    )
+    attn_mapping = server_args.mapping.attn
+    kwargs.update(
+        kvp_size=attn_mapping.kvp_size,
+        kvp_rank=attn_mapping.kvp_rank,
+        kvp_group=attn_mapping.kvp_group,
+        qcp_size=attn_mapping.qcp_size,
+        qcp_rank=attn_mapping.qcp_rank,
+        qcp_group=attn_mapping.qcp_group,
+    )
+    if server_args.speculative_algorithm is not None:
+        kwargs.update(
+            speculative_num_steps=server_args.speculative_num_steps,
+            speculative_num_draft_tokens=(
+                speculative_num_draft_tokens
+                if speculative_num_draft_tokens is not None
+                else resolve_speculative_num_tokens(server_args, is_draft)
+            ),
+        )
+    return kwargs

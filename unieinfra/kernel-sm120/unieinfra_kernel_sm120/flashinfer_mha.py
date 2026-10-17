@@ -754,6 +754,7 @@ def flashinfer_paged_mha_extend(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MHA extend against a paged KV cache, on FlashInfer's paged prefill kernel.
 
@@ -871,6 +872,7 @@ def flashinfer_paged_mha_decode(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MHA decode against a paged KV cache, on the same paged prefill kernel.
 

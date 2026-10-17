@@ -55,7 +55,6 @@ class InputProcessorBase(nn.Module):
         input_ids: Tensor,
         positions: Tensor,
         ctx: ForwardContext,
-        out_cache_loc: Tensor,
         input_embeds: Tensor = None,
     ) -> Tensor:
         if input_embeds is not None:
@@ -128,9 +127,8 @@ class ExtensibleLM(nn.Module):
             sys.path.insert(0, ext_def_dir)
             ext_def_module = f"{Path(ext_def_file).stem}"
             logger.info(
-                "\x1b[32m[[ExtensibleLM] Loading ext_def_dir=%r, ext_def_module=%r]\x1b[0m",
-                ext_def_dir,
-                ext_def_module,
+                f"\x1b[32m[[ExtensibleLM] Loading ext_def_dir={ext_def_dir!r}, "
+                f"ext_def_module={ext_def_module!r}]\x1b[0m",
             )
             importlib.import_module(ext_def_module)
 
@@ -171,20 +169,16 @@ class ExtensibleLM(nn.Module):
         ctx: ForwardContext,
         input_ids: Tensor,
         positions: Tensor,
-        out_cache_loc: Tensor,
         input_embeds: Tensor = None,
     ) -> LogitsProcessorOutput:
         # input processor: get input hidden states
-        input_embeds = self.input_processor(
-            input_ids, positions, ctx, out_cache_loc, input_embeds
-        )
+        input_embeds = self.input_processor(input_ids, positions, ctx, input_embeds)
 
         # base model forward
         out_hidden_states, _ = self.base_lm.model(
             input_ids=None,
             positions=positions,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             input_embeds=input_embeds,
         )
 

@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 // End-to-end lifecycle tests for the two-level KV-cache FSM path.
-// Config: two paged-cache groups (full + sliding-window), no L2/L3.
+// Config: two cache groups (full + sliding-window), no L2/L3.
 
 #include <algorithm>
 #include <array>
@@ -34,7 +34,7 @@ class KvCacheLifecycleTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
@@ -43,25 +43,22 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        PagedCacheGroupConfig full_grp;
+        CacheGroupConfig full_grp;
         full_grp.group_id = "full";
-        full_grp.rows_per_page = cfg.block_size;
-        full_grp.entry_stride_tokens = 1;
+        full_grp.block_granularity = cfg.prefix_granularity;
         full_grp.total_pages = cfg.device_allocator.total_pages;
         full_grp.cache_blocks_per_lcm_block = 2;
-        full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
-        full_grp.family = PagedCacheGroupFamily::History;
+        full_grp.attn_kind = AttnKind::kFull;
 
-        PagedCacheGroupConfig swa_grp;
+        CacheGroupConfig swa_grp;
         swa_grp.group_id = "swa";
-        swa_grp.rows_per_page = cfg.block_size;
-        swa_grp.entry_stride_tokens = 1;
+        swa_grp.block_granularity = cfg.prefix_granularity;
         swa_grp.total_pages = cfg.device_allocator.total_pages;
-        swa_grp.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        swa_grp.attn_kind = AttnKind::kSlidingWindow;
         swa_grp.sliding_window_tokens = 4;
-        swa_grp.family = PagedCacheGroupFamily::State;
 
-        cfg.paged_cache_groups = {full_grp, swa_grp};
+        cfg.cache_groups = {full_grp, swa_grp};
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -73,7 +70,7 @@ TEST_F(KvCacheLifecycleTestSuite, Construct_AndSubmit_Waiting) {
 }
 
 TEST_F(KvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     ExecutionPlan prefill_plan = PlanOnce();
@@ -120,30 +117,49 @@ TEST_F(KvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     SendFinish("r1");
     PlanOnce();
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
-// AvailableKvPages() reports the shared BlockPool.
-TEST_F(KvCacheLifecycleTestSuite, AvailableKvPagesReportsSharedPool) {
-    const std::size_t idle = scheduler_->AvailableKvPages();
-    EXPECT_EQ(idle, static_cast<std::size_t>(scheduler_->PoolFreeBlocks()));
+// AvailableLcmBlocks() reports the shared BlockPool.
+TEST_F(KvCacheLifecycleTestSuite, AvailableLcmBlocksReportsSharedPool) {
+    const std::int32_t idle = scheduler_->AvailableLcmBlocks();
     // 32 total pages, block 0 is the never-allocated null placeholder.
-    EXPECT_EQ(idle, 31u);
+    EXPECT_EQ(idle, 31);
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     PlanOnce();
-    EXPECT_EQ(scheduler_->AvailableKvPages(), static_cast<std::size_t>(scheduler_->PoolFreeBlocks()));
-    EXPECT_LT(scheduler_->AvailableKvPages(), idle)
+    EXPECT_LT(scheduler_->AvailableLcmBlocks(), idle)
         << "prefill draws from the shared pool and the bound accessor must see it";
 
     SendForwardDone("r1", {42});
     SendFinish("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->AvailableKvPages(), idle);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), idle);
+}
+
+// The per-step gauge splits the pool into empty, active and cache-only
+// parents without asking who holds each child.
+TEST_F(KvCacheLifecycleTestSuite, EmptyAndActiveLcmBlocksPartitionThePool) {
+    const std::int32_t total = scheduler_->EmptyLcmBlocks();
+    EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    PlanOnce();
+    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+        << "a live request's pages are active, not cache-only";
+
+    SendForwardDone("r1", {42});
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), total) << "the finished request's pages are evictable";
+    EXPECT_LT(scheduler_->EmptyLcmBlocks(), total) << "but they stay resident as cache-only parents";
 }
 
 TEST_F(KvCacheLifecycleTestSuite, TwoRequestsBatchBlockTables) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/101));
@@ -179,14 +195,14 @@ TEST_F(KvCacheLifecycleTestSuite, TwoRequestsBatchBlockTables) {
     SendFinish("r2");
     PlanOnce();
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 // KimiFourGroupSuite (integration_test_helper.h) is shared with the
 // four-group scenario tests in test_cache_kvcache_scenarios.cpp.
 
 TEST_F(KimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
-    const std::size_t before = scheduler_->AvailableKvPages();
+    const std::int32_t before = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(before, 32u);
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     ExecutionPlan plan = PlanOnce();
@@ -216,11 +232,11 @@ TEST_F(KimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
 
     AbortRequest("r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 }
 
 TEST_F(KimiFourGroupSuite, FinishAndAbortRestoreAllUsablePages) {
-    const std::size_t before = scheduler_->AvailableKvPages();
+    const std::int32_t before = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(before, 32u);
 
     Submit(MakeRequestSpec("finished", /*num_pages=*/2));
@@ -228,13 +244,13 @@ TEST_F(KimiFourGroupSuite, FinishAndAbortRestoreAllUsablePages) {
     SendForwardDone("finished", {42});
     SendFinish("finished");
     PlanOnce();
-    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 
     Submit(MakeRequestSpec("aborted", /*num_pages=*/2, /*start=*/101));
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
     AbortRequest("aborted");
     PlanOnce();
-    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 }
 
 }  // namespace tokenspeed::test

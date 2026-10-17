@@ -18,36 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 import struct
 import threading
 import time
 from dataclasses import dataclass
 
-import numpy as np
-import numpy.typing as npt
 import requests
 import zmq
 
+from tokenspeed.runtime.pd.base.manager import enable_ipv6_for_endpoint
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
-    CachePDPageManifest,
-    CachePDPeerLayout,
+    CachePDBlockManifest,
+    CacheTransferContract,
     validate_cache_manifest,
-    validate_cache_peer_layout,
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.transfer_plan import (
-    BufferKind,
-    BufferLayout,
-    ParallelLayout,
-    PDTransferPlanner,
     RankTransferPlan,
-    encode_transfer_fragments,
+    build_pipeline_transfer_plan,
 )
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.network import get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote, join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -68,36 +64,28 @@ def _get_prefill_parallel_info_from_server(
             prefill_parallel_info = response.json()
             cache_layout_wire = prefill_parallel_info.get("cache_layout")
             cache_layout = (
-                CachePDPeerLayout.from_wire_bytes(cache_layout_wire.encode("ascii"))
+                CacheTransferContract.from_wire_bytes(cache_layout_wire.encode("ascii"))
                 if cache_layout_wire is not None
                 else None
             )
             return PrefillParallelInfo(
                 tp_size=int(prefill_parallel_info["prefill_tp_size"]),
                 dp_size=int(prefill_parallel_info["prefill_dp_size"]),
-                kv_item_lens=tuple(
-                    int(x) for x in prefill_parallel_info.get("kv_item_lens", [])
-                ),
-                kv_unit_lens=tuple(
-                    int(x) for x in prefill_parallel_info.get("kv_unit_lens", [])
-                ),
-                state_item_lens=tuple(
-                    int(x) for x in prefill_parallel_info.get("state_item_lens", [])
-                ),
-                state_unit_lens=tuple(
-                    int(x) for x in prefill_parallel_info.get("state_unit_lens", [])
+                cache_fields_by_stage=tuple(
+                    tuple(stage)
+                    for stage in prefill_parallel_info["cache_fields_by_stage"]
                 ),
                 cache_layout=cache_layout,
+                pp_size=int(prefill_parallel_info.get("prefill_pp_size", 1)),
             )
         else:
             logger.error(
-                "Failed to get prefill parallel info: %s, %s",
-                response.status_code,
-                response.text,
+                f"Failed to get prefill parallel info: {response.status_code!s}, "
+                f"{response.text!s}",
             )
             return None
     except Exception as exc:
-        logger.error("Error fetching prefill parallel info from bootstrap: %s", exc)
+        logger.error(f"Error fetching prefill parallel info from bootstrap: {exc!s}")
         return None
 
 
@@ -111,342 +99,49 @@ def _get_bootstrap_info_from_server(bootstrap_addr, engine_rank, target_dp_group
             return bootstrap_info
         else:
             logger.error(
-                "Failed to get prefill server info: %s, %s",
-                response.status_code,
-                response.text,
+                f"Failed to get prefill server info: {response.status_code!s}, "
+                f"{response.text!s}",
             )
             return None
     except Exception as exc:
-        logger.error("Error fetching prefill info from bootstrap: %s", exc)
+        logger.error(f"Error fetching prefill info from bootstrap: {exc!s}")
         return None
 
 
 @dataclass(frozen=True)
 class ReceiverRoutePlan:
-    target_tp_rank: int | None
-    target_tp_ranks: tuple[int, ...]
-    required_prefill_response_num: int
-    default_required_dst_info_num: int
-    transfer_plan: RankTransferPlan | None = None
-    supports_remote_spec_candidates: bool = True
+    transfer_plan: RankTransferPlan
+    dummy_tp_ranks: tuple[int, ...] = ()
 
-    def required_dst_info_num_for_tp_rank(self, tp_rank: int) -> int:
-        if self.transfer_plan is None:
-            return self.default_required_dst_info_num
-        return self.transfer_plan.required_dst_info_num_for_prefill_rank(tp_rank)
-
-    def fragments_for_tp_rank(self, tp_rank: int):
-        if self.transfer_plan is None:
-            return ()
-        return self.transfer_plan.fragments_by_prefill_rank.get(tp_rank, ())
-
-
-def _buffer_kind_for_layer_offset(
-    kv_args, layer_index: int, offset_index: int
-) -> BufferKind:
-    is_draft = layer_index >= getattr(kv_args, "target_layer_num", len(kv_args.offsets))
-    if is_draft:
-        return BufferKind.DRAFT_K if offset_index == 0 else BufferKind.DRAFT_V
-    return BufferKind.TARGET_K if offset_index == 0 else BufferKind.TARGET_V
-
-
-def _unit_lens_or_default(unit_lens, item_lens):
-    if unit_lens:
-        return tuple(int(x) for x in unit_lens)
-    return tuple(1 for _ in item_lens)
-
-
-def _build_buffer_layout_pair(
-    *,
-    buffer_index: int,
-    buffer_kind: BufferKind,
-    sharded_axis: str,
-    prefill_item_len: int,
-    decode_item_len: int,
-    prefill_unit_len: int,
-    decode_unit_len: int,
-    prefill_tp_size: int,
-    decode_tp_size: int,
-):
-    """Build compatible logical layouts for one prefill/decode buffer pair.
-
-    Besides normal TP sharding and fully replicated buffers, this handles GQA
-    KV caches where prefill TP is larger than the number of distinct KV heads.
-    In that case multiple prefill TP ranks carry the same KV head, so the
-    transfer plan uses one representative rank from each replica group.
-    """
-
-    if prefill_unit_len != decode_unit_len:
-        raise ValueError(
-            f"prefill/decode unit sizes differ for {buffer_kind.value}: "
-            f"prefill={prefill_unit_len}, decode={decode_unit_len}"
-        )
-    if prefill_item_len % prefill_unit_len != 0:
-        raise ValueError(
-            f"prefill item length is not unit-aligned for {buffer_kind.value}: "
-            f"item={prefill_item_len}, unit={prefill_unit_len}"
-        )
-    if decode_item_len % decode_unit_len != 0:
-        raise ValueError(
-            f"decode item length is not unit-aligned for {buffer_kind.value}: "
-            f"item={decode_item_len}, unit={decode_unit_len}"
+    @property
+    def target_tp_ranks(self) -> tuple[int, ...]:
+        return tuple(
+            sorted((*self.transfer_plan.target_prefill_ranks, *self.dummy_tp_ranks))
         )
 
-    prefill_local_units = prefill_item_len // prefill_unit_len
-    decode_local_units = decode_item_len // decode_unit_len
-    prefill_global_units = prefill_local_units * prefill_tp_size
-    decode_global_units = decode_local_units * decode_tp_size
-    prefill_tp_replica_group_size = 1
-    if prefill_global_units == decode_global_units:
-        logical_axis = sharded_axis
-        logical_size = decode_global_units
-    elif prefill_item_len == decode_item_len:
-        logical_axis = "replicated"
-        logical_size = decode_local_units
-    elif (
-        sharded_axis == "kv_head"
-        and decode_global_units % prefill_local_units == 0
-        and decode_global_units // prefill_local_units <= prefill_tp_size
-        and prefill_tp_size % (decode_global_units // prefill_local_units) == 0
-    ):
-        logical_axis = sharded_axis
-        logical_size = decode_global_units
-        prefill_distinct_tp_size = decode_global_units // prefill_local_units
-        prefill_tp_replica_group_size = prefill_tp_size // prefill_distinct_tp_size
-    else:
-        raise ValueError(
-            f"unsupported heterogeneous TP buffer layout for {buffer_kind.value}: "
-            f"prefill_item={prefill_item_len}, decode_item={decode_item_len}, "
-            f"prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}, "
-            f"unit={decode_unit_len}"
-        )
-
-    return (
-        BufferLayout(
-            buffer_index=buffer_index,
-            buffer_kind=buffer_kind,
-            logical_axis=logical_axis,
-            logical_size=logical_size,
-            page_size=1,
-            bytes_per_logical_unit=decode_unit_len,
-            item_stride_bytes=prefill_item_len,
-            tp_replica_group_size=prefill_tp_replica_group_size,
-        ),
-        BufferLayout(
-            buffer_index=buffer_index,
-            buffer_kind=buffer_kind,
-            logical_axis=logical_axis,
-            logical_size=logical_size,
-            page_size=1,
-            bytes_per_logical_unit=decode_unit_len,
-            item_stride_bytes=decode_item_len,
-        ),
-    )
-
-
-def _build_kv_buffer_layouts(
-    kv_args, prefill_parallel_info: PrefillParallelInfo, decode_tp_size: int
-):
-    prefill_tp_size = prefill_parallel_info.prefill_tp_size_per_dp_rank
-    prefill_kv_item_lens = tuple(prefill_parallel_info.kv_item_lens)
-    if not prefill_kv_item_lens:
-        prefill_kv_item_lens = tuple(
-            int(x) * decode_tp_size // prefill_tp_size for x in kv_args.kv_item_lens
-        )
-    prefill_kv_unit_lens = _unit_lens_or_default(
-        prefill_parallel_info.kv_unit_lens, prefill_kv_item_lens
-    )
-    decode_kv_unit_lens = _unit_lens_or_default(
-        getattr(kv_args, "kv_unit_lens", []), kv_args.kv_item_lens
-    )
-
-    prefill_buffers = []
-    decode_buffers = []
-    for layer_index, ptr_offsets in enumerate(kv_args.offsets):
-        for offset_index, ptr_offset in enumerate(ptr_offsets):
-            buffer_kind = _buffer_kind_for_layer_offset(
-                kv_args, layer_index, offset_index
-            )
-            prefill_buffer, decode_buffer = _build_buffer_layout_pair(
-                buffer_index=ptr_offset,
-                buffer_kind=buffer_kind,
-                sharded_axis="kv_head",
-                prefill_item_len=int(prefill_kv_item_lens[ptr_offset]),
-                decode_item_len=int(kv_args.kv_item_lens[ptr_offset]),
-                prefill_unit_len=int(prefill_kv_unit_lens[ptr_offset]),
-                decode_unit_len=int(decode_kv_unit_lens[ptr_offset]),
-                prefill_tp_size=prefill_tp_size,
-                decode_tp_size=decode_tp_size,
-            )
-            prefill_buffers.append(prefill_buffer)
-            decode_buffers.append(decode_buffer)
-
-    decode_state_item_lens = tuple(getattr(kv_args, "state_item_lens", []) or [])
-    prefill_state_item_lens = tuple(prefill_parallel_info.state_item_lens)
-    if not prefill_state_item_lens:
-        prefill_state_item_lens = tuple(
-            int(x) * decode_tp_size // prefill_tp_size for x in decode_state_item_lens
-        )
-    prefill_state_unit_lens = _unit_lens_or_default(
-        prefill_parallel_info.state_unit_lens, prefill_state_item_lens
-    )
-    decode_state_unit_lens = _unit_lens_or_default(
-        getattr(kv_args, "state_unit_lens", []), decode_state_item_lens
-    )
-
-    for state_index, decode_item_len in enumerate(decode_state_item_lens):
-        prefill_buffer, decode_buffer = _build_buffer_layout_pair(
-            buffer_index=state_index,
-            buffer_kind=BufferKind.MAMBA_STATE,
-            sharded_axis="state_channel",
-            prefill_item_len=int(prefill_state_item_lens[state_index]),
-            decode_item_len=int(decode_item_len),
-            prefill_unit_len=int(prefill_state_unit_lens[state_index]),
-            decode_unit_len=int(decode_state_unit_lens[state_index]),
-            prefill_tp_size=prefill_tp_size,
-            decode_tp_size=decode_tp_size,
-        )
-        prefill_buffers.append(prefill_buffer)
-        decode_buffers.append(decode_buffer)
-    return tuple(prefill_buffers), tuple(decode_buffers)
-
-
-def _build_non_mla_route_plan(kv_mgr, prefill_parallel_info: PrefillParallelInfo):
-    prefill_tp_size = prefill_parallel_info.prefill_tp_size_per_dp_rank
-    decode_tp_size = kv_mgr.world_size // kv_mgr.dp_size
-    decode_tp_rank = kv_mgr.kv_args.engine_rank % decode_tp_size
-    prefill_buffers, decode_buffers = _build_kv_buffer_layouts(
-        kv_mgr.kv_args,
-        prefill_parallel_info,
-        decode_tp_size,
-    )
-    planner = PDTransferPlanner(
-        prefill_layout=ParallelLayout(
-            role="prefill",
-            world_size=prefill_tp_size,
-            dp_size=1,
-        ),
-        decode_layout=ParallelLayout(
-            role="decode",
-            world_size=decode_tp_size,
-            dp_size=1,
-        ),
-        prefill_buffers=prefill_buffers,
-        decode_buffers=decode_buffers,
-    )
-    transfer_plan = planner.plan_for_decode_rank(decode_tp_rank)
-    target_tp_ranks = tuple(transfer_plan.target_prefill_ranks)
-    target_tp_rank = (
-        target_tp_ranks[0] if transfer_plan.plan_kind == "identity" else None
-    )
-    default_required_dst_info_num = (
-        transfer_plan.required_dst_info_num_for_prefill_rank(target_tp_ranks[0])
-        if target_tp_ranks
-        else 1
-    )
-    return ReceiverRoutePlan(
-        target_tp_rank=target_tp_rank,
-        target_tp_ranks=target_tp_ranks,
-        required_prefill_response_num=transfer_plan.required_prefill_response_num,
-        default_required_dst_info_num=default_required_dst_info_num,
-        transfer_plan=transfer_plan,
-        supports_remote_spec_candidates=transfer_plan.plan_kind == "identity",
-    )
-
-
-def _legacy_mla_route_plan(
-    *,
-    target_tp_rank: int | None,
-    target_tp_ranks,
-    required_dst_info_num: int,
-    required_prefill_response_num: int,
-) -> ReceiverRoutePlan:
-    return ReceiverRoutePlan(
-        target_tp_rank=target_tp_rank,
-        target_tp_ranks=tuple(target_tp_ranks),
-        required_prefill_response_num=required_prefill_response_num,
-        default_required_dst_info_num=required_dst_info_num,
-    )
+    def is_dummy_tp_rank(self, tp_rank: int) -> bool:
+        return tp_rank in self.dummy_tp_ranks
 
 
 def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePlan:
-    prefill_tp_size_per_dp_rank = prefill_parallel_info.prefill_tp_size_per_dp_rank
-    local_tp_size_per_dp_rank = kv_mgr.world_size // kv_mgr.dp_size
-    local_cache_layout = getattr(kv_mgr.kv_args, "cache_layout", None)
     prefill_cache_layout = prefill_parallel_info.cache_layout
-
-    if local_cache_layout is not None:
-        if prefill_cache_layout is None:
-            raise RuntimeError(
-                "Paged cache decode connected to a non-Paged cache prefill"
-            )
-        validate_cache_peer_layout(local_cache_layout, prefill_cache_layout)
-        expected_item_lens = tuple(
-            local_cache_layout.physical_page_bytes
-            for _ in range(local_cache_layout.physical_slot_count)
+    if prefill_cache_layout is None:
+        raise RuntimeError(
+            "Cache-transfer decode connected to a non-cache-transfer prefill"
         )
-        if (
-            tuple(kv_mgr.kv_args.kv_item_lens) != expected_item_lens
-            or tuple(kv_mgr.kv_args.kv_unit_lens) != expected_item_lens
-            or tuple(prefill_parallel_info.kv_item_lens) != expected_item_lens
-            or tuple(prefill_parallel_info.kv_unit_lens) != expected_item_lens
-            or prefill_parallel_info.state_item_lens
-            or prefill_parallel_info.state_unit_lens
-        ):
-            raise RuntimeError(
-                "Paged cache P/D raw-slab Mooncake descriptors are incompatible"
-            )
-        if prefill_tp_size_per_dp_rank != local_tp_size_per_dp_rank:
-            raise NotImplementedError(
-                "Paged cache PD currently requires equal Prefill and Decode TP sizes"
-            )
-        target_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-        return _legacy_mla_route_plan(
-            target_tp_rank=target_tp_rank,
-            target_tp_ranks=(target_tp_rank,),
-            required_dst_info_num=1,
-            required_prefill_response_num=1,
-        )
-    if prefill_cache_layout is not None:
-        raise RuntimeError("non-Paged cache decode connected to a Paged cache prefill")
-
-    if not kv_mgr.is_mla_backend:
-        return _build_non_mla_route_plan(kv_mgr, prefill_parallel_info)
-
-    if local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
-        target_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-        return _legacy_mla_route_plan(
-            target_tp_rank=target_tp_rank,
-            target_tp_ranks=(target_tp_rank,),
-            required_dst_info_num=1,
-            required_prefill_response_num=1,
-        )
-
-    if local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
-        target_tp_rank = (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank) // (
-            local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
-        )
-        return _legacy_mla_route_plan(
-            target_tp_rank=target_tp_rank,
-            target_tp_ranks=(target_tp_rank,),
-            required_dst_info_num=local_tp_size_per_dp_rank
-            // prefill_tp_size_per_dp_rank,
-            required_prefill_response_num=1,
-        )
-
-    target_tp_ranks = tuple(
-        range(
-            (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank)
-            * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
-            (kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank + 1)
-            * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
-        )
+    # The bootstrap server validated the placement against the stage count
+    # when the prefill registered it; this side only consumes it.
+    transfer_plan, dummy_ranks = build_pipeline_transfer_plan(
+        prefill_tp_size=prefill_parallel_info.prefill_tp_size_per_dp_rank,
+        decode_tp_size=kv_mgr.topology.tp_size,
+        decode_tp_rank=kv_mgr.topology.tp_rank,
+        prefill_layout=prefill_cache_layout,
+        decode_layout=kv_mgr.kv_args.cache_layout,
+        cache_fields_by_stage=prefill_parallel_info.cache_fields_by_stage,
     )
-    return _legacy_mla_route_plan(
-        target_tp_rank=target_tp_ranks[0],
-        target_tp_ranks=target_tp_ranks,
-        required_dst_info_num=1,
-        required_prefill_response_num=1,
+    return ReceiverRoutePlan(
+        transfer_plan=transfer_plan,
+        dummy_tp_ranks=dummy_ranks,
     )
 
 
@@ -468,12 +163,6 @@ class MooncakeKVReceiver:
         self.init_time = None
 
         self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Bootstrapping)
-        logger.info(
-            "[MooncakeKVReceiver.__init__] bootstrap_addr=%s bootstrap_room=%s session_id=%s",
-            bootstrap_addr,
-            bootstrap_room,
-            self.session_id,
-        )
 
         prefill_parallel_info = self._get_prefill_parallel_info()
         if prefill_parallel_info is None:
@@ -482,30 +171,26 @@ class MooncakeKVReceiver:
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
             )
             self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
+            return
 
         route_plan = _calc(self.kv_mgr, prefill_parallel_info)
         self.route_plan = route_plan
-        self.supports_remote_spec_candidates = (
-            route_plan.supports_remote_spec_candidates
-        )
-        self.required_dst_info_num = route_plan.default_required_dst_info_num
-        self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
-            route_plan.required_prefill_response_num
+        self.kv_mgr.expected_prefill_ranks_table[self.bootstrap_room] = frozenset(
+            route_plan.transfer_plan.target_prefill_ranks
         )
         target_dp_group = self.bootstrap_room % prefill_parallel_info.dp_size
         target_tp_key = ",".join(str(rank) for rank in route_plan.target_tp_ranks)
         bootstrap_key = f"{self.bootstrap_addr}_{target_dp_group}_{target_tp_key}"
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = self._get_bootstrap_infos(target_dp_group, route_plan)
-            if bootstrap_infos is None:
+            if not bootstrap_infos:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
                     f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {target_dp_group}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
+                return
             else:
-                if not bootstrap_infos:
-                    raise RuntimeError("Could not fetch bootstrap info.")
                 self.bootstrap_infos = bootstrap_infos
                 self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
                 # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
@@ -515,13 +200,6 @@ class MooncakeKVReceiver:
 
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Bootstrapped)
-        logger.info(
-            "[MooncakeKVReceiver.__init__] done, status set to Bootstrapped. "
-            "bootstrap_room=%s bootstrap_addr=%s session_id=%s",
-            self.bootstrap_room,
-            self.bootstrap_addr,
-            self.session_id,
-        )
 
     def _get_prefill_parallel_info(self):
         prefill_parallel_info = self.kv_mgr.prefill_parallel_info.get(
@@ -539,10 +217,9 @@ class MooncakeKVReceiver:
                 return None
             else:
                 logger.debug(
-                    "Fetch prefill parallel info from [%s]: DP size:%s, TP size:%s",
-                    self.bootstrap_addr,
-                    prefill_parallel_info.dp_size,
-                    prefill_parallel_info.tp_size,
+                    f"Fetch prefill parallel info from [{self.bootstrap_addr!s}]: DP "
+                    f"size:{prefill_parallel_info.dp_size!s}, TP size:"
+                    f"{prefill_parallel_info.tp_size!s}",
                 )
                 self.kv_mgr.prefill_parallel_info[self.bootstrap_addr] = (
                     prefill_parallel_info
@@ -558,22 +235,14 @@ class MooncakeKVReceiver:
                 target_dp_group,
             )
             if bootstrap_info is not None:
-                #  only support MLA for now: select one prefill rank as real rank
-                bootstrap_info["is_dummy"] = not bool(
-                    _target_tp_rank == route_plan.target_tp_rank
-                    or route_plan.target_tp_rank is None
-                )
-                bootstrap_info["required_dst_info_num"] = (
-                    route_plan.required_dst_info_num_for_tp_rank(_target_tp_rank)
-                )
-                bootstrap_info["transfer_fragments"] = route_plan.fragments_for_tp_rank(
+                # Control-only rendezvous ranks participate in Prefill TP
+                # status collectives but do not receive cache data.
+                bootstrap_info["is_dummy"] = route_plan.is_dummy_tp_rank(
                     _target_tp_rank
                 )
                 logger.debug(
-                    "Fetched bootstrap info: %s for DP %s TP %s",
-                    bootstrap_info,
-                    target_dp_group,
-                    _target_tp_rank,
+                    f"Fetched bootstrap info: {bootstrap_info!s} for DP "
+                    f"{target_dp_group!s} TP {_target_tp_rank!s}",
                 )
                 bootstrap_infos.append(bootstrap_info)
             else:
@@ -582,21 +251,13 @@ class MooncakeKVReceiver:
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            self.prefill_server_url = join_host_port(
+                bootstrap_info["rank_ip"], bootstrap_info["rank_port"]
             )
-            logger.info(
-                "[MooncakeKVReceiver._register_kv_args] sending kv_args to prefill=%s bootstrap_room=%s session_id=%s",
-                self.prefill_server_url,
-                self.bootstrap_room,
-                self.session_id,
-            )
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_state_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
-            )
+            packed_kv_data_ptr = struct.pack("Q", self.kv_mgr.kv_args.kv_data_ptr)
+            cache_layout = self.kv_mgr.kv_args.cache_layout
+            decode_tp_size = self.kv_mgr.topology.tp_size
+            decode_tp_rank = self.kv_mgr.topology.tp_rank
 
             sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
@@ -606,11 +267,10 @@ class MooncakeKVReceiver:
                         get_local_ip_by_remote().encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        b"",  # aux_data_ptrs removed; kept as empty frame for protocol compat
-                        packed_state_data_ptrs,
-                        # Include decode_prefix_len for kv_args registration
-                        str(getattr(self, "decode_prefix_len", 0)).encode("ascii"),
+                        packed_kv_data_ptr,
+                        cache_layout.to_wire_bytes(),
+                        str(decode_tp_size).encode("ascii"),
+                        str(decode_tp_rank).encode("ascii"),
                     ]
                 )
 
@@ -619,6 +279,7 @@ class MooncakeKVReceiver:
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
+                enable_ipv6_for_endpoint(sock, endpoint)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -626,88 +287,33 @@ class MooncakeKVReceiver:
 
     def prefill(
         self,
-        kv_indices: npt.NDArray[np.int64],
-        aux_index: int | None = None,
-        decode_prefix_len: int | None = 0,
-        mamba_indices: npt.NDArray[np.int64] | None = None,
-        page_manifest: CachePDPageManifest | None = None,
+        block_manifest: CachePDBlockManifest | None = None,
     ):
-        logger.info(
-            "[MooncakeKVReceiver.init] bootstrap_room=%s kv_indices_len=%d aux_index=%s decode_prefix_len=%s",
-            self.bootstrap_room,
-            len(kv_indices),
-            aux_index,
-            decode_prefix_len,
+        cache_layout = self.kv_mgr.kv_args.cache_layout
+        if block_manifest is None:
+            raise ValueError("Mooncake PD requires a block manifest")
+        validate_cache_manifest(
+            block_manifest,
+            layout=cache_layout,
+            peer="destination",
         )
-        # Store decode_prefix_len to be sent back to prefill
-        self.decode_prefix_len = decode_prefix_len
-        cache_layout = getattr(self.kv_mgr.kv_args, "cache_layout", None)
-        if cache_layout is None:
-            if page_manifest is not None:
-                raise ValueError(
-                    "legacy Mooncake transfer cannot carry a Paged cache manifest"
-                )
-        else:
-            if page_manifest is None:
-                raise ValueError(
-                    "Paged cache Mooncake transfer requires a page manifest"
-                )
-            validate_cache_manifest(
-                page_manifest,
-                layout=cache_layout,
-                num_pages_with_null=cache_layout.num_pages_with_null,
-                peer="destination",
-            )
+        self.init_time = time.time()
+        self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.WaitingForInput)
+
         for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            self.prefill_server_url = join_host_port(
+                bootstrap_info["rank_ip"], bootstrap_info["rank_port"]
             )
             is_dummy = bootstrap_info["is_dummy"]
 
-            logger.info(
-                "[MooncakeKVReceiver.init] sending pre-alloc multipart to prefill=%s bootstrap_room=%s is_dummy=%s",
-                self.prefill_server_url,
-                self.bootstrap_room,
-                bootstrap_info["is_dummy"],
-            )
             sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
                 message_parts = [
                     str(self.bootstrap_room).encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
-                    str(self.kv_mgr.rank_port).encode("ascii"),
                     self.session_id.encode("ascii"),
-                    kv_indices.tobytes() if not is_dummy else b"",
-                    str(aux_index).encode("ascii") if not is_dummy else b"",
-                    str(
-                        bootstrap_info.get(
-                            "required_dst_info_num", self.required_dst_info_num
-                        )
-                    ).encode("ascii"),
-                    # Send decode_prefix_len as additional message part
-                    (
-                        str(self.decode_prefix_len).encode("ascii")
-                        if not is_dummy
-                        else b""
-                    ),
-                    (
-                        mamba_indices.tobytes()
-                        if (not is_dummy and mamba_indices is not None)
-                        else b""
-                    ),
+                    block_manifest.to_wire_bytes() if not is_dummy else b"",
                 ]
-                transfer_fragments = bootstrap_info.get("transfer_fragments", ())
-                if not is_dummy and (transfer_fragments or page_manifest is not None):
-                    message_parts.extend(encode_transfer_fragments(transfer_fragments))
-                if not is_dummy and page_manifest is not None:
-                    message_parts.extend(
-                        (
-                            page_manifest.to_wire_bytes(),
-                            cache_layout.peer.to_wire_bytes(),
-                        )
-                    )
                 sock.send_multipart(message_parts)
-            self.init_time = time.time()
 
     def poll(self) -> TransferPoll:
         if self.conclude_state is None:
@@ -723,6 +329,9 @@ class MooncakeKVReceiver:
                             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
                             "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
+                        self.kv_mgr.kv_transfer_metrics.record_kv_transfer_timeout(
+                            "waiting_for_input"
+                        )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.WaitingForInput",
@@ -731,8 +340,8 @@ class MooncakeKVReceiver:
                         return TransferPoll.Failed
             elif status == TransferPoll.Transferring:
                 logger.warning(
-                    "Req(room=%s) in Transferring, which is unexpected",
-                    self.bootstrap_room,
+                    f"Req(room={self.bootstrap_room!s}) in Transferring, which is "
+                    "unexpected",
                 )
 
             return status
@@ -740,24 +349,29 @@ class MooncakeKVReceiver:
             return self.conclude_state
 
     def clear(self) -> None:
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
-
-        if self.bootstrap_room in self.kv_mgr.required_prefill_response_num_table:
-            self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room)
-
-        if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
-            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        self.kv_mgr.expected_prefill_ranks_table.pop(self.bootstrap_room, None)
+        self.kv_mgr.bootstrap_token_table.pop(self.bootstrap_room, None)
+        self.kv_mgr.spec_candidate_ids_table.pop(self.bootstrap_room, None)
+        self.kv_mgr.cached_tokens_table.pop(self.bootstrap_room, None)
+        self.kv_mgr._pending_bootstrap_token_table.pop(self.bootstrap_room, None)
+        self.kv_mgr._pending_spec_candidate_ids_table.pop(self.bootstrap_room, None)
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        with self.kv_mgr.connection_lock:
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+                self.bootstrap_room
+            )
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = TransferPoll.Failed
 
-        self.clear()
-
         with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(
+            failure_reason = self.kv_mgr.failure_records.get(
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
             )
+        self.clear()
         raise KVTransferError(self.bootstrap_room, failure_reason, self.bootstrap_addr)

@@ -37,7 +37,7 @@ if not Platform.get().is_nvidia:
     pytest.skip("NVIDIA-only registration under test", allow_module_level=True)
 
 cutlass_unquant = pytest.importorskip(
-    "tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant"
+    "tokenspeed_kernel.ops.moe.flashinfer", exc_type=ImportError
 )
 
 
@@ -60,9 +60,11 @@ def _run_capturing_scales(monkeypatch, x_dtype, topk_weights):
         return torch.zeros_like(kwargs["input"])
 
     monkeypatch.setattr(cutlass_unquant, "cutlass_fused_moe", _stub)
-    # Freeze autotuning so the op takes the nullcontext branch: the real
-    # autotuner would try to profile the stub.
-    monkeypatch.setattr(cutlass_unquant, "autotune_frozen", lambda: True)
+    # The workspace builder constructs a real fused-MoE op; only the scale dtype
+    # handed to the kernel is under test.
+    monkeypatch.setattr(
+        cutlass_unquant, "cutlass_unquant_moe_workspace", lambda **_: None
+    )
 
     num_experts, top_k, hidden, inter, tokens = 8, 2, 16, 32, 4
     w = _Weights(num_experts, top_k, hidden, inter)

@@ -136,16 +136,6 @@ inline void FatalCheck(bool condition, const char* message = "Fatal check failed
                          static_cast<unsigned long>(loc.line()), loc.function_name());
             std::fflush(stderr);
         }
-        // Also to a file, because neither sink above survives the trip out of
-        // the engine's scheduler subprocess: spdlog's sink is not forwarded and
-        // stderr is swallowed, so a FatalCheck reads as "Fatal Python error:
-        // Aborted" with no cause at all. Debugging one cost several full engine
-        // runs before the message was recovered this way.
-        if (std::FILE* sink = std::fopen("/workspace/roy/.fatal_check.txt", "a")) {
-            std::fprintf(sink, "Fatal check failed: %s at %s:%lu in %s\n", message, loc.file_name(),
-                         static_cast<unsigned long>(loc.line()), loc.function_name());
-            std::fclose(sink);
-        }
         std::abort();
     }
 }

@@ -1,31 +1,65 @@
 name: Slurm Dispatch
+run-name: "Slurm ${{ inputs.commit || inputs.pr || github.sha }} | ${{ inputs.match }} | ${{ inputs.runners }} | ${{ inputs.cluster }}"
 
 on:
   workflow_dispatch:
     inputs:
       pr:
-        description: "Optional pull request number or URL; blank runs latest main"
+        description: "Optional pull request number or URL; blank runs the selected workflow ref"
         required: false
         default: ""
         type: string
+      commit:
+        description: "Optional full commit SHA, mutually exclusive with pr; tested without merging"
+        required: false
+        default: ""
+        type: string
+      require_idle:
+        description: "Report unavailable without submitting when selected tasks cannot start now"
+        required: true
+        default: false
+        type: boolean
+      container_image:
+        description: "Optional immutable ghcr.io/lightseekorg/tokenspeed-runner image override"
+        required: false
+        default: ""
+        type: string
+      cluster:
+        description: "Slurm cluster"
+        required: true
+        default: gb200
+        type: choice
+        options:
+          - gb200
+          - gb300
       yaml:
-        description: "Optional single B200/GB200 CI YAML"
+        description: "Optional single CI YAML; off runs the bulk task selection"
         required: true
         default: "off"
         type: choice
         options:
           - "off"
-          - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
-          - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/deepseek-v4.1-flash-dspark-evalscope-gsm8k.yaml
+          - test/ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
+          - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
           - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
-          - test/ci/eval/inkling-nvfp4-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/inkling-nvfp4-mtp-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-dflash-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gpqa-diamond.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gsm8k.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
+          - test/ci/eval/kimi-k3-mxfp4-tp16-four-node-evalscope-aime26-slurm.yaml
+          - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml
+          - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml
+          - test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          - test/ci/eval/kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          - test/ci/eval/kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml
+          - test/ci/eval/kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          - test/ci/eval/kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
@@ -33,19 +67,23 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
+          - test/ci/perf/qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml
+          - test/ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml
           - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
           - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
           - test/ci/ut/ut-runtime-1gpu.yaml
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
-          - test/ci/ut/ut-tokenspeed-kernel.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
       runners:
-        description: "Comma-separated exact runner labels"
+        description: "Logical bulk runners; GB300 maps B200/GB200 labels to matching GB300 runners"
         required: true
-        default: "b200-4gpu,gb200-4gpu"
+        default: "b200-4gpu,gb200-4gpu,slurm-gb200-4gpu"
         type: string
       task_types:
         description: "Comma-separated task types (ut,server_smoke,eval,perf)"
@@ -72,14 +110,15 @@ on:
           - nightly
           - debug
           - per-commit
+          - slurm
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
+  group: slurm-dispatch-${{ inputs.cluster }}-${{ github.ref }}-${{ inputs.commit || inputs.pr || 'checkout' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
   cancel-in-progress: false
 
 jobs:
   dispatch:
-    runs-on: slurm-dispatch
+    runs-on: ${{ inputs.cluster == 'gb300' && 'slurm-dispatch-gb300' || 'slurm-dispatch' }}
     timeout-minutes: 720
     permissions:
       contents: read
@@ -89,14 +128,22 @@ jobs:
       - name: Checkout trusted dispatcher
         uses: actions/checkout@v4
         with:
-          # pr_worktree fetches and merges the requested private-repo PR below.
-          ref: main
+          # PRs use the main dispatcher and merge in a temporary worktree.
+          # Without a PR, test the exact commit selected for this manual run.
+          ref: ${{ inputs.pr && 'main' || github.sha }}
           fetch-depth: 0
           persist-credentials: true
 
       - name: Submit and wait for Slurm tasks
         env:
+          COMMIT: ${{ inputs.commit }}
+          REQUIRE_IDLE: ${{ inputs.require_idle }}
           PR: ${{ inputs.pr }}
+          # A dispatched pull request may carry unmerged tokenspeed-mla changes,
+          # and the Slurm coordinator has no gh to narrow that to its diff.
+          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ (inputs.pr || inputs.commit) && '1' || '0' }}
+          CONTAINER_IMAGE: ${{ inputs.container_image }}
+          CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}
           RUNNERS: ${{ inputs.runners }}
           TASK_TYPES: ${{ inputs.task_types }}
@@ -105,43 +152,170 @@ jobs:
           TRIGGER: ${{ inputs.trigger }}
         run: |
           set -euo pipefail
+          if [ -n "$CONTAINER_IMAGE" ]; then
+            [[ "$CONTAINER_IMAGE" =~ ^ghcr\.io/lightseekorg/tokenspeed-runner:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}@sha256:[0-9a-f]{64}$ ]] || {
+              echo "container_image must be an immutable ghcr.io/lightseekorg/tokenspeed-runner image" >&2
+              exit 2
+            }
+            export TS_CI_CONTAINER_IMAGE="$CONTAINER_IMAGE"
+          fi
+          COMMIT=${COMMIT:-}
+          REQUIRE_IDLE=${REQUIRE_IDLE:-false}
           args=(--wait --report-dir "$RUNNER_TEMP/slurm-report")
           [ -z "$PR" ] || args+=(--pr "$PR")
+          [ -z "$COMMIT" ] || args+=(--commit "$COMMIT")
+          [ "$REQUIRE_IDLE" != true ] || args+=(--require-idle)
+
+          case "$CLUSTER" in
+            gb200)
+              runner_prefixes=(b200- gb200- slurm-gb200-)
+              ;;
+            gb300)
+              runner_prefixes=(gb300- slurm-gb300-)
+              coordinator_user=${USER:-$(id -un)}
+              export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
+              export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
+              ;;
+            *)
+              echo "Unsupported Slurm cluster: $CLUSTER" >&2
+              exit 2
+              ;;
+          esac
+
+          runner_is_supported() {
+            local runner=$1 prefix
+            for prefix in "${runner_prefixes[@]}"; do
+              [[ "$runner" == "$prefix"* ]] && return 0
+            done
+            return 1
+          }
+
+          gb300_runner_for() {
+            local runner=$1
+            case "$runner" in
+              b200-*) echo "gb300-${runner#b200-}" ;;
+              gb200-*) echo "gb300-${runner#gb200-}" ;;
+              slurm-b200-*) echo "slurm-gb300-${runner#slurm-b200-}" ;;
+              slurm-gb200-*) echo "slurm-gb300-${runner#slurm-gb200-}" ;;
+              gb300-*|slurm-gb300-*) echo "$runner" ;;
+              *) return 1 ;;
+            esac
+          }
 
           if [ "$YAML_SELECTION" != off ]; then
             args+=(--config "$YAML_SELECTION")
-            mapfile -t yaml_metadata < <(
-              python3 - "$YAML_SELECTION" <<'PY'
+            yaml_metadata_output=$(
+              python3 - "$YAML_SELECTION" "$CLUSTER" "$PR" "$COMMIT" <<'PY'
           import sys
           from pathlib import Path
 
           sys.path.insert(0, "test/ci_system")
           from pipeline import normalize_task
+          from slurm_submit import pr_worktree
+          from slurm_submit import commit_worktree
 
           repo = Path.cwd()
-          task = normalize_task(repo / sys.argv[1], repo)
+          selection = Path(sys.argv[1])
+          pr = sys.argv[3]
+          commit = sys.argv[4]
+          if pr:
+              with pr_worktree(repo, pr) as checkout:
+                  task = normalize_task(checkout / selection, checkout)
+          elif commit:
+              with commit_worktree(repo, commit) as checkout:
+                  task = normalize_task(checkout / selection, checkout)
+          else:
+              task = normalize_task(repo / selection, repo)
+          prefixes = {
+              "gb200": ("b200-", "gb200-", "slurm-gb200-"),
+              "gb300": (
+                  "b200-",
+                  "gb200-",
+                  "slurm-b200-",
+                  "slurm-gb200-",
+                  "gb300-",
+                  "slurm-gb300-",
+              ),
+          }[sys.argv[2]]
           print(f"type:{task['type']}")
           for label in task["runner"]["labels"]:
-              if label.startswith(("b200-", "gb200-")):
+              if label.startswith(prefixes):
                   print(label)
           PY
             )
+            mapfile -t yaml_metadata <<< "$yaml_metadata_output"
+            [[ "${yaml_metadata[0]-}" == type:* ]] || {
+              echo "Failed to read task metadata from $YAML_SELECTION" >&2
+              exit 2
+            }
             yaml_task_type="${yaml_metadata[0]#type:}"
             yaml_runners=("${yaml_metadata[@]:1}")
             ((${#yaml_runners[@]})) || {
-              echo "No B200/GB200 runners declared by $YAML_SELECTION" >&2
+              echo "No supported Slurm runners declared by $YAML_SELECTION" >&2
               exit 2
             }
             args+=(--type "$yaml_task_type")
-            for value in "${yaml_runners[@]}"; do
-              args+=(--runner "$value")
-            done
+            if [ "$CLUSTER" = gb300 ]; then
+              selected_runners=()
+              if [[ "${RUNNERS//[[:space:]]/}" == "b200-4gpu,gb200-4gpu" || \
+                    "${RUNNERS//[[:space:]]/}" == "b200-4gpu,gb200-4gpu,slurm-gb200-4gpu" ]]; then
+                selected_runners=("${yaml_runners[@]}")
+              else
+                IFS=',' read -ra values <<< "$RUNNERS"
+                for value in "${values[@]}"; do
+                  value="${value//[[:space:]]/}"
+                  [ -z "$value" ] && continue
+                  matches=0
+                  for yaml_runner in "${yaml_runners[@]}"; do
+                    effective_runner=$(gb300_runner_for "$yaml_runner") || continue
+                    if [ "$value" = "$yaml_runner" ] || [ "$value" = "$effective_runner" ]; then
+                      for selected_runner in "${selected_runners[@]}"; do
+                        [ "$selected_runner" != "$yaml_runner" ] || {
+                          echo "Runner $value selects $yaml_runner more than once" >&2
+                          exit 2
+                        }
+                      done
+                      selected_runners+=("$yaml_runner")
+                      ((matches += 1))
+                    fi
+                  done
+                  ((matches == 1)) || {
+                    echo "Runner $value does not identify exactly one runner declared by $YAML_SELECTION" >&2
+                    exit 2
+                  }
+                done
+              fi
+              for yaml_runner in "${selected_runners[@]}"; do
+                effective_runner=$(gb300_runner_for "$yaml_runner") || {
+                  echo "Runner $yaml_runner cannot run on the GB300 cluster" >&2
+                  exit 2
+                }
+                args+=(--runner-alias "$yaml_runner=$effective_runner")
+              done
+            else
+              for value in "${yaml_runners[@]}"; do
+                args+=(--runner "$value")
+              done
+            fi
           else
             args+=(--all)
             IFS=',' read -ra values <<< "$RUNNERS"
             for value in "${values[@]}"; do
               value="${value//[[:space:]]/}"
-              [ -z "$value" ] || args+=(--runner "$value")
+              [ -z "$value" ] && continue
+              if [ "$CLUSTER" = gb300 ]; then
+                effective_runner=$(gb300_runner_for "$value") || {
+                  echo "Runner $value cannot run on the GB300 cluster" >&2
+                  exit 2
+                }
+                args+=(--runner-alias "$value=$effective_runner")
+              else
+                runner_is_supported "$value" || {
+                  echo "Runner $value is not supported by the $CLUSTER cluster" >&2
+                  exit 2
+                }
+                args+=(--runner "$value")
+              fi
             done
 
             IFS=',' read -ra values <<< "$TASK_TYPES"

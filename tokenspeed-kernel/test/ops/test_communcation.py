@@ -26,12 +26,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.ops.communication import allreduce_residual_rmsnorm
 from tokenspeed_kernel.ops.communication import triton as triton_communication
+from tokenspeed_kernel.ops.communication.iris import (
+    create_iris_state,
+    iris_all_reduce,
+)
 from tokenspeed_kernel.ops.communication.triton import (
     all_gather,
-    all_reduce,
-    all_reduce_can_run,
-    allreduce_residual_rmsnorm,
     create_state,
     reduce_scatter,
 )
@@ -108,6 +110,7 @@ def worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None
             rank_in_group=rank,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
+            device=None,
         )
 
         for tokens in cases:
@@ -148,24 +151,23 @@ def check_all_gather(
 
 def check_all_reduce(rank: int, world_size: int, device) -> None:
     max_numel = 512 * 1024 // torch.empty((), dtype=torch.bfloat16).element_size()
-    state = create_state(
+    state = create_iris_state(
         group=dist.group.WORLD,
         rank_in_group=rank,
-        max_numel=max_numel,
+        staged_max_numel=max_numel,
+        producer_direct_max_numel=0,
+        dtype=torch.bfloat16,
         device=device,
+        heap_size=None,
     )
 
     for numel in [2880, 20160, 23040, 92160, 184320]:
         tensor = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)
-        assert all_reduce_can_run(state, tensor)
-        result = all_reduce(state, tensor)
+        result = iris_all_reduce(state, tensor, safe=False)
         assert result is tensor
         expected = torch.full_like(result, world_size * (world_size + 1) // 2)
         torch.testing.assert_close(result, expected, atol=0, rtol=0)
         torch.testing.assert_close(tensor, expected, atol=0, rtol=0)
-
-    large = torch.full((300000,), rank + 1, dtype=torch.bfloat16, device=device)
-    assert not all_reduce_can_run(state, large)
 
 
 def check_allreduce_residual_rmsnorm(rank: int, world_size: int, device) -> None:

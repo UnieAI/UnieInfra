@@ -20,168 +20,195 @@
 
 from __future__ import annotations
 
-import json
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from enum import Enum
-from typing import Literal
+
+import numpy as np
+
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    owned_local_pages,
+)
+from tokenspeed.runtime.pd.cache_protocol import (
+    CacheTransferContract,
+    validate_cache_peer_layout,
+)
 
 
 class UnsupportedPDLayoutError(ValueError):
     pass
 
 
-class BufferKind(str, Enum):
-    TARGET_K = "target_k"
-    TARGET_V = "target_v"
-    DRAFT_K = "draft_k"
-    DRAFT_V = "draft_v"
-    MAMBA_STATE = "mamba_state"
-
-
 @dataclass(frozen=True)
-class ParallelLayout:
-    role: Literal["prefill", "decode"]
-    world_size: int
-    dp_size: int = 1
+class CacheTransferFragment:
+    """One field-relative row fragment copied for every selected cache page.
 
-    def __post_init__(self):
-        if self.world_size <= 0:
-            raise UnsupportedPDLayoutError("world_size must be positive")
-        if self.dp_size <= 0:
-            raise UnsupportedPDLayoutError("dp_size must be positive")
-        if self.world_size % self.dp_size != 0:
-            raise UnsupportedPDLayoutError(
-                f"world_size={self.world_size} must be divisible by dp_size={self.dp_size}"
-            )
-
-    @property
-    def tp_size_per_dp(self) -> int:
-        return self.world_size // self.dp_size
-
-
-@dataclass(frozen=True)
-class BufferLayout:
-    """Logical layout for one cache/state buffer.
-
-    ``tp_replica_group_size`` describes TP ranks that hold the same logical
-    shard. It is used by GQA/MQA-style KV caches when the prefill TP size is
-    larger than the number of distinct KV heads.
+    Arena bases, segment page-zero offsets, page bases, and page strides are
+    deliberately resolved from the validated source/destination cache layouts
+    at execution time. Keeping those peer-local addresses out of the route
+    plan prevents the wire fragment from becoming a second, independently
+    trusted cache ABI.
     """
 
-    buffer_index: int
-    buffer_kind: BufferKind
-    logical_axis: Literal["kv_head", "state_channel", "replicated"]
-    logical_size: int
-    page_size: int
-    bytes_per_logical_unit: int
-    item_stride_bytes: int
-    tp_replica_group_size: int = 1
+    group_id: str
+    field_id: str
+    src_byte_offset: int
+    dst_byte_offset: int
+    src_row_stride_bytes: int
+    dst_row_stride_bytes: int
+    bytes_per_row: int
+    rows_per_page: int
 
-    def __post_init__(self):
-        if self.logical_size <= 0:
-            raise UnsupportedPDLayoutError("logical_size must be positive")
-        if self.page_size <= 0:
-            raise UnsupportedPDLayoutError("page_size must be positive")
-        if self.bytes_per_logical_unit <= 0:
-            raise UnsupportedPDLayoutError("bytes_per_logical_unit must be positive")
-        if self.item_stride_bytes <= 0:
-            raise UnsupportedPDLayoutError("item_stride_bytes must be positive")
-        if self.tp_replica_group_size <= 0:
-            raise UnsupportedPDLayoutError("tp_replica_group_size must be positive")
+
+def local_transfer_pages(
+    source_blocks: tuple[int, ...],
+    destination_blocks: tuple[int, ...],
+    *,
+    group_id: str,
+    source_layout: CacheTransferContract,
+    destination_layout: CacheTransferContract,
+    source_owner_rank: int,
+    destination_owner_rank: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve paired logical positions to pages owned by this transfer edge.
+
+    Block IDs are independently allocated by P and D, not comparable between
+    peers. The input order pairs the same logical positions. The owner ranks
+    are the two ends' positions inside their KVP subgroups (``kvp_rank``,
+    0 for a replicated group), the ``CachePageOwnerFilter`` coordinate.
+    Returns equally sized source/destination physical-page int64 arrays; an edge
+    with no owned pairs returns empty arrays and still participates in ACKs.
+    """
+    if len(source_blocks) != len(destination_blocks):
+        raise ValueError("Cache transfer source and destination pages differ in count")
+    source = np.asarray(source_blocks, dtype=np.int64)
+    destination = np.asarray(destination_blocks, dtype=np.int64)
+    # Placement permits null pages, but a PD manifest must contain real pages.
+    if source.size and (source.min() <= 0 or destination.min() <= 0):
+        raise UnsupportedPDLayoutError(
+            "Cache transfer block is outside the virtual address space"
+        )
+    try:
+        source_owned, source_pages = owned_local_pages(
+            source,
+            shard_count=source_layout.shard_count(group_id),
+            rank=source_owner_rank,
+            virtual_block_count=source_layout.virtual_block_count(group_id),
+        )
+        destination_owned, destination_pages = owned_local_pages(
+            destination,
+            shard_count=destination_layout.shard_count(group_id),
+            rank=destination_owner_rank,
+            virtual_block_count=destination_layout.virtual_block_count(group_id),
+        )
+    except IndexError as exc:
+        raise UnsupportedPDLayoutError(
+            "Cache transfer block is outside the virtual address space"
+        ) from exc
+    # Each helper already compacts its own pages. Select the other owner's
+    # mask at those original positions to preserve source/destination pairing.
+    return (
+        source_pages[destination_owned[source_owned]],
+        destination_pages[source_owned[destination_owned]],
+    )
+
+
+MAX_CACHE_TP_SIZE = 1024
 
 
 @dataclass(frozen=True)
-class TransferFragment:
-    buffer_index: int
-    buffer_kind: BufferKind
-    src_rank: int
-    dst_rank: int
-    src_page_stride_bytes: int
-    dst_page_stride_bytes: int
-    src_byte_offset: int
-    dst_byte_offset: int
-    bytes_per_page: int
-    page_count: int | None = None
+class CachePageOwnerFilter:
+    """Which of a sharded group's scheduler blocks one source rank holds.
 
+    A KVP-sharded group deals virtual blocks cyclically to ``owner_count``
+    ranks; the rank with ``owner_rank`` holds block ``v`` when
+    ``(v - 1) % owner_count == owner_rank`` (block 0 is the null block). The
+    sender keeps only those blocks of a manifest, translated to its local
+    pages, and of the destination blocks at the same manifest positions the
+    ones the receiving rank owns under its own group's sharding
+    (``local_transfer_pages``). The same placement the runtime's zeroing and
+    device translation use; see ``kv_cache/virtual_blocks.py``.
+    """
 
-TRANSFER_PLAN_PROTOCOL_VERSION = 1
+    owner_rank: int
+    owner_count: int
 
-
-def encode_transfer_fragments(
-    fragments: tuple[TransferFragment, ...],
-) -> tuple[bytes, bytes]:
-    payload = [
-        {
-            "buffer_index": fragment.buffer_index,
-            "buffer_kind": fragment.buffer_kind.value,
-            "src_rank": fragment.src_rank,
-            "dst_rank": fragment.dst_rank,
-            "src_page_stride_bytes": fragment.src_page_stride_bytes,
-            "dst_page_stride_bytes": fragment.dst_page_stride_bytes,
-            "src_byte_offset": fragment.src_byte_offset,
-            "dst_byte_offset": fragment.dst_byte_offset,
-            "bytes_per_page": fragment.bytes_per_page,
-            "page_count": fragment.page_count,
-        }
-        for fragment in fragments
-    ]
-    return (
-        str(TRANSFER_PLAN_PROTOCOL_VERSION).encode("ascii"),
-        json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-    )
-
-
-def decode_transfer_fragments(
-    version_frame: bytes | None,
-    payload_frame: bytes | None,
-) -> tuple[TransferFragment, ...]:
-    if not version_frame and not payload_frame:
-        return ()
-    if not version_frame or not payload_frame:
-        raise UnsupportedPDLayoutError("incomplete transfer plan frames")
-
-    try:
-        version = int(version_frame.decode("ascii"))
-    except ValueError as exc:
-        raise UnsupportedPDLayoutError(
-            "invalid transfer plan protocol version"
-        ) from exc
-    if version != TRANSFER_PLAN_PROTOCOL_VERSION:
-        raise UnsupportedPDLayoutError(
-            f"unsupported transfer plan protocol version={version}"
-        )
-
-    raw_fragments = json.loads(payload_frame.decode("utf-8"))
-    return tuple(
-        TransferFragment(
-            buffer_index=int(fragment["buffer_index"]),
-            buffer_kind=BufferKind(fragment["buffer_kind"]),
-            src_rank=int(fragment["src_rank"]),
-            dst_rank=int(fragment["dst_rank"]),
-            src_page_stride_bytes=int(fragment["src_page_stride_bytes"]),
-            dst_page_stride_bytes=int(fragment["dst_page_stride_bytes"]),
-            src_byte_offset=int(fragment["src_byte_offset"]),
-            dst_byte_offset=int(fragment["dst_byte_offset"]),
-            bytes_per_page=int(fragment["bytes_per_page"]),
-            page_count=(
-                None if fragment["page_count"] is None else int(fragment["page_count"])
-            ),
-        )
-        for fragment in raw_fragments
-    )
+    def __post_init__(self) -> None:
+        if self.owner_count < 2 or not 0 <= self.owner_rank < self.owner_count:
+            raise ValueError("cache page owner filter needs 0 <= rank < count >= 2")
 
 
 @dataclass(frozen=True)
 class RankTransferPlan:
-    plan_kind: Literal["identity", "fragmented"]
-    target_dp_group: int
-    target_prefill_ranks: tuple[int, ...]
-    required_prefill_response_num: int
-    fragments_by_prefill_rank: dict[int, tuple[TransferFragment, ...]]
-    required_dst_info_num_by_prefill_rank: dict[int, int]
+    fragments_by_prefill_rank: dict[int, tuple[CacheTransferFragment, ...]]
+    # One decision per (source rank, sharded group): the filter selecting the
+    # blocks that rank owns and sends, or None when its route carries no
+    # fragment of the group and it sends nothing for it. Every source rank of
+    # the route has an entry naming every sharded group of the layout (empty
+    # when the layout has none). Replicated groups are never listed: their
+    # blocks copy whole, as the rank's fragments say.
+    owner_filters_by_prefill_rank: dict[int, dict[str, CachePageOwnerFilter | None]]
 
-    def required_dst_info_num_for_prefill_rank(self, prefill_rank: int) -> int:
-        return self.required_dst_info_num_by_prefill_rank[prefill_rank]
+    def __post_init__(self) -> None:
+        if set(self.owner_filters_by_prefill_rank) != set(
+            self.fragments_by_prefill_rank
+        ):
+            raise ValueError(
+                "owner-filter decisions must cover exactly the route's source ranks"
+            )
+
+    @property
+    def target_prefill_ranks(self) -> tuple[int, ...]:
+        return tuple(self.fragments_by_prefill_rank)
+
+
+def validate_rank_owner_filters(
+    *,
+    group_specs: Sequence[CacheGroupSpec],
+    fragments: tuple[CacheTransferFragment, ...],
+    owner_filters: Mapping[str, CachePageOwnerFilter | None],
+) -> None:
+    """Check one source rank's owner-filter decisions against its cache groups.
+
+    Every sharded group needs a decision and no replicated group may have
+    one; a filter must match the group's shard count and accompany fragments
+    of that group, while a None decision must not. The sender applies the
+    decisions as given, so this runs once when the route is planned.
+    """
+    shard_counts = {
+        spec.group_id: spec.shard_count for spec in group_specs if spec.shard_count != 1
+    }
+    routed_groups = {fragment.group_id for fragment in fragments}
+    for group_id in owner_filters:
+        if group_id not in shard_counts:
+            raise ValueError(
+                f"owner filter names cache group {group_id!r}, which is not sharded"
+            )
+    for group_id, shard_count in shard_counts.items():
+        if group_id not in owner_filters:
+            raise ValueError(
+                f"cache group {group_id!r} is sharded but the registration route "
+                "carries no owner-filter decision for it"
+            )
+        owner_filter = owner_filters[group_id]
+        if owner_filter is None:
+            if group_id in routed_groups:
+                raise ValueError(
+                    f"the registration route carries fragments of sharded cache "
+                    f"group {group_id!r} but no owner filter"
+                )
+            continue
+        if owner_filter.owner_count != shard_count:
+            raise ValueError(
+                f"cache group {group_id!r} owner filter ({owner_filter.owner_count} "
+                f"owners) disagrees with its shard count {shard_count}"
+            )
+        if group_id not in routed_groups:
+            raise ValueError(
+                f"cache group {group_id!r} has an owner filter but the registration "
+                "route carries no fragment of it"
+            )
 
 
 @dataclass(frozen=True)
@@ -201,267 +228,454 @@ class _Interval:
         return _Interval(start, end)
 
 
-class PDTransferPlanner:
+@dataclass(frozen=True)
+class _RankPartition:
+    interval: _Interval
+    local_offset: int
+
+
+class CacheTransferPlanner:
+    """Plan model-neutral dense cache fields across unequal TP sizes.
+
+    Two source geometries compose here: head partitions split a page's rows
+    over TP ranks, and KVP page sharding (``CacheGroupSpec.shard_count``)
+    deals whole pages over a consecutive TP subgroup. Source and destination
+    cache groups shard independently.
+    """
+
     def __init__(
         self,
         *,
-        prefill_layout: ParallelLayout,
-        decode_layout: ParallelLayout,
-        prefill_buffers: tuple[BufferLayout, ...],
-        decode_buffers: tuple[BufferLayout, ...],
+        prefill_tp_size: int,
+        decode_tp_size: int,
+        prefill_layout: CacheTransferContract,
+        decode_layout: CacheTransferContract,
+        prefill_field_ids: frozenset[str] | None,
     ):
-        self.prefill_layout = prefill_layout
-        self.decode_layout = decode_layout
-        self.prefill_buffers = prefill_buffers
-        self.decode_buffers = decode_buffers
-        self._validate_buffers()
-        self._validate_alignment()
-        self._required_dst_info_num_by_prefill_rank = self._calc_source_fanout()
+        """Plan fragments between one Prefill rank set and one Decode rank set.
 
-    def plan_for_decode_rank(self, decode_rank: int) -> RankTransferPlan:
-        decode_tp_size = self.decode_layout.tp_size_per_dp
-        if decode_rank < 0 or decode_rank >= self.decode_layout.world_size:
-            raise UnsupportedPDLayoutError(f"decode_rank={decode_rank} is out of range")
-
-        target_dp_group = decode_rank // decode_tp_size
-        decode_tp_rank = decode_rank % decode_tp_size
-
-        if self._can_use_identity_plan() and (
-            self.prefill_layout.tp_size_per_dp == decode_tp_size
-        ):
-            prefill_rank = (
-                target_dp_group * self.prefill_layout.tp_size_per_dp + decode_tp_rank
+        Args:
+            prefill_field_ids: Explicit resident fields to transfer, or None
+                for the complete plan. Model/cache setup determines placement.
+        """
+        if prefill_tp_size <= 0 or decode_tp_size <= 0:
+            raise UnsupportedPDLayoutError("Cache TP sizes must be positive")
+        if prefill_tp_size > MAX_CACHE_TP_SIZE or decode_tp_size > MAX_CACHE_TP_SIZE:
+            raise UnsupportedPDLayoutError(
+                f"Cache TP sizes cannot exceed {MAX_CACHE_TP_SIZE}"
             )
-            return RankTransferPlan(
-                plan_kind="identity",
-                target_dp_group=target_dp_group,
-                target_prefill_ranks=(prefill_rank,),
-                required_prefill_response_num=1,
-                fragments_by_prefill_rank={},
-                required_dst_info_num_by_prefill_rank={
-                    prefill_rank: self._required_dst_info_num_by_prefill_rank[
-                        prefill_rank
-                    ]
-                },
-            )
-
-        fragments: dict[int, list[TransferFragment]] = {}
-        for prefill_buffer, decode_buffer in zip(
-            self.prefill_buffers, self.decode_buffers
-        ):
-            if prefill_buffer.logical_axis == "replicated":
-                prefill_tp_rank = self._replicated_source_tp_rank(
-                    self.prefill_layout.tp_size_per_dp,
-                    decode_tp_size,
-                    decode_tp_rank,
-                )
-                prefill_rank = (
-                    target_dp_group * self.prefill_layout.tp_size_per_dp
-                    + prefill_tp_rank
-                )
-                fragment = TransferFragment(
-                    buffer_index=prefill_buffer.buffer_index,
-                    buffer_kind=prefill_buffer.buffer_kind,
-                    src_rank=prefill_rank,
-                    dst_rank=decode_rank,
-                    src_page_stride_bytes=prefill_buffer.item_stride_bytes,
-                    dst_page_stride_bytes=decode_buffer.item_stride_bytes,
-                    src_byte_offset=0,
-                    dst_byte_offset=0,
-                    bytes_per_page=decode_buffer.item_stride_bytes,
-                )
-                fragments.setdefault(prefill_rank, []).append(fragment)
-                continue
-
-            decode_interval = self._rank_interval_for_buffer(
-                decode_buffer,
-                self.decode_layout,
-                decode_tp_rank,
-            )
-            if decode_interval is None:
-                continue
-            for prefill_tp_rank in range(self.prefill_layout.tp_size_per_dp):
-                prefill_rank = (
-                    target_dp_group * self.prefill_layout.tp_size_per_dp
-                    + prefill_tp_rank
-                )
-                prefill_interval = self._rank_interval_for_buffer(
-                    prefill_buffer,
-                    self.prefill_layout,
-                    prefill_tp_rank,
-                )
-                if prefill_interval is None:
-                    continue
-                intersection = prefill_interval.intersect(decode_interval)
-                if intersection is None:
-                    continue
-
-                fragment = TransferFragment(
-                    buffer_index=prefill_buffer.buffer_index,
-                    buffer_kind=prefill_buffer.buffer_kind,
-                    src_rank=prefill_rank,
-                    dst_rank=decode_rank,
-                    src_page_stride_bytes=prefill_buffer.item_stride_bytes,
-                    dst_page_stride_bytes=decode_buffer.item_stride_bytes,
-                    src_byte_offset=(intersection.start - prefill_interval.start)
-                    * prefill_buffer.bytes_per_logical_unit,
-                    dst_byte_offset=(intersection.start - decode_interval.start)
-                    * decode_buffer.bytes_per_logical_unit,
-                    bytes_per_page=intersection.length
-                    * prefill_buffer.bytes_per_logical_unit,
-                )
-                fragments.setdefault(prefill_rank, []).append(fragment)
-
-        fragments_by_rank = {
-            rank: tuple(rank_fragments)
-            for rank, rank_fragments in sorted(fragments.items())
+        self._prefill_shards = {
+            spec.group_id: spec.shard_count for spec in prefill_layout.group_specs
         }
-        target_prefill_ranks = tuple(fragments_by_rank)
+        self._decode_shards = {
+            spec.group_id: spec.shard_count for spec in decode_layout.group_specs
+        }
+        for layout, tp_size in (
+            (prefill_layout, prefill_tp_size),
+            (decode_layout, decode_tp_size),
+        ):
+            for spec in layout.group_specs:
+                if tp_size % spec.shard_count:
+                    raise UnsupportedPDLayoutError(
+                        "Cache shard count must divide attention TP size"
+                    )
+                if spec.shard_count > 1 and any(
+                    layout.transfer_schema.partition_for(field.field_id) is not None
+                    for field in layout.fields_for_group(spec.group_id)
+                ):
+                    raise UnsupportedPDLayoutError(
+                        "KVP transfer cannot use head-partitioned fields within page-sharded cache groups"
+                    )
+        self._has_sharded_cache = any(
+            count > 1
+            for count in (*self._prefill_shards.values(), *self._decode_shards.values())
+        )
+        self.prefill_tp_size = prefill_tp_size
+        self.decode_tp_size = decode_tp_size
+        all_fields = frozenset(field.field_id for field in prefill_layout.plan.fields)
+        if prefill_field_ids is not None and not prefill_field_ids <= all_fields:
+            raise UnsupportedPDLayoutError(
+                "stage placement contains unknown cache fields"
+            )
+        self._field_ids = None if prefill_field_ids == all_fields else prefill_field_ids
+        validate_cache_peer_layout(prefill_layout, decode_layout)
+
+        self._partitions = {
+            field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
+            for field in prefill_layout.plan.fields
+        }
+        self._shard_counts = {
+            group_id: count
+            for group_id, count in self._prefill_shards.items()
+            if count > 1
+        }
+        self._segment_pairs = tuple(
+            (prefill_spec.group_id, prefill_segment, decode_segment)
+            for prefill_spec, decode_spec in zip(
+                prefill_layout.group_specs,
+                decode_layout.group_specs,
+                strict=True,
+            )
+            for prefill_segment, decode_segment in zip(
+                prefill_layout.fields_for_group(prefill_spec.group_id),
+                decode_layout.fields_for_group(decode_spec.group_id),
+                strict=True,
+            )
+            if prefill_field_ids is None
+            or prefill_segment.field_id in prefill_field_ids
+        )
+        for group_id, prefill_segment, decode_segment in self._segment_pairs:
+            self._validate_tp_mapping(prefill_segment, decode_segment)
+            if (
+                group_id in self._shard_counts
+                and self._partitions[prefill_segment.field_id] is not None
+            ):
+                # Head partitions place a page's rows on distinct TP ranks and
+                # page sharding places whole pages on distinct ranks; a field
+                # under both would need rows no single rank holds.
+                raise UnsupportedPDLayoutError(
+                    f"cache field {prefill_segment.field_id!r} is both "
+                    "head-partitioned and page-sharded on Prefill"
+                )
+        self._decode_ranks_by_prefill_rank = self._calc_source_decode_ranks()
+
+    @property
+    def decode_ranks_by_prefill_rank(self) -> dict[int, frozenset[int]]:
+        """Decode ranks served by each Prefill rank."""
+        return dict(self._decode_ranks_by_prefill_rank)
+
+    @property
+    def has_sharded_groups(self) -> bool:
+        return bool(self._shard_counts)
+
+    @property
+    def sharded_group_ids(self) -> tuple[str, ...]:
+        return tuple(self._shard_counts)
+
+    @property
+    def _uses_whole_copy_route(self) -> bool:
+        """Equal TP, every field resident, no sharded group.
+
+        Each Decode rank then reads its same-index Prefill rank whole, which
+        empty fragments express. A stage owning only a subset of the fields
+        needs its explicit fragment route, and so does a sharded source: its
+        blocks come from a rank set, not from the one same-index rank.
+        """
+        return (
+            self.prefill_tp_size == self.decode_tp_size
+            and self._field_ids is None
+            and not self._has_sharded_cache
+        )
+
+    def plan_for_decode_rank(self, decode_tp_rank: int) -> RankTransferPlan:
+        if not 0 <= decode_tp_rank < self.decode_tp_size:
+            raise UnsupportedPDLayoutError(
+                f"decode_tp_rank={decode_tp_rank} is out of range"
+            )
+        if self._uses_whole_copy_route:
+            fragments_by_rank = {decode_tp_rank: ()}
+        else:
+            fragments_by_rank = self._fragments_for_decode_rank(decode_tp_rank)
+            if not fragments_by_rank:
+                raise UnsupportedPDLayoutError(
+                    f"Cache-transfer decode TP rank {decode_tp_rank} has no source "
+                    "fragments"
+                )
         return RankTransferPlan(
-            plan_kind="fragmented",
-            target_dp_group=target_dp_group,
-            target_prefill_ranks=target_prefill_ranks,
-            required_prefill_response_num=len(target_prefill_ranks),
             fragments_by_prefill_rank=fragments_by_rank,
-            required_dst_info_num_by_prefill_rank={
-                rank: self._required_dst_info_num_by_prefill_rank[rank]
-                for rank in target_prefill_ranks
+            owner_filters_by_prefill_rank={
+                rank: self.owner_filters_for(rank, fragments)
+                for rank, fragments in fragments_by_rank.items()
             },
         )
 
-    def _validate_buffers(self) -> None:
-        if len(self.prefill_buffers) != len(self.decode_buffers):
-            raise UnsupportedPDLayoutError("prefill/decode buffer counts differ")
-        for prefill_buffer, decode_buffer in zip(
-            self.prefill_buffers, self.decode_buffers
+    def owner_filters_for(
+        self, prefill_rank: int, fragments: tuple[CacheTransferFragment, ...]
+    ) -> dict[str, CachePageOwnerFilter | None]:
+        """Decide, for every sharded group, which blocks one source rank sends.
+
+        A rank whose fragments name the group owns the blocks of its KVP
+        subgroup position (``prefill_rank % shard_count``, subgroups being
+        aligned runs of ``shard_count`` consecutive TP ranks); a rank whose
+        fragments do not name the group sends nothing for it, recorded as
+        None so the sender never has to infer that from an absent entry.
+        """
+        routed_groups = {fragment.group_id for fragment in fragments}
+        return {
+            group_id: (
+                CachePageOwnerFilter(prefill_rank % shard_count, shard_count)
+                if group_id in routed_groups
+                else None
+            )
+            for group_id, shard_count in self._shard_counts.items()
+        }
+
+    def _validate_tp_mapping(self, prefill_segment, decode_segment) -> None:
+        field = prefill_segment.field_id
+        if self.prefill_tp_size == self.decode_tp_size and (
+            prefill_segment.shape != decode_segment.shape
+            or prefill_segment.payload_bytes != decode_segment.payload_bytes
         ):
-            if prefill_buffer.buffer_index != decode_buffer.buffer_index:
-                raise UnsupportedPDLayoutError("prefill/decode buffer indexes differ")
-            if prefill_buffer.buffer_kind != decode_buffer.buffer_kind:
-                raise UnsupportedPDLayoutError("prefill/decode buffer kinds differ")
-            if prefill_buffer.logical_axis != decode_buffer.logical_axis:
-                raise UnsupportedPDLayoutError("prefill/decode logical axes differ")
-            if prefill_buffer.logical_size != decode_buffer.logical_size:
-                raise UnsupportedPDLayoutError("prefill/decode logical sizes differ")
-            if (
-                prefill_buffer.bytes_per_logical_unit
-                != decode_buffer.bytes_per_logical_unit
-            ):
-                raise UnsupportedPDLayoutError(
-                    "prefill/decode logical unit sizes differ"
+            raise UnsupportedPDLayoutError(
+                f"equal-TP cache field {field!r} rank-local geometry differs"
+            )
+        partition = self._partitions[prefill_segment.field_id]
+        if partition is None:
+            return
+        self._rank_partitions(prefill_segment, partition, self.prefill_tp_size, 0)
+        self._rank_partitions(decode_segment, partition, self.decode_tp_size, 0)
+
+    def _fragments_for_decode_rank(
+        self, decode_tp_rank: int
+    ) -> dict[int, tuple[CacheTransferFragment, ...]]:
+        fragments: dict[int, list[CacheTransferFragment]] = {}
+        for group_id, prefill_segment, decode_segment in self._segment_pairs:
+            partition = self._partitions[prefill_segment.field_id]
+            if partition is None:
+                fragment = self._make_fragment(
+                    group_id=group_id,
+                    prefill_segment=prefill_segment,
+                    decode_segment=decode_segment,
+                    partition=None,
+                    intersection=None,
+                    prefill_interval=None,
+                    decode_interval=None,
                 )
-
-    def _validate_alignment(self) -> None:
-        for layout, buffers in (
-            (self.prefill_layout, self.prefill_buffers),
-            (self.decode_layout, self.decode_buffers),
-        ):
-            for buffer in buffers:
-                if buffer.logical_axis == "replicated":
-                    continue
-                if layout.tp_size_per_dp % buffer.tp_replica_group_size != 0:
-                    raise UnsupportedPDLayoutError(
-                        "tp replica group must divide TP size for "
-                        f"buffer_kind={buffer.buffer_kind.value}: "
-                        f"tp_size_per_dp={layout.tp_size_per_dp}, "
-                        f"tp_replica_group_size={buffer.tp_replica_group_size}"
-                    )
-                effective_tp_size = (
-                    layout.tp_size_per_dp // buffer.tp_replica_group_size
-                )
-                if buffer.logical_size % effective_tp_size != 0:
-                    raise UnsupportedPDLayoutError(
-                        "non-aligned TP heterogeneous mapping for "
-                        f"buffer_kind={buffer.buffer_kind.value}: logical_size="
-                        f"{buffer.logical_size}, effective_tp_size={effective_tp_size}"
-                    )
-                item_units = buffer.item_stride_bytes // buffer.bytes_per_logical_unit
-                required_units = buffer.logical_size // effective_tp_size
-                if item_units < required_units:
-                    raise UnsupportedPDLayoutError(
-                        "buffer item is smaller than its logical shard for "
-                        f"buffer_kind={buffer.buffer_kind.value}: item_units="
-                        f"{item_units}, required_units={required_units}"
-                    )
-
-    def _calc_source_fanout(self) -> dict[int, int]:
-        fanout = {rank: 0 for rank in range(self.prefill_layout.world_size)}
-        for decode_rank in range(self.decode_layout.world_size):
-            decode_tp_rank = decode_rank % self.decode_layout.tp_size_per_dp
-            target_dp_group = decode_rank // self.decode_layout.tp_size_per_dp
-            intersected_prefill_ranks = set()
-            for prefill_buffer, decode_buffer in zip(
-                self.prefill_buffers, self.decode_buffers
-            ):
-                if prefill_buffer.logical_axis == "replicated":
-                    prefill_tp_rank = self._replicated_source_tp_rank(
-                        self.prefill_layout.tp_size_per_dp,
-                        self.decode_layout.tp_size_per_dp,
-                        decode_tp_rank,
-                    )
-                    prefill_rank = (
-                        target_dp_group * self.prefill_layout.tp_size_per_dp
-                        + prefill_tp_rank
-                    )
-                    intersected_prefill_ranks.add(prefill_rank)
-                    continue
-
-                decode_interval = self._rank_interval_for_buffer(
-                    decode_buffer,
-                    self.decode_layout,
+                replica_rank = self._replicated_source_tp_rank(
+                    self.prefill_tp_size,
+                    self.decode_tp_size,
                     decode_tp_rank,
                 )
-                if decode_interval is None:
+                shard_count = self._shard_counts.get(group_id, 1)
+                if shard_count == 1:
+                    fragments.setdefault(replica_rank, []).append(fragment)
                     continue
-                for prefill_tp_rank in range(self.prefill_layout.tp_size_per_dp):
-                    prefill_interval = self._rank_interval_for_buffer(
-                        prefill_buffer,
-                        self.prefill_layout,
-                        prefill_tp_rank,
-                    )
-                    if prefill_interval is None:
-                        continue
-                    if prefill_interval.intersect(decode_interval) is None:
-                        continue
-                    prefill_rank = (
-                        target_dp_group * self.prefill_layout.tp_size_per_dp
-                        + prefill_tp_rank
-                    )
-                    intersected_prefill_ranks.add(prefill_rank)
-            for prefill_rank in intersected_prefill_ranks:
-                fanout[prefill_rank] += 1
-        return fanout
+                # The replica this decode rank would read whole is spread over
+                # its KVP subgroup (consecutive TP ranks); every member sends
+                # the blocks it owns, which owner_filters_for records.
+                subgroup_base = replica_rank - replica_rank % shard_count
+                for prefill_rank in range(subgroup_base, subgroup_base + shard_count):
+                    fragments.setdefault(prefill_rank, []).append(fragment)
+                continue
 
-    def _can_use_identity_plan(self) -> bool:
-        return all(
-            prefill_buffer.tp_replica_group_size == 1
-            and decode_buffer.tp_replica_group_size == 1
-            for prefill_buffer, decode_buffer in zip(
-                self.prefill_buffers, self.decode_buffers
+            decode_partitions = self._rank_partitions(
+                decode_segment, partition, self.decode_tp_size, decode_tp_rank
             )
+            for prefill_rank in range(self.prefill_tp_size):
+                if not self._is_representative_rank(
+                    prefill_segment,
+                    partition,
+                    self.prefill_tp_size,
+                    prefill_rank,
+                ):
+                    continue
+                prefill_partitions = self._rank_partitions(
+                    prefill_segment,
+                    partition,
+                    self.prefill_tp_size,
+                    prefill_rank,
+                )
+                for prefill_partition, decode_partition in zip(
+                    prefill_partitions, decode_partitions, strict=True
+                ):
+                    intersection = prefill_partition.interval.intersect(
+                        decode_partition.interval
+                    )
+                    if intersection is None:
+                        continue
+                    fragment = self._make_fragment(
+                        group_id=group_id,
+                        prefill_segment=prefill_segment,
+                        decode_segment=decode_segment,
+                        partition=partition,
+                        intersection=intersection,
+                        prefill_interval=prefill_partition.interval,
+                        decode_interval=decode_partition.interval,
+                        prefill_local_offset=prefill_partition.local_offset,
+                        decode_local_offset=decode_partition.local_offset,
+                    )
+                    fragments.setdefault(prefill_rank, []).append(fragment)
+        return {
+            rank: tuple(rank_fragments)
+            for rank, rank_fragments in sorted(fragments.items())
+        }
+
+    @staticmethod
+    def _make_fragment(
+        *,
+        group_id,
+        prefill_segment,
+        decode_segment,
+        partition,
+        intersection,
+        prefill_interval,
+        decode_interval,
+        prefill_local_offset=0,
+        decode_local_offset=0,
+    ) -> CacheTransferFragment:
+        if partition is None:
+            rows_per_page = 1
+            src_row_stride = prefill_segment.payload_bytes
+            dst_row_stride = decode_segment.payload_bytes
+            bytes_per_row = prefill_segment.payload_bytes
+            src_byte_offset = 0
+            dst_byte_offset = 0
+        else:
+            axis = partition.axis
+            inner_bytes = (
+                math.prod(prefill_segment.shape[axis + 1 :])
+                * prefill_segment.element_size
+            )
+            rows_per_page = math.prod(prefill_segment.shape[:axis])
+            src_row_stride = prefill_segment.shape[axis] * inner_bytes
+            dst_row_stride = decode_segment.shape[axis] * inner_bytes
+            bytes_per_row = intersection.length * inner_bytes
+            src_byte_offset = (
+                prefill_local_offset + intersection.start - prefill_interval.start
+            ) * inner_bytes
+            dst_byte_offset = (
+                decode_local_offset + intersection.start - decode_interval.start
+            ) * inner_bytes
+
+        if (
+            rows_per_page > 1
+            and src_row_stride == bytes_per_row
+            and dst_row_stride == bytes_per_row
+        ):
+            bytes_per_row *= rows_per_page
+            src_row_stride = bytes_per_row
+            dst_row_stride = bytes_per_row
+            rows_per_page = 1
+
+        return CacheTransferFragment(
+            group_id=group_id,
+            field_id=prefill_segment.field_id,
+            src_byte_offset=src_byte_offset,
+            dst_byte_offset=dst_byte_offset,
+            src_row_stride_bytes=src_row_stride,
+            dst_row_stride_bytes=dst_row_stride,
+            bytes_per_row=bytes_per_row,
+            rows_per_page=rows_per_page,
         )
 
     @staticmethod
-    def _rank_interval(logical_size: int, tp_size: int, tp_rank: int) -> _Interval:
-        local_size = logical_size // tp_size
-        start = tp_rank * local_size
-        return _Interval(start, start + local_size)
+    def _rank_partitions(
+        segment, partition, tp_size: int, tp_rank: int
+    ) -> tuple[_RankPartition, ...]:
+        axis = partition.axis
+        local_extent = segment.shape[axis]
+        global_extent = partition.global_extent
+        distinct_shards = global_extent // local_extent
+        if distinct_shards > tp_size or tp_size % distinct_shards:
+            raise UnsupportedPDLayoutError(
+                f"Cache field {segment.field_id!r} cannot map global "
+                f"extent {global_extent} and local extent {local_extent} to TP={tp_size}"
+            )
+        replica_group_size = tp_size // distinct_shards
+        shard_rank = tp_rank // replica_group_size
+        global_parts = partition.global_parts or (global_extent,)
+        partitions = []
+        global_offset = 0
+        local_offset = 0
+        for global_part_extent in global_parts:
+            local_part_extent = global_part_extent // distinct_shards
+            start = global_offset + shard_rank * local_part_extent
+            partitions.append(
+                _RankPartition(
+                    interval=_Interval(start, start + local_part_extent),
+                    local_offset=local_offset,
+                )
+            )
+            global_offset += global_part_extent
+            local_offset += local_part_extent
+        return tuple(partitions)
 
     @staticmethod
-    def _rank_interval_for_buffer(
-        buffer: BufferLayout, layout: ParallelLayout, tp_rank: int
-    ) -> _Interval | None:
-        replica_group_size = buffer.tp_replica_group_size
-        if tp_rank % replica_group_size != 0:
-            return None
-        effective_tp_size = layout.tp_size_per_dp // replica_group_size
-        effective_tp_rank = tp_rank // replica_group_size
-        return PDTransferPlanner._rank_interval(
-            buffer.logical_size, effective_tp_size, effective_tp_rank
-        )
+    def _is_representative_rank(segment, partition, tp_size: int, tp_rank: int) -> bool:
+        local_extent = segment.shape[partition.axis]
+        distinct_shards = partition.global_extent // local_extent
+        replica_group_size = tp_size // distinct_shards
+        return tp_rank % replica_group_size == 0
 
     @staticmethod
     def _replicated_source_tp_rank(
         prefill_tp_size: int, decode_tp_size: int, decode_tp_rank: int
     ) -> int:
         return (decode_tp_rank * prefill_tp_size) // decode_tp_size
+
+    def _calc_source_decode_ranks(self) -> dict[int, frozenset[int]]:
+        if self._uses_whole_copy_route:
+            return {rank: frozenset({rank}) for rank in range(self.prefill_tp_size)}
+        decode_ranks = {rank: set() for rank in range(self.prefill_tp_size)}
+        for decode_tp_rank in range(self.decode_tp_size):
+            for prefill_rank in self._fragments_for_decode_rank(decode_tp_rank):
+                decode_ranks[prefill_rank].add(decode_tp_rank)
+        return {rank: frozenset(ranks) for rank, ranks in decode_ranks.items()}
+
+
+def build_pipeline_transfer_plan(
+    *,
+    prefill_tp_size: int,
+    decode_tp_size: int,
+    decode_tp_rank: int,
+    prefill_layout: CacheTransferContract,
+    decode_layout: CacheTransferContract,
+    cache_fields_by_stage: tuple[tuple[str, ...], ...],
+) -> tuple[RankTransferPlan, tuple[int, ...]]:
+    """Plan every Prefill stage's resident fields for one Decode TP rank.
+
+    Args:
+        prefill_tp_size: Attention TP width inside one Prefill stage.
+        decode_tp_size: Attention TP width inside one Decode replica.
+        decode_tp_rank: Receiving TP coordinate inside that replica.
+        prefill_layout: Complete logical source cache contract.
+        decode_layout: Complete destination cache contract.
+        cache_fields_by_stage: Explicit resident field IDs for every Prefill stage.
+
+    Returns:
+        The stage-major source-rank plan and ranks joining completion with no data.
+    """
+    validate_cache_stage_fields(prefill_layout, cache_fields_by_stage)
+    fragments: dict[int, tuple[CacheTransferFragment, ...]] = {}
+    owner_filters: dict[int, dict[str, CachePageOwnerFilter | None]] = {}
+    dummy_ranks: list[int] = []
+    for stage, field_ids in enumerate(cache_fields_by_stage):
+        planner = CacheTransferPlanner(
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=decode_tp_size,
+            prefill_layout=prefill_layout,
+            decode_layout=decode_layout,
+            prefill_field_ids=frozenset(field_ids),
+        )
+        stage_plan = planner.plan_for_decode_rank(decode_tp_rank)
+        base = stage * prefill_tp_size
+        for rank, stage_fragments in stage_plan.fragments_by_prefill_rank.items():
+            fragments[base + rank] = stage_fragments
+        for rank, filters in stage_plan.owner_filters_by_prefill_rank.items():
+            owner_filters[base + rank] = filters
+        if decode_tp_rank == 0:
+            dummy_ranks.extend(
+                base + rank
+                for rank, decode_ranks in planner.decode_ranks_by_prefill_rank.items()
+                if not decode_ranks
+            )
+    return RankTransferPlan(
+        fragments_by_prefill_rank=fragments,
+        owner_filters_by_prefill_rank=owner_filters,
+    ), tuple(sorted(dummy_ranks))
+
+
+def validate_cache_stage_fields(
+    layout: CacheTransferContract, cache_fields_by_stage: tuple[tuple[str, ...], ...]
+) -> None:
+    """Require a nonempty stage list covering each logical field exactly once."""
+    fields = [field for stage in cache_fields_by_stage for field in stage]
+    if (
+        not cache_fields_by_stage
+        or any(not isinstance(field, str) for field in fields)
+        or len(fields) != len(set(fields))
+        or set(fields) != {field.field_id for field in layout.plan.fields}
+    ):
+        raise ValueError(
+            "cache stage placement must cover every logical field exactly once"
+        )

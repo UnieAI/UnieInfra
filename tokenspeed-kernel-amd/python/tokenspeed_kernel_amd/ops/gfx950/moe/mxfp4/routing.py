@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 cdna4 = gl.amd.cdna4
 _ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -41,6 +41,69 @@ _ROUTE_GL_DTYPE = {
 
 def _next_pow2(x: int) -> int:
     return 1 << (max(1, x) - 1).bit_length()
+
+
+@gluon.jit
+def _local_route_map_kernel(
+    topk_ids_ptr,
+    expanded_idx_ptr,
+    num_routes,
+    expert_start,
+    expert_end,
+    BLOCK: gl.constexpr,
+):
+    route = gl.program_id(0) * BLOCK + gl.arange(
+        0,
+        BLOCK,
+        layout=gl.BlockedLayout([1], [64], [4], [0]),
+    )
+    valid = route < num_routes
+    expert = gl.load(topk_ids_ptr + route, mask=valid, other=-1)
+    owned = valid & (expert >= expert_start) & (expert < expert_end)
+    gl.store(expanded_idx_ptr + route, gl.where(owned, route, -1), mask=valid)
+
+
+def gluon_local_route_map(
+    topk_ids: torch.Tensor,
+    expert_start: int,
+    num_local_experts: int,
+) -> torch.Tensor:
+    """Map local routes to canonical rows and mark remote EP routes with -1.
+
+    Args:
+        topk_ids: Global expert IDs with shape ``[tokens, top_k]``.
+        expert_start: First global expert ID owned by this rank.
+        num_local_experts: Number of contiguous experts owned by this rank.
+
+    Returns:
+        A flattened int32 route map. Local routes map to their canonical row;
+        routes owned by another EP rank contain ``-1``.
+    """
+
+    if topk_ids.ndim != 2:
+        raise ValueError("topk_ids must have shape [tokens, top_k]")
+    if expert_start < 0 or num_local_experts <= 0:
+        raise ValueError("the local expert range must be non-empty and non-negative")
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    num_routes = topk_ids.numel()
+    expanded_idx = torch.empty(
+        (num_routes,),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    if num_routes == 0:
+        return expanded_idx
+    block = 256
+    _local_route_map_kernel[(triton.cdiv(num_routes, block),)](
+        topk_ids,
+        expanded_idx,
+        num_routes,
+        expert_start,
+        expert_start + num_local_experts,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return expanded_idx
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +232,10 @@ def _route_u32_bits_to_f32(bits, element_ty: gl.constexpr):
         return bits.to(gl.uint16).to(element_ty, bitcast=True).to(gl.float32)
 
 
-@gluon.jit
+@gluon.jit(
+    do_not_specialize=("M",),
+    do_not_specialize_on_alignment=("M",),
+)
 def _sigmoid_bias_topk_route_gluon_kernel(
     logits_ptr,  # (M, E)
     bias_ptr,  # (E)
@@ -182,7 +248,7 @@ def _sigmoid_bias_topk_route_gluon_kernel(
     stride_tik,
     stride_twm,
     stride_twk,
-    M: gl.constexpr,
+    M,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     MP: gl.constexpr,
@@ -317,7 +383,7 @@ def invoke_softmax_topk_route_gluon(
         (M, topk), dtype=torch.float32, device=router_logits.device
     )
     bias = correction_bias if correction_bias is not None else topk_weights
-    nw = 1 if M <= 2 else 4
+    nw = min(_next_pow2(M), 4)
     _softmax_topk_route_gluon_kernel[(1,)](
         router_logits,
         bias,
@@ -358,7 +424,7 @@ def _launch_sigmoid_bias_topk_route_gluon(
     topk_weights = torch.empty(
         (M, topk), dtype=torch.float32, device=router_logits.device
     )
-    nw = 1 if M <= 2 else 4
+    nw = 1 if M == 1 else min(max(_next_pow2(M), 4), 8)
     _sigmoid_bias_topk_route_gluon_kernel[(1,)](
         router_logits,
         correction_bias,
@@ -371,7 +437,7 @@ def _launch_sigmoid_bias_topk_route_gluon(
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
-        M=M,
+        M,
         E=E,
         TOPK=topk,
         MP=_next_pow2(M),
@@ -423,7 +489,7 @@ def invoke_sigmoid_bias_topk_route_gluon(
 # Large-M package prefill routing: one independent CTA per token.
 # ---------------------------------------------------------------------------
 @gluon.jit
-def _sigmoid_bias_topk_route_prefill_kernel(
+def gluon_sigmoid_bias_topk_gfx950(
     logits_ptr,
     bias_ptr,
     topk_ids_ptr,
@@ -486,6 +552,8 @@ def _sigmoid_bias_topk_route_prefill_kernel(
         selected_weights = selected_weights.to(gl.float32) * (
             ROUTED_SCALING_FACTOR / denominator
         )
+    else:
+        selected_weights *= ROUTED_SCALING_FACTOR
 
     topk_mask = topk_lane < TOPK
     cdna4.buffer_store(
@@ -534,7 +602,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
         (tokens, topk), dtype=torch.float32, device=router_logits.device
     )
     num_warps = 1
-    _sigmoid_bias_topk_route_prefill_kernel[(tokens,)](
+    gluon_sigmoid_bias_topk_gfx950[(tokens,)](
         router_logits,
         correction_bias,
         topk_ids,

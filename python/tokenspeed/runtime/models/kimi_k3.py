@@ -29,7 +29,7 @@ Implemented (full text path):
 * ``KimiLinearMLAAttention`` — NoPE MLA + sigmoid output gate.
 * ``KimiLinearKDA`` — per-head gated delta-rule linear attention; routes the
   conv + gated-delta scan + conv/recurrent state cache through the hybrid
-  ``MambaAttnBackend`` KDA branch.
+  ``KdaAttnBackend``.
 * ``KimiLinearMLP`` — dense / shared-expert MLP with the SiTU activation.
 * ``KimiLinearMoE`` — sigmoid/noaux_tc router + Latent MoE + flashinfer's
   TRT-LLM fused SiTU + shared experts.
@@ -56,23 +56,26 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.ops.activation.triton import (
-    add3,
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
-from tokenspeed_kernel.ops.attention import mla_normalize_project_query
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd
+from tokenspeed_kernel.ops.attention.mla import (
+    mla_normalize_project_query,
+    validate_mla_query_projection,
+)
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
+from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
 from tokenspeed_kernel.ops.gemm import (
-    kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
@@ -80,65 +83,109 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
-)
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    decode_gemv,
+    mm,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-    situ_moe_unavailable_reason,
-)
-from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
+from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
+    COMM_ONESHOT_MAX_BYTES,
+    acquire_all_reduce_outputs,
+    all_gather,
     all_reduce,
-    prepare_all_reduce_fusion,
-    prepare_all_reduce_lane,
-    token_all_gather,
+    can_acquire_all_reduce_outputs,
+    reduce_scatter,
 )
-from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
+from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
+from tokenspeed.runtime.execution.forward_step import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.w8a8_fp8 import w8a8_fp8_per_channel_mm
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
 )
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
+    DPRowParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
+    DOWN_MAILBOX_MAX_TOKENS,
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
-    kimi3_join_reduce_moe,
     latent_moe_expert_shared_all_reduce,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    TopKOutputFormat,
+)
+from tokenspeed.runtime.layers.moe.utils import (
+    All2AllBackend,
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+    preprocess_fp8_pb_wo_weights,
+)
+from tokenspeed.runtime.layers.quantization.mxfp4 import (
+    Mxfp4Config,
+    preprocess_mxfp4_checkpoint_weights,
+)
+from tokenspeed.runtime.layers.quantization.utils import block_dequant
+from tokenspeed.runtime.layers.shared_expert_tp import (
+    SharedExpertCommunication,
+    initialize_shared_expert_group,
+    shared_expert_mapping,
+    validate_shared_expert_settings,
+)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_or_copy,
     default_weight_loader,
     sharded_weight_loader,
 )
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
-    DeepseekV3FusedQkvAProjWithMqa,
     _prepare_mla_kv_b_proj_weights,
+)
+from tokenspeed.runtime.models.kimi_k3_comm import (
+    K3_SHARED_RS_MAX_TOKENS,
+    K3AttnComm,
+    K3MoeTailComm,
+)
+from tokenspeed.runtime.models.kimi_k3_projection import (
+    KimiKDAColumnProj,
+    KimiMLAColumnProj,
+    KimiMLAReplicatedProj,
+    validate_projection_quantization,
+    validate_projection_settings,
 )
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
@@ -152,13 +199,14 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
+
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-        EncoderCudaGraphWrapper,
+        EncoderForwardStepRunner,
     )
 
 logger = logging.getLogger(__name__)
@@ -209,31 +257,45 @@ class KimiLinearMLP(nn.Module):
     place because Kimi-K3 runs the AttnRes residual path outside
     ``CommManager`` (see decision D4). EP Kimi can defer the shared-expert
     reduction so one Iris launch reduces it together with the routed latent.
+    Unsharded callers use tp_size=1 and tp_group=None.
     """
 
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        reduce_results: bool = True,
-        is_shared_expert: bool = False,
-        activation_situ_beta: float = 1.0,
-        activation_situ_linear_beta: float | None = None,
+        tp_rank: int,
+        tp_size: int,
+        tp_group: tuple[int, ...] | None,
+        shared_parallel: DenseLayerMapping | None,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        reduce_results: bool,
+        is_shared_expert: bool,
+        activation_situ_beta: float,
+        activation_situ_linear_beta: float | None,
     ) -> None:
         super().__init__()
-        self.mapping = mapping
-        if is_shared_expert:
-            tp_rank = mapping.moe.tp_ep_rank
-            tp_size = mapping.moe.tp_ep_size
-            tp_group = mapping.moe.tp_ep_group
-        else:
-            tp_rank = mapping.dense.tp_rank
-            tp_size = mapping.dense.tp_size
-            tp_group = mapping.dense.tp_group
-
+        self.shared_parallel = shared_parallel
+        self.shared_communication = None
+        if self.shared_parallel is not None:
+            if intermediate_size % self.shared_parallel.tp_size:
+                raise ValueError(
+                    "Shared-expert intermediate channels must be divisible by TP size"
+                )
+            if (
+                not is_shared_expert
+                or reduce_results
+                or (tp_rank, tp_size, tp_group)
+                != (
+                    shared_parallel.tp_rank,
+                    shared_parallel.tp_size,
+                    shared_parallel.tp_group,
+                )
+            ):
+                raise ValueError(
+                    "Shared-expert TP requires matching explicit TP geometry and deferred reduction"
+                )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -327,8 +389,25 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         prefix: str = "",
         reduce_attn_results: bool = True,
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        qkv_parallel: DenseLayerMapping | None,
+        output_parallel: DenseLayerMapping | None,
         **kwargs,
     ) -> None:
+        # The parent factories construct the final modules once, without a
+        # transient replicated weight allocation for every sharded layer.
+        self.qkv_parallel = qkv_parallel
+        self.output_parallel = output_parallel
+        self.use_output_gate = config.mla_use_output_gate
+        # Fused gated-layout row widths; _make_qkv_a_projection (invoked from
+        # super().__init__) fills them only for the gated layout.
+        self._qkv_a_width: int | None = None
+        self._gate_width: int | None = None
+        # Without Q-LoRA the parent skips the factory that builds the gate.
+        if self.use_output_gate and q_lora_rank is None:
+            raise ValueError("Gated MLA requires Q-LoRA (q_lora_rank must not be None)")
+        if qkv_parallel is not None and not self.use_output_gate:
+            raise ValueError("MLA QKV TP requires the gated q-lora projection")
         super().__init__(
             config=config,
             mapping=mapping,
@@ -349,23 +428,142 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             alt_stream=alt_stream,
             skip_rope=True,  # K3 MLA is NoPE (mla_use_nope=True)
         )
-        self.use_output_gate = config.mla_use_output_gate
+
+    def _make_qkv_a_projection(
+        self, *, quant_config: QuantizationConfig | None, prefix: str
+    ) -> nn.Module:
+        """Build the gated QKV-A layout directly, replicated or column-sharded."""
         if self.use_output_gate:
-            assert q_lora_rank is not None, "gated MLA assumes the q-lora path"
             # The gate projection shares its input with the a-projections, so
             # its per-rank shard rides the same GEMV: one weight laid out as
             # [q_a | kv_a+rope | g_shard] x hidden. (The dsv3 min-latency
             # kernel is shape-locked to 2112 rows and measures below nvjet's
             # effective bandwidth here anyway.)
-            self._qkv_a_width = q_lora_rank + kv_lora_rank + qk_rope_head_dim
-            self._gate_width = num_heads * v_head_dim // mapping.attn.tp_size
-            self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
-                hidden_size,
-                self._qkv_a_width + self._gate_width,
+            self._qkv_a_width = (
+                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+            )
+            self._gate_width = (
+                self.num_heads * self.v_head_dim // self.mapping.attn.tp_size
+            )
+            fused_prefix = add_prefix("fused_qkv_a_proj_with_mqa", prefix)
+            fused_out = self._qkv_a_width + self._gate_width
+            # FP8_PB_WO (w8a8) fused projection: pad the output rows to the
+            # 128-block grid so Fp8LinearMethod keeps the flashinfer
+            # blockscale GEMM (which requires N % 128 == 0) instead of the
+            # Triton fallback. Rows use the PRIVATE [gate | q_a | kv_a | pad]
+            # order (_FP8_FUSED_QKV_A_ORDER): all boundaries 128-aligned, so
+            # checkpoint codes and scales load verbatim (zero
+            # requantization); the zero pad rows complete kv_a's ragged
+            # trailing block and are sliced off right after the GEMM.
+            # bf16/mxfp4 checkpoints take pad 0, keep the canonical
+            # [q_a | kv_a | gate] order, and construct exactly as before.
+            self._fused_qkv_a_pad_rows = 0
+            self._fused_qkv_a_fp8_layout = False
+            if _fused_qkv_a_uses_fp8(quant_config, prefix):
+                padded_out = ceil_div(fused_out, 128) * 128
+                self._fused_qkv_a_pad_rows = padded_out - fused_out
+                self._fused_qkv_a_fp8_layout = True
+                fused_out = padded_out
+            if self.qkv_parallel is not None:
+                projection = KimiMLAColumnProj(
+                    hidden=self.hidden_size,
+                    rows=self._qkv_a_width + self._gate_width,
+                    parallel=self.qkv_parallel,
+                    block_fp8=self._fused_qkv_a_fp8_layout,
+                    prefix=fused_prefix,
+                )
+                method = (
+                    quant_config.get_quant_method(projection, fused_prefix)
+                    if quant_config is not None
+                    else None
+                )
+                validate_projection_quantization(projection, method, fused_prefix)
+                return projection
+            return KimiMLAReplicatedProj(
+                self.hidden_size,
+                fused_out,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                prefix=fused_prefix,
             )
+        return super()._make_qkv_a_projection(quant_config=quant_config, prefix=prefix)
+
+    def _make_output_projection(
+        self,
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        reduce_attn_results: bool,
+    ) -> nn.Module:
+        """Shard only the projection; attention heads and caches retain their mapping."""
+        if self.output_parallel is not None:
+            projection = DPRowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                parallel=self.output_parallel,
+                params_dtype=torch.get_default_dtype(),
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+            validate_projection_quantization(
+                projection, projection.quant_method, add_prefix("o_proj", prefix)
+            )
+            return projection
+        return super()._make_output_projection(
+            quant_config=quant_config,
+            prefix=prefix,
+            reduce_attn_results=reduce_attn_results,
+        )
+
+        if (
+            self.use_output_gate
+            and self.q_b_proj.weight.dtype not in _FP8_WEIGHT_DTYPES
+        ):
+            validate_mla_query_projection(
+                self.fused_qk_layernorm.weight_q_a,
+                self.fused_qk_layernorm.weight_kv_a,
+                self.q_b_proj.weight,
+                eps=self.q_a_layernorm.variance_epsilon,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
+
+    def _split_fused_qkv_a(
+        self, qkv_gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the fused a-projection output by the active row layout.
+
+        FP8 checkpoints load the PRIVATE [gate | q_a | kv_a] order
+        (_FP8_FUSED_QKV_A_ORDER, 128-aligned boundaries, verbatim scales);
+        bf16/mxfp4 keep the canonical [q_a | kv_a | gate].
+        """
+        if self._fused_qkv_a_fp8_layout:
+            # Locked to the assembly order: a layout change edits the
+            # constant, and this assertion turns any drift into a loud
+            # failure instead of silently mis-splitting the projections.
+            assert _FP8_FUSED_QKV_A_ORDER == (
+                "g_proj",
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+            )
+            gate, q_a, latent_cache = qkv_gate.split(
+                [
+                    self._gate_width,
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ],
+                dim=-1,
+            )
+        else:
+            q_a, latent_cache, gate = qkv_gate.split(
+                [
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self._gate_width,
+                ],
+                dim=-1,
+            )
+        return q_a, latent_cache, gate
 
     def _project_q_latent_gated(
         self,
@@ -383,21 +581,33 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             gate: Local output-gate shard.
             absorbed_query: Optional decode query projected into latent key space.
         """
-        if block_scale is not None:
-            qkv_gate = self.fused_qkv_a_proj_with_mqa(
-                hidden_states, block_scale, torch.bfloat16
-            )
-            if attnres_partial_args is not None:
+        dp_or_empty = self.qkv_parallel is not None or hidden_states.shape[0] == 0
+        if (
+            dp_or_empty
+            or block_scale is not None
+            or self.fused_qkv_a_proj_with_mqa.weight.dtype in _FP8_WEIGHT_DTYPES
+        ):
+            # Sharded and quantized weights must go through the Linear module,
+            # not the raw-BF16 producer fusions below. Keep standalone partials
+            # after the prequantized GEMM, and before it on the other paths.
+            prequantized = block_scale is not None and not dp_or_empty
+            if attnres_partial_args is not None and not prequantized:
                 attnres_partial_dual(*attnres_partial_args)
-            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
-            q_a, latent_cache, gate = qkv_gate.split(
-                [
-                    self.q_lora_rank,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    self._gate_width,
-                ],
-                dim=-1,
+            qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
+                hidden_states,
+                block_scale,
+                torch.bfloat16 if prequantized else None,
+                ctx=ctx,
             )
+            if attnres_partial_args is not None and prequantized:
+                attnres_partial_dual(*attnres_partial_args)
+            if dp_or_empty or self._fused_qkv_a_pad_rows:
+                qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
+            # DP Linear already restores complete local rows. Empty owners
+            # likewise skip the ordinary attention communication.
+            if not dp_or_empty:
+                qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
+            q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
         elif attnres_partial_args is not None:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
             qkv_gate = linear_attnres_partials(
@@ -443,7 +653,28 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
-        projection = mla_normalize_project_query(
+        if q_a.shape[0] == 0:
+            # Empty owners joined QKV but have no local norm or attention work.
+            return (
+                hidden_states.new_empty((0, self.q_b_proj.output_size_per_partition)),
+                latent_cache,
+                gate,
+                None,
+            )
+        if self.q_b_proj.weight.dtype in _FP8_WEIGHT_DTYPES:
+            # FP8-resident q_b (FP8_PB_WO w8a8): mla_normalize_project_query
+            # consumes a raw bf16 weight, so fall back to the unfused parent
+            # recipe — fused q_a/kv_a norms, then the quantized q_b GEMM.
+            # No absorbed-query preparation on this path; forward_absorb
+            # projects the query itself when absorbed_query is None.
+            q_norm = torch.empty_like(q_a)
+            if q_a.size(0) > 0:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm
+                )
+            q = self.q_b_proj(q_norm)[0]
+            return q, latent_cache, gate, None
+        q, absorbed_query = mla_normalize_project_query(
             q_a,
             kv_a,
             self.fused_qk_layernorm.weight_q_a,
@@ -454,13 +685,15 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return projection.query, latent_cache, gate, projection.absorbed_query
+        return q, latent_cache, gate, absorbed_query
 
     def can_fuse_attnres_partials(
         self,
         hidden_states: torch.Tensor,
         args: tuple,
     ) -> bool:
+        if self.qkv_parallel is not None:
+            return False
         projection = getattr(self, "fused_qkv_a_proj_with_mqa", None)
         if projection is None:
             return False
@@ -481,48 +714,68 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
+        *,
+        projection_out: torch.Tensor | None,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        if self.use_output_gate:
-            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
-                hidden_states,
-                ctx,
-                comm_manager,
-                block_scale,
-                attnres_partial_args,
-            )
-        else:
-            if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args)
-            q, latent_cache = self._project_q_latent(
-                hidden_states, ctx, comm_manager, block_scale
-            )
-            gate = None
-            absorbed_query = None
+        has_tokens = hidden_states.shape[0] > 0
+        # Empty owners need QKV only when peers share its projection weights.
+        if has_tokens or self.qkv_parallel is not None:
+            if self.use_output_gate:
+                q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
+                    hidden_states,
+                    ctx,
+                    comm_manager,
+                    block_scale,
+                    attnres_partial_args,
+                )
+            else:
+                if attnres_partial_args is not None:
+                    attnres_partial_dual(*attnres_partial_args)
+                q, latent_cache = self._project_q_latent(
+                    hidden_states, ctx, comm_manager, block_scale
+                )
+                gate = None
+                absorbed_query = None
+        if not has_tokens:
+            # Finish any O collective after QKV, without local attention work.
+            if self.output_parallel is None:
+                return hidden_states
+            empty = hidden_states.new_empty((0, self.num_local_heads * self.v_head_dim))
+            return self.o_proj(empty, ctx=ctx)[0]
         fuse_value_gate = (
             gate is not None
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
+            and not self.o_proj.supports_fp8_group128_input
         )
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
             positions,
             q,
             latent_cache,
             ctx,
-            out_cache_loc,
+            expanded=expanded,
             output_gate=gate if fuse_value_gate else None,
             absorbed_query=absorbed_query,
         )
         if gate is not None and not fuse_value_gate:
-            # Fused in-place fp32 sigmoid+mul; the gate shard matches the
-            # head-sharded attn_output.
+            if self.o_proj.supports_fp8_group128_input:
+                values, scales = quantize_fp8_with_gate(
+                    attn_output,
+                    gate,
+                    norm_weight=None,
+                    eps=0.0,
+                    enable_pdl=pdl_enabled(),
+                )
+                return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
             attn_output = sigmoid_mul(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
+        if projection_out is not None:
+            # K3AttnComm supplies this only for the unbiased BF16 TP shard.
+            return mm(attn_output, self.o_proj.weight, bias=None, out=projection_out)
+        output, _ = self.o_proj(attn_output, ctx=ctx)
         return output
 
 
@@ -539,6 +792,9 @@ def _apply_attn_res(
     norm: RMSNorm,
     num_valid_blocks: int,
     out_norm: RMSNorm | None = None,
+    *,
+    delta: torch.Tensor | None = None,
+    block_write_idx: int = -1,
 ) -> torch.Tensor:
     """AttnRes mixing: a learned softmax attention over block-residual snapshots.
 
@@ -555,16 +811,25 @@ def _apply_attn_res(
     ``out_norm`` is given, the following RMSNorm is fused into the kernel
     epilogue and the normed mix is returned.
     """
-    if num_valid_blocks <= 0:
+    if num_valid_blocks <= 0 and delta is None and block_write_idx < 0:
         return prefix_sum if out_norm is None else out_norm(prefix_sum)
+
+    # Calls that do not append a snapshot only need the valid rows. Preserve the
+    # tightly sliced contract used by backends without in-kernel snapshot writes.
+    kernel_blocks = (
+        block_residual if block_write_idx >= 0 else block_residual[:num_valid_blocks]
+    )
     return attn_res_fwd(
         prefix_sum,
-        block_residual[:num_valid_blocks],
+        kernel_blocks,
         proj.weight.reshape(-1),
         norm.weight,
         norm.variance_epsilon,
         out_norm_weight=None if out_norm is None else out_norm.weight,
         out_norm_eps=None if out_norm is None else out_norm.variance_epsilon,
+        delta=delta,
+        num_valid_blocks=num_valid_blocks,
+        block_write_idx=block_write_idx,
     )
 
 
@@ -579,23 +844,214 @@ def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
     return (config.activation_situ_beta, config.activation_situ_linear_beta)
 
 
+# FP8 storage dtypes accepted by the FP8-resident paths (matches the
+# quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on older ROCm).
+_FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+# Shared-expert and dense MLP modules in checkpoint naming.
+_K3_DENSE_MLP_MODULE = re.compile(r"(\.shared_experts\.|\.mlp\.)(gate|up|down)_proj$")
+
+
+def _dense_mlp_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Quantization config for K3's shared-expert and dense MLPs.
+
+    Their fused SiTU/down kernels consume BF16 weights. Under an MXFP4 config
+    these MLPs are built unquantized: MXFP4-serialized MLP weights are
+    dequantized at load (``preprocess_mxfp4_checkpoint_weights``) and BF16
+    ones load as-is. Other configs, such as the compressed-tensors config of
+    ``moonshotai/Kimi-K3``, are passed through unchanged.
+    """
+    return None if isinstance(quant_config, Mxfp4Config) else quant_config
+
+
+# FP8_PB_WO fused_qkv_a PRIVATE row layout (FP8 mode only). Segments are
+# REORDERED to [gate | q_a | kv_a | zero tail pad] so that every segment
+# boundary lands on the 128-row scale-block grid: the gate shard
+# (num_heads*v_head_dim/attn_tp) and q_a (q_lora_rank) are 128-multiples,
+# and kv_a (kv_lora_rank + rope = 576) sits last so its ragged half block is
+# completed by the zero pad rows (which dequantize to exact zeros under any
+# scale). Codes and scale rows are copied VERBATIM from the checkpoint — no
+# requantization anywhere. bf16/mxfp4 checkpoints keep the canonical
+# [q_a | kv_a | gate] order; consumers must split through
+# ``KimiLinearMLAAttention._split_fused_qkv_a``, never with checkpoint
+# offsets.
+_FP8_FUSED_QKV_A_ORDER = ("g_proj", "q_a_proj", "kv_a_proj_with_mqa")
+
+
+def _fused_qkv_a_uses_fp8(quant_config, layer_prefix: str) -> bool:
+    """Whether the fused a-projection must be built FP8-resident.
+
+    Real ModelOpt exports carry both the fused aliases and the per-segment
+    entries, but either alone must suffice: the alias
+    (``fused_qkv_a_proj_with_mqa``) or any source segment (q_a / kv_a / MLA
+    g) resolving to FP8_PB_WO selects the FP8 layout. Segments that disagree
+    (some FP8_PB_WO, some unquantized) cannot be fused verbatim — fail with
+    the actual routes instead of a misleading 128-alignment error later.
+    """
+    fp8_pb_wo_route = getattr(quant_config, "fp8_pb_wo_route", None)
+    if fp8_pb_wo_route is None:
+        return False
+    segment_routes = {
+        leaf: fp8_pb_wo_route(add_prefix(leaf, layer_prefix))
+        for leaf in ("q_a_proj", "kv_a_proj_with_mqa", "g_proj")
+    }
+    segment_values = set(segment_routes.values())
+    if "w8a8" in segment_values and None in segment_values:
+        raise ValueError(
+            "fused_qkv_a segments are partially FP8_PB_WO-quantized; all of "
+            f"q_a/kv_a/g must agree to fuse verbatim: {segment_routes}"
+        )
+    alias_route = fp8_pb_wo_route(add_prefix("fused_qkv_a_proj_with_mqa", layer_prefix))
+    return alias_route == "w8a8" or "w8a8" in segment_values
+
+
+def _assemble_fp8_fused_qkv_a(
+    segments: list[tuple[torch.Tensor, torch.Tensor]],
+    total_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stack FP8 segments and their scale grids verbatim, zero tail pad.
+
+    Args:
+        segments: ``(codes_fp8 [n_i, K], scale_f32 [ceil(n_i/128), K/128])``
+            in the fused row order; every segment except the last must be a
+            128-row multiple so the scale grids concatenate 1:1.
+        total_rows: Fused row count (the constructor's 128-padded output).
+
+    Returns:
+        ``(codes_fp8 [total_rows, K], scale_f32 [total_rows/128, K/128])``
+        with bit-identical segment codes/scales and exact-zero pad rows.
+    """
+    k = segments[0][0].shape[1]
+    n_real = sum(weight.shape[0] for weight, _ in segments)
+    if total_rows % 128 or total_rows < n_real:
+        raise ValueError(
+            f"fused rows {total_rows} must be a 128-multiple covering "
+            f"{n_real} segment rows"
+        )
+    device = segments[0][0].device
+    fused_w = torch.zeros(total_rows, k, dtype=torch.float8_e4m3fn, device=device)
+    fused_s = torch.ones(
+        total_rows // 128, (k + 127) // 128, dtype=torch.float32, device=device
+    )
+    row = 0
+    block = 0
+    for index, (weight, scale) in enumerate(segments):
+        if weight.dtype not in _FP8_WEIGHT_DTYPES:
+            raise TypeError(f"fused segment {index} must be FP8, got {weight.dtype}")
+        rows = weight.shape[0]
+        if index < len(segments) - 1 and rows % 128:
+            raise ValueError(
+                f"interior fused segment {index} has {rows} rows; only the "
+                "last segment may be ragged on the 128 grid"
+            )
+        nblocks = (rows + 127) // 128
+        if scale.shape != (nblocks, fused_s.shape[1]):
+            raise ValueError(
+                f"segment {index} scale shape {tuple(scale.shape)} does not "
+                f"match its {rows}x{k} codes"
+            )
+        fused_w[row : row + rows] = weight.to(device)
+        fused_s[block : block + nblocks] = scale.to(device)
+        row += rows
+        block += nblocks
+    # Any remaining scale rows (fully-pad blocks) keep the 1.0 guard: their
+    # zero codes dequantize to exact zeros under any scale.
+    return fused_w, fused_s
+
+
+def _k3_local_moe_blocks(config, mapping: Mapping) -> int:
+    """MoE blocks this pipeline stage runs, which is what the rotation sees.
+
+    Only the base model's blocks rotate. The draft builds one block and runs it
+    every step, so it states its own count rather than deriving one from the
+    target checkpoint's layers.
+    """
+    if mapping.pp_size > 1:
+        start, end = pp_layer_window(config.num_hidden_layers, mapping)
+    else:
+        start, end = 0, config.num_hidden_layers
+    freq = config.moe_layer_freq
+    return sum(
+        1
+        for layer in range(start, end)
+        if layer >= config.first_k_dense_replace and layer % freq == 0
+    )
+
+
+def _shard_k3_latent_projection(mapping: Mapping, hidden_size: int) -> bool:
+    """Whether to shard K3's routed latent projections without attention DP.
+
+    The platform test is what keeps a shard away from the packed input
+    projection: that path exists only under ``execution_plan.use_native``,
+    which follows ``native_latent_moe_available()`` and so is AMD-only. The two
+    are mutually exclusive by platform, not by any condition visible at the
+    call site. It asks the platform rather than ``torch.version.hip``, which
+    answers only about AMD and so admits NPU, where the multicast op's device
+    is not addressable at all.
+
+    True on an NVIDIA generation without the fabric: the multicast op declines
+    at construction and the projection stays replicated, so the width decision
+    is made downstream rather than here.
+    """
+    return (
+        mapping.attn.dp_size == 1
+        and current_platform().is_nvidia
+        and mapping.moe.tp_ep_size > 1
+        and hidden_size % mapping.moe.tp_ep_size == 0
+    )
+
+
+def _k3_trtllm_situ_internal_activation_dtype(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> str:
+    """Activation trait for FlashInfer TRT-LLM SiTU MoE by expert weight dtype.
+
+    MXFP4 SiTU cubins are w4a8 (activations quantized to MXFP8 -> ``"fp8"``);
+    NVFP4 SiTU runs w4a4 with the kernel wrapper quantizing the bf16 input to
+    NVFP4 itself, which the kernel registry models as ``"input"``.
+    """
+    if quant_config is not None and quant_config.moe_weight_dtype(prefix) == "nvfp4":
+        return "input"
+    return "fp8"
+
+
 # ===----------------------------------------------------------------------=== #
 # Text decoder layers
 # ===----------------------------------------------------------------------=== #
 
 
 class KimiKDAMergedProj(nn.Module):
-    """Merged bf16 KDA input projections: ``[q | k | v | g | f_a | b]``, one GEMM.
+    """Merged KDA input projections: ``[q | k | v | g | f_a | b]``, one GEMM.
 
-    All six consume the post-norm hidden states (``self_attn`` is on the
-    quantization ignore list, so everything is plain bf16). q/k/v/g/b shard
-    per-head over the attention TP group; ``f_a`` (low-rank decay-gate down
+    All six consume the post-norm hidden states. q/k/v/g/b shard per-head
+    over the attention TP group; ``f_a`` (low-rank decay-gate down
     projection) is replicated, so each rank carries a full copy. The ``q|k|v``
     slice reproduces the layout the hybrid backend's conv expects; ``g``,
     ``f_a`` and ``b`` (beta logits) ride along as strided slices, replacing two
-    extra latency-bound GEMVs per layer. Rows are padded to a multiple of 16:
-    off-multiple row counts fall off cublasLt's fast M=1 tactic (30us vs 13us
-    at 6284 vs 6288 x 7168). Loader ``shard_id`` in {"q","k","v","g","f_a","b"}.
+    extra latency-bound GEMVs per layer. Loader ``shard_id`` in
+    {"q","k","v","g","f_a","b"}.
+
+    bf16 checkpoints (mxfp4 recipe): rows pad to a multiple of 16
+    (off-multiple row counts fall off cublasLt's fast M=1 tactic, 30us vs
+    13us at 6284 vs 6288 x 7168) and the GEMM is plain bf16 — unchanged.
+
+    FP8_PB_WO checkpoints (``fp8_block_quant=True``): the buffer stays
+    FP8-resident with a per-[128, 128]-block f32 dequant scale grid, and the
+    used rows pad straight to the 128 grid (3206 -> 3328 @tp16,
+    6284 -> 6400 @tp8; the bf16 16-row alignment does not apply here) so the
+    w8a8 blockscale GEMM keeps the flashinfer kernel (N % 128 == 0). Every
+    segment offset (0/p/2p/3p/4p/4p+head_dim) is 128-aligned, so the
+    checkpoint's per-segment scale grids concatenate directly with no
+    requantization; the zero pad rows share ``b``'s trailing block scale and
+    dequantize to exact zeros (pad lemma).
+
+    Per-channel FP8 checkpoints (``fp8_channel_quant=True``, e.g. a per-layer
+    ``*self_attn*`` FP8 override): the buffer stays FP8-resident with one f32
+    dequant scale per output row, so each segment's scales load row-for-row
+    at the same offsets as its codes; rows keep the bf16 16-row alignment
+    and the zero pad rows carry scale 1.
     """
 
     _ROW_ALIGN = 16
@@ -608,12 +1064,20 @@ class KimiKDAMergedProj(nn.Module):
         head_dim: int,
         tp_rank: int,
         tp_size: int,
+        fp8_block_quant: bool = False,
+        *,
+        fp8_channel_quant: bool,
     ) -> None:
         super().__init__()
+        if fp8_block_quant and fp8_channel_quant:
+            raise ValueError("FP8 block and per-channel quantization are exclusive")
         self.proj_local = proj // tp_size
         self.local_num_heads = num_heads // tp_size
         self.head_dim = head_dim
         self.tp_rank = tp_rank
+        self.fp8_block_quant = fp8_block_quant
+        self.fp8_channel_quant = fp8_channel_quant
+        self.quant_method: Fp8LinearMethod | None = None
         p = self.proj_local
         self._offsets = {
             "q": 0,
@@ -632,46 +1096,149 @@ class KimiKDAMergedProj(nn.Module):
             "b": self.local_num_heads,
         }
         used = 4 * p + head_dim + self.local_num_heads
-        total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
         self.used_rows = used
-        # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
-        self.weight = nn.Parameter(
-            torch.empty(total, hidden_size, dtype=torch.bfloat16)
-        )
-        # Padding rows are never read back, but keep them finite.
-        self.weight.data[used:].zero_()
+        if fp8_block_quant:
+            if p % 128 or head_dim % 128 or hidden_size % 128:
+                raise ValueError(
+                    "FP8 merged KDA projection requires 128-aligned segment "
+                    f"offsets, got proj_local={p} head_dim={head_dim} "
+                    f"hidden_size={hidden_size}"
+                )
+            total = ceil_div(used, 128) * 128
+            # Zero codes: the pad rows (and any unwritten row) dequantize to
+            # exact zeros under any scale.
+            self.weight = nn.Parameter(
+                torch.zeros(total, hidden_size, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                torch.ones(total // 128, hidden_size // 128, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.weight_scale_inv.weight_loader = self._load_scale
+            # Zero-initialized buffers make a missing shard silently read as
+            # zeros; track loads explicitly and verify at post_load_weights.
+            self._loaded_weight_shards: set[str] = set()
+            self._loaded_scale_shards: set[str] = set()
+        elif fp8_channel_quant:
+            total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
+            self.weight = nn.Parameter(
+                torch.zeros(total, hidden_size, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale = nn.Parameter(
+                torch.ones(total, 1, dtype=torch.float32), requires_grad=False
+            )
+            self.weight_scale.weight_loader = self._load_channel_scale
+            self._loaded_weight_shards = set()
+            self._loaded_scale_shards = set()
+        else:
+            total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
+            # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
+            self.weight = nn.Parameter(
+                torch.empty(total, hidden_size, dtype=torch.bfloat16)
+            )
+            # Padding rows are never read back, but keep them finite.
+            self.weight.data[used:].zero_()
         self.weight.weight_loader = self._load_weight
+
+    def _shard_rows(self, loaded: torch.Tensor, shard_id: str) -> torch.Tensor:
+        """This rank's rows of a checkpoint segment (``f_a`` is replicated)."""
+        rows = self._rows[shard_id]
+        if shard_id == "f_a":
+            return loaded
+        return loaded.narrow(0, self.tp_rank * rows, rows)
+
+    def _load_channel_scale(
+        self, param: nn.Parameter, loaded_scale: torch.Tensor, shard_id: str
+    ) -> None:
+        """Place a segment's per-output-channel scales at its row offset."""
+        src = self._shard_rows(loaded_scale.reshape(-1, 1), shard_id)
+        start = self._offsets[shard_id]
+        param.data[start : start + self._rows[shard_id]].copy_(src)
+        self._loaded_scale_shards.add(shard_id)
 
     def _load_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str
     ) -> None:
+        fp8_resident = self.fp8_block_quant or self.fp8_channel_quant
+        if fp8_resident and loaded_weight.dtype not in _FP8_WEIGHT_DTYPES:
+            raise TypeError(
+                "FP8-resident merged KDA projection cannot load a "
+                f"{loaded_weight.dtype} shard (bf16 refit of FP8 KDA weights "
+                "is unsupported)."
+            )
         rows = self._rows[shard_id]
-        # f_a is replicated (full copy per rank); the rest are row-sharded.
-        src = (
-            loaded_weight
-            if shard_id == "f_a"
-            else loaded_weight.narrow(0, self.tp_rank * rows, rows)
-        )
+        src = self._shard_rows(loaded_weight, shard_id)
         start = self._offsets[shard_id]
         param.data[start : start + rows].copy_(src)
+        if fp8_resident:
+            self._loaded_weight_shards.add(shard_id)
+
+    def _load_scale(
+        self, param: nn.Parameter, loaded_scale: torch.Tensor, shard_id: str
+    ) -> None:
+        """Concatenate the checkpoint's per-segment scale grids in place.
+
+        Segment offsets are all 128-aligned, so each shard's scale rows map
+        1:1 onto the merged grid. ``f_a`` is replicated; ``b``'s <=96-row
+        shard lives inside the checkpoint's single scale block regardless of
+        rank, and the zero pad rows in the trailing block dequantize to
+        exact zeros under it.
+        """
+        block_start = self._offsets[shard_id] // 128
+        if shard_id in ("f_a", "b"):
+            src = loaded_scale[:1]
+            nblocks = 1
+        else:
+            nblocks = self._rows[shard_id] // 128
+            src = loaded_scale.narrow(0, self.tp_rank * nblocks, nblocks)
+        param.data[block_start : block_start + nblocks].copy_(src)
+        self._loaded_scale_shards.add(shard_id)
+
+    def verify_fp8_load_complete(self) -> None:
+        """Raise if any FP8 segment or scale shard never loaded.
+
+        The FP8 buffers are zero-initialized, so a dropped shard would
+        otherwise silently project to zeros.
+        """
+        if not (self.fp8_block_quant or self.fp8_channel_quant):
+            return
+        expected = set(self._rows)
+        missing_weights = expected - self._loaded_weight_shards
+        missing_scales = expected - self._loaded_scale_shards
+        if missing_weights or missing_scales:
+            raise RuntimeError(
+                "FP8 merged KDA projection incompletely loaded: missing "
+                f"weight shards {sorted(missing_weights)}, scale shards "
+                f"{sorted(missing_scales)}."
+            )
 
     def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Registry-dispatched: rowcta at M=1, cublasLt otherwise.
-        out = decode_gemv(x, self.weight)
-        p = self.proj_local
-        mixed_qkv = out[:, : 3 * p]
-        # No-op at decode (single row); prefill pays a small copy for the conv.
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
-        f_a_end = 4 * p + self.head_dim
-        return (
-            mixed_qkv,
-            out[:, 3 * p : 4 * p],
-            out[:, 4 * p : f_a_end],
-            out[:, f_a_end : f_a_end + self.local_num_heads],
-        )
+        self, x: torch.Tensor, *, ctx: ForwardContext | None
+    ) -> tuple[torch.Tensor, None]:
+        """Return the fused local projection, matching the DP Linear interface."""
+        if x.shape[0] == 0:
+            return x.new_empty((0, self.used_rows)), None
+        if self.fp8_channel_quant:
+            output = w8a8_fp8_per_channel_mm(
+                x, self.weight.t(), self.weight_scale, x.dtype
+            )
+        elif self.quant_method is not None:
+            output = self.quant_method.apply(
+                self,
+                x,
+                bias=None,
+                block_scale=None,
+                output_dtype=x.dtype,
+            )
+        else:
+            output = kimi3_qkvfab_projection(
+                x,
+                self.weight,
+                weight_scale=self.weight_scale_inv if self.fp8_block_quant else None,
+            )
+        return output, None
 
 
 class KimiLinearKDA(nn.Module):
@@ -686,7 +1253,7 @@ class KimiLinearKDA(nn.Module):
 
     The layer owns the projections + gates + output norm and routes the conv +
     gated-delta scan + conv/recurrent state cache through the hybrid attention
-    backend (``ctx.attn_backend`` -> ``MambaAttnBackend`` KDA branch), mirroring
+    backend (``ctx.attn_backend`` -> ``KdaAttnBackend``), mirroring
     ``Qwen3_5GatedDeltaNet``. The ``q/k/v_conv1d_weight`` parameters only hold the
     conv kernels; the convolution itself runs in the backend.
     """
@@ -698,11 +1265,16 @@ class KimiLinearKDA(nn.Module):
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        qkv_parallel: DenseLayerMapping | None,
+        output_parallel: DenseLayerMapping | None,
     ) -> None:
         super().__init__()
         self.config = config
         self.mapping = mapping
         self.layer_id = layer_id
+        self.qkv_parallel = qkv_parallel
+        self.output_parallel = output_parallel
 
         la = config.linear_attn_config
         if not la.get("use_full_rank_gate", False):
@@ -720,9 +1292,12 @@ class KimiLinearKDA(nn.Module):
         proj = self.num_heads * self.head_dim
         hidden = config.hidden_size
 
-        tp_rank = mapping.attn.tp_rank
-        tp_size = mapping.attn.tp_size
-        tp_group = mapping.attn.tp_group
+        # KDA parallelism reads the linear-attention mapping: it defaults to
+        # the attention TP width and diverges only under the
+        # MLA-DP + linear-attn-TP hybrid.
+        tp_rank = mapping.linear_attn.tp_rank
+        tp_size = mapping.linear_attn.tp_size
+        tp_group = mapping.linear_attn.tp_group
         self.local_num_heads = self.num_heads // tp_size
         proj_local = proj // tp_size
 
@@ -739,14 +1314,50 @@ class KimiLinearKDA(nn.Module):
             )
 
         # One merged GEMM replaces four per-head-sharded projections + the qkv concat.
-        self.qkvgb_proj = KimiKDAMergedProj(
-            hidden_size=hidden,
-            proj=proj,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+        # FP8_PB_WO checkpoints keep the merged buffer FP8-resident (w8a8
+        # blockscale GEMM); everything else stays bf16 exactly as before.
+        fp8_pb_wo_route = getattr(quant_config, "fp8_pb_wo_route", None)
+        merged_fp8 = (
+            fp8_pb_wo_route is not None
+            and fp8_pb_wo_route(add_prefix("q_proj", prefix)) == "w8a8"
         )
+        # A per-layer FP8 attention override keeps the merged buffer FP8 with
+        # per-channel scales (w8a8 per-token x per-channel GEMM).
+        merged_fp8_channel = (
+            isinstance(quant_config, Mxfp4Config)
+            and quant_config.fp8_override_route(add_prefix("q_proj", prefix)) == "w8a8"
+        )
+        if qkv_parallel is None:
+            self.qkvgb_proj = KimiKDAMergedProj(
+                hidden_size=hidden,
+                proj=proj,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                fp8_block_quant=merged_fp8,
+                fp8_channel_quant=merged_fp8_channel,
+            )
+        else:
+            if merged_fp8_channel:
+                raise ValueError("KDA QKV TP supports BF16 or 128x128 block FP8")
+            self.qkvgb_proj = KimiKDAColumnProj(
+                hidden=hidden,
+                proj=proj,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+                parallel=qkv_parallel,
+                block_fp8=merged_fp8,
+                prefix=add_prefix("qkvgb_proj", prefix),
+            )
+            for name in ("q_proj", "k_proj", "v_proj", "g_proj", "f_a_proj", "b_proj"):
+                source_prefix = add_prefix(name, prefix)
+                method = (
+                    quant_config.get_quant_method(self.qkvgb_proj, source_prefix)
+                    if quant_config is not None
+                    else None
+                )
+                validate_projection_quantization(self.qkvgb_proj, method, source_prefix)
         # Decay-gate up projection (f_a and beta ride in the merged GEMM).
         self.f_b_proj = _col(self.head_dim, proj, "f_b_proj")
 
@@ -782,36 +1393,79 @@ class KimiLinearKDA(nn.Module):
         self.conv_weights: torch.Tensor | None = None
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.o_proj = RowParallelLinear(
-            proj,
-            hidden,
-            bias=False,
-            reduce_results=False,  # layer-level fused AR+residual owns the reduce
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-        )
+        if output_parallel is None:
+            self.o_proj = RowParallelLinear(
+                proj,
+                hidden,
+                bias=False,
+                reduce_results=False,  # layer-level fused AR+residual owns the reduce
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                tp_group=tp_group,
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+        else:
+            self.o_proj = DPRowParallelLinear(
+                proj,
+                hidden,
+                parallel=output_parallel,
+                params_dtype=torch.get_default_dtype(),
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+            validate_projection_quantization(
+                self.o_proj, self.o_proj.quant_method, add_prefix("o_proj", prefix)
+            )
+
+        if (
+            merged_fp8
+            and qkv_parallel is None
+            and global_server_args_dict["dense_gemm_backend"] == "trtllm_cutedsl"
+        ):
+            # The merged buffer is not a LinearBase. Register the ordinary
+            # FP8 method so loading and warmup discover it like other linears.
+            self.qkvgb_proj.quant_method = Fp8LinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="dynamic",
+                    ignored_layers=None,
+                    weight_block_size=[128, 128],
+                    scale_fmt=None,
+                )
+            )
 
     def fuse_conv_weights(self) -> None:
-        """Concatenate the loaded q/k/v conv kernels into ``self.conv_weights``."""
-        self.conv_weights = torch.cat(
-            (self.q_conv1d_weight, self.k_conv1d_weight, self.v_conv1d_weight), dim=0
-        ).squeeze(1)
+        """Concatenate the loaded q/k/v conv kernels into ``self.conv_weights``.
+
+        A live weight update re-runs this; the bank is written in place so
+        captured CUDA graphs keep its address.
+        """
+        self.conv_weights = bind_or_copy(
+            self.conv_weights,
+            torch.cat(
+                (self.q_conv1d_weight, self.k_conv1d_weight, self.v_conv1d_weight),
+                dim=0,
+            ).squeeze(1),
+        )
 
     def _project_qkvfab(
         self,
         hidden_states: torch.Tensor,
+        ctx: ForwardContext | None,
         attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project every KDA hidden-state consumer."""
         proj_local = self.local_num_heads * self.head_dim
+        if attnres_partial_args is not None and (
+            self.qkvgb_proj.fp8_channel_quant
+            or self.qkvgb_proj.fp8_block_quant
+            or self.qkv_parallel is not None
+        ):
+            attnres_partial_dual(*attnres_partial_args)
+            attnres_partial_args = None
         if attnres_partial_args is None:
-            output = kimi3_qkvfab_projection(
-                hidden_states,
-                self.qkvgb_proj.weight,
-            )
+            output, _ = self.qkvgb_proj(hidden_states, ctx=ctx)
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
             output = linear_attnres_partials(
@@ -826,8 +1480,6 @@ class KimiLinearKDA(nn.Module):
             )
         f_a_end = 4 * proj_local + self.head_dim
         mixed_qkv = output[:, : 3 * proj_local]
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
         return (
             mixed_qkv,
             output[:, 3 * proj_local : 4 * proj_local],
@@ -840,6 +1492,8 @@ class KimiLinearKDA(nn.Module):
         hidden_states: torch.Tensor,
         args: tuple,
     ) -> bool:
+        if self.qkv_parallel is not None:
+            return False
         blocks, weight_a, weight_b, eps, scratch_a, scratch_b = args
         return linear_attnres_partials_available(
             hidden_states,
@@ -857,12 +1511,17 @@ class KimiLinearKDA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
+        *,
+        projection_out: torch.Tensor | None,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
+        if (
+            hidden_states.shape[0] == 0
+            and self.qkv_parallel is None
+            and self.output_parallel is None
+        ):
             return hidden_states
 
         h = hidden_states
@@ -877,11 +1536,21 @@ class KimiLinearKDA(nn.Module):
 
         # Raw (pre-conv) q/k/v projections concatenated; the hybrid backend runs
         # the short causal conv (+ SiLU) and manages the conv / recurrent state
-        # cache (KDA branch of MambaAttnBackend). g_raw is the raw decay-gate
+        # cache (``KdaAttnBackend``). g_raw is the raw decay-gate
         # input, beta the per-head logits (sigmoid applied in-kernel).
         mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
-            h, attnres_partial_args
+            h, ctx, attnres_partial_args
         )
+        if num_tokens == 0:
+            # Empty owners participate in QKV above and O below, but own no
+            # convolution, recurrent-state update, gate or norm work.
+            if self.output_parallel is not None:
+                return self.o_proj(h.new_empty((0, hn * hd)), ctx=ctx)[0]
+            return h
+        # Prefill consumes compact QKV; perform this copy in the captured
+        # projection segment rather than inside the eager attention break.
+        if not ctx.forward_mode.is_decode():
+            mixed_qkv = mixed_qkv.contiguous()
         # f_b runs inside the backend: fused into the decode scan kernel, a
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
@@ -892,7 +1561,6 @@ class KimiLinearKDA(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=out_cache_loc,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -902,7 +1570,7 @@ class KimiLinearKDA(nn.Module):
             activation="silu",
             key_dim=proj,
             value_dim=proj,
-            attention_tp_size=self.mapping.attn.tp_size,
+            attention_tp_size=self.mapping.linear_attn.tp_size,
             head_k_dim=hd,
             head_v_dim=hd,
             f_a_out=f_a_out,
@@ -915,16 +1583,28 @@ class KimiLinearKDA(nn.Module):
             seq_len=num_tokens,
         )
 
-        # Per-head gated RMSNorm + sigmoid output gate in one kernel.
+        core_out = core_out.reshape(num_tokens, hn * hd)
+        if self.o_proj.supports_fp8_group128_input:
+            values, scales = quantize_fp8_with_gate(
+                core_out,
+                out_gate,
+                norm_weight=self.o_norm.weight,
+                eps=self.o_norm.variance_epsilon,
+                enable_pdl=pdl_enabled(),
+            )
+            return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
         core_out = rmsnorm_gated_sigmoid(
-            core_out.reshape(num_tokens, hn * hd).contiguous(),
-            out_gate.contiguous(),
+            core_out.contiguous(),
+            out_gate,
             self.o_norm.weight,
             self.o_norm.variance_epsilon,
             hn,
             hd,
+            enable_pdl=pdl_enabled(),
         )
-        output, _ = self.o_proj(core_out)
+        if projection_out is not None:
+            return mm(core_out, self.o_proj.weight, bias=None, out=projection_out)
+        output, _ = self.o_proj(core_out, ctx=ctx)
         return output
 
 
@@ -950,7 +1630,6 @@ class KimiLinearMoEGate(nn.Module):
         return kimi3_router_projection(
             hidden_states,
             self.weight,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -1003,6 +1682,187 @@ def _attnres_scratch(
     return sc[slot]
 
 
+_IRIS_MAX_TOKENS = 8192
+_IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
+_IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
+
+
+def prepare_k3_all_reduce_buffers(
+    *,
+    mapping,
+    hidden_size: int,
+    routed_hidden_size: int,
+    max_num_tokens: int,
+    states: dict[tuple[int, ...], "K3IrisState"],
+) -> bool:
+    """Prepare and retain each node-local group's Iris buffers before capture."""
+    if not current_platform().is_cdna4:
+        return False
+
+    max_num_tokens = min(max_num_tokens, _IRIS_MAX_TOKENS)
+    if max_num_tokens <= 0:
+        return False
+
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        allreduce_residual_attnres_max_tokens,
+        prepare_k3_communication,
+    )
+    from tokenspeed_kernel.ops.communication.iris import IRIS_ALL_REDUCE_MAX_BYTES
+
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+    backend = get_global_backend()
+    if not isinstance(backend, AutoBackend):
+        return False
+
+    def prepare_group(
+        group,
+        *,
+        staged_max_numel,
+        producer_direct_max_numel,
+        attnres_max_numel,
+        attnres_max_rows,
+        enable_lamport,
+        moe_tail_max_rows,
+    ):
+        if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
+            return False
+        staged_max_numel = min(
+            staged_max_numel, IRIS_ALL_REDUCE_MAX_BYTES // torch.bfloat16.itemsize
+        )
+        state = states.get(group)
+        if state is not None:
+            if (
+                state.all_reduce.staged_max_numel < staged_max_numel
+                or state.all_reduce.producer_direct_max_numel
+                < producer_direct_max_numel
+                or state.enable_lamport != enable_lamport
+                or (
+                    attnres_max_rows
+                    and (
+                        state.attnres is None
+                        or state.attnres.max_rows < attnres_max_rows
+                        or state.attnres.max_numel < attnres_max_numel
+                    )
+                )
+                or (
+                    moe_tail_max_rows
+                    and (
+                        state.sharded is None
+                        or state.sharded.output.shape[0] < moe_tail_max_rows
+                    )
+                )
+            ):
+                raise RuntimeError("Cannot grow a prepared K3 Iris state")
+            return True
+        state = prepare_k3_communication(
+            group=_get_process_group(group),
+            rank_in_group=group.index(torch.distributed.get_rank()),
+            staged_max_numel=staged_max_numel,
+            producer_direct_max_numel=producer_direct_max_numel,
+            attnres_max_numel=attnres_max_numel,
+            attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
+            sharded_max_rows=moe_tail_max_rows,
+            dtype=torch.bfloat16,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            all_reduce=backend.iris.state(group, torch.bfloat16),
+        )
+        backend.iris.install(group, state.all_reduce)
+        states[group] = state
+        return True
+
+    attnres_max_rows = min(
+        max_num_tokens,
+        allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
+    )
+    groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
+    # The Lamport crossover was measured with attention TP8 and MoE TP8.
+    tp8_moe = (
+        groups_are_equal
+        and mapping.attn.tp_size == 8
+        and mapping.moe.tp_size == 8
+        and mapping.moe.ep_size == 1
+    )
+    enable_lamport = tp8_moe
+    # Keep the full producer-direct window for equal TP8 groups. Its 50K/500
+    # C16 gain survives content-sensitive EAGLE3 trajectories; retain 48 tokens
+    # for other mappings.
+    expand_moe_window = (
+        groups_are_equal and mapping.attn.tp_size == 8 and mapping.moe.tp_ep_size == 8
+    )
+    producer_direct_max_tokens = (
+        max_num_tokens
+        if expand_moe_window
+        else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
+    )
+    # The tail currently implements the measured TP8 Kimi-K3 dimensions.
+    # Other widths retain the ordinary reduction and projection contract.
+    moe_tail_max_rows = (
+        max_num_tokens // 8 * 8
+        if tp8_moe
+        and mapping.pp_size == 1
+        and (hidden_size, routed_hidden_size) == (7168, 3584)
+        and max_num_tokens >= _IRIS_MOE_ROW_SHARD_MIN_TOKENS
+        else 0
+    )
+    prepared = False
+    if mapping.attn.tp_size > 1:
+        prepared = prepare_group(
+            mapping.attn.tp_group,
+            staged_max_numel=max_num_tokens * hidden_size,
+            producer_direct_max_numel=(
+                producer_direct_max_tokens * (hidden_size + routed_hidden_size)
+                if groups_are_equal and mapping.moe.tp_ep_size > 1
+                else 0
+            ),
+            attnres_max_numel=attnres_max_rows * hidden_size,
+            attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
+            moe_tail_max_rows=moe_tail_max_rows,
+        )
+    if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
+        prepared = (
+            prepare_group(
+                mapping.moe.tp_ep_group,
+                staged_max_numel=max_num_tokens * hidden_size,
+                producer_direct_max_numel=producer_direct_max_tokens
+                * (hidden_size + routed_hidden_size),
+                attnres_max_numel=0,
+                attnres_max_rows=0,
+                enable_lamport=False,
+                moe_tail_max_rows=0,
+            )
+            or prepared
+        )
+    return prepared
+
+
+# Captured graphs retain each shape's address across later batches and layers.
+_AMD_MOE_JOIN_LANES: dict[tuple, torch.Tensor] = {}
+
+
+def _amd_moe_join_lane(like: torch.Tensor, width: int) -> torch.Tensor | None:
+    """Reuse a single-row lane or a CDNA5 strided-output buffer through M64."""
+    lane = allreduce_fusion_lane(like, width, enabled=True)
+    if lane is not None:
+        return lane
+    rows = like.shape[0]
+    if (
+        not current_platform().is_cdna5
+        or not 1 < rows <= 64
+        or rows * width * like.element_size() > COMM_ONESHOT_MAX_BYTES
+    ):
+        return None
+    key = (rows, width, like.dtype, like.device)
+    lane = _AMD_MOE_JOIN_LANES.get(key)
+    if lane is None and not torch.cuda.is_current_stream_capturing():
+        lane = like.new_zeros((rows, width))
+        _AMD_MOE_JOIN_LANES[key] = lane
+    return lane
+
+
 class KimiLinearMoE(nn.Module):
     """Kimi-K3 MoE block: sigmoid / noaux_tc router + Latent MoE + shared experts.
 
@@ -1015,7 +1875,8 @@ class KimiLinearMoE(nn.Module):
       ``routed_expert_up_proj``/``routed_expert_norm`` project back (7168).
     * **Routed experts** (MXFP4): AMD uses the native ``MoELayer`` plan wrapped
       by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. Non-AMD
-      platforms use flashinfer's TRTLLM-Gen SiTU MoE.
+      platforms use flashinfer's TRTLLM-Gen SiTU MoE. The selected MoE kernel
+      advertises whether it consumes precomputed TopK or routes from logits.
     * **Shared experts**: a plain ``KimiLinearMLP`` (SiTU).
     """
 
@@ -1023,14 +1884,54 @@ class KimiLinearMoE(nn.Module):
         self,
         config: KimiLinearConfig,
         mapping: Mapping,
+        layer_index: int,
+        model_scope: str,
+        moe_block_count: int,
         quant_config: QuantizationConfig | None = None,
-        layer_index: int = -1,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.mapping = mapping
+        self.comm: K3MoeTailComm | None = None
+        self.iris_state: K3IrisState | None = None
+        # Decoder layers inspect this even when attention DP skips native setup.
+        self.native_latent_moe: LatentMoELayer | None = None
+        if mapping.attn.dp_size > 1:
+            if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
+                raise ValueError(
+                    "Kimi-K3 attention DP requires attention DP == MoE EP == world size."
+                )
+        elif mapping.attn.tp_size != mapping.moe.tp_ep_size:
+            raise ValueError("Kimi-K3 attention TP must match the MoE TP x EP group.")
+        moe_backend = get_moe_backend()
+        all2all_backend = get_all2all_backend()
+        if mapping.attn.dp_size == 1 and all2all_backend in (
+            All2AllBackend.AGRS,
+            All2AllBackend.FLASHINFER,
+        ):
+            raise ValueError(
+                "Kimi-K3 agrs/flashinfer transport requires attention DP > 1."
+            )
+        self.execution_plan = Kimi3MoEExecutionPlan.build(
+            mapping,
+            moe_backend,
+            alt_stream,
+        )
+        fused_all2all_backend = (
+            All2AllBackend.GLUON_PETIT
+            if moe_backend.is_gluon_petit()
+            else All2AllBackend.NONE
+        )
+        if self.execution_plan.use_mega_moe and (
+            mapping.attn.dp_size <= 1 or all2all_backend is not fused_all2all_backend
+        ):
+            raise ValueError(
+                "K3 MegaMoE requires attention DP > 1 and "
+                f"--all2all-backend {fused_all2all_backend.value}; "
+                "the fused kernel owns dispatch/combine."
+            )
         # Router (gate+topk) and shared experts run on this stream during
         # graph capture, overlapped with the main-stream routed chain
         # (down_proj -> fused SiTU MoE -> up_proj). Collectives stay on the default
@@ -1047,77 +1948,22 @@ class KimiLinearMoE(nn.Module):
         )
         situ_beta, situ_linear_beta = _situ_betas(config)
 
-        moe_backend = get_moe_backend()
-        self.execution_plan = Kimi3MoEExecutionPlan.build(
-            mapping,
-            moe_backend,
-            alt_stream,
-            enforce_eager=bool(global_server_args_dict["enforce_eager"]),
-        )
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
-        self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
-        self.use_marlin_situ_moe = self.execution_plan.use_marlin
-        if not self.execution_plan.use_native and not self.use_marlin_situ_moe:
-            if not self.use_trtllm_situ_moe:
+        plan = self.execution_plan
+        if not plan.use_mega_moe and not plan.use_native and not plan.use_marlin:
+            if not plan.use_trtllm:
                 raise RuntimeError(
                     "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
                     "TRT-LLM, or Marlin (Hopper W4A16) backend; no portable SiTU "
                     f"Triton fallback exists (selected MoE backend: "
                     f"{moe_backend.value!r})."
                 )
-            # Fail here with the actual reason instead of letting MoELayer's
-            # kernel selection miss the (never-registered) SiTU kernel.
-            reason = situ_moe_unavailable_reason()
-            if reason is not None:
-                raise RuntimeError(
-                    "Kimi-K3's fused SiTU MoE requires flashinfer > 0.6.15 "
-                    f"with native SiTU, unavailable: {reason}. Upgrade "
-                    "flashinfer; no portable SiTU Triton fallback exists."
-                )
-            # Out-of-box tactics: seed the autotuner from the in-tree
-            # swept table for this GPU/flashinfer combo, if one ships
-            # (flashinfer's own heuristic mispicks MoE tactics at prefill
-            # batch sizes). A lookup miss leaves the startup autotune
-            # window to tune these shapes.
-            load_packaged_flashinfer_tuning_cache(
-                "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
-            )
-        # Attention DP partitions the batch when its TP group is smaller than
-        # the MoE TP×EP group. Gather those DP shards so every rank enters the
-        # K3 MoE with the same complete token batch.
-        self._gather_dp_tokens_for_moe = mapping.attn.tp_size != mapping.moe.tp_ep_size
-        if self._gather_dp_tokens_for_moe:
-            if (
-                mapping.attn.cp_size != 1
-                or mapping.moe.dp_size != 1
-                or mapping.moe.tp_ep_size != mapping.world_size
-                or mapping.attn.tp_size * mapping.attn.dp_size != mapping.moe.tp_ep_size
-            ):
-                raise ValueError(
-                    "Kimi-K3 cross-DP-EP MoE requires attn CP=1, MoE DP=1, "
-                    "and attn TP*DP == MoE TP*EP == world size."
-                )
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
 
-        self.topk = TopK(
-            top_k=self.top_k,
-            renormalize=config.moe_renormalize,
-            use_grouped_topk=config.use_grouped_topk,
-            num_expert_group=config.num_expert_group,
-            num_fused_shared_experts=0,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            output_format=TopKOutputFormat.STANDARD,
-            # bf16 weights out: makes the fused SiTU kernel's cast a no-op.
-            topk_weights_dtype=(
-                torch.bfloat16 if self.use_trtllm_situ_moe else torch.float32
-            ),
-        )
-
-        # AMD native and flashinfer's TRT-LLM SiTU MoE both consume K3's
-        # precomputed sigmoid/noaux_tc TopK.
+        # Leave routing unconstrained: the registry prefers a kernel-routing
+        # implementation when one exists and otherwise selects a precomputed-
+        # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
         self.experts = MoELayer(
             top_k=self.top_k,
             num_experts=self.num_experts,
@@ -1143,63 +1989,203 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode="precomputed_topk",
-            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations);
-            # FlashInfer's SiTU cubins require MXFP4 weights with MXFP8 acts.
+            routing_mode=("precomputed_topk" if mapping.attn.dp_size > 1 else None),
+            # Native gfx950 accepts bf16 model activations; the selected kernel
+            # may quantize them internally. Hopper Marlin runs A16W4.
+            # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
+            # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
+            # runs w4a4 with the kernel wrapper quantizing the bf16 input
+            # itself, which the registry models as "input".
             internal_activation_dtype_override=(
                 "input"
                 if self.execution_plan.use_native or self.execution_plan.use_marlin
-                else "fp8" if self.execution_plan.use_trtllm else None
+                else (
+                    _k3_trtllm_situ_internal_activation_dtype(quant_config, prefix)
+                    if self.execution_plan.use_trtllm
+                    else None
+                )
             ),
         )
-        if self.experts.support_routing:
-            raise RuntimeError(
-                "Kimi-K3 requires a precomputed-TopK SiTU MoE kernel; the "
-                "selected backend unexpectedly performs internal routing"
-            )
 
+        if mapping.attn.dp_size > 1:
+            if not self.experts.supports_precomputed_topk:
+                raise ValueError(
+                    "Kimi-K3 attention DP requires precomputed TopK support."
+                )
+            expected_a2a = (
+                fused_all2all_backend.value
+                if self.execution_plan.use_mega_moe
+                else "none"
+            )
+            if self.experts.plan.get("a2a_backend") not in (None, expected_a2a):
+                raise ValueError(
+                    "Kimi-K3 attention DP requires expert all-to-all backend "
+                    f"{expected_a2a!r}."
+                )
+
+        # Derive the producer contract from the concrete registry selection;
+        # backend family alone is too coarse (TRT-LLM has both kernel-routing
+        # MXFP4 SiTU and precomputed-TopK NVFP4 SiTU implementations).
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=config.moe_renormalize,
+            use_grouped_topk=config.use_grouped_topk,
+            num_expert_group=config.num_expert_group,
+            num_fused_shared_experts=0,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if self.experts.supports_precomputed_topk
+                else self.experts.topk_output_format
+            ),
+            # bf16 weights out: makes precomputed TRT-LLM SiTU consume them
+            # without a cast. This setting is unused by kernel-routing plans.
+            topk_weights_dtype=(
+                torch.bfloat16
+                if plan.use_trtllm or plan.use_mega_moe
+                else torch.float32
+            ),
+        )
+
+        # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the weight.
+        self._shard_latent_projections = _shard_k3_latent_projection(
+            mapping, config.hidden_size
+        )
+        # Every captured decode width takes the column shard when the fabric has one.
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        multicast_down = (
+            KimiK3LatentDownOp.initialize(
+                group=pg_manager.get_device_process_group(mapping.moe.tp_ep_group),
+                hidden_size=config.hidden_size,
+                latent_size=self.routed_hidden,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                block_index=layer_index // config.moe_layer_freq,
+                layer_count=moe_block_count,
+                model_scope=model_scope,
+                # The gate itself, so mailbox and gather meet by construction.
+                max_m=DOWN_MAILBOX_MAX_TOKENS,
+                publish_gemm=None,
+            )
+            # The mailbox and both producers are bf16; another activation dtype
+            # keeps the replica rather than failing at the first forward.
+            if self._shard_latent_projections
+            and torch.get_default_dtype() is torch.bfloat16
+            else None
+        )
+        # Past the mailbox's ceiling the same columns split over the group again.
+        column_down = (
+            self._shard_latent_projections
+            and self.routed_hidden % mapping.moe.tp_ep_size == 0
+        )
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
             self.routed_hidden,
             prefix=add_prefix("routed_expert_down_proj", prefix),
+            multicast_down=multicast_down,
+            column_group=(mapping.moe.tp_ep_group if column_down else None),
+            shard_rank=mapping.moe.tp_ep_rank,
+            shard_size=mapping.moe.tp_ep_size,
         )
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
             prefix=add_prefix("routed_expert_up_proj", prefix),
+            shard_group=(
+                mapping.moe.tp_ep_group if self._shard_latent_projections else None
+            ),
+            shard_rank=mapping.moe.tp_ep_rank,
+            shard_size=mapping.moe.tp_ep_size,
         )
         self.routed_expert_norm = (
             RMSNorm(self.routed_hidden, eps=config.rms_norm_eps)
             if config.latent_moe_use_norm
             else None
         )
-        self.execution_plan = self.execution_plan.prepare_latent_fusion(
-            mapping,
-            lane_width=self.routed_hidden + config.hidden_size,
-            has_latent_norm=self.routed_expert_norm is not None,
-            max_token_num=max(
-                int(global_server_args_dict["comm_fusion_max_num_tokens"]),
-                1,
-            ),
+        self._topk_ready = (
+            torch.cuda.Event()
+            if mapping.attn.dp_size == 1
+            and alt_stream is not None
+            and self.experts.supports_precomputed_topk
+            else None
         )
 
-        self._topk_ready = torch.cuda.Event() if alt_stream is not None else None
-
         # Shared experts (SiTU dense MLP over the full hidden size).
+        shared_parallel = shared_expert_mapping(
+            mapping, envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
+        )
         self.shared_experts = KimiLinearMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
-            mapping=mapping,
-            quant_config=quant_config,
+            tp_rank=(
+                shared_parallel.tp_rank
+                if shared_parallel is not None
+                else (0 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_rank)
+            ),
+            tp_size=(
+                shared_parallel.tp_size
+                if shared_parallel is not None
+                else (1 if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_size)
+            ),
+            tp_group=(
+                shared_parallel.tp_group
+                if shared_parallel is not None
+                else (None if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group)
+            ),
+            shared_parallel=shared_parallel,
+            quant_config=_dense_mlp_quant_config(quant_config),
             prefix=add_prefix("shared_experts", prefix),
-            # Partial sums only: the reduce happens in forward on the default
-            # stream after the aux-stream join, or in the joint Iris reduction.
+            # TP combines shared partials in the tail; DP keeps complete local outputs.
             reduce_results=False,
             is_shared_expert=True,
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
         self.packed_input_projection_weight: torch.Tensor | None = None
+
+        if mapping.attn.dp_size > 1:
+            self.moe_alltoall = None
+            if self.execution_plan.use_mega_moe:
+                if layer_index == config.first_k_dense_replace:
+                    logger.info(
+                        f"K3 routed MoE: {moe_backend.value} SiTU MegaMoE (EP={mapping.moe.ep_size})",
+                    )
+                return
+            if all2all_backend is not All2AllBackend.AGRS:
+                self.moe_alltoall = get_flashinfer_moe_alltoall(
+                    group=pg_manager.get_device_process_group(mapping.moe.ep_group),
+                    model_scope=model_scope,
+                    max_tokens=max(
+                        int(global_server_args_dict["max_prefill_tokens"]),
+                        int(global_server_args_dict["max_num_seqs"])
+                        * int(
+                            global_server_args_dict.get("speculative_num_draft_tokens")
+                            or 1
+                        ),
+                    ),
+                    hidden_size=self.routed_hidden,
+                    top_k=self.top_k,
+                    num_experts=self.num_experts,
+                    dtype=self.gate.weight.dtype,
+                    weights_dtype=self.topk.topk_config.topk_weights_dtype,
+                )
+                if (
+                    self.moe_alltoall is None
+                    and all2all_backend is All2AllBackend.FLASHINFER
+                ):
+                    raise ValueError(
+                        "Kimi-K3 --all2all-backend flashinfer requires NVIDIA ranks "
+                        "sharing a CUDA fabric; use --all2all-backend agrs."
+                    )
+            if self.moe_alltoall is None and layer_index == 0:
+                logger.info("K3 MoE communication: all-gather/reduce-scatter")
+            return
+
+        # Native EP owns its collectives; native TP reduces before replicated up-projection.
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1209,11 +2195,7 @@ class KimiLinearMoE(nn.Module):
                 routed_norm=self.routed_expert_norm,
                 routed_up_proj=self.routed_expert_up_proj,
                 shared_experts=self.shared_experts,
-                shared_reduce=(
-                    None
-                    if self.execution_plan.joint_moe_reduce
-                    else self._reduce_shared
-                ),
+                shared_reduce=None,
                 joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
                     alt_stream if self.execution_plan.overlap_shared_experts else None
@@ -1221,7 +2203,7 @@ class KimiLinearMoE(nn.Module):
                 expert_parallel_group=mapping.moe.ep_group,
                 input_projections=self._latent_input_projections,
             )
-            if self.execution_plan.use_native
+            if self.execution_plan.use_native and mapping.moe.tp_size == 1
             else None
         )
         # Dry-run exact registry selection for the fused decode pipeline.
@@ -1238,7 +2220,21 @@ class KimiLinearMoE(nn.Module):
                 self.experts.w2_weight_scale,
                 self.experts.plan,
                 topk=self.top_k,
+                linear_clamp=self.experts.activation_situ_linear_beta,
             )
+        )
+
+        if self.execution_plan.use_native:
+            return
+
+        self.comm = K3MoeTailComm(
+            mapping=mapping,
+            hidden_size=config.hidden_size,
+            routed_hidden=self.routed_hidden,
+            top_k=self.top_k,
+            routed_norm=self.routed_expert_norm,
+            up_proj=self.routed_expert_up_proj,
+            experts_supports_deferred_finalize=self.experts.supports_deferred_finalize,
         )
 
     def pack_input_projection_weights(self) -> None:
@@ -1277,10 +2273,16 @@ class KimiLinearMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
-        Returns ``None`` before the projection weights are concatenated, which
-        leaves the caller on the separate per-module projections.
+        Returns ``None`` before the projection weights are concatenated, and
+        whenever the routed projection narrowed its storage: this path reads that
+        weight directly, so it would hand the experts one rank's columns instead
+        of the gathered latent. The caller then takes the projection's own
+        forward, which gathers.
         """
-        if self.packed_input_projection_weight is None:
+        if (
+            self.packed_input_projection_weight is None
+            or self.routed_expert_down_proj.narrowed
+        ):
             return None
         router_logits, routed_input, shared_input = latent_moe_input_projections(
             hidden_states,
@@ -1299,16 +2301,31 @@ class KimiLinearMoE(nn.Module):
         )
         return router_logits, routed_input, shared_output
 
+    def process_weights_after_loading(self, module) -> None:
+        """Configure the latent projection from the processed expert input scale."""
+        if (
+            self.experts.plan["weight_dtype"] == "nvfp4"
+            and self.experts.plan["solution"] == "flashinfer_trtllm"
+        ):
+            # The loader visits this parent before its expert child.
+            self.experts.process_weights_after_loading(self.experts)
+            self.routed_expert_down_proj.prepare_nvfp4_output(
+                self.experts.w13_input_scale_quant
+            )
+
     def _routed_experts(
         self,
-        routed_in: torch.Tensor,
+        routed_in: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-        skip_reduce: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
-        if not self.use_trtllm_situ_moe and not self.use_marlin_situ_moe:
+        do_finalize: bool = True,
+    ) -> torch.Tensor:
+        """Run the selected SiTU MoE (kernel-routing or precomputed-TopK)."""
+        plan = self.execution_plan
+        if not (
+            plan.use_mega_moe or plan.use_native or plan.use_trtllm or plan.use_marlin
+        ):
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
                 "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
@@ -1318,14 +2335,26 @@ class KimiLinearMoE(nn.Module):
             topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=do_finalize,
         )
-        # Each TP rank owns an intermediate shard; each EP rank owns a
-        # contiguous expert shard. The routed kernel returns that rank's
-        # partial contribution, which must be combined before the replicated
-        # norm/up projection (skip_reduce: caller's fused AR covers it).
-        if self.mapping.moe.has_tp_ep and not skip_reduce:
-            out = all_reduce(out, self.mapping.moe.tp_ep_group)
+        # The kernel returns this rank's partial; the caller owns its reduction.
         return out
+
+    def _routing_output_format(self, ctx: ForwardContext | None) -> TopKOutputFormat:
+        """Choose between the selected kernel's two routing entry points."""
+        if not (
+            self.execution_plan.use_trtllm
+            and self.experts.support_routing
+            and self.experts.supports_precomputed_topk
+        ):
+            return self.experts.topk_output_format
+        # Keep the decode-optimized precomputed path. Extend/mixed forwards use
+        # FlashInfer's public routing API, which wins for prefill-sized batches.
+        if ctx is None:
+            return TopKOutputFormat.STANDARD
+        if ctx.forward_mode.is_decode():
+            return TopKOutputFormat.STANDARD
+        return TopKOutputFormat.BYPASSED
 
     def _forward_fused_decode_pipeline(
         self,
@@ -1375,51 +2404,334 @@ class KimiLinearMoE(nn.Module):
             shared_output,
         )
 
-    def _gather_dp_tokens(
+    def _forward_amd(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        ctx: ForwardContext | None,
+        *,
+        prefix_is_sharded: bool,
+    ) -> torch.Tensor:
+        """Run native EP, or join TP partials before norm and replicated up-projection.
+
+        TP producers use symmetric outputs or a packed lane when available.
+        After joining streams, the TP8 Iris tail normalizes and projects local
+        rows, then gathers the combined output. Other shapes reduce both partials
+        before forward_add3 combines the projection, shared output and residual.
+        """
+        if self.native_latent_moe is not None:
+            if self._use_fused_decode_pipeline and 0 < hidden_states.shape[0] <= 4:
+                return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
+            return self.native_latent_moe(
+                hidden_states,
+                num_global_tokens=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                prefix_sum=prefix_sum,
+            )
+
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            return prefix_sum
+
+        routing_output_format = self._routing_output_format(ctx)
+        precompute_topk = routing_output_format.is_standard()
+        group = self.mapping.moe.tp_ep_group
+        shapes = ((num_tokens, self.routed_hidden), (num_tokens, hidden_size))
+        outputs = None
+        lane = None
+        if can_acquire_all_reduce_outputs(shapes, hidden_states, group):
+            outputs = acquire_all_reduce_outputs(shapes, hidden_states, group)
+        else:
+            lane = _amd_moe_join_lane(hidden_states, self.routed_hidden + hidden_size)
+            if lane is not None:
+                outputs = (lane[:, : self.routed_hidden], lane[:, self.routed_hidden :])
+        routed_out, shared_out = outputs if outputs is not None else (None, None)
+        self.experts._situ_output_buffer = routed_out
+        fused_inputs = self._latent_input_projections(
+            hidden_states, shared_out=shared_out
+        )
+        if fused_inputs is not None:
+            router_logits, routed_in, shared_partial = fused_inputs
+        else:
+            router_logits = self.gate(hidden_states)
+            routed_in = shared_partial = None
+
+        # Warm the auxiliary stream serially before capture enables overlap.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
+        ) as fork:
+            with fork.branch():
+                topk_output = self.topk(
+                    hidden_states, router_logits, output_format=routing_output_format
+                )
+                if self._topk_ready is not None and precompute_topk and fork._active:
+                    self._topk_ready.record(torch.cuda.current_stream())
+                if shared_partial is None:
+                    shared_partial = self.shared_experts(
+                        hidden_states, down_out=shared_out
+                    )
+            if routed_in is None:
+                routed_in, _ = self.routed_expert_down_proj(hidden_states)
+            if self._topk_ready is not None and precompute_topk and fork._active:
+                self._topk_ready.wait(torch.cuda.current_stream())
+            routed = self._routed_experts(
+                routed_in,
+                topk_output,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                do_finalize=True,
+            )
+        # Both producers have joined before the tail reads their symmetric outputs.
+        # Its final gather completes before the next producer can reuse the input.
+        up_proj = self.routed_expert_up_proj
+        if (
+            outputs is not None
+            and lane is None
+            and current_platform().is_cdna4
+            and self.mapping.pp_size == 1
+            and _IRIS_MOE_ROW_SHARD_MIN_TOKENS <= num_tokens <= _IRIS_MAX_TOKENS
+            and self.mapping.attn.tp_size == 8
+            and self.mapping.moe.tp_size == 8
+            and self.mapping.moe.ep_size == 1
+            and self.mapping.attn.tp_group == self.mapping.moe.tp_ep_group
+            and self.iris_state is not None
+            and not up_proj.narrowed
+            and up_proj.solution == "auto"
+        ):
+            norm = self.routed_expert_norm
+            output = self.iris_state.moe_tail(
+                routed,
+                shared_partial,
+                prefix_sum,
+                up_proj.weight,
+                prefix_is_sharded=prefix_is_sharded,
+                norm_weight=norm.weight if norm is not None else None,
+                eps=norm.variance_epsilon if norm is not None else None,
+            )
+            if output is not None:
+                return output
+        if prefix_is_sharded:
+            # The optimized tail declined before consuming the producers.
+            # Every ordinary projection epilogue requires a replicated prefix.
+            prefix_sum = all_gather(prefix_sum, group, dim=0, backend=None)
+        # A producer may return its own tensor instead of filling its destination.
+        if outputs is not None and all(
+            partial.shape == output.shape and partial.data_ptr() == output.data_ptr()
+            for partial, output in zip((routed, shared_partial), outputs, strict=True)
+        ):
+            joined = outputs if lane is None else lane
+        elif routed.numel() * routed.element_size() > COMM_ONESHOT_MAX_BYTES:
+            joined = (routed, shared_partial)
+        else:
+            joined = torch.cat((routed, shared_partial), dim=-1)
+        reduced = (
+            self.iris_state.reduce_moe(joined)
+            if isinstance(joined, tuple)
+            and self.iris_state is not None
+            and self.iris_state.all_reduce.owns_outputs(joined)
+            else all_reduce(joined, group)
+        )
+        if isinstance(reduced, torch.Tensor):
+            routed, shared = reduced.split((self.routed_hidden, hidden_size), dim=-1)
+        else:
+            routed, shared = reduced
+        if self.routed_expert_norm is not None:
+            routed = self.routed_expert_norm(routed)
+        return self.routed_expert_up_proj.forward_add3(routed, prefix_sum, shared).view(
+            num_tokens, hidden_size
+        )
+
+    def _forward_attn_dp(
         self,
         hidden_states: torch.Tensor,
         prefix_sum: torch.Tensor,
         ctx: ForwardContext,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-        """Gather DP batches before the temporary cross-DP-EP MoE path.
-
-        Attention-TP replicas hold identical rows. Gathering on the matching
-        DP group collects each DP batch exactly once and leaves every MoE rank
-        with the complete global batch for the existing expert all-reduce.
-        """
-        global_counts = (
+    ) -> torch.Tensor:
+        """Keep dense work local and dispatch/combine only routed expert activations."""
+        counts = (
             ctx.collective_global_num_tokens
             if ctx.collective_global_num_tokens is not None
             else ctx.global_num_tokens
         )
-        if global_counts is None:
-            raise RuntimeError(
-                "Kimi-K3 cross-DP-EP MoE requires global_num_tokens for token-gather sizing."
+        num_tokens = hidden_states.shape[0]
+        if (
+            counts is None
+            or len(counts) != self.mapping.world_size
+            or num_tokens != counts[self.mapping.attn.dp_rank]
+            or prefix_sum.shape != hidden_states.shape
+        ):
+            raise ValueError(
+                "Kimi-K3 attention DP requires matching collective token counts."
             )
-        dp_counts = [
-            global_counts[
-                dp_rank * self.mapping.attn.tp_size * self.mapping.attn.cp_size
-            ]
-            for dp_rank in range(self.mapping.attn.dp_size)
-        ]
-        local_count = dp_counts[self.mapping.attn.dp_rank]
-        if hidden_states.shape[0] != local_count or prefix_sum.shape[0] != local_count:
-            raise RuntimeError(
-                "Kimi-K3 cross-DP-EP MoE rows do not match global_num_tokens."
+        max_tokens = max(counts)
+        if max_tokens == 0:
+            return prefix_sum
+
+        shared_communication = None
+        if self.shared_experts.shared_parallel is not None:
+            shared_communication = self.shared_experts.shared_communication
+            if shared_communication is None:
+                raise RuntimeError(
+                    "Shared-expert communication must be prepared before forward"
+                )
+
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+        ) as fork:
+            shared_output = None
+            if shared_communication is not None:
+                with fork.branch():
+                    # Hide gathering under local routing, but let dispatch
+                    # wait for AG alone while shared GEMMs keep running.
+                    shared_input = shared_communication.gather_inputs(
+                        hidden_states, counts
+                    )
+                    fork.record_checkpoint()
+                    shared_output = self.shared_experts(shared_input, down_out=None)
+
+            if num_tokens > 0:
+                router_logits = self.gate(hidden_states)
+                topk = self.topk(
+                    hidden_states,
+                    router_logits,
+                    output_format=TopKOutputFormat.STANDARD,
+                    num_token_non_padded=None,
+                    expert_location_dispatch_info=None,
+                )
+                routed_input, _ = self.routed_expert_down_proj(hidden_states)
+                topk_ids = topk.topk_ids
+                topk_weights = topk.topk_weights
+            else:
+                routed_input = hidden_states.new_empty((0, self.routed_hidden))
+                topk_ids = torch.empty(
+                    (0, self.top_k),
+                    dtype=self.topk.topk_config.topk_indices_dtype,
+                    device=hidden_states.device,
+                )
+                topk_weights = torch.empty(
+                    (0, self.top_k),
+                    dtype=self.topk.topk_config.topk_weights_dtype,
+                    device=hidden_states.device,
+                )
+
+            if self.experts.plan["weight_dtype"] == "nvfp4":
+                if num_tokens > 0:
+                    routed_input = fp4_quantize(
+                        routed_input,
+                        self.experts.w13_input_scale_quant,
+                        is_sf_swizzled_layout=False,
+                        enable_pdl=pdl_enabled(),
+                    )
+                else:
+                    routed_input = (
+                        hidden_states.new_empty(
+                            (0, self.routed_hidden // 2), dtype=torch.uint8
+                        ),
+                        hidden_states.new_empty(
+                            (0, self.routed_hidden // 16), dtype=torch.uint8
+                        ),
+                    )
+
+            if shared_communication is not None:
+                # Never overlap shared AG with routed communication, including
+                # the all-gather fallback and ranks with no local tokens.
+                fork.join_checkpoint()
+
+            if self.execution_plan.use_mega_moe:
+                pass
+            elif self.moe_alltoall is not None:
+                routed_input, topk_ids, topk_weights, combine_offset = (
+                    self.moe_alltoall.dispatch(
+                        routed_input, topk_ids, topk_weights, max_tokens
+                    )
+                )
+            else:
+                prequantized = isinstance(routed_input, tuple)
+                payloads = (
+                    [*routed_input, topk_ids, topk_weights]
+                    if prequantized
+                    else [routed_input, topk_ids, topk_weights]
+                )
+                if num_tokens < max_tokens:
+                    padding = (0, 0, 0, max_tokens - num_tokens)
+                    payloads = [
+                        F.pad(tensor, padding, mode="constant", value=0)
+                        for tensor in payloads
+                    ]
+                payloads = [
+                    all_gather(tensor.contiguous(), self.mapping.moe.ep_group, dim=0)
+                    for tensor in payloads
+                ]
+                routed_input = (
+                    (payloads[0], payloads[1]) if prequantized else payloads[0]
+                )
+                topk_ids, topk_weights = payloads[-2:]
+
+            if shared_communication is not None:
+                # Main has dispatched. Finish shared GEMMs before routed BMM,
+                # then let only shared reduction overlap the finite routed
+                # work. Empty owners obey the same event/collective ordering.
+                fork.join()
+                with fork.branch_after_main():
+                    shared_output = shared_communication.reduce_outputs(
+                        shared_output, num_tokens
+                    )
+                if self.execution_plan.use_mega_moe:
+                    # MegaMoE owns dispatch/combine inside the expert call;
+                    # its communication cannot overlap the shared collective.
+                    fork.join()
+
+            routing = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=None,
             )
-        return (
-            token_all_gather(
-                hidden_states,
-                group=self.mapping.attn.dp_group,
-                scattered_num_tokens=dp_counts,
-            ),
-            token_all_gather(
-                prefix_sum,
-                group=self.mapping.attn.dp_group,
-                scattered_num_tokens=dp_counts,
-            ),
-            sum(dp_counts),
-            sum(dp_counts[: self.mapping.attn.dp_rank]),
+            total_tokens = self.mapping.world_size * max_tokens
+            routed_output = self._routed_experts(
+                routed_input,
+                routing,
+                num_global_tokens=total_tokens,
+                max_num_tokens_per_gpu=max_tokens,
+                do_finalize=True,
+            )
+
+            if shared_communication is not None:
+                # Do not allow two peer-polling collectives to occupy the GPU
+                # concurrently: combine starts only after shared RS completes.
+                fork.join()
+
+            if self.execution_plan.use_mega_moe:
+                pass
+            elif self.moe_alltoall is not None:
+                routed_output = self.moe_alltoall.combine(
+                    routed_output, num_tokens, max_tokens, combine_offset
+                )
+            else:
+                routed_output = reduce_scatter(
+                    routed_output.contiguous(), group=self.mapping.moe.ep_group
+                )[:num_tokens]
+
+            if num_tokens > 0 and self.routed_expert_norm is not None:
+                routed_output = self.routed_expert_norm(routed_output)
+
+            if shared_communication is None:
+                with fork.branch():
+                    if num_tokens > 0:
+                        shared_output = self.shared_experts(
+                            hidden_states, down_out=None
+                        )
+
+        if num_tokens == 0:
+            return prefix_sum
+        return self.routed_expert_up_proj.forward_add3(
+            routed_output,
+            prefix_sum,
+            shared_output,
+            norm_weight=None,
+            eps=None,
         )
 
     def forward(
@@ -1429,109 +2741,146 @@ class KimiLinearMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None = None,
+        *,
+        prefix_is_sharded: bool,
     ) -> torch.Tensor:
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
-        Returns the new prefix (``prefix_sum + routed + shared``); at bs=1
-        the up-projection's store performs the accumulate in-kernel.
+        Reduce routed output and, for small batches, the shared shard inside
+        the stream fork. Join before projecting and assembling the output.
+        When ``prefix_is_sharded`` is true, ``prefix_sum`` contains this rank's
+        consecutive one-eighth of the token rows. The AMD tail consumes them
+        directly or gathers the residual before a path that expects every row.
         """
-        local_num_tokens = hidden_states.shape[0]
-        local_offset = 0
-        if self._gather_dp_tokens_for_moe:
-            if ctx is None:
-                raise RuntimeError("Kimi-K3 cross-DP-EP MoE requires a ForwardContext.")
-            hidden_states, prefix_sum, num_global_tokens, local_offset = (
-                self._gather_dp_tokens(hidden_states, prefix_sum, ctx)
+        if prefix_is_sharded and (
+            self.mapping.attn.dp_size > 1
+            or self.mapping.attn.tp_size != 8
+            or self.mapping.moe.tp_size != 8
+            or self.mapping.moe.ep_size != 1
+            or self.mapping.attn.tp_group != self.mapping.moe.tp_ep_group
+            or self.native_latent_moe is not None
+            or hidden_states.shape[0] % 8 != 0
+            or prefix_sum.shape != (hidden_states.shape[0] // 8, hidden_states.shape[1])
+        ):
+            raise ValueError(
+                "A residual with only this rank's rows requires matching TP8 groups and one eighth of the token rows"
             )
-            max_num_tokens_per_gpu = num_global_tokens
+        if self.mapping.attn.dp_size > 1:
+            if ctx is None:
+                raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
+            return self._forward_attn_dp(hidden_states, prefix_sum, ctx)
 
-        if self.native_latent_moe is not None:
-            if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
-                output = self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
-            else:
-                output = self.native_latent_moe(
-                    hidden_states,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                    prefix_sum=prefix_sum,
-                )
-            return output[local_offset : local_offset + local_num_tokens]
+        if self.execution_plan.use_native:
+            return self._forward_amd(
+                hidden_states,
+                prefix_sum,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                ctx,
+                prefix_is_sharded=prefix_is_sharded,
+            )
 
-        num_tokens, hidden_size = hidden_states.shape
+        num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
             return prefix_sum
 
-        # Router runs uncontended on main (3us; on aux it starves to 14us
-        # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
-        # down_proj from the aux stream, followed by the shared chain.
-        router_logits = self.gate(hidden_states)
-        lane = allreduce_fusion_lane(
-            hidden_states,
-            self.routed_hidden + hidden_size,
-            enabled=self.execution_plan.fused_moe_ar,
-        )
-        if lane is not None:
-            self.experts._situ_output_buffer = lane[:, : self.routed_hidden]
+        routing_output_format = self._routing_output_format(ctx)
+        precompute_topk = routing_output_format.is_standard()
+        if self.comm is None:
+            raise RuntimeError("K3 MoE communication is not initialized")
+        self.experts._situ_output_buffer = None
+
+        # The router, routed latent and shared gate/up read the same activation
+        # and reduce over the same width, so one GEMM replaces three. Returns
+        # None when the packed weight is unavailable or the shapes are outside
+        # the fused kernel, which leaves the separate projections below.
+        fused_inputs = self._latent_input_projections(hidden_states, shared_out=None)
+        if fused_inputs is not None:
+            router_logits, routed_in, shared_partial = fused_inputs
         else:
-            self.experts._situ_output_buffer = None
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            # Router runs uncontended on main (3us; on aux it starves to 14us
+            # under concurrent GEMMs). When the selected experts need
+            # precomputed TopK runs on the fork branch beside down_proj;
+            # routing bypasses it.
+            router_logits = self.gate(hidden_states)
+            routed_in = shared_partial = None
+
+        # Warm the auxiliary stream serially before capture enables overlap.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
+        ) as fork:
             with fork.branch():
-                topk_output = self.topk(hidden_states, router_logits)
-                if self._topk_ready is not None and fork._active:
-                    self._topk_ready.record(torch.cuda.current_stream())
-                shared_partial = self.shared_experts(
+                topk_output = self.topk(
                     hidden_states,
-                    down_out=(
-                        lane[:, self.routed_hidden :] if lane is not None else None
-                    ),
+                    router_logits,
+                    output_format=routing_output_format,
                 )
-            routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
-            if self._topk_ready is not None and fork._active:
+                if self._topk_ready is not None and precompute_topk and fork._active:
+                    self._topk_ready.record(torch.cuda.current_stream())
+                if shared_partial is None:
+                    shared_partial = self.shared_experts(
+                        hidden_states,
+                        down_out=None,
+                    )
+                if num_tokens <= K3_SHARED_RS_MAX_TOKENS:
+                    shared_shard = self.comm.shared_rs(shared_partial)
+
+            if routed_in is None:
+                routed_in, _ = self.routed_expert_down_proj(hidden_states)
+            if self._topk_ready is not None and precompute_topk and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
-            routed_out = self._routed_experts(
+            routed_partial = self._routed_experts(
                 routed_in,
                 topk_output,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
-                skip_reduce=self.execution_plan.fused_moe_ar,
+                do_finalize=not self.comm.defer_finalize,
             )
-            if not self.execution_plan.fused_moe_ar:
-                if self.routed_expert_norm is not None:
-                    routed_out = self.routed_expert_norm(routed_out)
-                routed_out = self.routed_expert_up_proj(routed_out)[0]
-        if self.execution_plan.fused_moe_ar:
-            routed_out, shared_out = kimi3_join_reduce_moe(
-                routed_out,
-                shared_partial,
-                lane=lane,
-                routed_hidden=self.routed_hidden,
-                routed_norm=self.routed_expert_norm,
-                group=self.mapping.moe.tp_ep_group,
-                enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
-                max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
-            )
-            output = kimi3_latent_projection_add3(
-                routed_out,
-                self.routed_expert_up_proj.weight,
-                prefix_sum,
-                shared_out,
-            ).view(num_tokens, hidden_size)
-        else:
-            shared_out = self._reduce_shared(shared_partial)
-            # routed_scaling_factor already applied in TopK; not re-applied here
-            # (matches the reference).
-            output = add3(
-                prefix_sum,
-                routed_out.view(num_tokens, hidden_size),
-                shared_out.view(num_tokens, hidden_size),
-            )
-        return output[local_offset : local_offset + local_num_tokens]
+            routed_latent = self.comm.routed_ar_fusion(routed_partial, num_tokens)
 
-    def _reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        """Reduce the shared experts' TP partial on the current (default) stream."""
-        if self.mapping.moe.tp_ep_size > 1:
-            return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
-        return shared_partial
+        if prefix_is_sharded:
+            prefix_sum = all_gather(
+                prefix_sum, self.mapping.moe.tp_ep_group, dim=0, backend=None
+            )
+        if num_tokens <= K3_SHARED_RS_MAX_TOKENS:
+            return self.comm.up_proj_ag(routed_latent, shared_shard, prefix_sum)
+        else:
+            return self.comm.up_proj_inject_ar(
+                routed_latent, shared_partial, prefix_sum
+            )
+
+
+def create_kimi_linear_moe(
+    config: KimiLinearConfig,
+    mapping: Mapping,
+    layer_index: int,
+    model_scope: str,
+    moe_block_count: int,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    alt_stream: torch.cuda.Stream | None,
+) -> nn.Module:
+    """Construct K3 MoE with the token ownership required by its transport.
+
+    Arguments match the K3 MoE constructor; the returned module preserves the
+    checkpoint parameter names and the common model-forward interface.
+    """
+    implementation = KimiLinearMoE
+    if get_all2all_backend().is_deepep():
+        from tokenspeed.runtime.models.kimi_k3_deepep import KimiLinearMoEDeepEP
+
+        implementation = KimiLinearMoEDeepEP
+    return implementation(
+        config=config,
+        mapping=mapping,
+        layer_index=layer_index,
+        model_scope=model_scope,
+        moe_block_count=moe_block_count,
+        quant_config=quant_config,
+        prefix=prefix,
+        alt_stream=alt_stream,
+    )
 
 
 class KimiLinearDecoderLayer(nn.Module):
@@ -1551,9 +2900,13 @@ class KimiLinearDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         mapping: Mapping,
         layer_id: int,
+        model_scope: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        qkv_parallel: DenseLayerMapping | None,
+        output_parallel: DenseLayerMapping | None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1564,7 +2917,13 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_prefix = add_prefix("self_attn", prefix)
         if config.is_kda_layer(layer_id):
             self.self_attn = KimiLinearKDA(
-                config, mapping, layer_id, quant_config, attn_prefix
+                config,
+                mapping,
+                layer_id,
+                quant_config,
+                attn_prefix,
+                qkv_parallel=qkv_parallel,
+                output_parallel=output_parallel,
             )
         else:
             self.self_attn = KimiLinearMLAAttention(
@@ -1583,6 +2942,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 prefix=attn_prefix,
                 reduce_attn_results=False,  # layer fused AR+residual reduces
                 alt_stream=alt_stream,
+                qkv_parallel=qkv_parallel,
+                output_parallel=output_parallel,
             )
 
         # --- FFN: dense MLP (first_k_dense_replace) or MoE block ---
@@ -1595,21 +2956,27 @@ class KimiLinearDecoderLayer(nn.Module):
         if self.is_moe_layer:
             # Named for the checkpoint index; not aliased as self.mlp (double
             # registration would duplicate every MoE param in state_dict).
-            self.block_sparse_moe = KimiLinearMoE(
-                config,
-                mapping,
-                quant_config,
-                layer_id,
-                add_prefix("block_sparse_moe", prefix),
+            self.block_sparse_moe = create_kimi_linear_moe(
+                moe_block_count=_k3_local_moe_blocks(config, mapping),
+                config=config,
+                mapping=mapping,
+                layer_index=layer_id,
+                model_scope=model_scope,
+                quant_config=quant_config,
+                prefix=add_prefix("block_sparse_moe", prefix),
                 alt_stream=alt_stream,
             )
         else:
             self.mlp = KimiLinearMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
-                mapping=mapping,
-                quant_config=quant_config,
+                tp_rank=mapping.dense.tp_rank,
+                tp_size=mapping.dense.tp_size,
+                tp_group=mapping.dense.tp_group,
+                shared_parallel=None,
+                quant_config=_dense_mlp_quant_config(quant_config),
                 prefix=add_prefix("mlp", prefix),
+                is_shared_expert=False,
                 reduce_results=True,
                 activation_situ_beta=situ_beta,
                 activation_situ_linear_beta=situ_linear_beta,
@@ -1641,26 +3008,7 @@ class KimiLinearDecoderLayer(nn.Module):
 
         # K3 AttnRes bypasses CommManager's fused residual, but the MLA attention
         # still uses it for the (no-op in AllReduce mode) pre_attn_comm.
-        # Fused AR+residual for the attention reduce: ones-weight RMSNorm rides
-        # the one-shot pattern; its norm output is discarded. Enabled when the
-        # attention TP group's one-shot lane is armed.
-        self._attn_ar_residual_fusion = (
-            mapping.attn.tp_size > 1
-            and prepare_all_reduce_lane(mapping.attn.tp_group, config.hidden_size)
-            and prepare_all_reduce_fusion(
-                mapping.attn.tp_group,
-                config.hidden_size,
-                max(
-                    int(global_server_args_dict["comm_fusion_max_num_tokens"]),
-                    1,
-                ),
-            )
-        )
-        self._dummy_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self._dummy_norm.weight.data = torch.ones(
-            config.hidden_size, dtype=torch.bfloat16
-        )
-        self._dummy_norm.weight.requires_grad_(False)
+        self.k3_comm = K3AttnComm(mapping=mapping, hidden_size=config.hidden_size)
 
         self.attn_fork = StreamFork(alt_stream)
         # (proj_w_getter, norm, valid_blocks) for the NEXT layer's attn-side
@@ -1677,6 +3025,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self._attn_split = False
         # True when the PREVIOUS layer precomputes our mlp-side block partial.
         self._mlp_split = False
+        self._dflash_attnres_capture_fallback = False
         # True when the NEXT layer folds our routed+shared residual accumulate
         # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
@@ -1684,8 +3033,10 @@ class KimiLinearDecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=False,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def _reduce_attn_accumulate(
@@ -1693,100 +3044,35 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_partial: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         combine: tuple | None = None,
+        *,
+        producer_direct: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """All-reduce the attention partial and accumulate the residual.
 
-        Small batches fold the residual add into the one-shot AR kernel;
-        with ``combine = (scratch, res_w, rms_w, out_norm_w, eps)`` the
-        mlp-side AttnRes prefix combine also rides its epilogue and the mixed
-        hidden comes back as the second return (else None -- block-write
-        layers, large batches and the plain-reduce fallback).
+        Delegates to :meth:`K3AttnComm.attn_reduce`; see kimi_k3_comm.py for
+        the branch semantics (AttnRes-combine epilogue / fused AR+residual /
+        B1 combine / plain reduce).
         """
-        num_tokens = attn_partial.shape[0]
-        if (
-            prefix_sum is not None
-            and self._attn_ar_residual_fusion
-            and 0 < num_tokens
-            and num_tokens <= global_server_args_dict["comm_fusion_max_num_tokens"]
-        ):
-            if combine is not None:
-                from tokenspeed_kernel.ops.communication.trtllm import (
-                    allreduce_residual_attnres_combine,
-                )
+        return self.k3_comm.attn_reduce(
+            attn_partial,
+            prefix_sum,
+            combine,
+            producer_direct=producer_direct,
+            mlp_wp=self._mlp_wp,
+        )
 
-                from tokenspeed.runtime.utils.pdl import pdl_enabled
-
-                scratch, res_w, rms_w, out_norm_w, eps = combine
-                h, residual_out = allreduce_residual_attnres_combine(
-                    attn_partial,
-                    prefix_sum,
-                    res_w,
-                    rms_w,
-                    out_norm_w,
-                    scratch=scratch,
-                    rank=self.mapping.attn.tp_rank,
-                    group=_get_process_group(self.mapping.attn.tp_group),
-                    eps=eps,
-                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    launch_with_pdl=pdl_enabled(),
-                )
-                return residual_out, h
-            _, residual_out, *_ = self._dummy_norm.forward_with_allreduce_fusion(
-                self.mapping.attn.tp_rank,
-                self.mapping.attn.tp_group,
-                attn_partial,
-                prefix_sum,
-            )
-            if residual_out is not None:
-                return residual_out, None
-        if combine is not None and prefix_sum is not None and num_tokens == 1:
-            scratch, _, _, out_norm_w, eps = combine
-            if out_norm_w is not None:
-                from tokenspeed_kernel.ops.communication.triton import (
-                    allreduce_residual_attnres_combine,
-                    allreduce_residual_attnres_combine_supported,
-                )
-
-                group = _get_process_group(self.mapping.attn.tp_group)
-                fused_supported = not global_server_args_dict.get(
-                    "force_deterministic_rsag", False
-                ) and allreduce_residual_attnres_combine_supported(
-                    attn_partial,
-                    prefix_sum,
-                    self._mlp_wp,
-                    out_norm_w,
-                    scratch,
-                    rank=self.mapping.attn.tp_rank,
-                    group=group,
-                    local_world_size=self.mapping.nprocs_per_node,
-                )
-                if fused_supported:
-                    h, residual_out = allreduce_residual_attnres_combine(
-                        attn_partial,
-                        prefix_sum,
-                        self._mlp_wp,
-                        out_norm_w,
-                        scratch,
-                        rank=self.mapping.attn.tp_rank,
-                        group=group,
-                        local_world_size=self.mapping.nprocs_per_node,
-                        eps=eps,
-                    )
-                else:
-                    residual_out = prefix_sum + all_reduce(
-                        attn_partial, self.mapping.attn.tp_group
-                    )
-                    h = attnres_combine(
-                        residual_out,
-                        self._mlp_wp,
-                        out_norm_w,
-                        eps,
-                        scratch,
-                        torch.empty_like(residual_out),
-                    )
-                return residual_out, h
-        reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
-        return (reduced if prefix_sum is None else prefix_sum + reduced), None
+    def capture_attnres(
+        self, prefix_sum: torch.Tensor, block_residual: torch.Tensor
+    ) -> torch.Tensor:
+        """Produce the preceding checkpoint tap before input norm and state writes."""
+        mixed = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.prev_valid_blocks,
+        )
+        return prefix_sum.clone() if mixed is prefix_sum else mixed
 
     def _mix_into_attention(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
@@ -1829,15 +3115,210 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum = None
         return h, prefix_sum
 
+    def _fused_attnres_graph_available(
+        self, hidden_states: torch.Tensor, block_residual: torch.Tensor
+    ) -> bool:
+        # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
+        if self._dflash_attnres_capture_fallback:
+            return False
+
+        # B1 already fuses the post-attention mix into the all-reduce.
+        if hidden_states.shape[0] == 1:
+            return False
+
+        num_tokens = hidden_states.shape[0]
+        if (
+            not self.is_block_write_layer
+            and hidden_states.is_cuda
+            and self.prev_valid_blocks > 0
+            and self._mlp_wp is not None
+            and 0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
+        ):
+            combine = (
+                _sliced_scratch(hidden_states, self._mlp_slot, num_tokens),
+                self.mlp_res_proj.weight.reshape(-1),
+                self.mlp_res_norm.weight,
+                self.post_attention_layernorm.weight,
+                self.mlp_res_norm.variance_epsilon,
+            )
+            if self.k3_comm.fused_attnres_reduce_available(
+                hidden_states,
+                hidden_states,
+                combine,
+                self._mlp_wp,
+            ):
+                return False
+
+        block_write_idx = self.block_write_idx if self.is_block_write_layer else -1
+        pre_attn = attn_res_fwd_available(
+            hidden_states,
+            block_residual,
+            self.self_attention_res_proj.weight.reshape(-1),
+            self.self_attention_res_norm.weight,
+            self.self_attention_res_norm.variance_epsilon,
+            out_norm_weight=self.input_layernorm.weight,
+            out_norm_eps=self.input_layernorm.variance_epsilon,
+            num_valid_blocks=self.prev_valid_blocks,
+            block_write_idx=block_write_idx,
+        )
+        if not pre_attn:
+            return False
+
+        mlp_valid_blocks = self.prev_valid_blocks + int(self.is_block_write_layer)
+        return attn_res_fwd_available(
+            hidden_states,
+            block_residual,
+            self.mlp_res_proj.weight.reshape(-1),
+            self.mlp_res_norm.weight,
+            self.mlp_res_norm.variance_epsilon,
+            out_norm_weight=self.post_attention_layernorm.weight,
+            out_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            delta=None if self.is_block_write_layer else hidden_states,
+            num_valid_blocks=mlp_valid_blocks,
+        )
+
+    def _forward_fused_attnres_graph(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+        block_residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one AttnRes launch on each side of the attention collective."""
+        prefix_sum = hidden_states
+        h = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.prev_valid_blocks,
+            out_norm=self.input_layernorm,
+            block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
+        )
+
+        # The collective depends on row count and topology in every forward mode.
+        projection_out = self.k3_comm.acquire_projection_output(
+            h,
+            self.self_attn.o_proj,
+        )
+        attn_partial = self.self_attn(
+            positions=positions,
+            hidden_states=h,
+            ctx=ctx,
+            comm_manager=self.comm_manager,
+            attnres_partial_args=None,
+            projection_out=projection_out,
+        )
+        mixed = None
+        if (
+            projection_out is not None
+            and self.is_moe_layer
+            and isinstance(self.block_sparse_moe, KimiLinearMoE)
+            and self.block_sparse_moe.native_latent_moe is None
+            and self.mapping.attn.dp_size == 1
+        ):
+            mixed = self.k3_comm.mix_for_moe(
+                attn_partial,
+                None if self.is_block_write_layer else prefix_sum,
+                block_residual,
+                self.mlp_res_proj.weight.reshape(-1),
+                self.mlp_res_norm.weight,
+                eps=self.mlp_res_norm.variance_epsilon,
+                out_norm_weight=self.post_attention_layernorm.weight,
+                out_norm_eps=self.post_attention_layernorm.variance_epsilon,
+                num_valid_blocks=self.prev_valid_blocks
+                + int(self.is_block_write_layer),
+            )
+        prefix_is_sharded = mixed is not None
+        if mixed is not None:
+            prefix_sum, h = mixed
+        else:
+            prefix_sum, delta = self.k3_comm.reduce_for_attnres(
+                attn_partial,
+                None if self.is_block_write_layer else prefix_sum,
+                producer_direct=projection_out is not None,
+            )
+            h = _apply_attn_res(
+                prefix_sum,
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.prev_valid_blocks + int(self.is_block_write_layer),
+                out_norm=self.post_attention_layernorm,
+                delta=delta,
+            )
+
+        # Before the MoE: the next layer's PDL combine prefetches this scratch early.
+        if not prefix_is_sharded:
+            self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
+        if self.is_moe_layer:
+            num_global_tokens, max_num_tokens_per_gpu = (
+                self.comm_manager.get_num_tokens(ctx)
+            )
+            prefix_sum = self.block_sparse_moe(
+                h,
+                prefix_sum,
+                num_global_tokens=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                # ctx is required by the cross-DP-EP token gather (was missing).
+                ctx=ctx,
+                prefix_is_sharded=prefix_is_sharded,
+            )
+        else:
+            prefix_sum = prefix_sum + self.mlp(h)
+        return prefix_sum, block_residual
+
+    def _prepare_next_fallback_attnres_partial(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> None:
+        """Bridge a fused layer to the existing split AttnRes fallback."""
+        num_tokens = hidden_states.shape[0]
+        if (
+            self._next_attn_mix is None
+            or not hidden_states.is_cuda
+            or not 0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
+        ):
+            return
+
+        next_layer, valid_blocks = self._next_attn_mix
+        if next_layer._fused_attnres_graph_available(hidden_states, block_residual):
+            return
+        attn_scratch = _sliced_scratch(hidden_states, 1, num_tokens)
+        if self._hoist_next_mlp:
+            attnres_partial_dual(
+                block_residual[:valid_blocks],
+                next_layer._mlp_wp,
+                next_layer._attn_wp,
+                next_layer.mlp_res_norm.variance_epsilon,
+                _sliced_scratch(hidden_states, next_layer._mlp_slot, num_tokens),
+                attn_scratch,
+            )
+        else:
+            attnres_partial(
+                block_residual[:valid_blocks],
+                next_layer._attn_wp,
+                next_layer.self_attention_res_norm.variance_epsilon,
+                attn_scratch,
+            )
+
     @torch.no_grad()
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._fused_attnres_graph_available(hidden_states, block_residual):
+            return self._forward_fused_attnres_graph(
+                positions,
+                hidden_states,
+                ctx,
+                block_residual,
+            )
+
         h, prefix_sum = self._mix_into_attention(hidden_states, block_residual)
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
@@ -1870,10 +3351,11 @@ class KimiLinearDecoderLayer(nn.Module):
             else None
         )
         attnres_partial_args = None
-        if next_mix is not None and self._hoist_next_mlp and num_tokens == 1:
+        if next_mix is not None and self._hoist_next_mlp:
             next_layer, _ = next_mix
             # This layer's attention projection writes both block partials
             # hoisted for the next layer, which consumes their scratch slots.
+            # Kernel availability below is the token-count capability gate.
             candidate_args = (
                 block_residual[:mlp_valid_blocks],
                 next_layer._mlp_wp,
@@ -1891,11 +3373,20 @@ class KimiLinearDecoderLayer(nn.Module):
             and (
                 num_tokens == 1
                 or (
-                    self._attn_ar_residual_fusion
+                    self.k3_comm.attn_ar_fusion_ok
                     and num_tokens
                     <= global_server_args_dict["comm_fusion_max_num_tokens"]
                 )
+                or self.k3_comm.fused_attnres_reduce_available(
+                    h,
+                    prefix_sum,
+                    ar_combine,
+                    self._mlp_wp,
+                )
             )
+        )
+        projection_out = self.k3_comm.acquire_projection_output(
+            h, self.self_attn.o_proj
         )
         with self.attn_fork.scope(
             enable=(
@@ -1935,17 +3426,23 @@ class KimiLinearDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=h,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
                 attnres_partial_args=attnres_partial_args,
+                projection_out=projection_out,
             )
             if not reduce_consumes_scratch:
                 prefix_sum, h_fused = self._reduce_attn_accumulate(
-                    attn_out, prefix_sum, combine=ar_combine
+                    attn_out,
+                    prefix_sum,
+                    combine=ar_combine,
+                    producer_direct=projection_out is not None,
                 )
         if reduce_consumes_scratch:
             prefix_sum, h_fused = self._reduce_attn_accumulate(
-                attn_out, prefix_sum, combine=ar_combine
+                attn_out,
+                prefix_sum,
+                combine=ar_combine,
+                producer_direct=projection_out is not None,
             )
         # --- mlp: AttnRes mixing -> norm -> FFN -> accumulate ---
         if h_fused is not None:
@@ -1978,6 +3475,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 ctx=ctx,
+                prefix_is_sharded=False,
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)
@@ -2010,37 +3508,73 @@ class KimiLinearModel(nn.Module):
         self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
+        self.iris_states = K3AttnComm.iris_states
 
-        alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # Agree on parsed sizes before any shared-expert subgroup is created.
+        shared_size = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
+        shared_parallel = validate_shared_expert_settings(mapping, shared_size)
+        if shared_parallel is not None:
+            initialize_shared_expert_group(shared_parallel)
+            logger.info(
+                f"K3 shared-expert TP enabled: tp_size={shared_parallel.tp_size}, num_groups={shared_parallel.dp_size}"
+            )
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+        qkv_parallel, output_parallel = validate_projection_settings(
+            mapping,
+            envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE.get(),
+            envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
         )
+
+        alt_stream = (
+            torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
+        )
+
+        # Pipeline stage layer window: [pp_start_layer, pp_end_layer). Global
+        # layer numbering everywhere; other stages' slots hold PPMissingLayer.
+        self.pp_start_layer, self.pp_end_layer = pp_layer_window(
+            config.num_hidden_layers, mapping
+        )
+        if mapping.is_first_pp_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                tp_rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                tp_group=mapping.attn.tp_group,
+            )
+        else:
+            self.embed_tokens = None
+
+        layers_scope = add_prefix("layers", prefix)
 
         def get_layer(idx: int, prefix: str):
             return KimiLinearDecoderLayer(
                 config=config,
                 mapping=mapping,
                 layer_id=idx,
+                model_scope=layers_scope,
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                qkv_parallel=qkv_parallel,
+                output_parallel=output_parallel,
             )
 
         self.layers = make_layers(
             config.num_hidden_layers,
             get_layer,
-            prefix=add_prefix("layers", prefix),
+            prefix=layers_scope,
+            pp_start_layer=self.pp_start_layer,
+            pp_end_layer=self.pp_end_layer,
         )
         # Cross-layer attn-side mix precompute: a layer's aux stream computes
         # the NEXT layer's block partial alongside its own mlp-side partial
-        # (one dual sweep under attention; blocks are final by then).
-        for i in range(len(self.layers) - 1):
+        # (one dual sweep under attention; blocks are final by then). Under PP
+        # the pair must live on the same stage — the stage boundary severs the
+        # dual sweep there, and the downstream stage's first layer falls back
+        # to its own (non-split) AttnRes mixing.
+        for i in range(self.pp_start_layer, self.pp_end_layer - 1):
             cur, nxt = self.layers[i], self.layers[i + 1]
             if nxt.prev_valid_blocks > 0:
                 assert (
@@ -2054,16 +3588,22 @@ class KimiLinearModel(nn.Module):
                 cur._hoist_next_mlp = not nxt.is_block_write_layer
                 nxt._mlp_split = cur._hoist_next_mlp
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # Model-level AttnRes output mixing.
-        self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.output_attn_res_proj = ReplicatedLinear(
-            config.hidden_size,
-            1,
-            bias=False,
-            prefix=add_prefix("output_attn_res_proj", prefix),
-        )
+        if mapping.is_last_pp_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            # Model-level AttnRes output mixing.
+            self.output_attn_res_norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.output_attn_res_proj = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                prefix=add_prefix("output_attn_res_proj", prefix),
+            )
+        else:
+            self.norm = None
+            self.output_attn_res_norm = None
+            self.output_attn_res_proj = None
         # One-based completed-layer ids; see set_eagle3_layers_to_capture.
         self.eagle3_layers_to_capture: tuple[int, ...] = ()
 
@@ -2071,12 +3611,65 @@ class KimiLinearModel(nn.Module):
         # stream is captured for the draft. Populated by
         # ``set_dflash_layers_to_capture``; empty means no capture.
         self.layers_to_capture: list[int] = []
-        self._dflash_incremental_callback = None
-        self._dflash_slot_bufs = None
+        self.dflash_aux_stream: str = "prefix"
+        # Each capture layer's positional tap index (the draft concatenates
+        # taps in this order).
         self._dflash_capture_idx_map: dict[int, int] = {}
+        self.pp_context_hidden_size: int | None = None
+
+    def _refresh_dflash_capture_fallback(self) -> None:
+        """Mark AttnRes consumers that need split execution."""
+        captured = set(self.layers_to_capture)
+        use_fallback = self.dflash_aux_stream == "attn_res"
+        for layer_idx, layer in enumerate(self.layers):
+            layer._dflash_attnres_capture_fallback = use_fallback and (
+                layer_idx - 1 in captured
+            )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
+
+    def pp_stage_state_spec(
+        self, num_tokens: int, device: torch.device
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        """Wire spec (name, shape, dtype) of the inter-stage boundary bundle.
+
+        K3's boundary state is the accumulated ``prefix_sum`` stream plus the
+        valid prefix of the AttnRes ``block_residual`` snapshot buffer. The
+        upstream stage ships ``ceil_div(its pp_end_layer, block)`` snapshot
+        rows and this stage expects ``ceil_div(pp_start_layer, block)`` — the
+        two are the same number because the windows abut, so no shape
+        metadata crosses the wire.
+        """
+        del device
+        hidden = self.config.hidden_size
+        valid_blocks = ceil_div(self.pp_start_layer, self.config.attn_res_block_size)
+        # The activation dtype. get_default_dtype() would be wrong here (the
+        # model-dtype context only wraps weight loading); take it from any
+        # floating live parameter — mid-stage ranks have no embed/norm.
+        dtype = None
+        for param in self.parameters():
+            if param.is_floating_point() and param.dtype in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                dtype = param.dtype
+                break
+        if dtype is None:
+            dtype = torch.bfloat16
+        spec = [
+            ("hidden_states", (num_tokens, hidden), dtype),
+            ("block_residual", (valid_blocks, num_tokens, hidden), dtype),
+        ]
+        if self.pp_context_hidden_size is not None:
+            spec.append(
+                (
+                    "projected_context",
+                    (num_tokens, self.pp_context_hidden_size),
+                    torch.float32,
+                )
+            )
+        return spec
 
     def _dspark_capture_stream(
         self,
@@ -2084,16 +3677,22 @@ class KimiLinearModel(nn.Module):
         prefix_sum: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> torch.Tensor:
-        """Capture vLLM's completed-layer DSpark target stream.
+        """Capture the configured target stream after layer_idx."""
+        if self.dflash_aux_stream != "attn_res":
+            return prefix_sum.clone()
 
-        vLLM captures ``prefix_sum + hidden_states`` immediately after the
-        named layer. This implementation accumulates the layer output into
-        ``prefix_sum`` before returning from the layer, so that sum is already
-        represented by ``prefix_sum``. Clone because later layers may update
-        the same storage in place.
-        """
-        del layer_idx, block_residual
-        return prefix_sum.clone()
+        if layer_idx + 1 < len(self.layers):
+            return self.layers[layer_idx + 1].capture_attnres(
+                prefix_sum, block_residual
+            )
+        proj = self.output_attn_res_proj
+        norm = self.output_attn_res_norm
+        num_blocks = ceil_div(
+            self.config.num_hidden_layers, self.config.attn_res_block_size
+        )
+
+        mixed = _apply_attn_res(prefix_sum, block_residual, proj, norm, num_blocks)
+        return prefix_sum.clone() if mixed is prefix_sum else mixed
 
     @torch.no_grad()
     def forward(
@@ -2101,11 +3700,15 @@ class KimiLinearModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: "ForwardContext",
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
+        pp_inbound: PPStageState | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, list | None]:
-        if input_embeds is not None:
+    ) -> tuple[torch.Tensor | PPStageState, list | None]:
+        if pp_inbound is not None:
+            # Mid-pipeline stage: resume the AttnRes stream received from the
+            # upstream stage instead of embedding.
+            hidden_states = pp_inbound.hidden_states
+        elif input_embeds is not None:
             hidden_states = input_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
@@ -2119,35 +3722,102 @@ class KimiLinearModel(nn.Module):
         block_residual = hidden_states.new_empty(
             num_blocks, hidden_states.size(0), hidden_states.size(1)
         )
+        if pp_inbound is not None:
+            # Seed the upstream stage's snapshot rows; this stage's own
+            # block-write layers fill the rest.
+            inbound_blocks = pp_inbound.block_residual
+            block_residual[: inbound_blocks.size(0)].copy_(inbound_blocks)
 
         capture_layers = self.layers_to_capture
         capture_dflash = bool(capture_layers)
         capture_eagle3 = bool(self.eagle3_layers_to_capture)
+        dspark_context = ctx.dspark_context_producer
         aux_hidden_states: list[torch.Tensor] | None = (
-            [] if capture_dflash or capture_eagle3 else None
+            []
+            if (capture_dflash and dspark_context is None) or capture_eagle3
+            else None
         )
+        projected_context = None
+        if dspark_context is not None:
+            projected_context = dspark_context.begin_stage(
+                hidden_states,
+                pp_inbound.projected_context if pp_inbound is not None else None,
+            )
 
         prefix_sum = hidden_states
-        for layer_idx, layer in enumerate(self.layers):
-            prefix_sum, block_residual = layer(
-                positions, prefix_sum, ctx, out_cache_loc, block_residual
+
+        def capture_tap(layer_idx: int) -> None:
+            captured = self._dspark_capture_stream(
+                layer_idx, prefix_sum, block_residual
             )
-            if capture_dflash and layer_idx in capture_layers:
-                captured = self._dspark_capture_stream(
-                    layer_idx, prefix_sum, block_residual
-                )
-                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if self._dflash_slot_bufs is not None and capture_idx is not None:
-                    num_tokens = captured.shape[0]
-                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
-                    if self._dflash_incremental_callback is not None:
-                        self._dflash_incremental_callback(capture_idx, num_tokens)
+            capture_idx = self._dflash_capture_idx_map[layer_idx]
+            if dspark_context is not None:
+                dspark_context.add_capture(projected_context, capture_idx, captured)
+            else:
+                if ctx.target_capture_sink is not None:
+                    ctx.target_capture_sink.on_target_capture(capture_idx, captured)
                 assert aux_hidden_states is not None
                 aux_hidden_states.append(captured)
+
+        for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
+            layer = self.layers[layer_idx]
+            # Tap labels stay checkpoint indices. AttnRes L is produced at
+            # L+1's entry on every topology, before that layer mutates snapshots.
+            if self.dflash_aux_stream == "attn_res" and layer_idx - 1 in capture_layers:
+                capture_tap(layer_idx - 1)
+            prefix_sum, block_residual = layer(
+                positions, prefix_sum, ctx, block_residual
+            )
+            if self.dflash_aux_stream == "prefix" and layer_idx in capture_layers:
+                capture_tap(layer_idx)
             # Clone: the copy must survive the next layer's in-place residual writes.
-            elif capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
+            if capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
                 assert aux_hidden_states is not None
                 aux_hidden_states.append(prefix_sum.clone())
+
+        if not self.mapping.is_last_pp_rank:
+            # Hand the AttnRes thread state to the next stage: the prefix sum
+            # plus the snapshot rows written so far. The wire count matches
+            # the downstream spec because the windows abut on the same block
+            # arithmetic (ceil_div of the shared boundary layer id).
+            valid_blocks = ceil_div(self.pp_end_layer, self.config.attn_res_block_size)
+            return (
+                PPStageState(
+                    hidden_states=prefix_sum,
+                    block_residual=block_residual[:valid_blocks],
+                    projected_context=projected_context,
+                ),
+                None,
+            )
+
+        if (
+            self.dflash_aux_stream == "attn_res"
+            and self.config.num_hidden_layers - 1 in capture_layers
+        ):
+            capture_tap(self.config.num_hidden_layers - 1)
+
+        if dspark_context is not None:
+            # Target and draft views share the full-history group's page-id
+            # space; keep the target's packed order: extend rows, then verify
+            # rows. A pure prefill round (every request extending -- a PD
+            # prefill engine never publishes a decode window) reads the
+            # extend span only.
+            if ctx.num_extends == ctx.bs:
+                cache_locs = ctx.attn_backend.extend_span_locations()
+            elif ctx.num_extends == 0:
+                cache_locs = ctx.attn_backend.decode_window_locations()
+            else:
+                cache_locs = torch.cat(
+                    (
+                        ctx.attn_backend.extend_span_locations(),
+                        ctx.attn_backend.decode_window_locations(),
+                    )
+                )
+            dspark_context.write_context(
+                projected_context,
+                positions,
+                cache_locs[: ctx.input_num_tokens],
+            )
 
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -2170,6 +3840,59 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     model_cls = KimiLinearModel
 
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        shared_mlps = [
+            layer.block_sparse_moe.shared_experts
+            for layer in self.model.layers
+            if hasattr(layer, "block_sparse_moe")
+            and layer.block_sparse_moe.shared_experts.shared_parallel is not None
+        ]
+        if shared_mlps:
+            communication = shared_mlps[0].shared_communication
+            weight = shared_mlps[0].gate_up_proj.weight
+            if weight.dtype != torch.bfloat16:
+                raise ValueError("Shared-expert TP currently requires BF16 weights")
+            if communication is None:
+                communication = SharedExpertCommunication(
+                    shared_mlps[0].shared_parallel,
+                    max_num_tokens,
+                    self.config.hidden_size,
+                    weight.device,
+                )
+            elif max_num_tokens > communication.capacity:
+                raise RuntimeError("Cannot grow a prepared shared-expert workspace")
+            for mlp in shared_mlps:
+                mlp.shared_communication = communication
+        routed_hidden_size = (
+            self.config.routed_expert_hidden_size
+            if self.config.routed_expert_hidden_size is not None
+            else self.config.hidden_size
+        )
+        prepared = prepare_k3_all_reduce_buffers(
+            mapping=self.mapping,
+            hidden_size=self.config.hidden_size,
+            routed_hidden_size=routed_hidden_size,
+            max_num_tokens=max_num_tokens,
+            states=self.model.iris_states,
+        )
+        attn_state = self.model.iris_states.get(self.mapping.attn.tp_group)
+        moe_state = self.model.iris_states.get(self.mapping.moe.tp_ep_group)
+        moe_comm: K3MoeTailComm | None = None
+        for layer in self.model.layers:
+            if not isinstance(layer, KimiLinearDecoderLayer):
+                continue
+            layer.k3_comm.iris_state = attn_state
+            if not layer.is_moe_layer:
+                continue
+            moe = layer.block_sparse_moe
+            if isinstance(moe, KimiLinearMoE):
+                moe.iris_state = moe_state
+                if moe_comm is None:
+                    moe_comm = moe.comm
+        if moe_comm is not None:
+            prepared = moe_comm.prepare(max_num_tokens) or prepared
+        return bool(shared_mlps) or prepared
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
         num_layers = len(self.model.layers)
@@ -2191,15 +3914,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
             )
         self.model.eagle3_layers_to_capture = tuple(selected)
 
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Capture the K3 residual stream after each named target layer.
 
         DFLASH/DSpark checkpoints name 0-indexed completed-layer outputs. The
@@ -2223,8 +3938,37 @@ class KimiLinearForCausalLM(BaseCausalLM):
         self.model._dflash_capture_idx_map = {
             layer_idx: i for i, layer_idx in enumerate(self.model.layers_to_capture)
         }
-        self.model._dflash_incremental_callback = incremental_callback
-        self.model._dflash_slot_bufs = slot_bufs
+        self.model._refresh_dflash_capture_fallback()
+
+    def set_target_context_capture(
+        self, layer_ids: list[int], stream: str, hidden_size: int
+    ) -> None:
+        """Configure per-tap projection without retaining concatenated hidden rows."""
+        self.set_dflash_layers_to_capture(layer_ids)
+        self.set_dflash_aux_hidden_stream(stream)
+        self.capture_aux_hidden_states = False
+        self.model.pp_context_hidden_size = hidden_size
+
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        """Select which K3 residual stream the DFLASH/DSpark taps read."""
+        if stream not in ("prefix", "attn_res"):
+            raise ValueError(
+                f"Unknown DFLASH aux hidden stream {stream!r}; "
+                "expected 'prefix' or 'attn_res'."
+            )
+        if stream == "attn_res" and not getattr(
+            self.config, "attn_res_block_size", None
+        ):
+            raise ValueError(
+                "The 'attn_res' aux hidden stream needs a target with AttnRes "
+                "enabled (config.attn_res_block_size); this target has none."
+            )
+        self.model.dflash_aux_stream = stream
+        self.model._refresh_dflash_capture_fallback()
+        logger.info(
+            "DFLASH/DSpark target capture: layers="
+            f"{tuple(self.model.layers_to_capture)!s} stream={stream!s}",
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the ``model.*`` / ``lm_head.*`` text weights.
@@ -2237,7 +3981,25 @@ class KimiLinearForCausalLM(BaseCausalLM):
         KDA layers' remaining ``self_attn.*`` weights (conv + A_log / dt_bias /
         f_b / o_norm / o_proj) load directly through the default path — their
         names match ``KimiLinearKDA``'s modules 1:1 (no fusion).
+
+        ModelOpt FP8_PB_WO checkpoints (nvidia/Kimi-K3-NVFP4) are adapted by
+        ``preprocess_fp8_pb_wo_weights`` before any of the above: only f_b
+        (raw GEMV inside the KDA attention backend) arrives block-dequantized
+        to bf16; every other attention projection stays FP8-resident with its
+        scale renamed to ``weight_scale_inv`` — o_proj / kv_b / q_b flow to
+        their w8a8 LinearBase params, the KDA merged q/k/v/g/f_a/b shards
+        stack into the FP8 qkvgb buffer (segment-concatenated scale grid),
+        and the MLA q_a/kv_a/g segments are reassembled verbatim into the
+        fused_qkv_a private layout below.
         """
+        weights = preprocess_fp8_pb_wo_weights(weights, self.quant_config)
+        weights = preprocess_mxfp4_checkpoint_weights(
+            weights,
+            self.quant_config,
+            dequantize_mxfp4_module=lambda module: bool(
+                _K3_DENSE_MLP_MODULE.search(module)
+            ),
+        )
         config = self.config
         stacked_params_mapping = [
             # KDA q/k/v/g/f_a/b stack into qkvgb_proj; MLA's g_proj falls
@@ -2254,6 +4016,86 @@ class KimiLinearForCausalLM(BaseCausalLM):
         fuse_qkv_a_proj = config.q_lora_rank is not None
 
         params_dict = dict(self.named_parameters())
+
+        # ModelOpt FP8_PB_WO fused_qkv_a assembly: MLA q_a / kv_a / g_proj
+        # arrive FP8-resident with per-segment block scales. The canonical
+        # [q_a | kv_a | gate] order is not 128-block aligned (the gate would
+        # start at row q_lora+kv_lora+rope = 2112), so collect the six
+        # tensors per MLA layer and stack them VERBATIM in the private
+        # [gate | q_a | kv_a | pad] order (_FP8_FUSED_QKV_A_ORDER) — zero
+        # requantization. KDA g_proj (FP8 too, but stacked into the merged
+        # qkvgb buffer) and bf16 checkpoints skip this path entirely.
+        fp8_fused_pending: dict[str, dict[str, torch.Tensor]] = {}
+        fp8_fused_segments = frozenset(_FP8_FUSED_QKV_A_ORDER)
+
+        def _try_fp8_fused_assembly(name: str, loaded_weight: torch.Tensor) -> bool:
+            is_scale = name.endswith(".weight_scale_inv")
+            if not (is_scale or name.endswith(".weight")):
+                return False
+            module_name = name.rsplit(".", 1)[0]
+            leaf = module_name.rsplit(".", 1)[-1]
+            if leaf not in fp8_fused_segments:
+                return False
+            base = module_name.rsplit(".", 1)[0]
+            fused_weight_name = f"{base}.fused_qkv_a_proj_with_mqa.weight"
+            if fused_weight_name not in params_dict:
+                return False  # KDA layers (g_proj) or unfused configs
+            if f"{base}.fused_qkv_a_proj_with_mqa.weight_scale_inv" not in params_dict:
+                return False  # bf16 or per-channel FP8: canonical fused path
+            if not is_scale and loaded_weight.dtype not in _FP8_WEIGHT_DTYPES:
+                return False  # bf16 checkpoints keep the existing fused path
+            entry = fp8_fused_pending.setdefault(base, {})
+            entry[f"{leaf}.{'scale' if is_scale else 'weight'}"] = loaded_weight
+            if len(entry) < 2 * len(fp8_fused_segments):
+                return True
+            pieces = fp8_fused_pending.pop(base)
+            # The checkpoint gate is globally head-sharded; take this
+            # attention rank's rows (its scale grid slices with it as long
+            # as the shard is block-aligned).
+            gate_w = pieces["g_proj.weight"]
+            gate_s = pieces["g_proj.scale"]
+            gate_rows = gate_w.shape[0] // self.mapping.attn.tp_size
+            if gate_rows % 128 != 0:
+                raise ValueError(
+                    f"FP8 fused_qkv_a gate shard ({gate_rows} rows) must "
+                    "align to the 128-row scale-block grid; adjust the "
+                    "attention TP size."
+                )
+            gate_start = self.mapping.attn.tp_rank * gate_rows
+            blocks_per_shard = gate_rows // 128
+            block_start = self.mapping.attn.tp_rank * blocks_per_shard
+            weight_param = params_dict[fused_weight_name]
+            # Verbatim stack in the private [gate | q_a | kv_a | pad] order:
+            # every boundary is 128-aligned, so codes and scale rows copy
+            # bit-identically — zero requantization; consumers split via
+            # _split_fused_qkv_a. The segment order is derived from
+            # _FP8_FUSED_QKV_A_ORDER so loader and consumers cannot drift.
+            ordered = {
+                "g_proj": (
+                    gate_w[gate_start : gate_start + gate_rows],
+                    gate_s[block_start : block_start + blocks_per_shard],
+                ),
+                "q_a_proj": (pieces["q_a_proj.weight"], pieces["q_a_proj.scale"]),
+                "kv_a_proj_with_mqa": (
+                    pieces["kv_a_proj_with_mqa.weight"],
+                    pieces["kv_a_proj_with_mqa.scale"],
+                ),
+            }
+            fused_w, fused_s = _assemble_fp8_fused_qkv_a(
+                [ordered[leaf] for leaf in _FP8_FUSED_QKV_A_ORDER],
+                # Assemble the full padded layout before the ordinary column
+                # loader intersects it with this projection rank's row shard.
+                total_rows=self.get_submodule(
+                    f"{base}.fused_qkv_a_proj_with_mqa"
+                ).output_size,
+            )
+            weight_param.weight_loader(weight_param, fused_w)
+            scale_param = params_dict[
+                f"{base}.fused_qkv_a_proj_with_mqa.weight_scale_inv"
+            ]
+            scale_param.weight_loader(scale_param, fused_s)
+            return True
+
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -2264,6 +4106,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
             ep_size=self.mapping.moe.ep_size,
         )
 
+        pp_start = self.model.pp_start_layer
+        pp_end = self.model.pp_end_layer
+        pp_windowed = not (pp_start == 0 and pp_end == config.num_hidden_layers)
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -2272,6 +4118,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
             if name.startswith("model.layers."):
                 layer_str = name.split(".")[2]
                 if layer_str.isdigit() and int(layer_str) >= config.num_hidden_layers:
+                    continue
+                # Skip layers another pipeline stage owns: the MoE loader
+                # raises on a matched-but-unloadable expert weight, so
+                # out-of-window layers must be dropped before it sees them.
+                if (
+                    pp_windowed
+                    and layer_str.isdigit()
+                    and not pp_start <= int(layer_str) < pp_end
+                ):
                     continue
             # Compressed-tensors MXFP4 routed experts ship the packed weight as
             # ``...w{1,2,3}.weight_packed``; the mxfp4 MoE param is
@@ -2282,6 +4137,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
             # KDA conv weights are plain params named ``<qkv>_conv1d_weight``.
             if "_conv1d.weight" in name:
                 name = name.replace("_conv1d.weight", "_conv1d_weight")
+
+            # FP8-resident fused_qkv_a segments (verbatim reorder), see above.
+            if _try_fp8_fused_assembly(name, loaded_weight):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -2348,26 +4207,70 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        if fp8_fused_pending:
+            raise RuntimeError(
+                "FP8 fused_qkv_a layers missing segments at end of checkpoint "
+                f"stream: { {k: sorted(v) for k, v in fp8_fused_pending.items()} }"
+            )
         self.post_load_weights()
+        # Return the loader's transient allocator blocks (block-dequant
+        # intermediates for the dequant-routed weights, fused-assembly
+        # segment buffers) to the device before the KV pool sizes itself
+        # from free memory; otherwise the reserved-but-free slack shrinks
+        # the pool by up to ~1 GiB per rank.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def post_load_weights(self) -> None:
         """Prepare the absorbed MLA weights (``w_kc``/``w_vc``) per MLA layer.
 
-        Kimi-K3's attention is unquantized (MXFP4 ignores ``self_attn.*``), so
-        ``kv_b_proj.weight`` is bf16 and no block dequant is needed. KDA layers
-        have no ``kv_b_proj`` (not ``KimiLinearMLAAttention``) and are skipped.
+        With FP8_PB_WO checkpoints ``kv_b_proj.weight`` stays FP8 for the
+        w8a8 prefill GEMM; the absorbed ``w_kc``/``w_vc`` copies follow the
+        DeepSeek R1 precedent and block-dequantize to the activation dtype
+        (``DeepseekV3ForCausalLM.post_load_weights``). bf16 checkpoints (e.g.
+        moonshotai/Kimi-K3, whose MXFP4 config ignores ``self_attn.*``) skip
+        the dequant. KDA layers have no ``kv_b_proj`` (not
+        ``KimiLinearMLAAttention``) and are skipped.
         """
         for layer in self.model.layers:
-            self_attn = layer.self_attn
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None:
+                continue  # PPMissingLayer: another pipeline stage owns it
             if isinstance(self_attn, KimiLinearMLAAttention):
+                w = self_attn.kv_b_proj.weight
+                if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                        raise RuntimeError(
+                            "kv_b_proj.weight_scale_inv is required for block "
+                            "FP8 dequant of the absorbed MLA weights."
+                        )
+                    weight_block_size = (
+                        self_attn.kv_b_proj.quant_method.quant_config.weight_block_size
+                    )
+                    w = block_dequant(
+                        w,
+                        self_attn.kv_b_proj.weight_scale_inv,
+                        weight_block_size,
+                    ).to(torch.get_default_dtype())
                 self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                    self_attn.kv_b_proj.weight, self_attn
+                    w, self_attn
                 )
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
+                merged = self_attn.qkvgb_proj
+                if self_attn.qkv_parallel is not None:
+                    merged.verify_load_complete()
+                    # The ordinary DP Linear quant method owns GEMM preparation.
+                    continue
+                if merged.fp8_channel_quant:
+                    merged.verify_fp8_load_complete()
+                elif getattr(merged, "fp8_block_quant", False):
+                    merged.verify_fp8_load_complete()
 
         # Fold the AttnRes rms_w * res_w products once; the split kernels take a single wp pointer.
         for layer in self.model.layers:
+            if not hasattr(layer, "self_attention_res_norm"):
+                continue  # PPMissingLayer
             layer._attn_wp = (
                 layer.self_attention_res_norm.weight.float()
                 * layer.self_attention_res_proj.weight.reshape(-1).float()
@@ -2430,7 +4333,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
             # Normal serving follows the text embedding dtype. Encoder-only
             # construction uses ModelLoader's configured default dtype.
-            if self.language_model is not None:
+            # Non-first pipeline stages own no embedding (and never run the
+            # vision encoder on live inputs); keep the loader dtype there.
+            if (
+                self.language_model is not None
+                and self.language_model.model.embed_tokens is not None
+            ):
                 target_dtype = self.get_input_embeddings().weight.dtype
                 self.vision = self.vision.to(dtype=target_dtype)
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
@@ -2447,24 +4355,35 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
         return self.language_model.model.get_input_embeddings()
 
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        if self.language_model is None:
+            return False
+        return self.language_model.prepare_communication_runtime(max_num_tokens)
+
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
 
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:
             raise AttributeError(
                 "Kimi-K3 encoder-only mode cannot capture target hidden states."
             )
-        self.language_model.set_dflash_layers_to_capture(
-            layer_ids,
-            incremental_callback=incremental_callback,
-            slot_bufs=slot_bufs,
-        )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def set_target_context_capture(
+        self, layer_ids: list[int], stream: str, hidden_size: int
+    ) -> None:
+        """Forward the pipeline context capture contract to the language model."""
+        if self.language_model is None:
+            raise AttributeError("Encoder-only Kimi-K3 cannot produce draft context")
+        self.language_model.set_target_context_capture(layer_ids, stream, hidden_size)
+
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        self.language_model.set_dflash_aux_hidden_stream(stream)
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if self.language_model is None:
@@ -2493,6 +4412,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return self.language_model.lm_head
 
     @property
+    def model(self):
+        """Expose the text backbone under the ``model`` attribute other
+        registered architectures use (the PP executor resolves the stage wire
+        spec via ``model.pp_stage_state_spec``)."""
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode does not expose a text backbone."
+            )
+        return self.language_model.model
+
+    @property
     def vision_tower(self):
         """Expose the shared MoonViT attribute expected by EPD prefill."""
         return self.vision.vision_tower if self.vision is not None else None
@@ -2509,7 +4439,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
-    ) -> EncoderCudaGraphWrapper:
+    ) -> EncoderForwardStepRunner:
         return self.vision.make_encoder_cudagraph_wrapper(mapping)
 
     def make_encoder_cudagraph_wrappers(self, mapping: Mapping) -> dict:
@@ -2534,6 +4464,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
             or self.vision_embedder is None
             or not multimodal_context.has_extend_inputs()
             or ctx.forward_mode.is_decode_or_idle()
+            # Non-first pipeline stages receive the residual stream from
+            # upstream; they own no embedding to splice vision embeds into.
+            or not self.mapping.is_first_pp_rank
         ):
             return None
         input_embeds, model_kwargs = self.vision_embedder.apply(
@@ -2552,7 +4485,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         ctx: "ForwardContext",
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         if self.language_model is None:
@@ -2567,7 +4499,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
             ctx,
             input_ids,
             positions,
-            out_cache_loc,
             **kwargs,
         )
 
@@ -2618,10 +4549,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
         if dropped_vision_weights:
             logger.warning(
-                "Dropping %d vision weights: multimodal path is inactive.",
-                dropped_vision_weights,
+                f"Dropping {dropped_vision_weights:d} vision weights: multimodal path "
+                "is inactive.",
             )
-        logger.debug("Loaded %d Kimi-K3 vision tensors.", loaded_vision_weights)
+        logger.debug(f"Loaded {loaded_vision_weights:d} Kimi-K3 vision tensors.")
 
 
 EntryClass = [KimiK3ForConditionalGeneration]

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import uuid
 from collections.abc import Mapping
@@ -72,27 +73,20 @@ def is_mm_pad_value_for(token_ids: torch.Tensor, modality: "Modality") -> torch.
     )
 
 
-def maybe_substitute_mm_pad(
-    input_ids: torch.Tensor,
-    substitute_ids: int | Mapping["Modality", int] | None,
+def substitute_mm_pad_(
+    token_ids: torch.Tensor,
+    substitute_ids: Mapping["Modality", int],
 ) -> torch.Tensor:
-    """Replace hash MM-pad positions with in-vocab draft token IDs.
+    """Replace hash MM-pad positions with in-vocab draft token IDs, in place.
 
-    A scalar keeps the legacy behavior and substitutes every modality with one
-    token. A mapping preserves modality-specific semantics, which is required
-    by mixed image+audio prompts such as TML/Inkling.
+    Rewrites every hash-derived multimodal pad id to its modality's in-vocab
+    substitute token, directly in ``token_ids``. Returns ``token_ids``.
+    Modality-specific substitutes are required by mixed image+audio prompts
+    such as TML/Inkling.
     """
-    if substitute_ids is None:
-        return input_ids
-    if isinstance(substitute_ids, int):
-        return input_ids.masked_fill(is_mm_pad_value(input_ids), substitute_ids)
-
-    output = input_ids
     for modality, substitute_id in substitute_ids.items():
-        if output is input_ids:
-            output = input_ids.clone()
-        output.masked_fill_(is_mm_pad_value_for(input_ids, modality), substitute_id)
-    return output
+        token_ids.masked_fill_(is_mm_pad_value_for(token_ids, modality), substitute_id)
+    return token_ids
 
 
 class Modality(Enum):
@@ -138,6 +132,12 @@ def resolve_mm_pad_substitute_ids(config: Any) -> dict[Modality, int]:
             "audio_token_id", "audio_placeholder_token_id"
         ),
     }
+    # GLM-5.3-Flash authors both image and video patch runs with image_token_id;
+    # the surrounding start/end tokens distinguish the modality. Restoring a
+    # hash-derived video pad to video_token_id would therefore change the
+    # authored prompt before the vision embedding is scattered into it.
+    if getattr(config, "model_type", None) == "glm53_flash":
+        candidates[Modality.VIDEO] = candidates[Modality.IMAGE]
     return {
         modality: token_id if token_id is not None else shared
         for modality, token_id in candidates.items()
@@ -169,6 +169,7 @@ class MultimodalDataItem(msgspec.Struct, eq=False, kw_only=True, array_like=True
     # tied to the request: when the request finishes the item is GC'd and
     # these tensors are released. ``encoded_deepstack`` is set only for
     # deepstack-enabled modalities. Scheduler-local: always None on the wire.
+    # Pinned host memory once every encoder token of the item is prefilled.
     encoded: torch.Tensor | None = None
     encoded_deepstack: torch.Tensor | None = None
     # EPD (encode-prefill-decode): when set, this item's embedding is received
@@ -251,7 +252,10 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: torch.Tensor | None = None
     mrope_position_delta_scalar: int | None = None
-    # Scheduler-local expansion cache; always None on the wire.
+    # Retired scheduler-local cache, kept as a reserved trailing slot: this
+    # struct is ``array_like`` and its element ORDER/ARITY is a wire contract
+    # with peers we cannot audit for fixed-arity decoding (an upstream
+    # preprocessor may pre-build these). Always None; never read in-process.
     mrope_position_delta_repeated_cache: torch.Tensor | None = None
 
     def ensure_pad_values(self) -> None:
@@ -282,11 +286,19 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
 
 @dataclasses.dataclass(eq=False)
 class MultimodalForwardContext:
-    """Per-forward multimodal metadata for prefill embedding replacement."""
+    """Per-forward multimodal metadata for prefill embedding replacement.
+
+    A snapshot handed to the data plane inside a forward closure: the
+    ``mm_inputs`` here are shallow copies, so the control plane's later edits
+    to a request's live ``multimodal_inputs`` (M-RoPE position extension as
+    the request generates) are invisible to a forward already in flight.
+    """
 
     mm_inputs: list[MultimodalInputs | None]
     extend_prefix_lens: list[int]
     extend_seq_lens: list[int]
+    # The forward token bound, which caps each encoder call; a larger item runs alone.
+    max_encoder_tokens: int
 
     def has_inputs(self) -> bool:
         return bool(self.mm_inputs and any(x is not None for x in self.mm_inputs))
@@ -296,3 +308,70 @@ class MultimodalForwardContext:
             mm_input is not None and index < len(self.extend_seq_lens)
             for index, mm_input in enumerate(self.mm_inputs)
         )
+
+
+def _resolve_mrope_delta_scalar(mm_input: MultimodalInputs) -> None:
+    """Materialize ``mrope_position_delta_scalar`` from the delta tensor.
+
+    Normally the input processor sets it at admission; a decode-only
+    ``MultimodalInputs`` arriving from a PD prefill node may carry only the
+    tensor. Reading it is a host-side ``item()`` on a CPU tensor, so it costs
+    no device sync and belongs on the control plane.
+
+    Args:
+        mm_input: The request's live multimodal inputs, resolved in place.
+    """
+    if mm_input.mrope_position_delta_scalar is not None:
+        return
+    delta = mm_input.mrope_position_delta
+    if delta is not None:
+        mm_input.mrope_position_delta_scalar = int(delta.flatten()[0].item())
+
+
+def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens: int):
+    """Assemble the batch's :class:`MultimodalForwardContext` from per-request
+    state.
+
+    Args:
+        forward_op: The forward op about to dispatch; supplies the batch's
+            request ids and extend geometry.
+        rid_to_state: The output processor's request-id -> state map, whose
+            states carry each request's ``multimodal_inputs``.
+        max_encoder_tokens: The forward token bound, which caps each encoder call.
+
+    Returns:
+        A ``MultimodalForwardContext`` aligned to the batch order, or ``None``
+        when no request in the batch carries multimodal inputs.
+    """
+    num_extends = forward_op.num_extends()
+    mm_inputs = []
+    has_mm = False
+    for rid in forward_op.request_ids:
+        state = rid_to_state.get(rid)
+        item = getattr(state, "multimodal_inputs", None) if state else None
+        if item is not None:
+            # Resolve the decode delta here rather than letting the forward
+            # write it back: the data plane must not edit a control-plane
+            # object, and resolving on the live struct keeps the value across
+            # rounds, which a per-round snapshot could not.
+            _resolve_mrope_delta_scalar(item)
+            # Snapshot. The struct is small and its tensors are shared by
+            # reference; what the copy buys is that this batch's view of
+            # ``mrope_positions`` cannot be swapped out from under an
+            # in-flight forward by the next round's extension above. The
+            # ``mm_items`` stay shared and mutable by DESIGN — the data plane
+            # writes ``encoded``/``feature`` through them mid-forward; that
+            # is the registered multimodal exception to the capture contract
+            # (see forward_thread.py, rule 5).
+            item = copy.copy(item)
+        mm_inputs.append(item)
+        has_mm = has_mm or item is not None
+    if not has_mm:
+        return None
+
+    return MultimodalForwardContext(
+        mm_inputs=mm_inputs,
+        extend_prefix_lens=list(forward_op.extend_prefix_lens),
+        extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
+        max_encoder_tokens=max_encoder_tokens,
+    )

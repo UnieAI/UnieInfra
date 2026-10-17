@@ -18,14 +18,105 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Paged attention."""
+"""Paged attention.
 
-from collections.abc import Sequence
+A ``PagedAttention`` layer declares its *visibility* -- how far back the
+kernel may look (``sliding_window_size``, a ``window_left`` mask) -- and
+nothing about storage. Which cache group its KV lives in is the cache plan's
+decision, bound onto the layer at executor startup by
+:func:`bind_cache_groups`, which also checks the one relation the two
+contracts must satisfy: a group must retain every token its layers can see.
+"""
+
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from typing import Protocol
 
 import torch
+from tokenspeed_kernel.ops.attention.prologue import (
+    FP8TensorScales,
+    GQAPrologueOutput,
+    HeadKVCache,
+    HeadNorm,
+    KVCacheFormat,
+    LatentKVCache,
+    MLAExpandedKV,
+    MLAPrologueOutput,
+    Rotary,
+    gqa_prologue,
+    latent_store,
+    mla_prologue,
+)
 from torch import nn
 
+from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.model_loader.weight_utils import (
+    K_CACHE_SCALE_SUFFIXES,
+    V_CACHE_SCALE_SUFFIXES,
+)
+
+
+@dataclass(frozen=True)
+class QueryShardGather:
+    """Where a query shard's latent rows come together before the KV write.
+
+    Under query context parallelism every rank rotates its own rows and the
+    prologue all-gathers the rotated latent over ``group`` (per-rank counts
+    ``plan.row_counts``) to the whole extend span before the owner-masked
+    store, so page ownership stays independent of the query shard.
+
+    Attributes:
+        plan: The forward's shard plan (``ctx.query_shard``).
+        group: The query-context-parallel group (``mapping.attn.qcp_group``).
+    """
+
+    plan: QueryShardPlan
+    group: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.group) != self.plan.size:
+            raise ValueError(
+                f"query shard group of {len(self.group)} ranks does not match a "
+                f"plan over {self.plan.size}"
+            )
+
+
+def hf_sliding_window_to_window_left(sliding_window: int) -> int:
+    """HF sliding windows count the current token; kernels take the number of
+    earlier tokens still visible (``window_left``)."""
+    return int(sliding_window) - 1
+
+
+class HeadRotary(Protocol):
+    """A rotary embedding the prologue applies."""
+
+    def as_rotary(self, positions: torch.Tensor) -> Rotary: ...
+
+
+class HeadRMSNorm(Protocol):
+    """A per-head RMSNorm the prologue applies: ``x * rsqrt(mean(x^2) + eps) *
+    (weight + weight_offset)``."""
+
+    weight: torch.Tensor
+    weight_offset: float
+    variance_epsilon: float
+
+
+def head_norm(q_norm: HeadRMSNorm, k_norm: HeadRMSNorm) -> HeadNorm:
+    """The prologue's norm step for a layer's per-head query and key norms."""
+    if (q_norm.weight_offset, q_norm.variance_epsilon) != (
+        k_norm.weight_offset,
+        k_norm.variance_epsilon,
+    ):
+        raise ValueError("query and key norms must share epsilon and weight offset")
+    return HeadNorm(
+        q_norm.weight, k_norm.weight, q_norm.weight_offset, q_norm.variance_epsilon
+    )
 
 
 class PagedAttention(nn.Module):
@@ -43,8 +134,12 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
-        group_id: str = "",
+        *,
+        rotary_emb: HeadRotary | None,
+        qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | None,
     ):
+        """``rotary_emb`` and ``qk_norm`` are the steps the attention prologue
+        applies before core attention; ``None`` skips a step."""
         super().__init__()
         self.tp_q_head_num = num_heads
         self.tp_k_head_num = num_kv_heads
@@ -55,80 +150,428 @@ class PagedAttention(nn.Module):
         self.scaling = scaling
         self.layer_id = layer_id
         self.logit_cap = logit_cap
-        self.sliding_window_size = sliding_window_size or -1
-        # paged cache group ("" -> single-table fallback in the backend).
-        # make group_id mandatory once flat is the only path.
-        self.group_id = group_id
-        # Pooling models never read their own KV back: one prefill, one
-        # vector, no decode. Set by BaseCausalLM when the server is in
-        # embedding mode, honoured by the backend, which refuses it on any
-        # path that would then read pages that were never written.
-        self.skip_kv_cache = False
-        self.k_scale = None
-        self.v_scale = None
+        # window_left of the compute mask: -1 for full attention, 0 for the current token only.
+        if sliding_window_size is None or sliding_window_size < -1:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_size is a "
+                f"window_left >= 0 or -1 for full attention, got "
+                f"{sliding_window_size!r}"
+            )
+        self.sliding_window_size = int(sliding_window_size)
+        # The cache group this layer's KV rides, bound at startup by bind_cache_groups.
+        self._group_id: str | None = None
+        self.rotary_emb = rotary_emb
+        self.qk_norm = qk_norm
+        # Per-tensor FP8 KV-cache scales (None at unit); a non-FP8 cache ignores them.
+        self.fp8_kv_scales: FP8TensorScales | None = None
+
+    def load_kv_cache_scale(self, name: str, scale: torch.Tensor) -> None:
+        """Take a checkpoint's key, value or shared KV-cache scale tensor."""
+        if scale.numel() != 1:
+            raise NotImplementedError(
+                f"PagedAttention layer_id={self.layer_id}: {name} holds "
+                f"{scale.numel()} scales; only per-tensor KV-cache scales are "
+                "supported"
+            )
+        k, v = (
+            (1.0, 1.0)
+            if self.fp8_kv_scales is None
+            else (self.fp8_kv_scales.k, self.fp8_kv_scales.v)
+        )
+        if name.endswith(K_CACHE_SCALE_SUFFIXES):
+            k = float(scale.item())
+        elif name.endswith(V_CACHE_SCALE_SUFFIXES):
+            v = float(scale.item())
+        elif name.endswith(".kv_scale"):
+            k = v = float(scale.item())
+        else:
+            raise KeyError(f"{name!r} is not a KV-cache scale tensor")
+        self.fp8_kv_scales = None if k == v == 1.0 else FP8TensorScales(k, v)
+
+    @property
+    def group_id(self) -> str:
+        if self._group_id is None:
+            raise RuntimeError(
+                f"PagedAttention layer_id={self.layer_id} has no cache group "
+                "bound; bind_cache_groups runs at executor startup, before any "
+                "forward."
+            )
+        return self._group_id
+
+    def bind_cache_group(self, group_id: str) -> None:
+        """Bind the plan's group for this layer; rebinding to another group
+        is a contract bug, not a rename."""
+        if not group_id:
+            raise ValueError(
+                f"PagedAttention layer_id={self.layer_id}: cache group id must "
+                "be nonempty"
+            )
+        if self._group_id is not None and self._group_id != group_id:
+            raise ValueError(
+                f"PagedAttention layer_id={self.layer_id} is bound to cache "
+                f"group {self._group_id!r}; cannot rebind to {group_id!r}"
+            )
+        self._group_id = group_id
 
     def forward(
         self,
-        q,
-        k,
-        v,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        positions: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-        save_kv_cache: bool = True,
         **kwargs,
-    ):
-        if k is not None:
-            # For cross-layer sharing, kv can be None
-            if v is None:
-                raise ValueError("v must be provided when k is provided.")
-            if "k_pe" not in kwargs:
-                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-            else:
-                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
-                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+    ) -> torch.Tensor:
+        """Run this layer's attention.
 
+        A GQA layer given K/V takes its projected rows: the prologue normalizes
+        and rotates them and writes K/V at the backend's write locations, padded
+        to the rows the forward carries so a graph can record it; core attention
+        runs in the eager break (:meth:`attend`). ``k = v = None`` means the
+        inputs are prepared and the cache written (by :meth:`prologue`, or by
+        an MLA layer's :meth:`latent_prologue`).
+        """
+        if k is not None and v is None:
+            raise ValueError("v must be provided when k is provided.")
+        if k is not None and not ctx.forward_mode.is_idle():
+            out = self.prologue(q, k, v, positions, ctx)
+            q, k, v = out.q, out.k, out.v
+        return self.attend(q, k, v, ctx, **kwargs)
+
+    @break_point
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        ctx: ForwardContext,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Core attention over prepared inputs, the eager break: the prologue's
+        query and, for a forward that is not a decode, its returned key and
+        value rows. A model that runs :meth:`prologue` inside its own stream
+        scope calls this afterwards."""
+        if k is not None:
+            k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+            v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
         return ctx.attn_backend.forward(
             q,
             k,
             v,
             self,
-            out_cache_loc,
             ctx.token_to_kv_pool,
             ctx.forward_mode,
             ctx.bs,
-            save_kv_cache,
+            save_kv_cache=False,
+            ctx=ctx,
             **kwargs,
         )
 
+    def prologue(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> GQAPrologueOutput:
+        """Run a GQA layer's prologue alone: prepare ``q`` and write K/V.
 
-def validate_paged_cache_group_ids(
-    model: nn.Module,
-    paged_cache_group_specs: Sequence,
-) -> None:
-    """Fail fast (ValueError) when a pool publishing more than one paged-cache
-    group meets a PagedAttention layer whose group_id is empty or unknown --
-    instead of a KeyError deep in the backend, possibly during graph capture.
+        :meth:`forward` calls this before core attention; a narrowed draft step
+        calls it and then attends its live rows.
+
+        Returns:
+            The prepared query, and the key/value rows unless the forward
+            decodes (decode attention reads the cache).
+        """
+        norm, rotary = self._steps(positions)
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=rotary,
+            cache=self._write_target(q, ctx),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
+    def store_prepared(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> GQAPrologueOutput:
+        """Write rows whose projection or collective already applied norm/RoPE.
+
+        The producer must match this layer's prologue numerical contract.
+        This method owns the usual padded write slots and cache conversion;
+        call :meth:`attend` with its result to avoid repeating the head steps.
+        """
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=None,
+            rotary=None,
+            cache=self._write_target(q, ctx),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
+    def _steps(
+        self, positions: torch.Tensor | None
+    ) -> tuple[HeadNorm | None, Rotary | None]:
+        return (
+            None if self.qk_norm is None else head_norm(*self.qk_norm),
+            None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions),
+        )
+
+    def _write_target(
+        self, q: torch.Tensor, ctx: ForwardContext
+    ) -> HeadKVCache | LatentKVCache:
+        slots = ctx.attn_backend.padded_write_locations(
+            self, ctx.forward_mode, q.shape[0]
+        )
+        return self._local_target(slots, ctx)
+
+    def _local_target(
+        self, slots: torch.Tensor, ctx: ForwardContext
+    ) -> HeadKVCache | LatentKVCache:
+        """The pool's target for ``slots``, local to this rank's shard under KVP."""
+        slots, owned = resolve_cache_slots(
+            slots, ctx.attn_backend.cache_placement(self)
+        )
+        target = ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+        if (
+            self.fp8_kv_scales is not None
+            and isinstance(target, HeadKVCache)
+            and target.format is KVCacheFormat.FP8
+        ):
+            # Every reader of this cache must apply the scales it was written at.
+            if not ctx.attn_backend.reads_fp8_kv_scales(self):
+                raise NotImplementedError(
+                    f"layer {self.layer_id} has per-tensor KV-cache scales "
+                    f"{self.fp8_kv_scales}, which "
+                    f"{type(ctx.attn_backend).__name__} does not read"
+                )
+            target = replace(target, scales=self.fp8_kv_scales)
+        return target
+
+    def attend_live_rows(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """A narrowed draft's first step: write every row's K/V, then attend
+        only the live rows (``ctx.gather_ids``) as a decode over the accepted
+        prefix."""
+        ctx.draft_narrowing.publish_accepted_prefix()
+        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
+        q = self.prologue(q, k, v, positions, decode_ctx).q
+        return self.forward(
+            q.index_select(0, ctx.gather_ids),
+            k=None,
+            v=None,
+            positions=None,
+            ctx=decode_ctx,
+            # The DECODE dispatch would skip the PD cache step a catch-up round records.
+            record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
+        )
+
+    def latent_prologue(
+        self,
+        query: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        *,
+        slots: torch.Tensor,
+        expanded: MLAExpandedKV | None,
+        key_rows: QueryShardGather | None,
+    ) -> MLAPrologueOutput:
+        """Run an MLA layer's prologue: rotate, write the latent rows to
+        ``slots``, and return attention inputs (FP8 for an FP8 cache, not
+        per-token-head planes).
+
+        Args:
+            query: ``[num_tokens, num_heads, q_nope_dim + rope_dim]`` whose
+                leading channels hold the query's non-RoPE part.
+            q_pe: Unrotated query RoPE part; it may alias ``query``.
+            latent_cache: Normalized latent and unrotated key RoPE part.
+            positions: Token positions.
+            ctx: Forward context.
+            slots: Cache slots of the leading latent rows to write. Under a
+                query shard this is the whole extend span (every rank holds
+                it) while the rows above are this rank's shard.
+            expanded: Per-head keys and values for non-absorbed attention.
+            key_rows: The query shard's gather, or ``None`` when the rows
+                are the whole span. With a shard the prologue rotates the
+                local rows, all-gathers the rotated latent to the span and
+                stores it owner-masked, so every rank writes the pages it
+                owns whichever rank computed the row.
+        """
+        rotary = (
+            None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions)
+        )
+        if key_rows is None:
+            return mla_prologue(
+                query,
+                q_pe,
+                latent_cache,
+                expanded=expanded,
+                rotary=rotary,
+                cache=self._local_target(slots, ctx),
+                solution=None,
+                override=None,
+            )
+        if expanded is not None:
+            raise ValueError(
+                "a query shard writes its latent through the absorbed prologue; "
+                "expanded attention cannot gather per-head keys"
+            )
+        plan = key_rows.plan
+        if latent_cache.shape[0] != plan.local_rows:
+            raise ValueError(
+                f"query shard rank {plan.rank} rotates {plan.local_rows} rows, "
+                f"got {latent_cache.shape[0]}"
+            )
+        if slots.numel() != plan.total_rows:
+            raise ValueError(
+                f"a sharded latent store takes the whole span of {plan.total_rows} "
+                f"slots, got {slots.numel()}"
+            )
+        if plan.local_rows > 0:
+            out = mla_prologue(
+                query,
+                q_pe,
+                latent_cache,
+                expanded=None,
+                rotary=rotary,
+                cache=None,
+                solution=None,
+                override=None,
+            )
+        else:
+            # An empty shard rotates nothing but still joins the gather and
+            # stores the rows it owns of what the other ranks computed.
+            out = MLAPrologueOutput(
+                query=query, key=None, value=None, latent=latent_cache
+            )
+        gathered = token_all_gather(
+            out.latent.contiguous(), key_rows.group, list(plan.row_counts)
+        )
+        latent_store(
+            gathered,
+            kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],
+            cache=self._local_target(slots, ctx),
+        )
+        return out
+
+
+class _CacheGroupSpecLike(Protocol):
+    group_id: str
+    attn_kind: str
+    sliding_window_tokens: int | None
+
+
+class _CacheArenaLike(Protocol):
+    @property
+    def cache_group_specs(self) -> tuple[_CacheGroupSpecLike, ...]: ...
+
+
+class _CacheViewLike(Protocol):
+    """What :func:`bind_cache_groups` reads from a cache pool (duck-typed:
+    the pool package imports this module)."""
+
+    arena: _CacheArenaLike
+
+    def history_group_by_layer(self) -> Mapping[int, str]: ...
+
+
+def bind_cache_groups(model: nn.Module, cache_pool: _CacheViewLike) -> None:
+    """Bind every ``PagedAttention`` layer to the cache group the plan
+    declared its KV planes in, checking retention covers visibility.
+
+    Fails fast (ValueError) at startup instead of a KeyError deep in the
+    backend, possibly during graph capture. The plan is the single record
+    of layer -> group, so the model side carries no group vocabulary at all;
+    the one thing a layer must satisfy is that its group keeps every token
+    its mask can reach: a full-visibility layer cannot ride a sliding group,
+    and a sliding mask must fit inside the group's retention window.
     """
-    group_ids = {str(spec.group_id) for spec in paged_cache_group_specs}
-    if len(group_ids) <= 1:
-        return
+    specs = {str(spec.group_id): spec for spec in cache_pool.arena.cache_group_specs}
+    group_by_layer = cache_pool.history_group_by_layer()
     model_name = type(model).__name__
     for name, module in model.named_modules():
         if not isinstance(module, PagedAttention):
             continue
-        if not module.group_id:
+        group_id = group_by_layer.get(module.layer_id)
+        if group_id is None:
             raise ValueError(
                 f"{model_name}: attention layer {name!r} (layer_id="
-                f"{module.layer_id}) has empty group_id but the KV pool "
-                f"publishes {len(group_ids)} paged-cache groups "
-                f"{sorted(group_ids)}; pass group_id=<layer_type> to "
-                "PagedAttention (see gpt_oss.py)."
+                f"{module.layer_id}) has no history cache group in the "
+                f"pool's plan (planned layers: {sorted(group_by_layer)})."
             )
-        if module.group_id not in group_ids:
+        _check_visibility_within_retention(model_name, name, module, specs[group_id])
+        module.bind_cache_group(group_id)
+
+
+def _check_visibility_within_retention(
+    model_name: str, name: str, layer: PagedAttention, spec: _CacheGroupSpecLike
+) -> None:
+    if spec.attn_kind != "sliding_window":
+        return
+    window_left = layer.sliding_window_size
+    retained = spec.sliding_window_tokens
+    if window_left < 0:
+        raise ValueError(
+            f"{model_name}: attention layer {name!r} (layer_id={layer.layer_id}) "
+            f"sees the full history but its cache group {spec.group_id!r} "
+            f"retains only a {retained}-token window."
+        )
+    # The scheduler keeps the last `retained - 1` computed tokens ahead of
+    # the next position (GroupGeometry::ExpiredBlocksAt), exactly the HF
+    # window minus the current token.
+    if retained is None or window_left + 1 > retained:
+        raise ValueError(
+            f"{model_name}: attention layer {name!r} (layer_id={layer.layer_id}) "
+            f"masks to window_left={window_left} but its cache group "
+            f"{spec.group_id!r} retains only a {retained}-token window."
+        )
+
+
+def check_block_drafter_storage(
+    draft_model: nn.Module, target_cache_pool: _CacheViewLike
+) -> None:
+    """A block drafter writes at the target's cache locations, so every one of
+    its layers must ride a full-history group the target's own layers share.
+
+    Bind the draft first (:func:`bind_cache_groups`). Without a target
+    full-history group there is nothing to borrow: the draft's KV would sit
+    in a group of its own while the target router hands it another group's
+    slots.
+    """
+    target_groups = set(target_cache_pool.history_group_by_layer().values())
+    specs = {
+        str(spec.group_id): spec for spec in target_cache_pool.arena.cache_group_specs
+    }
+    model_name = type(draft_model).__name__
+    for name, module in draft_model.named_modules():
+        if not isinstance(module, PagedAttention):
+            continue
+        group_id = module.group_id
+        if group_id not in target_groups or specs[group_id].attn_kind != "full_history":
             raise ValueError(
-                f"{model_name}: attention layer {name!r} (layer_id="
-                f"{module.layer_id}) has group_id={module.group_id!r} which "
-                "is not among the KV pool's paged-cache groups "
-                f"{sorted(group_ids)}."
+                f"{model_name}: block drafter layer {name!r} (layer_id="
+                f"{module.layer_id}) rides cache group {group_id!r}, but a block "
+                "drafter must share a full-history group with the target's "
+                f"layers (target groups: {sorted(target_groups)})."
             )

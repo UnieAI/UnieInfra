@@ -4,8 +4,8 @@ import importlib.util
 import os
 import pathlib
 import sys
-import unittest
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -33,64 +33,31 @@ def _load_page_table_module():
     return module
 
 
-class PageTableConversionTest(unittest.TestCase):
+class TestPageTableConversionTest:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         cls.module = _load_page_table_module()
 
-    def test_expands_logical_pages_into_kernel_pages(self):
-        logical = torch.tensor([[3, 5, -1], [0, -1, -1]], dtype=torch.int32)
+    def test_build_prefill_slots_with_known_output_size_matches_masked_path(self):
+        page_table = torch.tensor([[5, 6], [8, 9]], dtype=torch.int32)
+        seq_lens = torch.tensor([3, 2], dtype=torch.int32)
+        kwargs = {
+            "page_table": page_table,
+            "seq_lens": seq_lens,
+            "max_seq_len": 3,
+            "page_size": 2,
+            "device": torch.device("cpu"),
+        }
 
-        actual = self.module.expand_page_table(
-            logical,
-            logical_page_size=128,
-            kernel_page_size=64,
-            max_kernel_pages=6,
+        expected = self.module.build_prefill_kv_workspace_slots(**kwargs)
+        actual = self.module.build_prefill_kv_workspace_slots(
+            **kwargs,
+            num_tokens=5,
         )
 
-        expected = torch.tensor(
-            [[6, 7, 10, 11, 0, 1], [0, 1, 0, 1, 0, 1]],
-            dtype=torch.int32,
-        )
-        self.assertTrue(torch.equal(actual, expected))
-
-    def test_first_and_last_logical_pages_stay_in_expanded_lcm_range(self):
-        # Four logical pages consist of null page 0 and usable pages 1..3.
-        logical = torch.tensor([[0, 1, 3, -1]], dtype=torch.int32)
-
-        actual = self.module.expand_page_table(
-            logical,
-            logical_page_size=128,
-            kernel_page_size=64,
-        )
-
-        expected = torch.tensor(
-            [[0, 1, 2, 3, 6, 7, 0, 1]],
-            dtype=torch.int32,
-        )
-        self.assertTrue(torch.equal(actual, expected))
-        self.assertLessEqual(int(actual.max()), 7)
-
-    def test_rejects_incompatible_page_sizes(self):
-        with self.assertRaisesRegex(ValueError, "positive multiple"):
-            self.module.expand_page_table(
-                torch.tensor([[1]], dtype=torch.int32),
-                logical_page_size=96,
-                kernel_page_size=64,
-            )
-
-    def test_equal_page_sizes_keep_the_existing_table_view(self):
-        table = torch.tensor([[3, 5, -1]], dtype=torch.int32)
-
-        actual = self.module.expand_page_table(
-            table,
-            logical_page_size=64,
-            kernel_page_size=64,
-        )
-
-        self.assertEqual(actual.data_ptr(), table.data_ptr())
-        self.assertEqual(actual.tolist(), [[3, 5, -1]])
+        assert (actual.tolist()) == ([10, 11, 12, 16, 17])
+        assert torch.equal(actual, expected)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

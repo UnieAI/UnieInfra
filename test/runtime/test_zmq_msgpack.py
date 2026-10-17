@@ -37,6 +37,7 @@ import msgspec
 import pytest
 import zmq
 
+from tokenspeed.runtime.engine import load_snapshot as load_snapshot_module
 from tokenspeed.runtime.engine import zmq_msgpack, zmq_wire
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
@@ -162,7 +163,7 @@ def test_generate_request_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(req))
     assert isinstance(raw, list)
     assert raw[0] == "TokenizedGenerateReqInput"
-    assert len(raw) == 24  # tag + 23 fields
+    assert len(raw) == 25  # tag + 24 fields (data_parallel_rank appended last)
     assert raw[1] == "x"  # rid
     assert raw[2] is None  # http_worker_ipc
     assert raw[3] is None  # input_text
@@ -251,6 +252,10 @@ def test_slim_out_from_full_roundtrip():
     assert rt.output_token_logprobs_val == [[]]
     assert rt.output_token_logprobs_idx == [[]]
     assert rt.engine_index == 0
+    assert rt.num_running == 0
+    assert rt.num_waiting == 0
+    assert rt.kv_active_pages == 0
+    assert rt.kv_total_pages == 0
 
 
 def test_slim_out_carries_the_producing_engine_index():
@@ -261,14 +266,21 @@ def test_slim_out_carries_the_producing_engine_index():
     assert rt.engine_index == 3
 
 
-def test_slim_out_engine_index_defaults_for_older_senders():
-    # Appended field: a 9-element array from an older sender must still decode.
-    slim = BatchTokenIDOutSlim.from_full(_make_batch_out())
+@pytest.mark.parametrize(("prefix_length", "expected_engine_index"), [(9, 0), (10, 7)])
+def test_slim_out_load_tail_defaults_for_older_senders(
+    prefix_length: int, expected_engine_index: int
+):
+    # Pre-DP 9-element and pre-load 10-element senders both omit the load tail.
+    slim = BatchTokenIDOutSlim.from_full(_make_batch_out(), engine_index=7)
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
-        msgspec.msgpack.encode(raw[:9])
+        msgspec.msgpack.encode(raw[:prefix_length])
     )
-    assert rt.engine_index == 0
+    assert rt.engine_index == expected_engine_index
+    assert rt.num_running == 0
+    assert rt.num_waiting == 0
+    assert rt.kv_active_pages == 0
+    assert rt.kv_total_pages == 0
 
 
 def test_slim_out_sources_output_ids_not_the_detok_window():
@@ -305,22 +317,32 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form must be a 10-element tagged array (the frontend's codec
-    depends on the tag and column order; engine_index is the appended tail)."""
+    """The wire form pins SMG's exact 14-element positional contract."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
-    slim = BatchTokenIDOutSlim.from_full(out, engine_index=1)
+    slim = BatchTokenIDOutSlim.from_full(
+        out,
+        engine_index=1,
+        num_running=2,
+        num_waiting=3,
+        kv_active_pages=4,
+        kv_total_pages=20,
+    )
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 10
+    assert len(raw) == 14
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
     assert raw[7] == [[pytest.approx(-0.5)]]
     assert raw[8] == [[10]]
     assert raw[9] == 1  # engine_index (appended)
+    assert raw[10] == 2  # num_running
+    assert raw[11] == 3  # num_waiting
+    assert raw[12] == 4  # kv_active_pages
+    assert raw[13] == 20  # kv_total_pages
 
 
 def test_slim_out_finish_reason_none_maps_to_empty():
@@ -373,7 +395,12 @@ def test_recv_socket_aborts_request_with_invalid_sampling_params():
     # and OutputProcesser streams as a terminal "abort" output.
     bad = _add_frames("bad", SamplingParams(top_k=0))
     good = _add_frames("good", SamplingParams(top_k=-1))
-    recv = zmq_msgpack.MsgpackRecvSocket(_FakeInputSocket([bad, good]), vocab_size=32)
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket([bad, good]),
+        vocab_size=32,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
+    )
 
     io_bad = recv.recv_pyobj()
     assert io_bad.rid == "bad"
@@ -405,6 +432,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         _FakeInputSocket([_logprob_frames("r1")]),
         vocab_size=32,
         enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
     )
     io = recv_off.recv_pyobj()
     assert io.rid == "r1"
@@ -414,8 +442,70 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         _FakeInputSocket([_logprob_frames("r2")]),
         vocab_size=32,
         enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
     )
-    assert recv_on.recv_pyobj().validation_error is None
+    io = recv_on.recv_pyobj()
+    assert io.validation_error is None
+    # -1 resolves to the last prompt token, as on the pickle path.
+    assert io.logprob_start_len == 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "needle"),
+    [
+        ({"logprob_start_len": 0}, "msgpack output wire"),
+        ({"logprob_start_len": 1}, "msgpack output wire"),
+        ({"logprob_start_len": 3}, "smaller than the prompt length"),
+        ({"logprob_start_len": -2}, "must be -1 or >= 0"),
+        ({"top_logprobs_num": 2}, "top_logprobs_num"),
+        ({"token_ids_logprob": [1]}, "token_ids_logprob"),
+    ],
+)
+def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
+    # The slim per-step output has no prompt-logprob columns, so a start that
+    # would produce them is refused loudly instead of computed and dropped.
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [_add_frames("r1", SamplingParams(), return_logprob=True, **overrides)]
+        ),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
+    )
+    io = recv.recv_pyobj()
+    assert io.validation_error and needle in io.validation_error
+
+    # The same knobs are inert without return_logprob (vLLM dialect).
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket([_add_frames("r2", SamplingParams(), **overrides)]),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
+    )
+    assert recv.recv_pyobj().validation_error is None
+
+
+def test_recv_socket_names_the_engine_capability_before_the_wire_limit():
+    # An engine that cannot score prompt rows (narrowing model, pipeline
+    # split) says so; the wire limit is the reason only once it could.
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [
+                _add_frames(
+                    "r1", SamplingParams(), return_logprob=True, logprob_start_len=0
+                ),
+                _add_frames(
+                    "r2", SamplingParams(), return_logprob=True, logprob_start_len=-1
+                ),
+            ]
+        ),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=False,
+    )
+    io = recv.recv_pyobj()
+    assert io.validation_error and "not supported by this engine" in io.validation_error
+    assert recv.recv_pyobj().validation_error is None
 
 
 def test_recv_socket_drops_malformed_message_and_keeps_draining():
@@ -425,7 +515,10 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
     short = [b"\x07"]  # unknown type byte AND too few frames
     good = _add_frames("good", SamplingParams())
     recv = zmq_msgpack.MsgpackRecvSocket(
-        _FakeInputSocket([malformed, short, good]), vocab_size=32
+        _FakeInputSocket([malformed, short, good]),
+        vocab_size=32,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
     )
     io = recv.recv_pyobj()
     assert io.rid == "good"
@@ -435,7 +528,12 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
 
 def test_recv_socket_verify_does_not_apply_to_abort():
     abort = [zmq_wire.REQ_TYPE_ABORT, msgspec.msgpack.encode(["a", "b"])]
-    recv = zmq_msgpack.MsgpackRecvSocket(_FakeInputSocket([abort]), vocab_size=32)
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket([abort]),
+        vocab_size=32,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
+    )
     a1 = recv.recv_pyobj()
     a2 = recv.recv_pyobj()
     assert {a1.rid, a2.rid} == {"a", "b"}
@@ -460,6 +558,72 @@ class _FakeOutputSocket:
 
     def close(self) -> None:
         pass
+
+
+def _decode_last_slim_output(socket: _FakeOutputSocket) -> BatchTokenIDOutSlim:
+    return msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(socket.sent[-1][-1])
+
+
+def test_send_socket_uses_zero_load_tail_before_observation():
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket, engine_index=5)
+
+    sender.send_pyobj(_make_batch_out())
+
+    output = _decode_last_slim_output(socket)
+    assert output.engine_index == 5
+    assert (
+        output.num_running,
+        output.num_waiting,
+        output.kv_active_pages,
+        output.kv_total_pages,
+    ) == (0, 0, 0, 0)
+
+
+def test_send_socket_load_snapshot_setter_sends_no_frame():
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket)
+
+    sender.set_load_snapshot(1, 2, 3, 4)
+
+    assert socket.sent == []
+
+
+def test_send_socket_next_output_uses_latest_load_snapshot():
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket)
+    sender.set_load_snapshot(1, 2, 3, 4)
+    sender.set_load_snapshot(5, 6, 7, 8)
+
+    sender.send_pyobj(_make_batch_out())
+
+    output = _decode_last_slim_output(socket)
+    assert (
+        output.num_running,
+        output.num_waiting,
+        output.kv_active_pages,
+        output.kv_total_pages,
+    ) == (5, 6, 7, 8)
+
+
+def test_direct_load_snapshot_sink_maps_active_pages_without_transport():
+    """The direct sink ignores used pages and only updates the next batch."""
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket)
+    sink = load_snapshot_module.DirectLoadSnapshotSink(sender.set_load_snapshot)
+
+    sink.observe((5, 6, 7, 18, 20))
+    sink.close()
+
+    assert socket.sent == []
+    sender.send_pyobj(_make_batch_out())
+    output = _decode_last_slim_output(socket)
+    assert (
+        output.num_running,
+        output.num_waiting,
+        output.kv_active_pages,
+        output.kv_total_pages,
+    ) == (5, 6, 7, 20)
 
 
 def test_send_socket_engine_dead_sentinel():
@@ -600,6 +764,8 @@ def test_connect_and_data_plane_roundtrip():
                     max_model_len=4096, dtype="bfloat16", vllm_version="tokenspeed-test"
                 ),
                 vocab_size=32000,
+                enable_output_logprobs=False,
+                supports_prompt_logprobs=True,
             )
             engine_holder["recv"] = recv
             engine_holder["send"] = send
@@ -684,6 +850,8 @@ def test_two_dp_ranks_connect_with_distinct_identities():
                     data_parallel_rank=index,
                 ),
                 vocab_size=32000,
+                enable_output_logprobs=False,
+                supports_prompt_logprobs=True,
             )
         except Exception as exc:
             errors[index] = exc

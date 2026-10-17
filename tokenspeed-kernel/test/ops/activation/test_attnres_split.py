@@ -11,11 +11,20 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial,
     attnres_partial_dual,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
 H = 7168  # K3 hidden size; the kernels static-assert two 4096 sweeps.
+
+
+@pytest.fixture(autouse=True)
+def disable_pdl():
+    previous = pdl_enabled()
+    pdl_enabled(overwrite=False)
+    yield
+    pdl_enabled(overwrite=previous)
 
 
 def _reference(prefix, blocks, wp, eps, out_w):

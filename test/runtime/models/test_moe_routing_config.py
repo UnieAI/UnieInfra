@@ -59,12 +59,8 @@ def _normalize_expr(relpath: str) -> str:
 def test_config_driven_moe_models_propagate_topk_normalization_flag() -> None:
     for relpath in (
         "python/tokenspeed/runtime/models/deepseek_v3.py",
-        "python/tokenspeed/runtime/models/deepseek_v4.py",
+        "python/tokenspeed/runtime/models/deepseek_v41_moe.py",
         "python/tokenspeed/runtime/models/longcat_flash.py",
         "python/tokenspeed/runtime/models/qwen3_5_moe.py",
     ):
         assert _normalize_expr(relpath) == "config.norm_topk_prob"
-
-
-def test_minimax_moe_routing_matches_hardcoded_topk_normalization() -> None:
-    assert _normalize_expr("python/tokenspeed/runtime/models/minimax_m2.py") == "True"

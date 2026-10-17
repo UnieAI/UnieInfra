@@ -35,12 +35,10 @@ from __future__ import annotations
 
 import pytest
 
-from tokenspeed.runtime.engine.event_loop import validate_mixed_batch_backend
+from tokenspeed.runtime.execution.model_executor import validate_mixed_batch_backend
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-    HybridLinearAttnBackend,
-)
-from tokenspeed.runtime.layers.attention.backends.msa import MSAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.msa import MSAAttnBackend
 
 
 class _Incapable:
@@ -65,46 +63,38 @@ class _Args:
 
 def test_backends_may_mix_by_default():
     """A backend that says nothing is assumed capable, as before this guard."""
-    assert AttentionBackend.supports_mixed_batch is True
+    assert getattr(AttentionBackend, "supports_mixed_batch", True) is True
 
 
-def test_msa_declares_it_cannot_mix():
-    """MSA builds extend metadata for every row, so a decode tail is out of range.
-
-    It is a class attribute rather than a property because the constraint is
-    structural, not configuration-dependent.
-    """
-    assert MSAAttnBackend.supports_mixed_batch is False
+@pytest.mark.parametrize("leaf", [MHAAttnBackend, MSAAttnBackend])
+def test_paged_leaves_that_assert_against_mixed_declare_it(leaf):
+    """Both leaves assert ``not forward_mode.is_mixed()`` in prepare()."""
+    assert leaf.supports_mixed_batch is False
 
 
-def test_hybrid_linear_attn_defers_to_its_full_attention_half():
-    """The recurrent half serves MIXED without splitting, so it adds no constraint.
+class _Router:
+    """Stands in for CacheGroupRouter: per-group leaves, nothing declared."""
 
-    A decode row is an extend row of length 1 whose prefix is its history, which
-    makes the whole plan one valid extend batch. The only remaining constraint
-    is the full-attention half's (spec width, draft rank), so the answer comes
-    from there -- hence a property rather than a class attribute.
-    """
-    backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
-
-    backend.full_attn_backend = _Capable()
-    assert backend.supports_mixed_batch is True
-
-    backend.full_attn_backend = _Incapable()
-    assert backend.supports_mixed_batch is False
+    def __init__(self, *leaves):
+        self.leaves = {f"g{i}": leaf for i, leaf in enumerate(leaves)}
 
 
-def test_hybrid_needs_no_environment_opt_in(monkeypatch):
-    """The env gate that kept the unfinished split unreachable is gone.
+class _Hybrid:
+    """Stands in for HybridLinearAttnBackend: two halves, nothing declared."""
 
-    Pinned because its removal is the user-visible half of the fix: a hybrid
-    model now takes `--enable-mixed-batch` directly.
-    """
-    backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
-    backend.full_attn_backend = _Capable()
+    def __init__(self, full, linear):
+        self.full_attn_backend = full
+        self.linear_attn_backend = linear
 
-    monkeypatch.delenv("TOKENSPEED_ENABLE_HYBRID_MIXED_BATCH", raising=False)
-    assert backend.supports_mixed_batch is True
+
+def test_a_composite_refuses_when_any_leaf_cannot_mix():
+    backend = _Hybrid(_Router(_Capable(), _Incapable()), _Capable())
+    with pytest.raises(ValueError, match="_Incapable"):
+        validate_mixed_batch_backend(_Args(True), backend)
+
+
+def test_a_composite_of_capable_leaves_is_allowed():
+    validate_mixed_batch_backend(_Args(True), _Hybrid(_Router(_Capable()), _Silent()))
 
 
 # ---- the refusal ----

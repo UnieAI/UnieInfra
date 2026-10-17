@@ -23,7 +23,8 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
-from tokenspeed_kernel.numerics.inputs import get_input_generator
+from tokenspeed_kernel.numerics.gemm import tolerance as gemm_tolerance
+from tokenspeed_kernel.numerics.inputs import get_input_generator, shape_traits
 from tokenspeed_kernel.numerics.reference.gemm import (
     torch_bmm_fp8_blockscale,
     torch_bmm_fp8_scaled,
@@ -38,7 +39,13 @@ from tokenspeed_kernel.numerics.verify import (
 )
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
 _fp8_dtype = torch.float8_e4m3fn
 
@@ -69,6 +76,15 @@ class TestCompareOutputs:
 
         assert not result.passed
         assert result.num_mismatches == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, _fp8_dtype])
+def test_gemm_tolerance_stays_at_output_cast_floor(dtype: torch.dtype) -> None:
+    # Both emit bf16 against an exactly dequantized reference, so the output
+    # cast bounds the error at every K; a K-scaled FP8 tolerance would accept
+    # accumulation bugs on the K=7168 standard shapes.
+    for k in (64, 512, 7168):
+        assert gemm_tolerance(dtype, K=k) == Tolerance(atol=1.5e-2, rtol=1.5e-2)
 
 
 def test_gemm_input_generator_uses_signature_scale_metadata() -> None:
@@ -149,6 +165,18 @@ def test_bmm_input_generator_honors_n_contiguous_weight_trait() -> None:
 
     assert inputs["B"].shape == (12, 512, 128)
     assert inputs["B"].stride(1) == 1
+
+
+def test_shape_traits_lowercases_gemm_dimensions() -> None:
+    assert shape_traits({"M": 16, "N": 32, "K": 64}) == {"m": 16, "n": 32, "k": 64}
+    assert shape_traits({"batch": 2, "M": 4, "N": 8, "K": 16}) == {
+        "batch": 2,
+        "m": 4,
+        "n": 8,
+        "k": 16,
+    }
+    assert shape_traits({"B": 2, "M": 4}) == {"batch": 2, "m": 4}
+    assert shape_traits({"seq_len": 128, "num_heads": 8}) == {}
 
 
 def test_quantized_reference_gemm_supports_out() -> None:
@@ -347,27 +375,74 @@ class TestNumericsVerification:
         for family_name, mode in registry.list_operators():
             if family and family_name != family:
                 continue
-            # Only run kernels that have a paired reference for this dtype;
-            # otherwise verify_kernel raises ValueError and the test errors.
-            op_specs = registry.get_for_operator(family_name, mode)
-            dtype_specs = [
-                s
-                for s in op_specs
-                if s.format_signatures_for_storage_dtype(dtype, dtype_role)
-            ]
-            has_reference = any(s.solution == "reference" for s in dtype_specs)
-            if not has_reference:
-                continue
-            for spec in dtype_specs:
+            for spec in registry.get_for_operator(family_name, mode, platform=platform):
                 if spec.solution == "reference":
                     continue
                 if spec.solution == "deep_gemm":
                     continue
-                if not spec.capability.satisfied_by(platform):
+                _, reference = _verification_signature_and_reference(
+                    registry, spec, dtype, dtype_role
+                )
+                if reference is None:
                     continue
                 specs.append(spec)
         specs.sort(key=lambda s: (s.family, s.mode, s.name))
         return specs
+
+    def test_collector_requires_exact_compatible_reference(self, fresh_registry):
+        dense_signature = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.bfloat16),
+        )
+        mixed_signature = format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=tensor_format(
+                "nvfp4",
+                torch.uint8,
+                scale=ScaleFormat(
+                    storage_dtype=torch.float8_e4m3fn,
+                    granularity="block",
+                    block_shape=(16,),
+                ),
+            ),
+        )
+        registry = KernelRegistry.get()
+        for spec in (
+            KernelSpec(
+                name="test_dense_reference",
+                family="gemm",
+                mode="collector_mm",
+                solution="reference",
+                format_signatures=frozenset({dense_signature}),
+            ),
+            KernelSpec(
+                name="test_dense_candidate",
+                family="gemm",
+                mode="collector_mm",
+                solution="triton",
+                format_signatures=frozenset({dense_signature}),
+            ),
+            KernelSpec(
+                name="test_mixed_candidate",
+                family="gemm",
+                mode="collector_mm",
+                solution="flashinfer",
+                format_signatures=frozenset({mixed_signature}),
+            ),
+        ):
+            registry.register(spec, lambda **_kwargs: None)
+
+        names = {
+            spec.name
+            for spec in TestNumericsVerification._get_verifiable_specs(
+                torch.bfloat16,
+                "a",
+                family="gemm",
+            )
+        }
+
+        assert "test_dense_candidate" in names
+        assert "test_mixed_candidate" not in names
 
     def _verify(self, spec: KernelSpec, dtype: torch.dtype, dtype_role: str) -> None:
         if not torch.cuda.is_available():

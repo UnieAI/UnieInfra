@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import math
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.mla import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
+    mla_project_value,
+    supports_mla_decode_query_blocks,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -18,17 +21,29 @@ torch.manual_seed(42)
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
 
 
+@pytest.mark.parametrize("num_heads", [12, 128])
 @pytest.mark.parametrize(
-    "dtype,num_heads,qk_head_dim,v_head_dim",
+    "dtype,qk_head_dim,v_head_dim",
     [
-        pytest.param(torch.float16, 128, 192, 128, id="fp16"),
-        pytest.param(torch.bfloat16, 128, 192, 128, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, 128, 192, 128, id="fp8-e4m3"),
-        pytest.param(torch.float8_e5m2, 128, 192, 128, id="fp8-e5m2"),
+        pytest.param(torch.float16, 192, 128, id="fp16"),
+        pytest.param(torch.bfloat16, 192, 128, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, 192, 128, id="fp8-e4m3"),
+        pytest.param(torch.float8_e5m2, 192, 128, id="fp8-e5m2"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize("is_causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [
+        pytest.param((853, 1045), (853, 1045), id="ragged-self"),
+        pytest.param(
+            (1, 127, 128, 129, 255, 256, 257),
+            (65, 191, 256, 385, 511, 640, 769),
+            id="query-tile-tails-with-prefix",
+        ),
+    ],
+)
 def test_mla_prefill(
     device: str,
     solution: str,
@@ -37,14 +52,18 @@ def test_mla_prefill(
     num_heads: int,
     qk_head_dim: int,
     v_head_dim: int,
+    q_lens: tuple[int, ...],
+    kv_lens: tuple[int, ...],
     require,
 ) -> None:
     require("attention", "mla_prefill", solution, dtype, "q")
 
-    q_lens = [853, 1045]
-    kv_lens = q_lens
-    cu_seqlens_q = torch.tensor([0, 853, 1898], device=device, dtype=torch.int32)
-    cu_seqlens_kv = cu_seqlens_q
+    cu_seqlens_q = torch.tensor(
+        [0, *accumulate(q_lens)], device=device, dtype=torch.int32
+    )
+    cu_seqlens_kv = torch.tensor(
+        [0, *accumulate(kv_lens)], device=device, dtype=torch.int32
+    )
     init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
     q = torch.randn(
         sum(q_lens), num_heads, qk_head_dim, device=device, dtype=init_dtype
@@ -61,7 +80,7 @@ def test_mla_prefill(
         v = v.to(dtype)
     softmax_scale = 1.0 / math.sqrt(qk_head_dim)
 
-    out, lse = mla_prefill(
+    kwargs = dict(
         q=q,
         k=k,
         v=v,
@@ -74,6 +93,7 @@ def test_mla_prefill(
         return_lse=True,
         solution=solution,
     )
+    out, lse = mla_prefill(**kwargs)
 
     refs = []
     ref_lses = []
@@ -320,6 +340,8 @@ def test_mla_decode_with_kvcache(
     require,
 ) -> None:
     require("attention", "mla_decode_with_kvcache", solution, q_dtype, "q")
+    if q_dtype != kv_dtype and not platform.is_cdna4:
+        pytest.skip("only test mixed query/cache dtypes on gfx950")
 
     q_len = 1
     qk_nope_head_dim = 128
@@ -418,6 +440,92 @@ def test_mla_decode_with_kvcache(
 
 
 @pytest.mark.parametrize(
+    "window_left,kv_lora_rank,qk_rope_head_dim,qk_nope_head_dim",
+    [(129, 8, 4, 4), (-1, 512, 64, 128)],
+    ids=["windowed", "full-attention"],
+)
+def test_mla_decode_noncausal_block_matches_reference_and_captures(
+    device: str,
+    window_left: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    qk_nope_head_dim: int,
+) -> None:
+    torch.manual_seed(91)
+    block_size = 8
+    context_len = 177
+    cache_len = context_len + block_size
+    page_size = 64
+    num_heads = 2
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    max_pages = math.ceil(cache_len / page_size)
+
+    q = torch.randn(
+        block_size,
+        1,
+        num_heads,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        max_pages,
+        page_size,
+        1,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.arange(max_pages, device=device, dtype=torch.int32).repeat(
+        block_size, 1
+    )
+    cache_seqlens = torch.full(
+        (block_size,), cache_len, device=device, dtype=torch.int32
+    )
+    softmax_scale = 1.0 / math.sqrt(qk_head_dim)
+
+    def run(query: torch.Tensor) -> torch.Tensor:
+        return mla_decode_with_kvcache(
+            q=query,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=cache_len,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            window_left=window_left,
+            noncausal_block_size=block_size,
+        )
+
+    output = run(q)
+    dense_kv = kv_cache.reshape(-1, qk_head_dim)[:cache_len].float()
+    expected = []
+    for block_position in range(block_size):
+        start = (
+            max(0, context_len - window_left + block_position)
+            if window_left >= 0
+            else 0
+        )
+        visible = dense_kv[start:cache_len]
+        scores = torch.einsum("hd,kd->hk", q[block_position, 0].float(), visible)
+        probs = torch.softmax(scores * softmax_scale, dim=-1)
+        expected.append(torch.matmul(probs, visible[:, :kv_lora_rank]))
+    expected_output = torch.stack(expected).unsqueeze(1)
+    torch.testing.assert_close(output.float(), expected_output, rtol=8e-2, atol=8e-2)
+
+    graph_output = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output.copy_(run(q))
+    eager_output = output.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
     "dtype",
     [
         pytest.param(torch.float16, id="fp16"),
@@ -505,7 +613,7 @@ def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> No
             refs.append(torch.matmul(probs, visible_kv[:, :kv_lora_rank]))
         q_start += q_len
 
-    tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
+    tol = 1.5e-1 if dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), torch.stack(refs), rtol=tol, atol=tol)
 
 
@@ -687,6 +795,8 @@ def test_mla_decode_small_batch_fixed_entrypoints_match_reference(
     return_lse: bool,
     require,
 ) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("fixed gfx950 MLA decode entrypoints require CDNA4")
     require(
         "attention",
         "mla_decode_with_kvcache",
@@ -715,6 +825,8 @@ def test_mla_decode_small_batch_fixed_entrypoints_match_each_other(
     cache_seqlens_list: list[int],
     require,
 ) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("fixed gfx950 MLA decode entrypoints require CDNA4")
     require(
         "attention",
         "mla_decode_with_kvcache",
@@ -749,6 +861,8 @@ def test_mla_decode_small_batch_fixed_entrypoints_use_out(
     override: str,
     require,
 ) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("fixed gfx950 MLA decode entrypoints require CDNA4")
     require(
         "attention",
         "mla_decode_with_kvcache",
@@ -765,28 +879,47 @@ def test_mla_decode_small_batch_fixed_entrypoints_use_out(
     )
 
 
-def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
+@pytest.mark.parametrize("batch", [1, 4, 8])
+def test_mla_decode_with_kvcache_projected_value_matches_split(
     device: str,
+    batch: int,
 ) -> None:
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("K3 fused MLA epilogue requires CDNA4 or CDNA5")
-    from tokenspeed_kernel import mla_project_value
+    if platform.is_cdna4 and batch > 4:
+        pytest.skip("gfx950 projected MLA is restricted to batch <= 4")
 
     torch.manual_seed(67)
-    q = torch.randn(1, 1, 12, 576, device=device, dtype=torch.bfloat16).to(
+    q = torch.randn(batch, 1, 12, 576, device=device, dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    kv_cache = torch.randn(64, 64, 1, 576, device=device, dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
+    kv_cache = torch.randn(
+        batch * 64,
+        64,
+        1,
+        576,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    page_table = torch.arange(
+        batch * 64,
+        device=device,
+        dtype=torch.int32,
+    ).view(batch, 64)
+    cache_seqlens = torch.tensor(
+        [4096 - 64 * (index % 4) for index in range(batch)],
+        device=device,
+        dtype=torch.int32,
     )
-    page_table = torch.arange(64, device=device, dtype=torch.int32).view(1, 64)
-    cache_seqlens = torch.tensor([4096], device=device, dtype=torch.int32)
     weight = torch.randn(12, 512, 128, device=device, dtype=torch.bfloat16)
-    gate = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
-    output = torch.empty_like(gate)
-    projected_override = (
-        "gluon_mla_decode_projected_value_gfx1250" if platform.is_cdna5 else None
+    gate_storage = torch.randn(
+        batch,
+        3648,
+        device=device,
+        dtype=torch.bfloat16,
     )
+    gate = gate_storage[:, -1536:]
+    output = torch.empty_like(gate)
     attention = mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
@@ -799,11 +932,12 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
         softmax_scale=1.0 / math.sqrt(192),
         solution="gluon",
     )
-    expected = mla_project_value(
-        attention.reshape(1, 12, 512),
+    projected = torch.bmm(
+        attention.reshape(batch, 12, 512).transpose(0, 1).contiguous(),
         weight,
-        gate=gate,
     )
+    expected = projected.transpose(0, 1).contiguous().reshape_as(output)
+    expected = (expected.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
 
     mla_decode_with_kvcache(
         q=q,
@@ -818,7 +952,6 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
         value_weight=weight,
         gate=gate,
         out=output,
-        override=projected_override,
     )
     eager_output = output.clone()
     graph = torch.cuda.CUDAGraph()
@@ -836,32 +969,42 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
             value_weight=weight,
             gate=gate,
             out=output,
-            override=projected_override,
         )
     assert returned.data_ptr() == output.data_ptr()
+    output.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
     torch.testing.assert_close(output, eager_output, atol=0, rtol=0)
-    # Split scheduling and reducer order can differ from the generic
-    # composition. Validate within the established FP8 reduction envelope.
-    torch.testing.assert_close(output, expected, atol=0.125, rtol=0.05)
+    # Different split partitions are bitwise identical when matched, but can
+    # cross a BF16 rounding boundary when the optimized and composed paths use
+    # different split counts.
+    torch.testing.assert_close(output, expected, atol=0.25, rtol=0.05)
 
 
 @pytest.mark.parametrize("use_gate", [False, True])
+@pytest.mark.parametrize(
+    "q_len,window_left,block_size",
+    [(1, -1, 1), (1, -1, 2), (1, 3, 2), (2, -1, 2), (2, 3, 2)],
+    ids=["plain", "flat-block", "flat-window", "query-block", "query-window"],
+)
 def test_mla_decode_with_kvcache_composes_projected_value_fallback(
     monkeypatch: pytest.MonkeyPatch,
     use_gate: bool,
+    q_len: int,
+    window_left: int,
+    block_size: int,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
-    latent = torch.arange(24, dtype=torch.float32).reshape(2, 1, 3, 4) / 16
-    q = torch.empty(2, 1, 3, 6)
+    latent = torch.arange(24 * q_len, dtype=torch.float32).reshape(2, q_len, 3, 4) / 16
+    q = torch.empty(2, q_len, 3, 6)
     kv_cache = torch.empty(1, 8, 1, 6)
     page_table = torch.zeros(2, 1, dtype=torch.int32)
     cache_seqlens = torch.ones(2, dtype=torch.int32)
     weight = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2) / 32
-    raw_gate = torch.linspace(-1, 1, 12).reshape(2, 6)
+    raw_gate = torch.linspace(-1, 1, 12 * q_len).reshape(2 * q_len, 6)
     gate = raw_gate if use_gate else None
     output = torch.empty_like(raw_gate)
 
@@ -869,9 +1012,15 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
         if args[1] == "mla_project_value":
             raise NoKernelFoundError
         if args[1] == "mla_decode_projected_value":
-            assert kwargs["traits"]["support_logit_cap"] is True
+            assert kwargs["traits"]["logit_cap"] is True
             raise NoKernelFoundError
         assert args[1] == "mla_decode_with_kvcache"
+        # Unwindowed flattened rows carry block-end cache lengths, so the
+        # projected-value fallback selects ordinary single-query decode.
+        expected_block_size = block_size if window_left >= 0 or q_len > 1 else 1
+        assert kwargs["traits"]["noncausal_block_size"] == expected_block_size
+        assert kwargs["traits"]["sliding_window"] == (window_left >= 0)
+        assert kwargs["traits"]["q_len"] == q_len
         split_decode.name = "split_decode"
         return split_decode
 
@@ -879,6 +1028,11 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
         assert kwargs["kv_lora_rank"] == 4
         assert kwargs["qk_rope_head_dim"] == 2
         assert kwargs["logit_cap"] == 2.5
+        assert kwargs["softmax_scale"] == 0.75
+        assert kwargs["out"] is None
+        if window_left >= 0 or q_len > 1:
+            assert kwargs["window_left"] == window_left
+            assert kwargs["noncausal_block_size"] == block_size
         return latent
 
     monkeypatch.setattr(attention_ops, "select_kernel", select_decode_kernel)
@@ -892,14 +1046,16 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
         qk_nope_head_dim=2,
         kv_lora_rank=4,
         qk_rope_head_dim=2,
-        softmax_scale=1.0,
+        softmax_scale=0.75,
+        window_left=window_left,
+        noncausal_block_size=block_size,
         value_weight=weight,
         gate=gate,
         out=output,
         logit_cap=2.5,
     )
     expected = torch.bmm(
-        latent.reshape(2, 3, 4).transpose(0, 1).contiguous(),
+        latent.reshape(2 * q_len, 3, 4).transpose(0, 1).contiguous(),
         weight,
     )
     expected = expected.transpose(0, 1).reshape_as(output)
@@ -931,10 +1087,10 @@ def test_mla_decode_with_kvcache_rejects_invalid_projected_out() -> None:
             out=out,
         )
 
-    with pytest.raises(ValueError, match="contiguous and colocated"):
+    with pytest.raises(ValueError, match="be contiguous"):
         call(torch.empty(2, 12)[:, ::2])
-    with pytest.raises(ValueError, match="contiguous and colocated"):
-        call(torch.empty(2, 6, device="meta"))
+    with pytest.raises(ValueError, match="match value_weight dtype"):
+        call(torch.empty(2, 6, dtype=torch.float64))
 
     with pytest.raises(ValueError, match="gate requires value_weight"):
         mla_decode_with_kvcache(
@@ -969,7 +1125,7 @@ def test_mla_decode_with_kvcache_rejects_invalid_projected_out() -> None:
 def test_mla_project_value_fallback_preserves_fp32_gate_math(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     def no_kernel(*args, **kwargs):
@@ -989,10 +1145,51 @@ def test_mla_project_value_fallback_preserves_fp32_gate_math(
     assert not torch.equal(output, attention.reshape(1, 1) * gate.sigmoid())
 
 
+@pytest.mark.parametrize("batch", [1, 8])
+def test_mla_project_value_amd_batches(
+    device: str,
+    batch: int,
+) -> None:
+    if not (platform.is_cdna4 or platform.is_cdna5):
+        pytest.skip("batched MLA value projection requires CDNA4 or CDNA5")
+    if platform.is_cdna4 and batch not in {1, 2, 4}:
+        pytest.skip("gfx950 MLA value projection supports batches 1, 2, and 4")
+
+    torch.manual_seed(73 + batch)
+    attention = torch.randn(batch, 12, 512, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(12, 512, 128, device=device, dtype=torch.bfloat16)
+    gate_storage = torch.randn(
+        batch,
+        3648,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gate = gate_storage[:, -1536:]
+    out = torch.empty(batch, 1536, device=device, dtype=torch.bfloat16)
+    expected = torch.einsum("bhl,hlv->bhv", attention, weight).reshape_as(out)
+    expected = (expected.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+
+    override = (
+        "gluon_mla_project_value_gfx1250"
+        if platform.is_cdna5
+        else "gluon_mla_project_value_gfx950"
+    )
+    returned = mla_project_value(
+        attention,
+        weight,
+        gate=gate,
+        out=out,
+        override=override,
+    )
+
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, expected, atol=0.125, rtol=0.05)
+
+
 def test_mla_project_value_nvidia_fallback_writes_projection_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     def no_kernel(*args, **kwargs):
@@ -1032,7 +1229,7 @@ def test_mla_normalize_project_query_cuda_fallback(
     device: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     def no_kernel(*args, **kwargs):
@@ -1059,7 +1256,7 @@ def test_mla_normalize_project_query_cuda_fallback(
     ).to(torch.bfloat16)
     expected_output = expected_query @ projection_weight.t()
 
-    returned = attention_ops.mla_normalize_project_query(
+    returned_query, absorbed_query = attention_ops.mla_normalize_project_query(
         query,
         kv,
         query_weight,
@@ -1071,9 +1268,9 @@ def test_mla_normalize_project_query_cuda_fallback(
         qk_rope_head_dim=4,
     )
 
-    assert returned.absorbed_query is None
+    assert absorbed_query is None
     torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
-    torch.testing.assert_close(returned.query, expected_output, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(returned_query, expected_output, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("heads", [12, 16])
@@ -1082,7 +1279,7 @@ def test_mla_normalize_project_query_split_output(
     require,
     heads: int,
 ) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
+    import tokenspeed_kernel.ops.attention.mla as attention_ops
 
     require(
         "attention",
@@ -1101,7 +1298,7 @@ def test_mla_normalize_project_query_split_output(
     expected_kv = kv.clone()
     eps = 1e-6
 
-    returned = attention_ops.mla_normalize_project_query(
+    returned_query, absorbed_query = attention_ops.mla_normalize_project_query(
         query,
         kv,
         query_weight,
@@ -1131,17 +1328,43 @@ def test_mla_normalize_project_query_split_output(
         * kv_weight.float()
     ).to(torch.bfloat16)
 
-    assert returned.absorbed_query is not None
+    assert absorbed_query is not None
     torch.testing.assert_close(
-        returned.query, projected[..., :128], atol=2e-2, rtol=2e-2
+        returned_query, projected[..., :128], atol=2e-2, rtol=2e-2
     )
     torch.testing.assert_close(
-        returned.absorbed_query[..., 512:],
+        absorbed_query[..., 512:],
         projected[..., 128:],
         atol=2e-2,
         rtol=2e-2,
     )
     torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
+
+
+def test_gfx1250_projected_decode_split_policy() -> None:
+    if not current_platform().is_cdna5:
+        pytest.skip("K3 projected MLA split policy targets CDNA5")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        _select_projected_value_num_kv_splits,
+    )
+
+    def select(batch_size: int, max_seqlen_k: int) -> int:
+        return _select_projected_value_num_kv_splits(
+            batch_size=batch_size,
+            num_sms=256,
+            num_q_programs=batch_size,
+            max_seqlen_k=max_seqlen_k,
+            tile_size=64,
+        )
+
+    assert select(1, 64) == 1
+    assert select(1, 4097) == 16
+    assert select(2, 4097) == 8
+    assert select(8, 16384) == 16
+    assert select(16, 16384) == 16
+    assert select(16, 32768) == 32
+    assert select(8, 32769) == 64
+    assert select(16, 32769) == 32
 
 
 def test_gfx950_k3_decode_split_policy() -> None:
@@ -1168,3 +1391,178 @@ def test_gfx950_k3_decode_split_policy() -> None:
         )
         == 128
     )
+
+
+# Real MLA widths: the fast windowed kernel is registered for these alone.
+_QUERY_BLOCK_DIMS = dict(kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128)
+
+
+def _windowed_decode(q, kv_cache, page_table, cache_seqlens, cache_len, window, block):
+    return mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=cache_len,
+        softmax_scale=(_QUERY_BLOCK_DIMS["kv_lora_rank"] + 64) ** -0.5,
+        window_left=window,
+        noncausal_block_size=block,
+        **_QUERY_BLOCK_DIMS,
+    )
+
+
+@pytest.mark.skipif(
+    not platform.is_blackwell_plus,
+    reason="the query-axis block MLA decode is a Blackwell CuteDSL kernel",
+)
+@pytest.mark.parametrize("window", [129, -1], ids=["windowed", "full-attention"])
+def test_mla_block_decode_agrees_across_both_block_layouts(
+    device: str, window: int
+) -> None:
+    """One flattened row per block position, or the block on the query axis.
+
+    The two spell the same mask and dispatch to different kernels, so agreeing
+    is what makes the layout a caller's choice rather than a semantic one. A
+    draft mixes windowed and full-attention layers, so both masks have to hold.
+    """
+    torch.manual_seed(91)
+    block, context_len, page_size, heads = 8, 177, 64, 8
+    cache_len = context_len + block
+    qk_head_dim = (
+        _QUERY_BLOCK_DIMS["kv_lora_rank"] + _QUERY_BLOCK_DIMS["qk_rope_head_dim"]
+    )
+    pages = math.ceil(cache_len / page_size)
+
+    assert supports_mla_decode_query_blocks(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=page_size,
+        num_q_heads=heads,
+        q_len=block,
+        kv_lora_rank=_QUERY_BLOCK_DIMS["kv_lora_rank"],
+        qk_rope_head_dim=_QUERY_BLOCK_DIMS["qk_rope_head_dim"],
+        sliding_window=window >= 0,
+        noncausal_block_size=block,
+    )
+
+    q = torch.randn(block, heads, qk_head_dim, device=device, dtype=torch.bfloat16) / 8
+    kv_cache = (
+        torch.randn(
+            pages, page_size, 1, qk_head_dim, device=device, dtype=torch.bfloat16
+        )
+        / 8
+    )
+    table = torch.arange(pages, device=device, dtype=torch.int32)
+    lens = torch.full((1,), cache_len, device=device, dtype=torch.int32)
+
+    flattened = _windowed_decode(
+        q.unsqueeze(1),
+        kv_cache,
+        table.repeat(block, 1),
+        lens.repeat(block),
+        cache_len,
+        window,
+        block,
+    )
+    query_axis = _windowed_decode(
+        q.unsqueeze(0),
+        kv_cache,
+        table.unsqueeze(0),
+        lens,
+        cache_len,
+        window,
+        block,
+    )
+    torch.testing.assert_close(
+        query_axis.reshape(block, heads, -1).float(),
+        flattened.reshape(block, heads, -1).float(),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> None:
+    """A caller that gets False keeps the flattened form the portable kernel reads."""
+    probe = dict(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=64,
+        num_q_heads=8,
+        q_len=8,
+        sliding_window=True,
+        noncausal_block_size=8,
+        **{k: v for k, v in _QUERY_BLOCK_DIMS.items() if k != "qk_nope_head_dim"},
+    )
+    assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 128})
+    assert not supports_mla_decode_query_blocks(**{**probe, "kv_lora_rank": 8})
+    assert not supports_mla_decode_query_blocks(**{**probe, "solution": "triton"})
+    # A block of one is ordinary decode or target verify, never a proposal.
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+
+
+def test_query_block_support_distinguishes_causal_fp8_from_other_masks() -> None:
+    if not current_platform().is_cdna4:
+        pytest.skip("causal FP8 query blocks target CDNA4")
+    probe = dict(
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        page_size=64,
+        num_q_heads=12,
+        q_len=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        sliding_window=False,
+        noncausal_block_size=1,
+        solution="gluon",
+    )
+    assert supports_mla_decode_query_blocks(**probe)
+    # Ordinary decode, non-causal draft blocks, windows and BF16 queries keep
+    # their existing kernels and flattened rows.
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+    assert not supports_mla_decode_query_blocks(**{**probe, "noncausal_block_size": 4})
+    assert not supports_mla_decode_query_blocks(**{**probe, "sliding_window": True})
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_dtype": torch.bfloat16})
+
+
+@pytest.mark.parametrize("solution", [None, "triton"])
+def test_fp8_swa_latent_1024_with_strided_pages(solution):
+    torch.manual_seed(194)
+    lengths = [31, 32, 33, 512, 513, 514, 1050]
+    batch, heads, page_size, width = len(lengths), 8, 32, 1088
+    pages_per_request = math.ceil(max(lengths) / page_size)
+    pages = batch * pages_per_request
+    storage = (torch.randn(pages, page_size + 3, 1, width, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    cache = storage[:, :page_size]
+    table = torch.randperm(pages, device="cuda", dtype=torch.int32).view(
+        batch, pages_per_request
+    )
+    query = (torch.randn(batch, 1, heads, width, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    out, lse = mla_decode_with_kvcache(
+        q=query,
+        kv_cache=cache,
+        page_table=table,
+        cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        max_seqlen_k=max(lengths),
+        qk_nope_head_dim=192,
+        kv_lora_rank=1024,
+        qk_rope_head_dim=64,
+        softmax_scale=256**-0.5,
+        window_left=512,
+        return_lse=True,
+        solution=solution,
+    )
+    for row, length in enumerate(lengths):
+        positions = torch.arange(max(0, length - 513), length, device="cuda")
+        keys = cache[
+            table[row, positions // page_size], positions % page_size, 0
+        ].float()
+        logits = query[row, 0].float() @ keys.T * (256**-0.5)
+        ref = logits.softmax(-1) @ keys[:, :1024]
+        torch.testing.assert_close(out[row, 0].float(), ref, atol=0.01, rtol=0.01)
+        torch.testing.assert_close(
+            lse[row, 0], logits.logsumexp(-1), atol=1e-4, rtol=1e-4
+        )

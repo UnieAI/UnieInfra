@@ -48,10 +48,12 @@ class TestMixedBatchFlag(unittest.TestCase):
         ServerArgs.add_cli_args(parser)
         return parser.parse_args([*argv, "--model-path", "/nonexistent"])
 
-    def test_defaults_on(self):
-        self.assertTrue(self._parse([]).enable_mixed_batch)
+    def test_defaults_off(self):
+        """Upstream's default (off) since the upstream merge; the fork's
+        default-on depended on backends declaring MIXED support."""
+        self.assertFalse(self._parse([]).enable_mixed_batch)
 
-    def test_enable_flag_keeps_it_on(self):
+    def test_enable_flag_turns_it_on(self):
         self.assertTrue(self._parse(["--enable-mixed-batch"]).enable_mixed_batch)
 
     def test_disable_flag_turns_it_off(self):

@@ -32,6 +32,16 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.scalar_type impor
     ScalarType as ScalarType,
 )
 
+# Fused projections are absent from ModelOpt ignore lists, which name the
+# constituent shards instead (e.g. ``...ple.key_proj``/``...ple.value_proj``).
+# A fused module is excluded only when every member is excluded.
+_EXCLUDED_FUSED_MEMBERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "gate_up_proj": ("gate_proj", "up_proj"),
+        "kv_proj": ("key_proj", "value_proj"),
+    }
+)
+
 
 def should_exclude_quant_module(prefix: str, exclude_modules: list[str]) -> bool:
     """Whether ``prefix`` matches a ModelOpt-style glob in ``exclude_modules``."""
@@ -41,6 +51,14 @@ def should_exclude_quant_module(prefix: str, exclude_modules: list[str]) -> bool
         regex_str = pattern.replace(".", r"\.").replace("*", ".*")
         if re.fullmatch(regex_str, prefix):
             return True
+    proj_name = prefix.rsplit(".", 1)[-1]
+    members = _EXCLUDED_FUSED_MEMBERS.get(proj_name)
+    if members is not None:
+        base = prefix.removesuffix(proj_name)
+        return all(
+            should_exclude_quant_module(base + member, exclude_modules)
+            for member in members
+        )
     return False
 
 
@@ -119,6 +137,15 @@ def should_ignore_quant_layer(
                     and prefix_v_proj in ignored_layers
                 ):
                     should_ignore_layer = True
+            elif prefix.endswith(".ple.kv_proj"):
+                # Qwen4-Exp PLE fuses key_proj and value_proj into kv_proj.
+                if all(
+                    check_equal_or_regex_match(
+                        prefix.replace("kv_proj", shard), ignored_layers
+                    )
+                    for shard in ("key_proj", "value_proj")
+                ):
+                    should_ignore_layer = True
             elif "in_proj_qkvzba" in prefix:
                 shard_groups = (
                     ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
@@ -181,6 +208,8 @@ def find_matched_target(
     Third, we try to map the layer_name to a list of fused module names.
         *All* component module names must match in order for a match to be
         successful. A successful match returns the first component target
+    Last, a target naming a class of the module (compressed-tensors' class
+        match: any class in its MRO, ``Linear`` for every ``LinearBase``)
 
     :param layer_name: layer name
     :param module: torch.nn.Module
@@ -197,6 +226,7 @@ def find_matched_target(
         _find_first_match(layer_name, targets)
         or _find_first_match(module.__class__.__name__, targets, True)
         or _match_fused_layer(layer_name, targets, fused_mapping)
+        or next((t for t in targets if matches_module_class(module, t)), None)
     )
 
     if matched_target is None:
@@ -206,6 +236,16 @@ def find_matched_target(
         )
 
     return matched_target
+
+
+def matches_module_class(module: Module, target: str) -> bool:
+    """Whether ``target`` names a class of ``module`` as compressed-tensors
+    matches ``targets`` and ``ignore`` entries: a class in the module's MRO,
+    with ``Linear`` naming every ``LinearBase``."""
+    return any(
+        cls.__name__ == target or (cls.__name__ == "LinearBase" and target == "Linear")
+        for cls in type(module).__mro__
+    )
 
 
 def _find_first_match(
@@ -448,3 +488,16 @@ def block_dequant(
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
     return x_dq_block
+
+
+def modelopt_block_scale_to_2d(scale: torch.Tensor) -> torch.Tensor:
+    """Normalize ModelOpt's 4-D block-scale layout to the 2-D block grid.
+
+    ModelOpt MIXED_PRECISION checkpoints store per-block FP8 dequant scales as
+    ``[ceil(N/block_n), 1, ceil(K/block_k), 1]``; runtime consumers use the
+    plain 2-D ``[ceil(N/block_n), ceil(K/block_k)]`` grid. 2-D inputs pass
+    through unchanged.
+    """
+    if scale.dim() == 4 and scale.shape[1] == 1 and scale.shape[3] == 1:
+        return scale.reshape(scale.shape[0], scale.shape[2])
+    return scale

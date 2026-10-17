@@ -6,32 +6,20 @@ import sys
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
-from test.runtime.conftest import TP8_PAGE_SET_BYTES
+from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
 
+import pytest
 import torch
-
-from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-    kimi_k3_lcm_blocks_needed,
-    kimi_k3_token_capacity_for_cache_pool,
-    solve_kimi_k3_cache_layout,
-)
 
 
 def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
-    layout = solve_kimi_k3_cache_layout(
-        KimiLinearConfig(),
-        tp_size=tp_size,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-    )
-    return layout.with_num_lcm_blocks(num_lcm_blocks)
+    return kimi_tp8_layout(tp_size=tp_size)[2].bind(num_lcm_blocks)
 
 
 def test_lcm_reference_geometry_is_exact() -> None:
     plan = _plan(7)
 
-    assert plan.logical_block_tokens == 128
+    assert plan.prefix_granularity == 128
     assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
     assert len(plan.planes) == 24
     assert {
@@ -65,52 +53,215 @@ def test_lcm_reference_geometry_is_exact() -> None:
         assert {field.plane_id for field in fields_by_group[group_id]} == {
             f"slot.{slot}" for slot in range(23)
         }
+    conv = next(
+        field for field in plan.fields if field.field_id.endswith(".conv_state")
+    )
+    assert conv.shape[0] == 3 * 96 * 128 // 8
 
 
-def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
-    """KDA state halves at TP16; two pages pack per MLA-sized plane."""
+def test_lcm_geometry_shrinks_with_the_kda_state_at_tp16() -> None:
+    """KDA state halves at TP16; the plane and the parent halve with it."""
     plan = _plan(7, tp_size=16)
 
     assert {
         group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
     } == {
-        "full_attention": 12,
-        "linear_attention_0": 2,
-        "linear_attention_1": 2,
-        "linear_attention_2": 2,
+        "full_attention": 6,
+        "linear_attention_0": 1,
+        "linear_attention_1": 1,
+        "linear_attention_2": 1,
     }
-    # MLA planes still dominate, so the LCM block geometry matches TP8.
-    assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
+    # Half the TP8 state needs half the plane width, so the parent halves.
+    assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES // 2
     assert len(plan.planes) == 24
+    conv = next(
+        field for field in plan.fields if field.field_id.endswith(".conv_state")
+    )
+    assert conv.shape[0] == 3 * 96 * 128 // 16
+
+
+def test_attention_dp_layouts_grow_the_mla_packing() -> None:
+    """Attention-DP (tp < 8) grows the KDA state; the packing follows it.
+
+    The original constant-12 packing made every tp < 8 boot fail on the
+    exact-page-stride check: the state outgrew the plane and the planner
+    widened it, breaking the latent kernel's implicit 73,728-byte stride.
+    """
+    latent_page_bytes = 128 * 576
+    for tp_size, mla_packing in ((4, 23), (2, 45), (1, 89)):
+        plan = _plan(7, tp_size=tp_size)
+
+        assert {
+            group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+        } == {
+            "full_attention": mla_packing,
+            "linear_attention_0": 1,
+            "linear_attention_1": 1,
+            "linear_attention_2": 1,
+        }
+        assert plan.lcm_block_bytes == 24 * mla_packing * latent_page_bytes
+        assert len(plan.planes) == 24
+
+
+def test_latent_stride_stays_exact_for_every_tp() -> None:
+    """The MLA kernel indexes pages by an implicit payload-sized stride."""
+    latent_page_bytes = 128 * 576
+    for tp_size in (1, 2, 4, 8, 16):
+        plan = _plan(7, tp_size=tp_size)
+        latent = next(
+            field for field in plan.fields if field.field_id.endswith(".latent_kv")
+        )
+        assert latent.page_stride_bytes == latent_page_bytes, tp_size
+
+
+def test_bf16_mla_cache_reuses_the_same_packing_rule() -> None:
+    """The packing is a ratio of byte counts, so the cache dtype scales it."""
+    _, _, layout = kimi_tp8_layout(tp_size=1, kv_cache_dtype=torch.bfloat16)
+    plan = layout.bind(7)
+
+    latent_page_bytes = 128 * 576 * 2
+    assert {
+        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+    } == {
+        "full_attention": 45,
+        "linear_attention_0": 1,
+        "linear_attention_1": 1,
+        "linear_attention_2": 1,
+    }
+    latent = next(
+        field for field in plan.fields if field.field_id.endswith(".latent_kv")
+    )
+    assert latent.page_stride_bytes == latent_page_bytes
+
+
+@pytest.mark.parametrize("kvp_size", [1, 4])
+def test_speculative_verify_workspace_is_reserved_outside_the_arena(
+    monkeypatch,
+    kvp_size,
+) -> None:
+    from dataclasses import replace
+
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
+        lambda dtype, **kwargs: False,
+    )
+    recipe, _, layout = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        device="cuda",
+        kvp_size=kvp_size,
+        kvp_group=tuple(range(kvp_size)),
+        components=(
+            replace(recipe.attn_config.components[0], backend_name="tokenspeed_mla"),
+            *recipe.attn_config.components[1:],
+        ),
+    )
+
+    # Four requests, each with one committed seed row and eight candidate rows,
+    # across all 69 target KDA layers.
+    expected_workspace_bytes = 2_022_174_720
+    assert recipe.workspace_bytes() == expected_workspace_bytes
+
+    setup = recipe.setup()
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    expected_parents = (
+        recipe.cache_budget_bytes - expected_workspace_bytes
+    ) // layout.lcm_block_bytes - 1
+    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
+        lambda dtype, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_batched_replay_uses_raw_gate",
+        lambda dtype, **kwargs: False,
+    )
+    recipe, groups, layout = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+    conv_row_bytes = 4 * sum(
+        field.payload_bytes
+        for spec, fields in groups
+        if spec.group_id != "full_attention"
+        for field in fields
+        if field.field_id.endswith(".conv_state")
+    )
+    # 69 KDA layers x (4 requests x 8 draft tokens) rows, each one bf16
+    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus an fp32 gate row
+    # (12 x 128), per rank at TP8.
+    expected_payload_bytes = 69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * 4)
+    expected_workspace_bytes = conv_row_bytes + expected_payload_bytes
+
+    setup = recipe.setup()
+
+    assert recipe.workspace_bytes() == expected_workspace_bytes
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    expected_parents = (
+        recipe.cache_budget_bytes - expected_workspace_bytes
+    ) // layout.lcm_block_bytes - 1
+    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
+    recipe, _, _ = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm=None,
+        speculative_num_draft_tokens=8,
+    )
+
+    assert recipe.workspace_bytes() == 0
 
 
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
-    plan = _plan(300)
-    sizing = dict(
+    recipe, _, layout = kimi_tp8_layout(max_bs=1, max_scheduled_tokens=8_192)
+
+    # Non-overlap sparse state prefill needs one input, one cacheable aligned
+    # checkpoint, one final continuation block, and one banked growth block per
+    # KDA group. The search inverts that demand -- what 98 parents admit needs no more,
+    # and one parent fewer admits strictly less.
+    assert recipe.parents_needed(layout, 131_072) == 98
+    admitted = recipe.token_capacity(layout, 98)
+    assert admitted >= 131_072
+    assert recipe.parents_needed(layout, admitted) <= 98
+    assert recipe.token_capacity(layout, 97) < admitted
+
+
+def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:
+    baseline, _, layout = kimi_tp8_layout(
+        max_bs=3,
         max_scheduled_tokens=8_192,
-        max_live_requests=1,
-        decode_input_tokens=1,
+        decode_input_tokens=128,
         overlap_schedule_depth=0,
     )
-
-    assert kimi_k3_lcm_blocks_needed(plan, token_capacity=131_072, **sizing) == 284
-    assert (
-        kimi_k3_token_capacity_for_cache_pool(
-            plan,
-            num_lcm_blocks=284,
-            upper_bound_tokens=131_072,
-            **sizing,
-        )
-        == 131_072
+    overlapped, _, _ = kimi_tp8_layout(
+        max_bs=3,
+        max_scheduled_tokens=8_192,
+        decode_input_tokens=128,
+        overlap_schedule_depth=1,
     )
+
+    # A full-block decode width plus overlap needs one more growth block per
+    # request and state group (3 requests x 3 groups). The full-attention
+    # protection term still fits in the same packed parent.
     assert (
-        kimi_k3_token_capacity_for_cache_pool(
-            plan,
-            num_lcm_blocks=283,
-            upper_bound_tokens=131_072,
-            **sizing,
-        )
-        < 131_072
+        overlapped.parents_needed(layout, 131_072)
+        - baseline.parents_needed(layout, 131_072)
+        == 9
     )
 
 
@@ -118,37 +269,20 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
     """One big model: five BF16 draft MLA layers join the K3 solve as
     continuation layers 93-97 in the full_attention group — same packing/page-id
     space, one plan, one arena."""
-    import torch
-
-    from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-        mla_cache_fields,
-    )
-
-    draft_fields = mla_cache_fields(
-        layer_group_ids=("full_attention",) * 5,
-        logical_block_tokens=128,
-        latent_width=576,
-        element_size=torch.bfloat16.itemsize,
-    )
-    merged = solve_kimi_k3_cache_layout(
-        KimiLinearConfig(),
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-        draft_fields=draft_fields,
-    )
+    _, _, merged = kimi_tp8_layout(draft_layers=5)
     # 24 target MLA planes + 5 draft continuation planes.
     assert len(merged.plane_bytes) == 29
     assert dict(merged.group_packing)["full_attention"] == 12
-    plan = merged.with_num_lcm_blocks(7)
+    plan = merged.bind(7)
     target_field = plan.field("layer.3.latent_kv")
     assert target_field.element_size == 1
     target_plane_ids = {f"slot.{slot}" for slot in range(24)}
-    for global_layer_id in range(93, 98):
+    for draft_index, global_layer_id in enumerate(range(93, 98)):
         draft_field = plan.field(f"layer.{global_layer_id}.latent_kv")
         assert draft_field.group_id == target_field.group_id == "full_attention"
-        assert draft_field.plane_id == f"slot.{global_layer_id}"
+        # Planes number by tenancy, not by layer id: the draft layers are the
+        # group's 25th..29th tenants, continuing the target's slot.0..23.
+        assert draft_field.plane_id == f"slot.{24 + draft_index}"
         assert draft_field.plane_id not in target_plane_ids
         assert draft_field.element_size == 2
         assert draft_field.page_stride_bytes == 2 * target_field.page_stride_bytes
@@ -162,19 +296,7 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
     """Binding-hole metric on real K3 geometry: full bindings use
     the whole parent; state bindings use 88.2%, dropping to ~62.2% when the
     five BF16 draft planes widen the parent."""
-    import torch
-
-    from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-        mla_cache_fields,
-    )
-
-    base = solve_kimi_k3_cache_layout(
-        KimiLinearConfig(),
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-    ).with_num_lcm_blocks(10)
+    base = kimi_tp8_layout()[2].bind(10)
     report = base.capacity_report()
     assert abs(report["full_attention"]["binding_utilization"] - 1.0) < 1e-3
     for k in range(3):
@@ -182,19 +304,33 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
             abs(report[f"linear_attention_{k}"]["binding_utilization"] - 0.882) < 1e-3
         )
 
-    draft_fields = mla_cache_fields(
-        layer_group_ids=("full_attention",) * 5,
-        logical_block_tokens=128,
-        latent_width=576,
-        element_size=torch.bfloat16.itemsize,
-    )
-    merged = solve_kimi_k3_cache_layout(
-        KimiLinearConfig(),
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-        draft_fields=draft_fields,
-    ).with_num_lcm_blocks(10)
+    merged = kimi_tp8_layout(draft_layers=5)[2]
+    merged = merged.bind(10)
     widened = merged.capacity_report()
     assert abs(widened["full_attention"]["binding_utilization"] - 1.0) < 1e-3
     assert abs(widened["linear_attention_0"]["binding_utilization"] - 0.6224) < 1e-3
+
+
+@pytest.mark.parametrize("limit", [1, 16384])
+@pytest.mark.parametrize("kvp_size", [1, 4])
+def test_token_limit_retains_kda_working_set(limit, kvp_size):
+    from dataclasses import replace
+
+    recipe, _, layout = kimi_tp8_layout(max_bs=4)
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        device="cuda",
+        kvp_size=kvp_size,
+        kvp_group=tuple(range(kvp_size)),
+        components=(
+            replace(recipe.attn_config.components[0], backend_name="flashmla"),
+            recipe.attn_config.components[1],
+        ),
+    )
+    recipe.server_args.max_total_tokens = limit
+    setup = recipe.setup()
+    assert setup.spec.token_capacity == limit
+    assert setup.spec.memory_plan.num_lcm_blocks == recipe.parents_needed(layout, limit)
+    assert recipe.parents_needed(layout, limit) > (
+        limit // (recipe._max_packing(layout) * layout.prefix_granularity)
+    )

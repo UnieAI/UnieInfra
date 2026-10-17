@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import time
 
+import torch.distributed as dist
 import zmq
 
 from tokenspeed.runtime.cache.embedding_cache import (
@@ -52,11 +53,43 @@ from tokenspeed.runtime.cache.embedding_cache import (
     TieredEmbeddingCache,
 )
 from tokenspeed.runtime.epd.encode_scheduler import EncodeScheduler
-from tokenspeed.runtime.epd.encode_worker import EncodeWorker
+from tokenspeed.runtime.epd.encode_worker import EncodeRequest, EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
+from tokenspeed.runtime.utils.jit_compile_check import mark_jit_compile_serving
 
 logger = get_colorful_logger(__name__)
+
+
+def _submit_encode_requests(
+    worker: EncodeWorker,
+    requests: list[object],
+    *,
+    tp_cpu_group: dist.ProcessGroup | None,
+) -> None:
+    encode_requests = []
+    for request in requests:
+        if isinstance(request, EncodeRequest):
+            encode_requests.append(request)
+        else:
+            logger.warning(
+                f"encode loop ignoring unsupported scheduler message "
+                f"{type(request).__name__}"
+            )
+    handles = [
+        item.feature_shm
+        for request in encode_requests
+        for item in request.items
+        if item.feature_shm is not None
+    ]
+    for handle in handles:
+        handle.attach()
+    if handles and tp_cpu_group is not None:
+        # submit() consumes and unlinks pixels even on an embedding-cache hit.
+        # Every TP peer must open all segments before any peer may unlink them.
+        dist.barrier(group=tp_cpu_group)
+    for request in encode_requests:
+        worker.submit(request)
 
 
 # Vision-embedding cache capacity. L1 lives in GPU VRAM; the optional L2 lives in
@@ -83,14 +116,13 @@ def _make_embedding_cache(l1_bytes: int, l2_bytes: int, device: str):
     (VRAM L1 + host-DRAM L2) when the L2 capacity is enabled (``l2_bytes > 0``)."""
     if l2_bytes > 0:
         logger.info(
-            "EPD encode embedding cache: L1(VRAM)=%d MiB, L2(host DRAM)=%d MiB",
-            l1_bytes >> 20,
-            l2_bytes >> 20,
+            f"EPD encode embedding cache: L1(VRAM)={l1_bytes >> 20:d} MiB, L2(host "
+            f"DRAM)={l2_bytes >> 20:d} MiB",
         )
         return TieredEmbeddingCache(l1_bytes, l2_bytes, device=device)
     logger.info(
-        "EPD encode embedding cache: L1(VRAM)=%d MiB (host-DRAM L2 disabled)",
-        l1_bytes >> 20,
+        f"EPD encode embedding cache: L1(VRAM)={l1_bytes >> 20:d} MiB (host-DRAM L2 "
+        "disabled)",
     )
     return EmbeddingCache(l1_bytes)
 
@@ -123,14 +155,10 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     """Assemble the encode worker: model + Mooncake manager + bootstrap server +
     executor + scheduler + cache, driven from the real ServerArgs."""
     from tokenspeed.runtime.configs.model_config import ModelConfig
-    from tokenspeed.runtime.epd.encode_executor import (
-        DisaggEncodeExecutor,
-    )
+    from tokenspeed.runtime.epd.encode_executor import DisaggEncodeExecutor
     from tokenspeed.runtime.epd.entities import EmbeddingArgs
     from tokenspeed.runtime.epd.mooncake.conn import MooncakeEmbeddingBootstrapServer
-    from tokenspeed.runtime.epd.mooncake.encode import (
-        MooncakeEmbeddingManagerEncode,
-    )
+    from tokenspeed.runtime.epd.mooncake.encode import MooncakeEmbeddingManagerEncode
     from tokenspeed.runtime.execution.distributed_initializer import (
         DistributedConfig,
         DistributedInitializer,
@@ -151,6 +179,9 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
         quantization=server_args.quantization,
         server_args=server_args,
     )
+    # The communication backend's probes read the resolved launch from this
+    # dict; publish before the distributed init runs them.
+    global_server_args_dict_update(server_args)
     DistributedInitializer.initialize(
         DistributedConfig.from_server_args(
             server_args=server_args,
@@ -260,8 +291,11 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             "chunked_prefill_size": server_args.chunked_prefill_size,
             "max_model_len": model_config.context_len,
             "multimodal_encoder_dtype": multimodal_encoder_dtype,
+            # No LM here: nothing scores prompt rows.
+            "supports_prompt_logprobs": False,
         }
     )
+    mark_jit_compile_serving()
 
     while True:
         # Rank 0 drains the gateway ZMQ without blocking; other ranks get the
@@ -282,8 +316,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
                 new_reqs, attn_global_rank, tp_cpu_group, src=attn_tp_src_rank
             )
 
-        for request in new_reqs:
-            worker.submit(request)
+        _submit_encode_requests(worker, new_reqs, tp_cpu_group=tp_cpu_group)
         drained = len(new_reqs) > 0
 
         # Encode + ship one scheduler batch. step() returns 0 when idle. All ranks

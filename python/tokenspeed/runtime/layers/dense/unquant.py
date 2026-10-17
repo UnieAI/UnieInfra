@@ -19,10 +19,12 @@
 # SOFTWARE.
 
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.selection import resolve_kernel_override
 from torch.nn.parameter import Parameter
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.utils import set_weight_attrs
 
@@ -61,8 +63,30 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from tokenspeed.runtime.utils.env import global_server_args_dict
 
-        return tokenspeed_kernel.mm(
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+            # Bitwise envelopes: one batch-invariant GEMM for every shape. The
+            # GEMV and large-M fast paths below switch kernels by shape, which
+            # is exactly the row-result drift the envelope forbids. A missing
+            # "aok" leaf fails selection loudly rather than falling back.
+            return kernel_mm(
+                x,
+                layer.weight,
+                bias=bias,
+                override="aok",
+            )
+
+        if resolve_kernel_override("gemm", "mm", None) is not None:
+            return kernel_mm(x, layer.weight, bias=bias)
+
+        if bias is None:
+            from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
+
+            largem = _try_gluon_largem_gfx1250(x, layer.weight)
+            if largem is not None:
+                return largem
+        return kernel_mm(
             x,
             layer.weight,
             bias=bias,

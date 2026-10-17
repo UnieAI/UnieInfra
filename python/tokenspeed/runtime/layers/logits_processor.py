@@ -23,29 +23,53 @@
 import dataclasses
 
 import torch
-import triton
-import triton.language as tl
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
-    create_dist_argmax_state,
+    DistArgmaxState,
     distributed_argmax,
 )
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     is_available as dist_argmax_available,
 )
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    supports_dist_argmax_shape,
+    try_create_dist_argmax_state,
+)
+from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import (
+    argmax_key_index,
+    vocab_parallel_argmax_keys,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.configs.numerics import (
+    BITWISE_ENVELOPES,
+    MEGATRON_VOCAB_BLOCK,
+)
+from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
+from tokenspeed.runtime.distributed.comm_manager import (
+    dp_group_row_counts,
+    gather_sampled_rows,
+)
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather,
+    all_gather_single,
+    all_reduce,
+    all_to_all_transpose,
+    token_all_gather,
+    token_all_gather_rows,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -56,15 +80,97 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
+from tokenspeed.runtime.sampling.utils import (
+    gather_token_logprobs,
+    top_token_logprobs,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = get_colorful_logger(__name__)
 
 
+_UNQUANTIZED_LM_HEAD_METHODS = frozenset(
+    {"UnquantizedEmbeddingMethod", "UnquantizedLinearMethod"}
+)
+
+
+def _has_lm_head_runtime_attrs(lm_head, attr_names: tuple[str, ...]) -> bool:
+    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
+def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    """Whether ``lm_head``'s quant method should run the logits GEMM.
+
+    Returns ``True`` only when the head is genuinely quantized and its runtime
+    tensor layout matches the method (so a packed weight is never matmul'd, and
+    a mismatched/stale method never runs). Otherwise the caller falls back to a
+    dense ``weight`` matmul.
+    """
+    if (
+        quant_method is None
+        or not hasattr(lm_head, "weight")
+        or not callable(getattr(quant_method, "apply", None))
+    ):
+        return False
+
+    method_name = type(quant_method).__name__
+    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    if method_name == "Nvfp4W4A16LinearMethod":
+        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "alpha",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
+
+    return True
+
+
 def _force_deterministic_rsag() -> bool:
+    """``--force-deterministic-rsag``: NCCL only, even for the pure-data-movement
+    multicast gather of the logits."""
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+
+def _dist_argmax_vetoed() -> bool:
+    """Whether the distributed argmax (a cross-rank reduction over symmetric
+    memory) stays off: under ``--force-deterministic-rsag`` like every
+    symmetric-memory path, and under the bitwise envelope, which was verified
+    with the gather plus the canonical local argmax and pins that form."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    return (
+        _force_deterministic_rsag()
+        or global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+    )
+
+
+class VocabParallelArgmax:
+    """Greedy token ids from logits left sharded over the vocabulary.
+
+    Each rank packs its shard's row maximum and global index into an int64
+    key, and an all-reduce MAX over the group picks the same token the
+    argmax of the gathered row would. It exchanges 8 bytes per row instead
+    of the logits shards.
+    """
+
+    def __init__(self, tp_group: tuple[int, ...], vocab_offset: int):
+        self.tp_group = tp_group
+        self.vocab_offset = vocab_offset
+
+    def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+        keys = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+        vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
+        keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
+        return argmax_key_index(keys, out=torch.empty_like(keys))
 
 
 @dataclasses.dataclass
@@ -88,39 +194,41 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: list | None = None
     next_token_token_ids_logprobs_idx: list | None = None
+    # Eager prefills only (``ForwardContext.sampled_top_k``): the most likely
+    # tokens of each prefill row's sampled position, fp32 log-softmax values
+    # and int64 ids, set by the executor after sampling. shape: [#prefill rows, k]
+    sampled_top_logprobs_val: torch.Tensor | None = None
+    sampled_top_logprobs_idx: torch.Tensor | None = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
-    # The logprobs of input tokens.        shape: [#token]
+    # The logprobs of the prompt rows the forward's ``InputLogprobPlan``
+    # named, fp32 in plan order, whole on every rank.  shape: [#rows]
     input_token_logprobs: torch.Tensor | None = None
-    # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: list = None
-    input_top_logprobs_idx: list = None
-    # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
-    input_token_ids_logprobs_val: list | None = None
-    input_token_ids_logprobs_idx: list | None = None
+    # With the plan's ``top_k``: each row's most likely next tokens, fp32
+    # values and int64 ids, most likely first.  shape: [#rows, k]
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
+    # The rows ``hidden_states`` holds are this rank's shard of the forward
+    # (query context parallelism); None when they are the whole forward. It
+    # selects the row-selection path (gathers over the TP group or local
+    # indexing), so every constructor names it.
+    query_shard: QueryShardPlan | None = dataclasses.field(kw_only=True)
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     gather_ids: torch.Tensor | None = None
-
-    extend_return_logprob: bool = False
-    extend_return_top_logprob: bool = False
-    extend_token_ids_logprob: bool = False
-    extend_seq_lens_cpu: list[int] | None = None
-    extend_logprob_start_lens_cpu: list[int] | None = None
-    extend_logprob_pruned_lens_cpu: list[int] | None = None
-    top_logprobs_nums: list[int] | None = None
-    extend_input_logprob_token_ids_gpu: torch.Tensor | None = None
-    token_ids_logprobs: list[list[int]] | None = None
-
-    # logits and logprobs post processing
-    temp_scaled_logprobs: bool = False
-    temperature: torch.Tensor = None
-    top_p_normalized_logprobs: bool = False
-    top_p: torch.Tensor = None
+    logits_rows_selected: bool = False
+    # Prompt rows whose next-token logprob the forward returns (SGLang
+    # ``logprob_start_len``); None when none is wanted.
+    input_logprob_rows: InputLogprobRows | None = None
+    # The forward's per-rank row tables (attention DP), for the LM-head TP
+    # group's row counts; see LogitsProcessor._lm_head_tp_row_counts.
+    all_decode_or_idle: bool = False
+    global_num_tokens: list[int] | None = None
+    collective_global_num_tokens: list[int] | None = None
 
     # DP attention metadata. Not needed when DP attention is not used.
     # Number of tokens in the request.
@@ -138,6 +246,12 @@ class LogitsMetadata:
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
+            logits_rows_selected=ctx.logits_rows_selected,
+            input_logprob_rows=ctx.input_logprob_rows,
+            query_shard=ctx.query_shard,
+            all_decode_or_idle=ctx.all_decode_or_idle,
+            global_num_tokens=ctx.global_num_tokens,
+            collective_global_num_tokens=ctx.collective_global_num_tokens,
         )
 
 
@@ -185,7 +299,7 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
     cast_hidden = hidden_states.to(weight.dtype)
     should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
     if should_use_fused is not None and should_use_fused(cast_hidden, weight):
-        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+        return lm_head_gemm(cast_hidden, weight)
     return torch.matmul(cast_hidden, weight.T)
 
 
@@ -210,7 +324,18 @@ class LogitsProcessor(nn.Module):
         tp_rank: int | None = None,
         tp_size: int | None = None,
         tp_group: tuple[int, ...] | None = None,
+        *,
+        dp_lm_head_tp: bool,
     ):
+        """``tp_*`` describe the group ``lm_head`` is vocab-sharded over.
+
+        ``dp_lm_head_tp`` selects the layout where that group's ranks are
+        data-parallel for attention and hold different rows: the rows are
+        all-gathered before the logits GEMM and the vocab shards transposed
+        back to each rank's own rows afterwards (``skip_all_gather`` is then
+        required, as the plain vocab all-gather does not apply). ``False`` is
+        today's layout: every rank of the group holds the same rows.
+        """
         super().__init__()
         self.config = config
         self.skip_all_gather = skip_all_gather
@@ -220,6 +345,22 @@ class LogitsProcessor(nn.Module):
         self.dp_sampling_min_bs = 0
         self.logit_scale = logit_scale
         self._logits_layout_executor: LogitsLayoutExecutor | None = None
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # --logprob-order: the log-softmax behind input (prompt) logprobs.
+        self.logprob_order: str = global_server_args_dict["logprob_order"]
+        if (
+            self.logprob_order == "megatron"
+            and config.vocab_size % MEGATRON_VOCAB_BLOCK != 0
+        ):
+            # The logits every logprob reads are sliced to config.vocab_size
+            # (_get_logits), and the trainer's sum(exp) folds fixed-width
+            # blocks of them; refuse at construction, not on the forward thread.
+            raise ValueError(
+                "--logprob-order megatron folds sum(exp) over fixed "
+                f"{MEGATRON_VOCAB_BLOCK}-wide vocabulary blocks and needs a "
+                f"vocab_size that is a multiple of it; got {config.vocab_size}"
+            )
 
         if tp_rank is None:
             if tp_size is not None or tp_group is not None:
@@ -232,6 +373,12 @@ class LogitsProcessor(nn.Module):
         if tp_size != 1 and tp_group is None:
             raise ValueError("tp_group is required when tp_size > 1.")
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
+        if dp_lm_head_tp and (tp_size == 1 or not skip_all_gather):
+            raise ValueError(
+                "dp_lm_head_tp needs a vocab-sharded head (tp_size > 1) and "
+                "skip_all_gather=True"
+            )
+        self.dp_lm_head_tp = dp_lm_head_tp
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
@@ -247,6 +394,34 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
+    def require_full_vocab_logits(self) -> None:
+        """Turn the fused draft argmax off so every forward returns full-vocab logits.
+
+        Draft models construct with ``do_argmax=True``: under tensor
+        parallelism the fused path reduces the argmax across the vocab shards
+        and hands back the local shard's logits, which only a greedy proposal
+        can live with. A consumer that samples from the draft distribution
+        (``--enable-speculative-sampling``) calls this once after construction
+        and before the first forward; the ordinary vocab all-gather then runs
+        on every draft step. Under attention DP the logits are full-vocab
+        either way: the head is replicated (``skip_all_gather``), or
+        ``dp_lm_head_tp`` transposes the vocab shards back to each rank's rows.
+        Returns None.
+        """
+        self.do_argmax = False
+
+    def fuse_argmax(self) -> None:
+        """Emit ``next_token_ids`` from every forward, as draft models do.
+
+        For a target model whose sampler reads only each row's argmax (greedy
+        sampling without logprobs or grammar masks). Under tensor parallelism
+        the argmax is then reduced across the vocabulary shards, and
+        ``next_token_logits`` stays this rank's shard instead of the gathered
+        vocabulary. Call once after construction and before the first forward.
+        Returns None.
+        """
+        self.do_argmax = True
 
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
@@ -296,23 +471,45 @@ class LogitsProcessor(nn.Module):
             num_tokens_per_req=n,
         )
 
-    def _tp_group_spans_nodes(self) -> bool:
+    def _tp_group_multicast_reachable(self) -> bool:
+        """Whether the gather's symmetric buffer can map multicast here.
+
+        Topology now only admits: an NVLink domain can span hosts, so a
+        host-spread group is asked of the fabric rather than refused outright,
+        and without fabric the rendezvous hangs rather than failing over. The
+        rank count cannot stand in for the topology test -- a strided group can
+        be smaller than one host's device count while living on two.
+
+        The world fabric map is gathered during distributed initialization, so
+        the group verdict is a local lookup with no dispatch-time collective.
+        """
         if self.tp_group is None:
             return False
+
+        from tokenspeed_kernel.ops.communication.fabric import (
+            group_has_fabric,
+        )
 
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         mapping = global_server_args_dict.get("mapping")
         nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
-        if not nprocs_per_node:
-            return False
-        return len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+        spans_hosts = bool(nprocs_per_node) and (
+            len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+        )
+        if not spans_hosts:
+            return True
+        return group_has_fabric(self.tp_group)
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
-        if self.tp_size == 1 or self.skip_all_gather or self._tp_group_spans_nodes():
+        if (
+            self.tp_size == 1
+            or self.skip_all_gather
+            or not self._tp_group_multicast_reachable()
+        ):
             return None
 
         vocab_padded = lm_head.weight.size(0) * self.tp_size
@@ -329,68 +526,118 @@ class LogitsProcessor(nn.Module):
                     rank_in_group=self.tp_rank,
                     max_tokens=self._LOGITS_AG_MAX_TOKENS,
                     hidden_size=vocab_padded,
+                    device=None,
                 )
             except Exception as exc:
                 # The RSAG kernel reduces through multimem instructions, so its
                 # buffer has to rendezvous as symmetric memory -- which needs
-                # NVLink/NVSwitch between the ranks. On a PCIe box the
+                # NVLink/NVSwitch between the ranks. On a single-host PCIe box
+                # (which _tp_group_multicast_reachable does not rule out) the
                 # rendezvous fails with "CUDA driver error: invalid device
-                # ordinal", and because this runs during the first forward it
-                # took down startup for every tensor-parallel launch rather
-                # than degrading. The guards above cover platform, world size,
-                # node spanning and vocab alignment; none of them can see the
-                # interconnect, so the attempt is the test.
-                #
-                # Cached per key: without this every layer retries a rendezvous
-                # that cannot succeed.
+                # ordinal" during the first forward and took down startup for
+                # every tensor-parallel launch. Cached per key so every layer
+                # does not retry a rendezvous that cannot succeed.
                 self._LOGITS_AG_UNAVAILABLE.add(key)
                 logger.warning(
-                    "Triton RSAG all-gather unavailable for tp_group %s "
-                    "(vocab %d); falling back to the plain all-gather. This is "
-                    "expected without NVLink between the ranks. Cause: %s: %s",
-                    self.tp_group,
-                    vocab_padded,
-                    type(exc).__name__,
-                    exc,
+                    f"Triton RSAG all-gather unavailable for tp_group "
+                    f"{self.tp_group} (vocab {vocab_padded}); falling back to "
+                    "the plain all-gather. This is expected without NVLink "
+                    f"between the ranks. Cause: {type(exc).__name__}: {exc}"
                 )
                 return None
         return self._LOGITS_AG_STATES[key]
 
-    def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia or _force_deterministic_rsag():
-            return None
+    def _agree_across_tp(self, ok: bool, group, device: torch.device) -> bool:
+        """Reduce a per-rank verdict so the whole group takes the same path."""
+        vote = torch.tensor([int(ok)], dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(
+            vote, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        return bool(vote.item())
 
-        # CuTe DSL argmax is unavailable on some SKUs (e.g. H20 lacks TMA
-        # cluster launch). Fall back to the plain all-gather + argmax path.
-        if not dist_argmax_available():
-            return None
+    def acquire_dist_argmax_state(
+        self,
+        lm_head: VocabParallelEmbedding,
+        *,
+        max_M: int,
+        skip_ping_pong: bool,
+        dtype: torch.dtype,
+    ) -> DistArgmaxState | None:
+        """Build this TP group's distributed-argmax state, or None to fall back.
 
-        if (
-            self.tp_size == 1
-            or self.skip_all_gather
-            or self.dp_sampling_enabled
-            or self._tp_group_spans_nodes()
+        Shared by the sampler and the drafters. Construction rendezvouses and
+        barriers, so a rank deciding alone would strand the others: platform
+        eligibility and the build outcome are both reduced with MIN. Callers
+        apply their own config-uniform gates first, which may return early
+        because those cost no collective work.
+
+        Args:
+            lm_head: The vocab-parallel head whose shard the argmax reduces.
+            max_M: Largest row count the caller will ever pass.
+            skip_ping_pong: Pin the slot band instead of alternating; only
+                when the caller synchronizes across ranks between calls.
+            dtype: Value dtype of the logits selected by the caller.
+
+        Returns:
+            The state, or None when this group must use the gather path.
+        """
+        device = lm_head.weight.device
+        key = (
+            self.tp_group,
+            lm_head.weight.size(0),
+            max_M,
+            skip_ping_pong,
+            dtype,
+            device,
+        )
+        if key in self._LOGITS_DIST_ARGMAX_STATES:
+            return self._LOGITS_DIST_ARGMAX_STATES[key]
+        if torch.cuda.is_current_stream_capturing():
+            return None  # never rendezvous inside capture; warmup probes first
+
+        group = pg_manager.get_process_group("nccl", self.tp_group)
+        if self._agree_across_tp(
+            current_platform().is_nvidia and dist_argmax_available(), group, device
         ):
+            state = try_create_dist_argmax_state(
+                group=group,
+                rank_in_group=self.tp_rank,
+                max_M=max_M,
+                dtype=dtype,
+                device=device,
+                skip_ping_pong=skip_ping_pong,
+            )
+            if not self._agree_across_tp(state is not None, group, device):
+                state = None
+        else:
+            state = None
+        self._LOGITS_DIST_ARGMAX_STATES[key] = state
+        return state
+
+    def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
+        if _dist_argmax_vetoed():
+            return None
+        if not 2 <= self.tp_size <= 32:
+            return None  # the kernel's cross-rank reduce is a single warp shuffle
+        if self.skip_all_gather or self.dp_sampling_enabled:
             return None
 
         vocab_per_rank = lm_head.weight.size(0)
         if vocab_per_rank * self.tp_size != self.config.vocab_size:
             return None  # padded vocab: sharded argmax could pick a pad column
-        if vocab_per_rank < 4096 or vocab_per_rank % 32 != 0:
-            return None  # below the kernel's vocab floor / alignment
-
-        key = (self.tp_group, vocab_per_rank)
-        if key not in self._LOGITS_DIST_ARGMAX_STATES:
-            self._LOGITS_DIST_ARGMAX_STATES[key] = create_dist_argmax_state(
-                group=pg_manager.get_process_group("nccl", self.tp_group),
-                rank_in_group=self.tp_rank,
+        state = None
+        if supports_dist_argmax_shape(
+            vocab_per_rank, lm_head.weight.dtype, self.tp_size
+        ):
+            state = self.acquire_dist_argmax_state(
+                lm_head,
                 max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
-                dtype=lm_head.weight.dtype,
-                device=lm_head.weight.device,
                 skip_ping_pong=True,
+                dtype=lm_head.weight.dtype,
             )
-
-        return self._LOGITS_DIST_ARGMAX_STATES[key]
+        if state is None and not torch.cuda.is_current_stream_capturing():
+            state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
+        return state
 
     def forward(
         self,
@@ -400,86 +647,111 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
-        # Get the last hidden states and last logits for the next token prediction
-        if not logits_metadata.extend_return_logprob:
-            gather_ids = logits_metadata.gather_ids
-            if gather_ids is not None:
-                # Shapes align iff midlayer already pruned to one row per request
-                # (draft first-step reduce). Other paths emit [N, H] with N > bs.
-                if gather_ids.shape[0] == hidden_states.shape[0]:
-                    pruned_states = hidden_states
-                    if aux_hidden_states is not None:
-                        aux_pruned_states = list(aux_hidden_states)
-                else:
-                    pruned_states = hidden_states[gather_ids]
-                    if aux_hidden_states is not None:
-                        aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
-            else:
-                if logits_metadata.forward_mode.is_extend_or_mixed():
-                    raise RuntimeError(
-                        "EXTEND/MIXED forward must set gather_ids on ForwardContext"
-                    )
-                pruned_states = hidden_states
-                if aux_hidden_states is not None:
-                    aux_pruned_states = list(aux_hidden_states)
+        """The model exit: prompt logprobs, the sampled rows, their logits.
 
-            sample_indices = None
-            input_logprob_indices = None
-        else:
-            # Input logprobs are required.
-            # Find 3 different indices.
-            # 1. pruned_states: hidden states that we want logprobs from.
-            # 2. sample_indices: Indices that have sampled tokens.
-            # 3. input_logprob_indices: Indices that have input logprob tokens.
-            sample_index_pt = -1
-            sample_indices = []
-            input_logprob_indices_pt = 0
-            input_logprob_indices = []
-            pt, pruned_states = 0, []
-            for extend_logprob_start_len, extend_len in zip(
-                logits_metadata.extend_logprob_start_lens_cpu,
-                logits_metadata.extend_seq_lens_cpu,
-            ):
-                # It can happen in chunked prefill. We still need to sample 1 token,
-                # But we don't want to include it in input logprob.
-                if extend_len == extend_logprob_start_len:
-                    start_len = extend_logprob_start_len - 1
-                else:
-                    start_len = extend_logprob_start_len
-
-                # We always need at least 1 token to sample because that's required
-                # by a caller.
-                if extend_len <= start_len:
-                    raise RuntimeError("extend_len must be greater than start_len.")
-                pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
-                pt += extend_len
-                sample_index_pt += extend_len - start_len
-                sample_indices.append(sample_index_pt)
-                input_logprob_indices.extend(
-                    [
-                        input_logprob_indices_pt + i
-                        for i in range(extend_len - extend_logprob_start_len)
-                    ]
+        ``hidden_states`` are every input row of the forward, or this rank's
+        shard of them under query context parallelism
+        (``logits_metadata.query_shard``), or -- when the model selected its
+        logits rows itself (``logits_rows_selected``) -- the sampled rows
+        already. Prompt logprobs are scored first, where the activations
+        live, then the sampled rows are selected: ``hidden_states[gather_ids]``
+        on whole rows, :func:`gather_sampled_rows` over the group on a shard
+        (every rank ends with the batch's ``[bs, hidden]`` rows in request
+        order, so the LM head and the vocab all-gather run as without a
+        shard). A FULL hidden capture is the rows as given -- the shard under
+        a shard, which is what a drafter's extend step consumes; a LAST
+        capture is the selected ``[bs, hidden]`` rows (the aux taps', when the
+        model has them), whole on every rank.
+        """
+        shard = self._query_shard(logits_metadata)
+        # A model may finish a cache-only chunk without any logits rows.
+        # Return before LM-head/collective kernels, retaining the empty taps.
+        if logits_metadata.logits_rows_selected and hidden_states.shape[0] == 0:
+            if logits_metadata.input_logprob_rows is not None:
+                raise ValueError("selected logits rows cannot provide input logprobs")
+            capture = None
+            if logits_metadata.capture_hidden_mode.need_capture():
+                capture = (
+                    torch.cat(aux_hidden_states, dim=-1)
+                    if aux_hidden_states
+                    else hidden_states
                 )
-                input_logprob_indices_pt += extend_len - start_len
-
-            pruned_states = torch.cat(pruned_states)
-            sample_indices = torch.tensor(
-                sample_indices, device=pruned_states.device, dtype=torch.int64
+            if self.dp_lm_head_tp:
+                # The LM-head TP peers hold rows: join their exchange with none.
+                logits = self._get_logits(
+                    hidden_states, lm_head, logits_metadata, require_full_vocab=False
+                )
+            else:
+                logits = hidden_states.new_empty(
+                    (0, self.config.vocab_size), dtype=torch.float32
+                )
+            return LogitsProcessorOutput(
+                next_token_logits=logits, hidden_states=capture
             )
-            input_logprob_indices = torch.tensor(
-                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
+
+        # Prompt logprobs read the [num_input_rows, hidden] activations this
+        # rank holds, so they are scored before the sampled-row selection
+        # below (on a shard: before the sampled rows leave it).
+        input_token_logprobs = input_top = None
+        if logits_metadata.input_logprob_rows is not None:
+            input_token_logprobs, input_top = self.compute_input_token_logprobs(
+                hidden_states, lm_head, logits_metadata, shard
             )
 
-        # Compute logits for both input and sampled tokens.
+        # Get the last hidden states and last logits for the next token prediction
+        gather_ids = logits_metadata.gather_ids
+        # Only a LAST capture stores the sampled rows of the aux hidden states
+        # (Eagle3's layer taps), so only then are they selected -- on a shard,
+        # gathered: a collective per tap per forward otherwise spent for
+        # nothing. Uniform across the group: the mode rides the context.
+        aux_pruned_states: list[torch.Tensor] | None = None
+        select_aux = (
+            aux_hidden_states is not None
+            and logits_metadata.capture_hidden_mode.is_last()
+        )
+        if gather_ids is not None:
+            if logits_metadata.logits_rows_selected or (
+                # Shapes align iff midlayer already pruned to one row per
+                # request (draft first-step reduce). Other paths emit [N, H]
+                # with N > bs. A shard's rows are never pre-selected.
+                shard is None
+                and gather_ids.shape[0] == hidden_states.shape[0]
+            ):
+                pruned_states = hidden_states
+                if select_aux:
+                    aux_pruned_states = list(aux_hidden_states)
+            elif shard is not None:
+                pruned_states = gather_sampled_rows(
+                    hidden_states, shard, gather_ids, group=self.tp_group
+                )
+                if select_aux:
+                    aux_pruned_states = [
+                        gather_sampled_rows(h, shard, gather_ids, group=self.tp_group)
+                        for h in aux_hidden_states
+                    ]
+            else:
+                pruned_states = hidden_states[gather_ids]
+                if select_aux:
+                    aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
+        else:
+            if logits_metadata.forward_mode.is_extend_or_mixed():
+                raise RuntimeError(
+                    "EXTEND/MIXED forward must set gather_ids on ForwardContext"
+                )
+            pruned_states = hidden_states
+            if select_aux:
+                aux_pruned_states = list(aux_hidden_states)
+
+        # Compute logits for the sampled tokens.
         logits_layout_plan = self._resolve_logits_layout_plan(
             pruned_states, logits_metadata
         )
-        logits = self._get_logits(
-            pruned_states, lm_head, logits_metadata, plan=logits_layout_plan
-        )
-        sampled_logits = (
-            logits[sample_indices] if sample_indices is not None else logits
+        sampled_logits = self._get_logits(
+            pruned_states,
+            lm_head,
+            logits_metadata,
+            plan=logits_layout_plan,
+            require_full_vocab=False,
         )
 
         hidden_states_to_store: torch.Tensor | None = None
@@ -495,94 +767,242 @@ class LogitsProcessor(nn.Module):
                 else:
                     hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
-                # Get the last token hidden states. If sample_indices is None,
-                # pruned states only contain the last tokens already.
-                if aux_hidden_states is not None:
-                    aux_pruned_states = (
+                # Get the last token hidden states; pruned states only contain
+                # the last tokens already (on a shard: the batch's gathered
+                # [bs, hidden] rows, so the capture is whole on every rank).
+                if aux_pruned_states is not None:
+                    hidden_states_to_store = (
                         aux_pruned_states[0]
                         if len(aux_pruned_states) == 1
                         else torch.cat(aux_pruned_states, dim=-1)
                     )
-                    hidden_states_to_store = (
-                        aux_pruned_states[sample_indices]
-                        if sample_indices is not None
-                        else aux_pruned_states
-                    )
                 else:
-                    hidden_states_to_store = (
-                        pruned_states[sample_indices]
-                        if sample_indices is not None
-                        else pruned_states
-                    )
+                    hidden_states_to_store = pruned_states
             else:
                 raise RuntimeError("Should never reach")
 
-        if not logits_metadata.extend_return_logprob:
-            # Decode mode or extend mode without return_logprob.
-            # Greedy draft path: emit token ids here, fusing the cross-rank
-            # vocab reduction into the argmax when gated on.
-            next_token_ids = self._argmax(sampled_logits) if self.do_argmax else None
-            return LogitsProcessorOutput(
-                next_token_logits=sampled_logits,
-                next_token_ids=next_token_ids,
-                hidden_states=hidden_states_to_store,
-                logits_layout_plan=logits_layout_plan,
+        # Greedy draft path: emit token ids here, fusing the cross-rank
+        # vocab reduction into the argmax when gated on.
+        next_token_ids = self._argmax(sampled_logits) if self.do_argmax else None
+        return LogitsProcessorOutput(
+            next_token_logits=sampled_logits,
+            next_token_ids=next_token_ids,
+            hidden_states=hidden_states_to_store,
+            logits_layout_plan=logits_layout_plan,
+            input_token_logprobs=input_token_logprobs,
+            input_top_logprobs_val=None if input_top is None else input_top[0],
+            input_top_logprobs_idx=None if input_top is None else input_top[1],
+        )
+
+    def _query_shard(self, logits_metadata: LogitsMetadata) -> QueryShardPlan | None:
+        """The forward's query shard when ``hidden_states`` are a shard.
+
+        The shard's collectives (the sampled-row gather, the gather of the
+        planned prompt rows) run over this processor's TP group: it is the LM
+        head's vocab-shard group, every rank of which must hold the same rows
+        for the vocab all-gather to be consistent, and query context
+        parallelism shards queries over exactly that group
+        (``Mapping``: ``qcp_size == attn_tp_size``). A plan of another
+        width, or a replicated head (attention DP), names a layout this
+        processor cannot serve.
+        """
+        plan = logits_metadata.query_shard
+        if plan is None or plan.size == 1:
+            return None
+        if plan.size != self.tp_size or self.skip_all_gather:
+            head = (
+                "a replicated LM head"
+                if self.skip_all_gather
+                else f"an LM head sharded over {self.tp_size} ranks"
             )
+            raise ValueError(
+                f"query shard of {plan.size} ranks over {head}: the sampled rows "
+                "and prompt logprobs are gathered over the head's vocab-shard "
+                "group, so the query shard group must be it"
+            )
+        return plan
+
+    def compute_input_token_logprobs(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        shard: QueryShardPlan | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """Logprob of each named prompt row's next token, position-chunked.
+
+        The rows (``logits_metadata.input_logprob_rows``) are pushed through the
+        LM head ``chunk_tokens`` at a time so the transient ``[rows, vocab]``
+        logits stay bounded; each chunk takes the same ``_get_logits`` route
+        as the sampled rows (quantized head, rl-bitwise GEMM, TP gather,
+        softcap) and the sampler's own ``gather_token_logprobs`` in the
+        launch's ``--logprob-order``, so prompt and output logprobs of one
+        token agree bitwise. Both orders are row-local, so the chunk size
+        never changes a value. The chunks ask for
+        a private full-vocab tensor (``require_full_vocab=True``): the
+        multicast gather returns a view of the TP group's shared buffer that
+        the next chunk's gather on a faster rank would overwrite while this
+        rank still reads it, so the chunk loop never takes that path.
+
+        Under a query shard (``InputLogprobRows.rows_per_rank`` is set) the
+        rows this rank holds are the plan's rows inside its shard. The head
+        is vocab-sharded over the same group, so a row's full-vocabulary
+        logits need every rank's slice *of that row*: the planned rows'
+        activations are all-gathered first (one collective with the
+        per-rank counts, rank order being row order) and the chunk loop then
+        runs over the whole plan on every rank, exactly as without a shard.
+        Every rank ends with the same fp32 vector -- the unsharded forward's
+        bit for bit, since each row meets the same operands -- so no result
+        gather follows and the per-request NaN audit agrees across the
+        group. A rank without any planned row contributes no activation and
+        still joins the gather and every chunk's vocab all-gather.
+
+        Args:
+            hidden_states: The ``[num_input_rows, hidden]`` activations this
+                rank holds, one row per input token it computed.
+            lm_head: The vocab-parallel head.
+            logits_metadata: Carries ``input_logprob_rows``.
+            shard: The forward's query shard as ``forward`` resolved it
+                (``_query_shard``): the plan whose rows ``hidden_states`` are,
+                ``None`` when they are the whole forward's.
+
+        With the plan's ``top_k`` each chunk's rows also get their ``top_k``
+        most likely tokens from ``top_token_logprobs``, the function the
+        sampled rows' alternatives come from, so a row's alternatives are
+        the same whether it is a prompt row or a sampled one, and a target's
+        value equals its own top-k entry bit for bit. Top-k is taken in
+        torch's logprob order only (the ingress refuses it otherwise).
+
+        Returns:
+            fp32 ``[plan rows]`` logprobs in row order, the whole plan's, and
+            with a ``top_k`` the ``([plan rows, top_k]`` fp32 values,
+            ``[plan rows, top_k]`` int64 ids``) of each row's most likely next
+            tokens, most likely first; None without one.
+
+        Raises:
+            ValueError: The model narrowed its logits rows (``hidden_states``
+                does not cover every input row it computed), so prompt rows
+                have no activations to read.
+            RuntimeError: The head is vocab-sharded over attention-DP ranks
+                (``dp_lm_head_tp``); admission refuses such requests
+                (``RequestHandler.supports_input_logprobs``), so reaching here
+                is a routing error.
+        """
+        plan = logits_metadata.input_logprob_rows
+        if self.dp_lm_head_tp:
+            # Each chunk's LM-head TP exchange needs every peer, and the peers
+            # hold different numbers of prompt rows (attention DP), so their
+            # chunk loops would not line up; refuse rather than hang.
+            raise RuntimeError(
+                "prompt logprobs are not supported with --lm-head-tp-size > 1 "
+                "under attention DP"
+            )
+        if logits_metadata.logits_rows_selected or (
+            hidden_states.shape[0] != plan.num_input_rows
+        ):
+            raise ValueError(
+                "input logprobs need one activation row per input token; this "
+                f"model narrowed {plan.num_input_rows} input rows to "
+                f"{hidden_states.shape[0]} logits rows"
+            )
+        if plan.chunk_tokens <= 0:
+            raise ValueError("input_logprob_chunk_tokens must be positive")
+        if (plan.rows_per_rank is None) != (shard is None):
+            raise ValueError(
+                "input logprob rows were staged for "
+                f"{'a sharded' if plan.rows_per_rank is not None else 'an unsharded'} "
+                f"forward but the forward is {'sharded' if shard else 'not'}"
+            )
+        if shard is None:
+            # Chunks index the activations in place: no [rows, hidden] copy.
+            source, index = hidden_states, plan.rows
+            staged_rows = index.shape[0]
         else:
-            input_logprobs = logits[input_logprob_indices]
-            del hidden_states, logits
-
-            # Normalize the logprob w/o temperature, top-p
-            pruned_lens = torch.tensor(
-                logits_metadata.extend_logprob_pruned_lens_cpu,
-                device=input_logprobs.device,
-            )
-            if logits_metadata.temp_scaled_logprobs:
-                logits_metadata.temperature = torch.repeat_interleave(
-                    logits_metadata.temperature.view(-1),
-                    pruned_lens,
-                ).view(-1, 1)
-            if logits_metadata.top_p_normalized_logprobs:
-                logits_metadata.top_p = torch.repeat_interleave(
-                    logits_metadata.top_p,
-                    pruned_lens,
+            if plan.rows.shape[0] != plan.rows_per_rank[shard.rank]:
+                raise ValueError(
+                    f"query shard rank {shard.rank} staged {plan.rows.shape[0]} "
+                    f"prompt rows but its share of the plan is "
+                    f"{plan.rows_per_rank[shard.rank]}"
                 )
-            input_logprobs = self.compute_temp_top_p_normalized_logprobs(
-                input_logprobs, logits_metadata
+            source = token_all_gather_rows(
+                hidden_states[plan.rows], self.tp_group, list(plan.rows_per_rank)
             )
-
-            # Get the logprob of top-k tokens
-            if logits_metadata.extend_return_top_logprob:
-                (
-                    input_top_logprobs_val,
-                    input_top_logprobs_idx,
-                ) = self.get_top_logprobs(input_logprobs, logits_metadata)
-            else:
-                input_top_logprobs_val = input_top_logprobs_idx = None
-
-            # Get the logprob of given token id
-            if logits_metadata.extend_token_ids_logprob:
-                (
-                    input_token_ids_logprobs_val,
-                    input_token_ids_logprobs_idx,
-                ) = self.get_token_ids_logprobs(input_logprobs, logits_metadata)
-            else:
-                input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
-
-            input_token_logprobs = input_logprobs[
-                torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
-                logits_metadata.extend_input_logprob_token_ids_gpu,
-            ]
-
-            return LogitsProcessorOutput(
-                next_token_logits=sampled_logits,
-                input_token_logprobs=input_token_logprobs,
-                input_top_logprobs_val=input_top_logprobs_val,
-                input_top_logprobs_idx=input_top_logprobs_idx,
-                hidden_states=hidden_states_to_store,
-                input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            index = None
+            staged_rows = source.shape[0]
+        num_rows = plan.num_result_rows
+        if staged_rows != num_rows:
+            raise ValueError(
+                f"{num_rows} prompt-logprob targets for {staged_rows} rows"
             )
+        # A k larger than the vocabulary returns every token
+        # (``top_token_logprobs``), so the buffers below hold that many.
+        top_k = min(plan.top_k, self.config.vocab_size)
+        if top_k > 0 and self.logprob_order != "torch":
+            raise ValueError(
+                "top-k prompt logprobs need --logprob-order torch, not "
+                f"{self.logprob_order}"
+            )
+        out = torch.empty(num_rows, dtype=torch.float32, device=hidden_states.device)
+        top = None
+        if top_k > 0:
+            top = (
+                torch.empty(
+                    (num_rows, top_k), dtype=torch.float32, device=hidden_states.device
+                ),
+                torch.empty(
+                    (num_rows, top_k), dtype=torch.int64, device=hidden_states.device
+                ),
+            )
+        for begin in range(0, num_rows, plan.chunk_tokens):
+            end = min(begin + plan.chunk_tokens, num_rows)
+            rows = source[begin:end] if index is None else source[index[begin:end]]
+            logits = self._get_logits(
+                rows,
+                lm_head,
+                logits_metadata,
+                plan=None,
+                require_full_vocab=True,
+            )
+            out[begin:end] = gather_token_logprobs(
+                logits, plan.targets[begin:end], logprob_order=self.logprob_order
+            )
+            if top is not None:
+                top[0][begin:end], top[1][begin:end] = top_token_logprobs(logits, top_k)
+            del logits
+        return out, top
+
+    def _lm_head_tp_row_counts(
+        self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> list[int]:
+        """Rows each LM-head TP rank brings to the logits GEMM.
+
+        On the decode path every rank's logits rows follow the forward's
+        host-side tables -- its decode tokens, or the live rows a narrowing
+        drafter reported (``collective_global_num_tokens``) -- so the counts
+        are read, not exchanged, and the step stays free of host syncs. The
+        other shapes have no table: a prefill keeps one row per request or the
+        logprob rows, a MIXED round mixes both, and a model selecting its own
+        rows is on its own; those exchange the counts (a device sync, off the
+        decode path). A graph capture records a uniform padded batch on every
+        rank, so its counts are uniform and no sync is recorded.
+        """
+        rows = hidden_states.shape[0]
+        if logits_metadata.all_decode_or_idle and not (
+            logits_metadata.input_logprob_rows is not None
+            or logits_metadata.logits_rows_selected
+        ):
+            table = (
+                logits_metadata.collective_global_num_tokens
+                if logits_metadata.collective_global_num_tokens is not None
+                else logits_metadata.global_num_tokens
+            )
+            return dp_group_row_counts(
+                table, self.tp_group, self.tp_group[self.tp_rank], rows
+            )
+        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+            return [rows] * self.tp_size
+        counts = torch.tensor([rows], dtype=torch.int64, device=hidden_states.device)
+        return all_gather(counts, self.tp_group, dim=0).tolist()
 
     def _get_logits(
         self,
@@ -591,12 +1011,22 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: torch.Tensor | None = None,
         plan: LogitsLayoutPlan | None = None,
+        *,
+        require_full_vocab: bool,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
-        If sampled_logits_only is True, it means hidden_states only contain the
-        last position (e.g., extend without input logprobs). The caller should
-        guarantee the given hidden_states follow this constraint.
+        Args:
+            require_full_vocab: The caller reads the whole distribution of
+                every row and keeps the tensor across further device work
+                (prompt logprobs). Under TP this disables two shortcuts the
+                sampled rows take: a ``do_argmax`` processor with the
+                distributed argmax active keeps its logits TP-sharded for
+                ``_argmax``, and the multicast all-gather returns a view of the
+                group's shared comm buffer without an entry barrier (safe only
+                because a whole forward separates consecutive sampled-row
+                gathers). With it set the TP gather is the NCCL collective
+                into a private tensor. ``False`` is the sampled-row route.
         """
         dp_sampling = plan is not None
         if dp_sampling and not self.dp_sampling_enabled:
@@ -614,21 +1044,51 @@ class LogitsProcessor(nn.Module):
                 hidden_states, plan
             )
 
-        if hasattr(lm_head, "weight"):
-            if self._use_fused_lm_head:
-                logits = _lm_head_matmul(hidden_states, lm_head.weight)
-            else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+        lm_head_tp_row_counts: list[int] | None = None
+        if self.dp_lm_head_tp:
+            if dp_sampling:
+                raise RuntimeError("dp_lm_head_tp cannot combine with DP sampling")
+            lm_head_tp_row_counts = self._lm_head_tp_row_counts(
+                hidden_states, logits_metadata
+            )
+            hidden_states = token_all_gather(
+                hidden_states, self.tp_group, lm_head_tp_row_counts
+            )
+
+        quant_method = getattr(lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(lm_head, quant_method):
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+        elif hasattr(lm_head, "weight"):
+            from tokenspeed.runtime.utils.env import global_server_args_dict
+
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+                logits = kernel_mm(
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight,
+                    override="aok",
                 )
+            else:
+                cast_hidden = hidden_states.to(lm_head.weight.dtype)
+                if current_platform().is_amd:
+                    logits = kernel_mm(cast_hidden, lm_head.weight)
+                elif self._use_fused_lm_head:
+                    logits = _lm_head_matmul(cast_hidden, lm_head.weight)
+                else:
+                    logits = torch.matmul(cast_hidden, lm_head.weight.T)
         else:
             # GGUF models
-            logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
+            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if dp_sampling and not self.skip_all_gather:
+        if lm_head_tp_row_counts is not None:
+            # [T_full, V / W] -> [T_own, V]: this rank's rows with every
+            # rank's vocab shard, in rank order like the plain all-gather.
+            logits = all_to_all_transpose(
+                logits, self.tp_group, input_split_sizes=lm_head_tp_row_counts
+            )
+        elif dp_sampling and not self.skip_all_gather:
             if self._logits_layout_executor is None:
                 raise RuntimeError(
                     "dp_sampling logits layout executor is not configured"
@@ -636,32 +1096,59 @@ class LogitsProcessor(nn.Module):
             logits = self._logits_layout_executor.swap_batch_vocab(logits, plan)
 
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
-            if self.do_argmax:
-                if self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
+            if self.do_argmax and not require_full_vocab:
+                if (
+                    self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
                     self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
 
                 if (
-                    self._dist_argmax_state is not None
+                    self._dist_argmax_state
+                    not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
                     and not self.final_logit_softcapping
                     and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
                 ):
                     return logits
 
-            if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
-                self._all_gather_state = self._init_all_gather_state(lm_head)
+            # The multicast buffer/kernel is BF16-only; retain other logits dtypes
+            # through the existing collective, including when a state is cached.
+            # A private full-vocab result never uses the shared buffer either.
+            state = (
+                self._all_gather_state
+                if logits.dtype == torch.bfloat16 and not require_full_vocab
+                else None
+            )
+            if state is self._LOGITS_AG_STATE_UNINITIALIZED:
+                # create_state rendezvouses; leave it for an eager call.
+                if torch.cuda.is_current_stream_capturing():
+                    state = None
+                else:
+                    state = self._all_gather_state = self._init_all_gather_state(
+                        lm_head
+                    )
 
-            if (
-                self._all_gather_state is not None
-                and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS
-            ):
+            if state is not None and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS:
                 # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
                 logits = all_gather_inner(
-                    self._all_gather_state,
+                    state,
                     logits,
                     tp_hidden_dim=logits.size(-1) * self.tp_size,
                     skip_entry_sync=True,
                     safe=False,
                 )
+            elif (
+                current_platform().is_cdna4
+                and not require_full_vocab
+                and (
+                    iris := get_global_backend().get_prepared_all_gather(
+                        self.tp_group, logits.dtype
+                    )
+                )
+                is not None
+                and iris.can_run(logits)
+            ):
+                logits = iris.run(logits)
             else:
                 num_rows = logits.size(0)
                 local_vocab_size = logits.size(1)
@@ -671,7 +1158,7 @@ class LogitsProcessor(nn.Module):
                     dtype=logits.dtype,
                     device=logits.device,
                 )
-                all_gather_into_tensor(gathered_logits, logits, self.tp_group)
+                all_gather_single(gathered_logits, logits, self.tp_group)
                 logits = (
                     gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
@@ -693,92 +1180,12 @@ class LogitsProcessor(nn.Module):
             and not self.final_logit_softcapping
             and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
         ):
+            if isinstance(self._dist_argmax_state, VocabParallelArgmax):
+                return self._dist_argmax_state(logits)
             _, idx = distributed_argmax(self._dist_argmax_state, logits)
             return idx
         else:
             return sampling_argmax(logits)
-
-    @staticmethod
-    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
-        max_k = max(logits_metadata.top_logprobs_nums)
-        ret = all_logprobs.topk(max_k, dim=1)
-        values = ret.values.tolist()
-        indices = ret.indices.tolist()
-
-        input_top_logprobs_val, input_top_logprobs_idx = [], []
-
-        pt = 0
-        for k, pruned_len in zip(
-            logits_metadata.top_logprobs_nums,
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-        ):
-            if pruned_len <= 0:
-                input_top_logprobs_val.append([])
-                input_top_logprobs_idx.append([])
-                continue
-
-            input_top_logprobs_val.append(
-                [values[pt + j][:k] for j in range(pruned_len)]
-            )
-            input_top_logprobs_idx.append(
-                [indices[pt + j][:k] for j in range(pruned_len)]
-            )
-            pt += pruned_len
-
-        return input_top_logprobs_val, input_top_logprobs_idx
-
-    @staticmethod
-    def get_token_ids_logprobs(
-        all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
-    ):
-        input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
-        pt = 0
-        for token_ids, pruned_len in zip(
-            logits_metadata.token_ids_logprobs,
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-        ):
-            if pruned_len <= 0:
-                input_token_ids_logprobs_val.append([])
-                input_token_ids_logprobs_idx.append([])
-                continue
-
-            input_token_ids_logprobs_val.append(
-                [all_logprobs[pt + j, token_ids].tolist() for j in range(pruned_len)]
-            )
-            input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
-            pt += pruned_len
-
-        return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
-
-    @staticmethod
-    def compute_temp_top_p_normalized_logprobs(
-        last_logits: torch.Tensor, logits_metadata: LogitsMetadata
-    ) -> torch.Tensor:
-        """
-        compute logprobs for the output token from the given logits.
-
-        Returns:
-            torch.Tensor: logprobs from logits
-        """
-        last_logits = last_logits.float()
-        # Scale logits if temperature scaling is enabled
-        if logits_metadata.temp_scaled_logprobs:
-            last_logits = last_logits / logits_metadata.temperature
-
-        # Normalize logprobs if top_p normalization is enabled
-        #  only normalize logprobs when top_p is set and not equal to 1.0
-        if (
-            logits_metadata.top_p_normalized_logprobs
-            and (logits_metadata.top_p != 1.0).any()
-        ):
-            from tokenspeed.runtime.sampling.utils import top_p_normalize_probs_torch
-
-            probs = torch.softmax(last_logits, dim=-1)
-            del last_logits
-            probs = top_p_normalize_probs_torch(probs, logits_metadata.top_p)
-            return torch.log(probs)
-        else:
-            return torch.nn.functional.log_softmax(last_logits, dim=-1)
 
 
 @triton.jit

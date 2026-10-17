@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,10 +21,10 @@ GPT_OSS_LAYER_TYPES = (
 )
 
 
-class MHAPoolGroupPublicationTest(unittest.TestCase):
+class TestMHAPoolGroupPublicationTest:
     """Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -31,12 +32,12 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
                 MHATokenToKVPool,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from cache_pool_test_utils import make_mha_memory_plan
+        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
 
         kwargs = {
             "size": 32,
@@ -46,59 +47,65 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             "layer_num": 2,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
         }
         kwargs.update(overrides)
-        from cache_pool_test_utils import make_layer_group_ids
+        from test.runtime.cache_pool_test_utils import make_layer_group_ids
 
-        kwargs["memory_plan"] = make_mha_memory_plan(
+        # Resolve the labels the way a recipe does: one per layer,
+        # full-history when the test declares none.
+        layer_types = (
+            kwargs.get("layer_types") or ("full_attention",) * kwargs["layer_num"]
+        )
+        plan = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
             dtype=kwargs["dtype"],
-            layer_types=kwargs.get("layer_types", ()),
+            layer_types=layer_types,
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
-        kwargs.setdefault(
-            "layer_group_ids",
-            make_layer_group_ids(
-                layer_num=kwargs["layer_num"],
-                layer_types=kwargs.get("layer_types", ()),
-                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
-            ),
+        group_ids = make_layer_group_ids(
+            layer_num=kwargs["layer_num"],
+            layer_types=layer_types,
+            sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-            build_paged_cache_group_specs,
-        )
+        from test.runtime.cache_pool_test_utils import specs_for_layers
 
         kwargs.setdefault(
-            "paged_cache_group_specs",
-            build_paged_cache_group_specs(
-                layer_types=kwargs.get("layer_types", ()),
-                group_ids=kwargs["layer_group_ids"],
+            "cache_group_specs",
+            specs_for_layers(
+                layer_types=layer_types,
+                group_ids=group_ids,
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
-                page_size=kwargs["page_size"],
+                prefix_granularity=kwargs["prefix_granularity"],
             ),
         )
         kwargs.pop("sliding_window_tokens", None)
-        return self.MHATokenToKVPool(**kwargs)
+        device = kwargs.pop("device")
+        for owned_by_arena in ("size", "prefix_granularity", "enable_memory_saver"):
+            kwargs.pop(owned_by_arena, None)
+        kwargs.pop("layer_types", None)
+        from test.runtime.cache_pool_test_utils import make_pool
+
+        _, pool = make_pool(self.MHATokenToKVPool, plan, device=device, **kwargs)
+        return pool
 
     def test_plain_no_spec_publishes_single_full_group(self):
         # The scheduler allocates pages only through configured groups, so
         # plain models keep one full-history group published.
         pool = self._pool()
-        self.assertEqual(len(pool.paged_cache_group_specs), 1)
-        spec = pool.paged_cache_group_specs[0]
-        self.assertEqual(spec.group_id, "full_attention")
-        self.assertEqual(spec.retention, "full_history")
-        self.assertIn("full_attention", pool.paged_cache_group_page_counts)
-        self.assertIsNotNone(pool.buffer)
-        self.assertEqual(
-            pool.k_buffer[0].untyped_storage().data_ptr(),
-            pool.buffer.untyped_storage().data_ptr(),
+        assert (len(pool.arena.cache_group_specs)) == (1)
+        spec = pool.arena.cache_group_specs[0]
+        assert (spec.group_id) == ("full_attention")
+        assert (spec.attn_kind) == ("full_history")
+        assert ("full_attention") in (pool.arena.cache_group_page_counts)
+        assert (pool.arena.buffer) is not None
+        assert (pool.k_buffer[0].untyped_storage().data_ptr()) == (
+            pool.arena.buffer.untyped_storage().data_ptr()
         )
 
     def test_hybrid_no_spec_publishes_two_groups(self):
@@ -109,15 +116,13 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             sliding_window_tokens=128,
             layer_num=len(GPT_OSS_LAYER_TYPES),
         )
-        self.assertEqual(
-            {s.group_id for s in pool.paged_cache_group_specs},
-            {"full_attention", "sliding_attention"},
+        assert ({s.group_id for s in pool.arena.cache_group_specs}) == (
+            {"full_attention", "sliding_attention"}
         )
-        self.assertEqual(
-            set(pool.paged_cache_group_page_counts),
-            {"full_attention", "sliding_attention"},
+        assert (set(pool.arena.cache_group_page_counts)) == (
+            {"full_attention", "sliding_attention"}
         )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

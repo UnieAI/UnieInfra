@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton.mha_decode import (
+from tokenspeed_kernel.ops.attention.mha.triton import (
     triton_mha_decode_with_kvcache,
 )
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -56,8 +56,8 @@ _DECODE_TRAITS = {
     "head_dim": 128,
     "page_size": 64,
     "sliding_window": False,
-    "support_logit_cap": False,
-    "support_sinks": False,
+    "logit_cap": False,
+    "sinks": False,
     "return_lse": False,
 }
 _EXTEND_TRAITS = {**_DECODE_TRAITS, "is_causal": True}
@@ -80,7 +80,7 @@ def _signature(q_dtype, kv_dtype):
         (
             "mha_decode_with_kvcache",
             _DECODE_TRAITS,
-            "triton_mha_decode_with_kvcache_cached",
+            "triton_mha_decode_with_kvcache",
         ),
         ("mha_extend_with_kvcache", _EXTEND_TRAITS, "triton_mha_extend_with_kvcache"),
     ],

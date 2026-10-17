@@ -28,11 +28,10 @@ Covers:
 """
 
 from tokenspeed_scheduler import (
+    AttnKind,
+    CacheGroupConfig,
     ExecutionEvent,
     ForwardEvent,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -42,22 +41,21 @@ from tokenspeed_scheduler import (
 def make_config(
     max_scheduled_tokens: int = 512,
     max_batch_size: int = 8,
-    page_size: int = 16,
+    prefix_granularity: int = 16,
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.block_size = page_size
+    cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    cfg.num_snapshot_pages = 1  # never retracts
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id="full_attention",
-            rows_per_page=page_size,
-            entry_stride_tokens=1,
+            block_granularity=prefix_granularity,
             total_pages=num_device_pages,
-            retention=PagedCacheRetention.FullHistory,
-            family=PagedCacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     return cfg
@@ -112,9 +110,12 @@ def get_to_decoding(
     """
     submit(scheduler, request_id, tokens)
     scheduler.next_execution_plan()  # → PrefillDone
+    advance_forward(scheduler, request_id, [100])  # every planned forward lands
     for peer in decoding_peers:
         send_reserve(scheduler, peer, 0)
     scheduler.next_execution_plan()  # → Decoding
+    for rid in (request_id, *decoding_peers):
+        advance_forward(scheduler, rid, [101])
 
 
 def get_forward_op(plan):
@@ -178,8 +179,10 @@ class TestReqPoolIndices:
         first_plan = s.next_execution_plan()
         r0_idx = first_plan.forward[0].request_pool_indices[0]
 
-        advance_forward(s, "r0", finish=True)
-        s.next_execution_plan()  # erases r0 (FinishEvent already applied)
+        advance_forward(
+            s, "r0", [102], finish=True
+        )  # the decode lands; r0 finishes and settles
+        s.next_execution_plan()  # erases r0
 
         submit(s, "r1", list(range(4)))
         new_plan = s.next_execution_plan()  # r1: Submitted → PrefillDone

@@ -7,7 +7,7 @@ try:
 except ImportError:  # test modules importorskip on their own
     ts = None
 
-# Kimi-K3 shape: cfg.block_size == P (1536 in production; ratio semantics
+# Kimi-K3 shape: cfg.prefix_granularity == P (1536 in production; ratio semantics
 # identical at P=2).
 PAGE = 2
 K3_HISTORY_GROUP = "full_attention"
@@ -17,30 +17,28 @@ K3_GROUP_IDS = (K3_HISTORY_GROUP,) + K3_STATE_GROUPS
 
 def _make_k3_config() -> "ts.SchedulerConfig":
     """Kimi-K3-shaped 4-group config: one full-attention History group plus
-    three linear-attention State groups with FullHistory retention --
-    MakeSpecsFromConfig maps State+FullHistory to AttnKind::kMambaState ->
-    MambaStateManager (SwaManager window=2), i.e. one page per
-    state-snapshot slot, exactly the production ratio."""
+    three linear-attention State groups. A State group has no token span
+    (block_granularity 0): its table is two slots, the input checkpoint and
+    the live state, each one page -- exactly the production ratio."""
     cfg = ts.SchedulerConfig()
-    cfg.block_size = PAGE
+    cfg.prefix_granularity = PAGE
     cfg.num_device_pages = 33  # page 0 = null sentinel, 32 usable
     cfg.num_host_pages = 0
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = False
-    cfg.paged_cache_groups = [
-        ts.PagedCacheGroupConfig(
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
             group_id=group_id,
-            rows_per_page=cfg.block_size,
-            entry_stride_tokens=1,
+            block_granularity=(
+                cfg.prefix_granularity if group_id == K3_HISTORY_GROUP else 0
+            ),
             total_pages=cfg.num_device_pages,
-            retention=ts.PagedCacheRetention.FullHistory,
-            family=(
-                ts.PagedCacheGroupFamily.History
-                if group_id == K3_HISTORY_GROUP
-                else ts.PagedCacheGroupFamily.State
+            attn_kind=(
+                ts.AttnKind.Full if group_id == K3_HISTORY_GROUP else ts.AttnKind.State
             ),
         )
         for group_id in K3_GROUP_IDS

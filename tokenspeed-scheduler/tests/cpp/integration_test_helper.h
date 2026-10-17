@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -38,25 +39,39 @@
 
 namespace tokenspeed::test {
 
+// Retraction capacity for a test config that does not exercise image-fit
+// refusals: a snapshot pool as large as the Device pool and one blob slot per
+// request slot on the retracting roles, so any resident request can be
+// imaged; none on the P role, which never retracts. Suites that test a
+// refusal size the pool themselves instead of calling this.
+inline void SetTestSnapshotPool(SchedulerConfig& cfg) {
+    if (cfg.role == Role::kP) {
+        cfg.snapshot_allocator.total_pages = 1;
+        cfg.max_retracted_requests = 0;
+        return;
+    }
+    cfg.snapshot_allocator.total_pages = cfg.device_allocator.total_pages;
+    cfg.max_retracted_requests = std::max(cfg.max_batch_size, 1);
+}
+
 class SchedulerTestSuite : public ::testing::Test {
 protected:
     // Subclasses can override this to customize the config.
     virtual SchedulerConfig MakeConfig() {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
-        cfg.paged_cache_groups.push_back(PagedCacheGroupConfig{
+        cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
-            .rows_per_page = cfg.block_size,
-            .entry_stride_tokens = 1,
+            .block_granularity = cfg.prefix_granularity,
             .total_pages = cfg.device_allocator.total_pages,
-            .retention = PagedCacheGroupConfig::Retention::FullHistory,
-            .family = PagedCacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
         });
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -66,14 +81,12 @@ protected:
     }
 
     const SchedulerConfig& Config() const { return config_; }
-    std::int32_t PageSize() const { return config_.block_size; }
-    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, std::int32_t start = 1,
-                                std::int32_t max_new_tokens = 0) {
-        auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
+    std::int32_t PrefixGranularity() const { return config_.prefix_granularity; }
+    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, std::int32_t start = 1) {
+        auto tokens = MakeAlignedTokens(num_pages, PrefixGranularity(), start);
         return RequestSpec{
             .request_id = id,
             .tokens = tokens,
-            .max_new_tokens = max_new_tokens,
         };
     }
 
@@ -117,16 +130,43 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    void AckWriteBacks(const ExecutionPlan& plan) {
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            for (std::uint32_t id : std::get<WriteBackBatch>(op).op_ids) {
+                SendWriteBackDone(id);
+            }
+        }
+    }
+
     void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(cache::LoadBackDone{
-            .op_id = op_id,
-        });
+        event.With(cache::LoadBackDone{.op_id = op_id});
         scheduler_->Advance(std::move(event));
     }
 
-    // Send ExtendResult (new decode tokens) to the scheduler.
-    void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens) {
+    // A pre-admission L3 prefetch finished with its first landed_pages prefix
+    // pages fetched.
+    void SendPrefetchDone(std::uint32_t op_id, std::int32_t landed_pages) {
+        ExecutionEvent event;
+        event.With(cache::PrefetchDone(op_id, landed_pages));
+        scheduler_->Advance(std::move(event));
+    }
+
+    static const PrefetchBatch* FindPrefetch(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* prefetch = std::get_if<PrefetchBatch>(cache_op)) {
+                    return prefetch;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    // Send ExtendResult to the scheduler: the forward landed. `tokens` are
+    // the new tokens it produced -- empty for an intermediate prefill chunk,
+    // which produces only KV.
+    void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens = {}) {
         ExecutionEvent event;
         event.With(forward::ExtendResult{
             .request_id = request_id,
@@ -135,8 +175,8 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    // Send Finish (generation complete) to the scheduler.
-    // This triggers FinishEvent: Decoding → Draining (or Finished if no writeback needed).
+    // Send Finish (generation complete) to the scheduler. Finish-created
+    // transfer tickets retain writeback sources after the request reaches Finished.
     void SendFinish(const std::string& request_id) {
         ExecutionEvent event;
         event.With(forward::Finish{
@@ -151,6 +191,59 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    void SendSnapshotDone(std::uint32_t op_id) {
+        ExecutionEvent event;
+        event.With(cache::SnapshotDone{.op_id = op_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendRestoreDone(std::uint32_t op_id) {
+        ExecutionEvent event;
+        event.With(cache::RestoreDone{.op_id = op_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    // Acknowledges both legs of every retraction image the plan stores: the
+    // L2 write-backs and the snapshot stores.
+    void AckImageStores(const ExecutionPlan& plan) {
+        AckWriteBacks(plan);
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<SnapshotStoreBatch>(plan)) {
+            for (std::uint32_t id : std::get<SnapshotStoreBatch>(op).op_ids) {
+                SendSnapshotDone(id);
+            }
+        }
+    }
+
+    void AckRestores(const ExecutionPlan& plan) {
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<SnapshotRestoreBatch>(plan)) {
+            for (std::uint32_t id : std::get<SnapshotRestoreBatch>(op).op_ids) {
+                SendRestoreDone(id);
+            }
+        }
+    }
+
+    static const SnapshotStoreBatch* FindSnapshotStore(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* store = std::get_if<SnapshotStoreBatch>(cache_op)) {
+                    return store;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static const SnapshotRestoreBatch* FindRestore(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* restore = std::get_if<SnapshotRestoreBatch>(cache_op)) {
+                    return restore;
+                }
+            }
+        }
+        return nullptr;
+    }
+
     SchedulerConfig config_{};
     std::unique_ptr<Scheduler> scheduler_;
 };
@@ -161,6 +254,11 @@ inline const ForwardBatch* FindForwardBatch(const ExecutionPlan& plan) {
         if (const auto* batch = std::get_if<ForwardBatch>(&op)) return batch;
     }
     return nullptr;
+}
+
+// D-side remote admissions ride the plan's own stream, beside the batch.
+inline const ForwardBatch* FindRemoteAdmission(const ExecutionPlan& plan) {
+    return plan.remote_prefill ? &*plan.remote_prefill : nullptr;
 }
 
 // Inserts every real (>0) page id found in `rows` into `seen`, expecting each
@@ -190,7 +288,7 @@ inline std::size_t CollectDisjointRealPages(const std::vector<std::vector<std::i
 
 // Kimi-K3-shaped KV-cache fixture: one full-attention (history) group
 // plus three linear-attention (state) groups drawing from one global pool.
-// Shared by test_kv_cache_lifecycle.cpp and test_kv_cache_scenarios.cpp.
+// Shared by test_kv_cache_lifecycle.cpp and test_cache_scenarios.cpp.
 class KimiFourGroupSuite : public SchedulerTestSuite {
 protected:
     static const std::array<std::string, 4>& GroupIds() {
@@ -201,7 +299,7 @@ protected:
 
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 33;
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 64;
@@ -211,15 +309,14 @@ protected:
         cfg.disable_prefix_cache = false;
 
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
-            PagedCacheGroupConfig group;
+            CacheGroupConfig group;
             group.group_id = GroupIds()[i];
-            group.rows_per_page = cfg.block_size;
-            group.entry_stride_tokens = 1;
+            group.attn_kind = i == 0 ? AttnKind::kFull : AttnKind::kState;
+            group.block_granularity = i == 0 ? cfg.prefix_granularity : 0;
             group.total_pages = cfg.device_allocator.total_pages;
-            group.retention = PagedCacheGroupConfig::Retention::FullHistory;
-            group.family = i == 0 ? PagedCacheGroupFamily::History : PagedCacheGroupFamily::State;
-            cfg.paged_cache_groups.push_back(std::move(group));
+            cfg.cache_groups.push_back(std::move(group));
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 

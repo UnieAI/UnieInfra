@@ -60,7 +60,7 @@ def _route_get(bootstrap_addr: str, engine_rank: int, target_dp_group: int):
     try:
         resp = requests.get(url, timeout=5)
     except Exception as e:  # noqa: BLE001 -- any transport failure -> per-room fail
-        logger.error("EPD bootstrap /route fetch failed (%s): %s", url, e)
+        logger.error(f"EPD bootstrap /route fetch failed ({url!s}): {e!s}")
         return None
     if resp.status_code == 200:
         return resp.json()
@@ -161,8 +161,11 @@ class MooncakeEmbeddingReceiver:
             dst_deepstack_ptr=ea.deepstack_data_ptr,
         )
         for info in self.encode_infos:
-            sock = self.mgr._connect(f"tcp://{info['rank_ip']}:{info['rank_port']}")
-            sock.send_multipart(reg.to_zmq())
+            sock, lock = self.mgr._connect(
+                f"tcp://{info['rank_ip']}:{info['rank_port']}"
+            )
+            with lock:
+                sock.send_multipart(reg.to_zmq())
 
     def pre_alloc(
         self,
@@ -200,8 +203,11 @@ class MooncakeEmbeddingReceiver:
                 row_start=row_start,
                 span=span,
             )
-            sock = self.mgr._connect(f"tcp://{info['rank_ip']}:{info['rank_port']}")
-            sock.send_multipart(ti.to_zmq())
+            sock, lock = self.mgr._connect(
+                f"tcp://{info['rank_ip']}:{info['rank_port']}"
+            )
+            with lock:
+                sock.send_multipart(ti.to_zmq())
 
     def poll(self) -> int:
         return self.mgr.check_status(self.bootstrap_room)

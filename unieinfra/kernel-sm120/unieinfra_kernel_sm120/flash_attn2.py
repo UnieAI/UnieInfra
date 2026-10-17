@@ -259,6 +259,7 @@ def fa2_mha_extend_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MHA extend against a paged KV cache, on FlashAttention-2.
 
@@ -348,6 +349,7 @@ def fa2_mha_decode_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MHA decode against a paged KV cache, on the same FA2 varlen entry point.
 
@@ -555,8 +557,8 @@ def register_flash_attn2() -> None:
     # in-tree Triton kernel.
     traits = {
         "sliding_window": frozenset({False}),
-        "support_sinks": frozenset({False}),
-        "support_logit_cap": frozenset({False}),
+        "sinks": frozenset({False}),
+        "logit_cap": frozenset({False}),
         "return_lse": frozenset({False, True}),
     }
 
@@ -595,7 +597,7 @@ def register_flash_attn2() -> None:
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
         priority=priority,
-        traits=traits,
+        traits={"skip_softmax": frozenset({False}), **traits},
         tags={"unieinfra", "sm120"},
     )(fa2_mha_prefill)
 

@@ -87,44 +87,62 @@ def test_dependent_source_write_precedes_gather_read():
     assert dst.item() == 123
 
 
-def test_state_pages_matches_reference():
+@pytest.mark.parametrize("BS", [8, 300])
+def test_state_pages_reads_the_input_slot_when_present(BS):
     torch.manual_seed(1)
     dev = "cuda"
-    BS, SLOTS, P = 8, 6, 64
-    rows = torch.randint(1, 500, (BS, SLOTS), dtype=torch.int32, device=dev)
-    seq_lens = torch.tensor(
-        [1, 63, 64, 65, 128, 129, 200, 384], dtype=torch.int32, device=dev
-    )
+    rows = torch.randint(1, 500, (BS, 2), dtype=torch.int32, device=dev)
+    # Requests whose input checkpoint was consumed evolve slot 1 in place.
+    rows[::3, 0] = 0
     state_in = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
     state_out = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
 
     tape = PrepTape(dev)
     tape.state_pages(
-        state_in,
-        state_out,
-        rows_ptr=Reg.PTR0,
-        seq_lens_ptr=Reg.PTR1,
-        bs=Reg.BS,
-        max_slots=SLOTS,
-        page_size=P,
+        state_in, state_out, rows_ptr=Reg.PTR0, bs=Reg.BS, row_stride=Reg.USER0
     )
     tape.filltail(state_in, live=Reg.BS, total=BS + 4, value=-1)
     tape.filltail(state_out, live=Reg.BS, total=BS + 4, value=-1)
     tape.finalize()
     assert isinstance(tape._descs, torch.Tensor)
-    tape.run({Reg.BS: BS, Reg.PTR0: rows, Reg.PTR1: seq_lens})
+    tape.run({Reg.BS: BS, Reg.PTR0: rows, Reg.USER0: rows.stride(0)})
     torch.cuda.synchronize()
 
-    after = seq_lens.long()
-    before = after - 1
-    in_slots = torch.div(before - 1, P, rounding_mode="floor").clamp(min=0)
-    out_slots = torch.div(after - 1, P, rounding_mode="floor").clamp(
-        min=0, max=SLOTS - 1
-    )
-    ref_in = rows.gather(1, in_slots.unsqueeze(1)).squeeze(1)
-    ref_in = torch.where(before > 0, ref_in, torch.zeros_like(ref_in))
-    ref_out = rows.gather(1, out_slots.unsqueeze(1)).squeeze(1)
-    assert torch.equal(state_in[:BS], ref_in.int())
-    assert torch.equal(state_out[:BS], ref_out.int())
+    ref_in = torch.where(rows[:, 0] > 0, rows[:, 0], rows[:, 1])
+    assert torch.equal(state_in[:BS], ref_in)
+    assert torch.equal(state_out[:BS], rows[:, 1])
     assert (state_in[BS:] == -1).all()
     assert (state_out[BS:] == -1).all()
+
+
+def test_filltail_writes_int64_buffers():
+    """Graph input buffers that index a request pool are int64; a tail written
+    as int32 would leave every other 4 bytes of the pair stale."""
+    dst = torch.arange(16, dtype=torch.int64, device="cuda")
+    before = dst.clone()
+    tape = PrepTape("cuda")
+    tape.filltail(dst, Reg.BS, 16, -7)
+    tape.finalize()
+    tape.run({Reg.BS: 5})
+    assert torch.equal(dst[:5], before[:5])
+    assert dst[5:].tolist() == [-7] * 11
+    assert dst.dtype == torch.int64
+
+
+def test_filltail_int32_and_int64_share_one_launch():
+    """Mixed widths must coexist in a stage: that is what the input buffers are."""
+    a = torch.zeros(12, dtype=torch.int32, device="cuda")
+    b = torch.zeros(12, dtype=torch.int64, device="cuda")
+    tape = PrepTape("cuda")
+    tape.filltail(a, Reg.BS, 12, 3)
+    tape.filltail(b, Reg.BS, 12, 1 << 40)
+    tape.finalize()
+    tape.run({Reg.BS: 4})
+    assert a.tolist() == [0] * 4 + [3] * 8
+    assert b.tolist() == [0] * 4 + [1 << 40] * 8
+
+
+def test_filltail_rejects_a_width_it_cannot_address():
+    tape = PrepTape("cuda")
+    with pytest.raises(TypeError):
+        tape.filltail(torch.zeros(4, dtype=torch.int16, device="cuda"), Reg.BS, 4, 0)

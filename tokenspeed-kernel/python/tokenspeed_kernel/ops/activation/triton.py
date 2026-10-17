@@ -22,18 +22,26 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
+
+_RELU2_FP8_MAX = tl.constexpr(448.0)
 
 __all__ = [
     "add3",
     "fused_gate_sigmoid_mul_add",
     "fused_swiglu_fp8_ue8m0",
     "fused_swiglu_fp8_ue8m0_masked_packed",
+    "relu2",
     "sigmoid_mul",
     "silu_and_mul",
     "situ_and_mul",
     "swiglu_oai",
+    "tanh_softcap",
+    "tanh_softcap_rejection",
 ]
 
 
@@ -45,9 +53,15 @@ def _fused_gate_sigmoid_mul_add_kernel(
     final_ptr,
     hidden_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
     row_offset = token_id * hidden_dim
+
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     # Phase 1: gate = dot(hidden_states[token_id], gate_weight)
     # BLOCK >= hidden_dim so this loop is single-iteration (unrolled away).
@@ -126,6 +140,8 @@ def fused_gate_sigmoid_mul_add(
     BLOCK = triton.next_power_of_2(hidden_dim)
     num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
     grid = (num_tokens,)
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fused_gate_sigmoid_mul_add_kernel[grid](
         hidden_states,
         gate_weight,
@@ -133,7 +149,9 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         hidden_dim=hidden_dim,
         BLOCK=BLOCK,
+        ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
+        **pdl_kwargs,
     )
     return final_hidden_states
 
@@ -143,11 +161,13 @@ def _sigmoid_mul_kernel(
     x_ptr,
     gate_ptr,
     n_elements,
+    bias_ptr,
     hidden_dim: tl.constexpr,
     head_dim: tl.constexpr,
     gate_row_stride: tl.constexpr,
     gate_head_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
@@ -160,14 +180,26 @@ def _sigmoid_mul_kernel(
     d = col % head_dim
     gate_addrs = gate_ptr + row * gate_row_stride + head * gate_head_stride + d
 
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     g = tl.load(gate_addrs, mask=mask).to(tl.float32)
-    out = x * tl.sigmoid(g)
+    if bias_ptr is not None:
+        # The eager FP32 sigmoid: libdevice exp and an IEEE-rounded division.
+        z = g + tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
+        out = x * tl.div_rn(1.0, 1.0 + libdevice.exp(-z))
+    else:
+        out = x * tl.sigmoid(g)
     tl.store(x_ptr + offsets, out, mask=mask)
 
 
-def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """In-place ``x *= sigmoid(gate)``.
+def sigmoid_mul(
+    x: torch.Tensor, gate: torch.Tensor, head_bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """In-place ``x *= sigmoid(gate)``, or ``x *= sigmoid(gate + head_bias)``.
 
     ``x`` must be contiguous 2D ``[num_tokens, hidden_dim]`` and is mutated.
     ``gate`` may be either
@@ -179,6 +211,15 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 
     The strided form lets callers skip the ``.reshape(-1)`` copy after the
     chunk; both layouts share the same kernel via the explicit gate strides.
+
+    ``head_bias`` is an optional contiguous 1D BF16, FP16 or FP32 tensor with
+    one value per gate head, added to the gate before the sigmoid. A 3D gate
+    must have ``head_bias.numel()`` heads; a 2D gate is split into that many
+    equal heads. With it, the kernel computes
+    ``x * (1 / (1 + exp(-(gate + bias))))`` in FP32 with libdevice ``exp`` and
+    an IEEE-rounded division, rounding once on the store. Without it the
+    kernel is unchanged and uses ``tl.sigmoid``.
+
     """
     if x.ndim != 2:
         raise ValueError(f"x must be 2D, got {x.ndim}D")
@@ -210,21 +251,50 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError(f"gate must be 2D or 3D, got {gate.ndim}D")
 
+    if head_bias is not None:
+        if head_bias.ndim != 1 or not head_bias.is_contiguous():
+            raise ValueError(
+                f"head_bias must be contiguous 1D, got shape {tuple(head_bias.shape)} "
+                f"stride {head_bias.stride()}"
+            )
+        if head_bias.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise ValueError(
+                f"head_bias must be bf16, fp16 or fp32, got {head_bias.dtype}"
+            )
+        bias_heads = head_bias.numel()
+        if gate.ndim == 3:
+            if bias_heads != gate.shape[1]:
+                raise ValueError(
+                    f"num_heads mismatch: gate={gate.shape[1]} head_bias={bias_heads}"
+                )
+        elif bias_heads == 0 or hidden_dim % bias_heads != 0:
+            raise ValueError(
+                f"hidden_dim mismatch: x={hidden_dim} is not a multiple of "
+                f"head_bias={bias_heads}"
+            )
+        else:
+            head_dim = gate_head_stride = hidden_dim // bias_heads
+
     n = x.numel()
     if n == 0:
         return x
 
     BLOCK_SIZE = 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _sigmoid_mul_kernel[grid](
         x,
         gate,
         n,
+        head_bias,
         hidden_dim=hidden_dim,
         head_dim=head_dim,
         gate_row_stride=gate_row_stride,
         gate_head_stride=gate_head_stride,
         BLOCK_SIZE=BLOCK_SIZE,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return x
 
@@ -237,7 +307,10 @@ def _silu_and_mul_kernel(
     hidden_dim: tl.constexpr,
     input_stride_row: tl.constexpr,
     out_stride_row: tl.constexpr,
+    limit: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
@@ -249,8 +322,16 @@ def _silu_and_mul_kernel(
     gate_addrs = x_ptr + row * input_stride_row + col
     up_addrs = gate_addrs + hidden_dim
 
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     gate = tl.load(gate_addrs, mask=mask).to(tl.float32)
     up = tl.load(up_addrs, mask=mask).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, limit)
+        up = tl.clamp(up, -limit, limit)
     out = gate * tl.sigmoid(gate) * up
     tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
 
@@ -258,15 +339,16 @@ def _silu_and_mul_kernel(
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
-    *,
-    enable_pdl: bool = False,
+    limit: float | None = None,
 ) -> torch.Tensor:
     """Fused ``SiLU(x[..., :D]) * x[..., D:]``.
 
     ``x`` is interpreted as ``[..., 2 * D]`` with gate values in the first half
     and up values in the second half. The output has shape ``[..., D]``.
+
     """
-    del enable_pdl
+    if limit is not None and limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
     if x.stride(-1) != 1:
@@ -290,6 +372,8 @@ def silu_and_mul(
 
     BLOCK_SIZE = 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _silu_and_mul_kernel[grid](
         flat_x,
         flat_out,
@@ -297,7 +381,11 @@ def silu_and_mul(
         hidden_dim=hidden_dim,
         input_stride_row=flat_x.stride(0),
         out_stride_row=flat_out.stride(0),
+        limit=0.0 if limit is None else limit,
+        HAS_LIMIT=limit is not None,
         BLOCK_SIZE=BLOCK_SIZE,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
 
@@ -313,6 +401,7 @@ def _swiglu_oai_kernel(
     alpha: tl.constexpr,
     limit: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     offset = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < n_elements
@@ -320,6 +409,11 @@ def _swiglu_oai_kernel(
     col = offset % hidden_dim
     gate_ptr = gate_up_ptr + row * input_stride_row + col
     up_ptr = gate_ptr + hidden_dim
+
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     gate = tl.load(gate_ptr, mask=mask, other=0.0).to(tl.float32)
     up = tl.load(up_ptr, mask=mask, other=0.0).to(tl.float32)
@@ -340,6 +434,7 @@ def swiglu_oai(
     ``gate_up`` is interpreted as ``[..., 2 * D]`` with gate values in the first
     half and up values in the second half. The gate is upper-clamped to ``limit``
     and up is clamped to ``[-limit, limit]``. The output has shape ``[..., D]``.
+
     """
     if gate_up.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {gate_up.shape[-1]}")
@@ -361,6 +456,8 @@ def swiglu_oai(
         return out
 
     block_size = 1024
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _swiglu_oai_kernel[((n_elements + block_size - 1) // block_size,)](
         flat_input,
         flat_out,
@@ -371,8 +468,19 @@ def swiglu_oai(
         alpha=alpha,
         limit=limit,
         BLOCK_SIZE=block_size,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
+
+
+@triton.jit
+def _situ_and_mul_values(gate, up, beta, linear_beta, HAS_LINEAR_BETA: tl.constexpr):
+    """Shared FP32 SiTU math for dense and device-counted row layouts."""
+    gate = beta * libdevice.tanh(gate / beta) * tl.sigmoid(gate)
+    if HAS_LINEAR_BETA:
+        up = linear_beta * libdevice.tanh(up / linear_beta)
+    return gate * up
 
 
 @triton.jit
@@ -387,6 +495,7 @@ def _situ_and_mul_kernel(
     out_stride_row: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -397,12 +506,17 @@ def _situ_and_mul_kernel(
     gate_addrs = x_ptr + row * input_stride_row + col
     up_addrs = gate_addrs + hidden_dim
 
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     gate = tl.load(gate_addrs, mask=mask).to(tl.float32)
     up = tl.load(up_addrs, mask=mask).to(tl.float32)
-    gate = beta * libdevice.tanh(gate / beta) * tl.sigmoid(gate)
-    if HAS_LINEAR_BETA:
-        up = linear_beta * libdevice.tanh(up / linear_beta)
-    tl.store(out_ptr + row * out_stride_row + col, gate * up, mask=mask)
+    out = _situ_and_mul_values(
+        gate, up, beta, linear_beta, HAS_LINEAR_BETA=HAS_LINEAR_BETA
+    )
+    tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
 
 
 def situ_and_mul(
@@ -411,7 +525,6 @@ def situ_and_mul(
     *,
     beta: float = 1.0,
     linear_beta: float | None = None,
-    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Apply SiTU to a concatenated ``[gate, up]`` tensor.
 
@@ -425,12 +538,10 @@ def situ_and_mul(
         out: Optional output tensor shaped ``[..., D]``.
         beta: Positive gate soft-clipping scale.
         linear_beta: Optional positive up-branch soft-clipping scale.
-        enable_pdl: Reserved for API compatibility; ignored on this kernel.
 
     Returns:
         Tensor shaped ``[..., D]`` in the same dtype and device as ``x``.
     """
-    del enable_pdl
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
     if beta <= 0.0:
@@ -468,6 +579,8 @@ def situ_and_mul(
 
     block_size = 1024
     grid = (triton.cdiv(n, block_size),)
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _situ_and_mul_kernel[grid](
         flat_x,
         flat_out,
@@ -479,7 +592,9 @@ def situ_and_mul(
         out_stride_row=flat_out.stride(0),
         HAS_LINEAR_BETA=linear_beta is not None,
         BLOCK_SIZE=block_size,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
     if kernel_out is not out:
         out.copy_(kernel_out)
@@ -575,7 +690,7 @@ def fused_swiglu_fp8_ue8m0(
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     *,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused SwiGLU activation + FP8 UE8M0 block-scale quantization.
 
@@ -588,9 +703,10 @@ def fused_swiglu_fp8_ue8m0(
         swiglu_limit: Clamp bound. 0 or negative disables clamping.
         swiglu_alpha: Sigmoid multiplier applied to the gate.
         swiglu_beta: Value added to the up projection before multiplication.
-        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain. The
-            kernel waits for the preceding producer before reading ``gate_up``
-            and releases the following dependent after writing both outputs.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain, defaulting
+            to the platform setting. The kernel waits for the preceding producer
+            before reading ``gate_up`` and releases the following dependent after
+            writing both outputs.
 
     Returns:
         ``(fp8_out, scale)``: ``fp8_out`` is ``[M, N]`` float8_e4m3fn,
@@ -621,6 +737,7 @@ def fused_swiglu_fp8_ue8m0(
     PACK = 4
     packs_per_row = (groups_per_row + PACK - 1) // PACK
     num_programs = M * packs_per_row
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fused_swiglu_fp8_ue8m0_kernel[(num_programs,)](
         gate_up,
@@ -932,21 +1049,30 @@ def _rmsnorm_gated_kernel(
     weight_ptr,
     out_ptr,
     eps,
+    gate_stride,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     offs_h = tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, head_dim)
     mask_h = offs_h < num_heads
     idx = token * num_heads * head_dim + offs_h[:, None] * head_dim + offs_d[None, :]
+    w = tl.load(weight_ptr + offs_d).to(tl.float32)
+    gate_idx = token * gate_stride + offs_h[:, None] * head_dim + offs_d[None, :]
+    g = tl.load(gate_ptr + gate_idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    if ENABLE_PDL:
+        # Gate and norm weight are independent of the KDA primary. Delay only
+        # the attention-output read until every primary CTA has completed.
+        tl.extra.cuda.gdc_wait()
     x = tl.load(x_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / head_dim
     rsig = tl.math.rsqrt(var + eps)
-    w = tl.load(weight_ptr + offs_d).to(tl.float32)
-    g = tl.load(gate_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
     tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
 
@@ -957,31 +1083,39 @@ def rmsnorm_gated_sigmoid(
     eps: float,
     num_heads: int,
     head_dim: int,
+    *,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Per-head RMSNorm fused with a sigmoid output gate: ``rmsnorm(x)*w*sigmoid(g)``.
 
     Args:
         x: ``[num_tokens, num_heads*head_dim]`` bf16 input (contiguous).
-        gate: same shape as ``x``; raw gate logits (sigmoid applied in-kernel).
+        gate: same shape as ``x`` with unit inner stride; raw gate logits.
         weight: ``[head_dim]`` RMSNorm weight.
         eps: RMSNorm epsilon.
         num_heads / head_dim: per-head norm geometry.
+        enable_pdl: Whether to prefetch gate/weight before waiting for the
+            immediately preceding programmatic-launch primary.
 
     Returns:
         ``[num_tokens, num_heads*head_dim]`` tensor of ``x``'s dtype.
     """
-    assert x.is_contiguous() and gate.is_contiguous()
+    assert x.is_contiguous() and gate.shape == x.shape and gate.stride(-1) == 1
     out = torch.empty_like(x)
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _rmsnorm_gated_kernel[(x.shape[0],)](
         x,
         gate,
         weight,
         out,
         eps,
+        gate.stride(0),
         num_heads=num_heads,
         head_dim=head_dim,
         BLOCK_H=triton.next_power_of_2(num_heads),
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
     return out
 
@@ -998,10 +1132,17 @@ def _add3_kernel(
     stride_c,
     stride_o,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = col < n_cols
+
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     a = tl.load(a_ptr + row * stride_a + col, mask=mask).to(tl.float32)
     b = tl.load(b_ptr + row * stride_b + col, mask=mask).to(tl.float32)
     c = tl.load(c_ptr + row * stride_c + col, mask=mask).to(tl.float32)
@@ -1029,6 +1170,8 @@ def add3(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     rows, cols = a.shape
     out = torch.empty_like(a, memory_format=torch.contiguous_format)
     BLOCK = 1024
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _add3_kernel[(rows, (cols + BLOCK - 1) // BLOCK)](
         a,
         b,
@@ -1040,6 +1183,8 @@ def add3(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         c.stride(0),
         out.stride(0),
         BLOCK=BLOCK,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
 
@@ -1057,6 +1202,7 @@ def _attnres_partial_kernel(
     stride_bt,
     eps,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Online-softmax partial over the static block candidates (aux stream).
 
@@ -1072,6 +1218,13 @@ def _attnres_partial_kernel(
     col1 = BLOCK + offs
     mask0 = col0 < n_cols
     mask1 = col1 < n_cols
+
+    if ENABLE_PDL:
+        # The successor waits before reading our scratch; release it now so
+        # it can prefetch ready weights while this partial is running.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     wp0 = tl.load(wp_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
     wp1 = tl.load(wp_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
 
@@ -1119,6 +1272,7 @@ def _attnres_partial_dual_kernel(
     stride_bt,
     eps,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Two online-softmax partials over the same block sweep (aux stream).
 
@@ -1135,6 +1289,13 @@ def _attnres_partial_dual_kernel(
     col1 = BLOCK + offs
     mask0 = col0 < n_cols
     mask1 = col1 < n_cols
+
+    if ENABLE_PDL:
+        # The successor waits before reading our scratch; release it now so
+        # it can prefetch ready weights while this partial is running.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     wa0 = tl.load(wp_a_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
     wa1 = tl.load(wp_a_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
     wb0 = tl.load(wp_b_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
@@ -1199,10 +1360,13 @@ def _attnres_combine_kernel(
     eps,
     HAS_OUTNORM: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Fold the prefix candidate into the block partial; optional out-norm.
 
-    All operands are read once and stay register-resident.
+    All operands are read once and stay register-resident. Under PDL the
+    weights are prefetched before ``gdc_wait``; scratch and prefix are read
+    afterward. The caller must ensure the weights are already ready.
     """
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -1214,31 +1378,36 @@ def _attnres_combine_kernel(
     mask0 = col0 < n_cols
     mask1 = col1 < n_cols
 
-    v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
-    v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
     wp0 = tl.load(wp_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
     wp1 = tl.load(wp_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
+    if HAS_OUTNORM:
+        ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
+        ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
+
+    if ENABLE_PDL:
+        # The predecessor may still be writing scratch and prefix.
+        tl.extra.cuda.gdc_wait()
+
+    m_b = tl.load(m_ptr + t)
+    s_b = tl.load(s_ptr + t)
+    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
+    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
+    v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
+    v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
     sq = tl.sum(v0 * v0) + tl.sum(v1 * v1)
     dot = tl.sum(v0 * wp0) + tl.sum(v1 * wp1)
     rsig = tl.math.rsqrt(sq / n_cols + eps)
     logit_p = dot * rsig
-    m_b = tl.load(m_ptr + t)
-    s_b = tl.load(s_ptr + t)
     m = tl.maximum(m_b, logit_p)
     corr = tl.exp(m_b - m)
     w_p = tl.exp(logit_p - m)
     inv_s = 1.0 / (s_b * corr + w_p)
-
-    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
-    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
     mix0 = ((a0 * corr + w_p * v0) * inv_s).to(tl.bfloat16).to(tl.float32)
     mix1 = ((a1 * corr + w_p * v1) * inv_s).to(tl.bfloat16).to(tl.float32)
 
     if HAS_OUTNORM:
         mix_sq = tl.sum(mix0 * mix0) + tl.sum(mix1 * mix1)
         rsig_mix = tl.math.rsqrt(mix_sq / n_cols + eps)
-        ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
-        ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
         tl.store(
             out_ptr + t * stride_o + col0,
             (mix0 * rsig_mix * ow0).to(out_ptr.dtype.element_ty),
@@ -1260,12 +1429,16 @@ def _attnres_combine_kernel(
             mix1.to(out_ptr.dtype.element_ty),
             mask=mask1,
         )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def attnres_partial(blocks, wp, eps, scratch):
     """Blocks-side online-softmax partial. scratch = (m [T], s [T], acc [T,H] fp32)."""
     KB, T, H = blocks.shape
     m, s_, acc = scratch
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_kernel[(T,)](
         blocks,
         wp,
@@ -1278,7 +1451,9 @@ def attnres_partial(blocks, wp, eps, scratch):
         stride_bt=blocks.stride(1),
         eps=eps,
         BLOCK=4096,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **pdl_kwargs,
     )
 
 
@@ -1294,6 +1469,8 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
     KB, T, H = blocks.shape
     m_a, s_a, acc_a = scratch_a
     m_b, s_b, acc_b = scratch_b
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_dual_kernel[(T,)](
         blocks,
         wp_a,
@@ -1310,7 +1487,9 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
         stride_bt=blocks.stride(1),
         eps=eps,
         BLOCK=4096,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **pdl_kwargs,
     )
 
 
@@ -1327,6 +1506,8 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
     """
     T, H = prefix.shape
     m, s_, acc = scratch
+    enable_pdl = pdl_enabled()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_combine_kernel[(T,)](
         prefix,
         wp,
@@ -1342,5 +1523,209 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
         HAS_OUTNORM=out_norm_w is not None,
         BLOCK=4096,
         num_warps=8,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
+    )
+    return out
+
+
+@triton.jit
+def _relu2_kernel(
+    x_ptr,
+    out_ptr,
+    fp8_scale_ptr,
+    stride_x,
+    stride_out,
+    n_cols,
+    BLOCK: tl.constexpr,
+    HAS_FP8: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    if HAS_FP8:
+        inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    y = tl.maximum(x, 0.0)
+    y = y * y
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    if HAS_FP8:
+        # Quantize the activation-dtype square, as the consumer would.
+        y = y.to(x_ptr.dtype.element_ty).to(tl.float32)
+        y = tl.clamp(y * inv_scale, -_RELU2_FP8_MAX, _RELU2_FP8_MAX)
+    tl.store(
+        out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask
+    )
+
+
+def relu2(
+    x: torch.Tensor, out: torch.Tensor, *, fp8_scale: torch.Tensor | None
+) -> torch.Tensor:
+    """Squared ReLU, ``relu(x) ** 2`` in FP32, optionally quantized to static FP8.
+
+    Args:
+        x: ``[M, N]`` input, rows may be strided but columns dense.
+        out: ``[M, N]`` output; FP8 exactly when ``fp8_scale`` is given.
+        fp8_scale: One-element FP32 dequant scale of the consuming linear.
+
+    Returns:
+        ``out``.
+    """
+    if x.dim() != 2 or out.shape != x.shape or x.stride(1) != 1 or out.stride(1) != 1:
+        raise ValueError("relu2 operands must be [M, N] with dense columns")
+    if (fp8_scale is not None) != (out.dtype == torch.float8_e4m3fn):
+        raise ValueError("relu2 writes FP8 exactly when fp8_scale is given")
+    rows, cols = x.shape
+    if rows == 0:
+        return out
+    block = 1024
+    enable_pdl = pdl_enabled()
+    _relu2_kernel[(rows, triton.cdiv(cols, block))](
+        x,
+        out,
+        x if fp8_scale is None else fp8_scale,
+        x.stride(0),
+        out.stride(0),
+        cols,
+        BLOCK=block,
+        HAS_FP8=fp8_scale is not None,
+        ENABLE_PDL=enable_pdl,
+        num_warps=4,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return out
+
+
+# Launch options of the softcap pass: FP contraction off and libdevice's non-FTZ
+# path, as Torch's CUDA kernels compute (no fast math, denormals kept).
+_TANH_SOFTCAP_BLOCK = 2048
+_TANH_SOFTCAP_LAUNCH_OPTIONS = dict(
+    num_warps=4,
+    enable_fp_fusion=False,
+    enable_reflect_ftz=False,
+)
+
+
+@triton.jit
+def _mul_rn_f32(left, right):
+    """One correctly rounded FP32 multiply (``mul.rn.f32``, non-FTZ) that the
+    compiler cannot fuse."""
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[left, right],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _tanh_softcap_kernel(
+    x_ptr,
+    out_ptr,
+    stride_x,
+    n_cols,
+    inv_cap,
+    cap,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask).to(tl.float32)
+    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
+    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
+    y = _mul_rn_f32(x, inv_cap)
+    y = libdevice.tanh(y)
+    y = _mul_rn_f32(y, cap)
+    tl.store(out_ptr + row * n_cols + cols, y, mask=mask)
+
+
+@functools.lru_cache(maxsize=16)
+def tanh_softcap_scalars(cap: float) -> tuple[float, float]:
+    """``(fl32(1 / fl32(cap)), fl32(cap))``: the FP32 operands Torch multiplies by
+    in ``x / cap`` and ``* cap`` when ``cap`` is a Python scalar.
+
+    Torch divides an FP32 tensor by a CPU scalar as a multiply by the scalar's FP32
+    reciprocal, computed on the host in FP32 (``div_true_kernel_cuda``); the
+    multiply takes the scalar rounded to FP32.
+    """
+    cap32 = torch.tensor(cap, dtype=torch.float32)
+    return (torch.ones((), dtype=torch.float32) / cap32).item(), cap32.item()
+
+
+def tanh_softcap_cap_normal(cap: object) -> bool:
+    """Whether ``cap`` is a real number whose FP32 rounding and FP32 reciprocal
+    are positive normal numbers (the kernel takes both as FP32 operands)."""
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+        return False
+    inv_cap, cap32 = tanh_softcap_scalars(cap)
+    normal = 2.0**-126
+    return normal <= cap32 < float("inf") and normal <= inv_cap < float("inf")
+
+
+def tanh_softcap_rejection(x: torch.Tensor, cap: float) -> str:
+    """Why :func:`tanh_softcap` cannot serve this call; empty when admitted.
+
+    Metadata only: ``cap`` as :func:`tanh_softcap_cap_normal` admits it, ``x`` a
+    2-D BF16, FP16 or FP32 CUDA tensor with dense columns.
+    """
+    if not tanh_softcap_cap_normal(cap):
+        return (
+            "cap must be a real number that rounds to a positive normal FP32 "
+            f"with a normal reciprocal, got {cap!r}"
+        )
+    if x.dim() != 2:
+        return f"x must be 2-D, got {x.dim()}-D"
+    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return f"x must be BF16, FP16 or FP32, got {x.dtype}"
+    if x.stride(1) != 1:
+        return f"x must have dense columns, got strides {tuple(x.stride())}"
+    if not x.is_cuda:
+        return f"x must be a CUDA tensor, got device {x.device}"
+    return ""
+
+
+def tanh_softcap(x: torch.Tensor, cap: float) -> torch.Tensor:
+    """``(x.float() / cap).tanh() * cap`` in one pass, byte for byte.
+
+    The FP32 statement is three elementwise kernels after the cast; this kernel
+    reads ``x`` once and writes the FP32 result once, with the same operations in
+    the same order: ``x * fl32(1 / cap)`` and ``* cap`` as single ``mul.rn.f32``
+    and libdevice ``tanhf`` (non-FTZ), the function Torch's CUDA ``tanh`` calls.
+
+    Args:
+        x: ``[rows, cols]`` BF16, FP16 or FP32 CUDA logits with dense columns
+            (rows may be strided).
+        cap: The soft cap (see :func:`tanh_softcap_rejection`).
+
+    Returns:
+        A fresh contiguous FP32 ``[rows, cols]`` tensor.
+
+    Raises:
+        ValueError: :func:`tanh_softcap_rejection` rejects the call.
+    """
+    rejection = tanh_softcap_rejection(x, cap)
+    if rejection:
+        raise ValueError(f"tanh_softcap cannot serve this call: {rejection}")
+    inv_cap, cap32 = tanh_softcap_scalars(cap)
+    rows, cols = x.shape
+    out = torch.empty((rows, cols), dtype=torch.float32, device=x.device)
+    if out.numel() == 0:
+        return out
+    _tanh_softcap_kernel[(rows, triton.cdiv(cols, _TANH_SOFTCAP_BLOCK))](
+        x,
+        out,
+        x.stride(0),
+        cols,
+        inv_cap,
+        cap32,
+        BLOCK=_TANH_SOFTCAP_BLOCK,
+        **_TANH_SOFTCAP_LAUNCH_OPTIONS,
     )
     return out

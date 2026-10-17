@@ -22,14 +22,16 @@
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
+    AbortReason,
+    AttnKind,
+    CacheGroupConfig,
+    CacheTransferPolicy,
+    CapacityModel,
     ExecutionEvent,
     ExecutionPlan,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
-    PagedCacheTransferPolicy,
     RequestSpec,
     Scheduler,
+    SchedulerAbort,
     SchedulerConfig,
 )
 
@@ -49,6 +51,7 @@ def _forward_batch_repr(self):
         f"input_ids={list(self.input_ids)}, "
         f"shifted_input_ids={list(self.shifted_input_ids)}, "
         f"extend_prefix_lens={list(self.extend_prefix_lens)}, "
+        f"extend_replay_lens={list(self.extend_replay_lens)}, "
         f"num_extends={self.num_extends()}"
         f")"
     )
@@ -56,28 +59,19 @@ def _forward_batch_repr(self):
 
 Forward.Batch.__repr__ = _forward_batch_repr
 
-# Optional: present only once the matching extension is installed. This module
-# is resolved through an editable .pth for every process on this box, so an
-# unconditional import of a new symbol breaks engine startup box-wide the
-# moment the Python and the .so disagree. It did, on 2026-08-20, for a
-# teammate's grid that never referenced this name.
-try:
-    from tokenspeed_scheduler.tokenspeed_scheduler_ext import ContextChunkPolicy
-except ImportError:  # installed extension predates the context-chunk policy
-    ContextChunkPolicy = None
-
 __all__ = [
-    *(["ContextChunkPolicy"] if ContextChunkPolicy is not None else []),
     # Core
     "Scheduler",
     "SchedulerConfig",
     "RequestSpec",
-    "PagedCacheRetention",
-    "PagedCacheGroupConfig",
-    "PagedCacheGroupFamily",
-    "PagedCacheTransferPolicy",
+    "AttnKind",
+    "CacheGroupConfig",
+    "CacheTransferPolicy",
+    "CapacityModel",
     # Execution plan & operations
     "ExecutionPlan",
+    "SchedulerAbort",
+    "AbortReason",
     "Forward",
     "PD",
     "Cache",

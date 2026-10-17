@@ -94,25 +94,21 @@ class MultimodalRuntime:
     # M-RoPE position overrides
     # ------------------------------------------------------------------
 
-    def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
-        # Cache delta expansion for retracted/chunked requests.
-        if mm_input.mrope_position_delta_repeated_cache is None:
-            mm_input.mrope_position_delta_repeated_cache = (
-                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
-            )
-        return mm_input.mrope_position_delta_repeated_cache + seq_len
-
     @staticmethod
     def _mrope_delta_scalar(mm_input) -> int:
+        """Read the request's decode position delta.
+
+        ``multimodal_context_for_forward`` resolves the scalar on the control
+        plane, so this is a plain read for anything the engine dispatched;
+        the tensor branch covers directly-constructed inputs.
+        """
         delta = getattr(mm_input, "mrope_position_delta_scalar", None)
         if delta is not None:
             return int(delta)
         tensor = getattr(mm_input, "mrope_position_delta", None)
         if tensor is None:
             return 0
-        delta = int(tensor.flatten()[0].item())
-        mm_input.mrope_position_delta_scalar = delta
-        return delta
+        return int(tensor.flatten()[0].item())
 
     def _build_decode_mrope_positions_override(
         self,
@@ -229,19 +225,15 @@ class MultimodalRuntime:
                 start = int(forward_op.extend_prefix_lens[batch_idx])
                 end = start + int(forward_op.input_lengths[batch_idx])
                 positions = mm_input.mrope_positions[:, start:end]
-                if positions.numel() != 0:
-                    mrope_chunks.append(
-                        positions.to(device=self.device, dtype=torch.int64)
+                if positions.numel() == 0:
+                    # The table covers the whole prompt and no prefill chunk
+                    # reaches past it (nothing re-prefills generated tokens).
+                    raise RuntimeError(
+                        "M-RoPE positions table has no rows for prefill chunk "
+                        f"[{start}, {end}) of request {forward_op.request_ids[batch_idx]}"
                     )
-                    continue
-                if base_chunk.numel() == 1:
-                    seq_len = int(base_chunk[-1].item()) + 1
-                    mrope_chunks.append(
-                        self._expand_mrope_from_input(mm_input, seq_len).to(
-                            device=self.device, dtype=torch.int64
-                        )
-                    )
-                    continue
+                mrope_chunks.append(positions.to(device=self.device, dtype=torch.int64))
+                continue
 
             delta = mm_input.mrope_position_delta
             if delta is None:
@@ -267,7 +259,7 @@ class MultimodalRuntime:
         Overrides modality encoder callables (e.g. ``image_encoder``,
         ``video_encoder``) with model-built graph wrappers — the
         multimodal-encoder analogue of ``forward_step``'s
-        ``CudaGraphWrapper``. Returns the installed wrappers by attribute
+        ``ForwardStepRunner``. Returns the installed wrappers by attribute
         name (empty when the model has no encoder-graph support or it is
         disabled).
         """
@@ -284,8 +276,8 @@ class MultimodalRuntime:
         for encoder_attr, wrapper in wrappers.items():
             if not hasattr(model, encoder_attr):
                 logger.warning(
-                    "Skipping encoder CUDA graph wrapper for missing attribute %s",
-                    encoder_attr,
+                    "Skipping encoder CUDA graph wrapper for missing attribute "
+                    f"{encoder_attr!s}",
                 )
                 continue
             setattr(model, encoder_attr, wrapper)
@@ -293,11 +285,24 @@ class MultimodalRuntime:
         return active_wrappers
 
     @staticmethod
-    def wire_drafter(drafter, target_hf_config) -> None:
-        """Hand the drafter the pad-substitute token IDs for mm placeholders."""
-        mm_pad_substitute_ids = resolve_mm_pad_substitute_ids(target_hf_config)
-        if mm_pad_substitute_ids and hasattr(drafter, "set_mm_pad_substitute_ids"):
-            drafter.set_mm_pad_substitute_ids(mm_pad_substitute_ids)
+    def wire_drafter(input_buffers, target_model_config) -> None:
+        """Wire mm pad substitution for the draft path.
+
+        Substitution runs once at fill time on the drafter-only shift-1
+        buffer, so drafters only ever see in-vocab input ids. A multimodal
+        target with no resolvable substitutes must fail here, loudly —
+        otherwise the fill clamp would silently rewrite media positions.
+        """
+        substitute_ids = resolve_mm_pad_substitute_ids(target_model_config.hf_config)
+        if substitute_ids:
+            input_buffers.set_mm_pad_substitute_ids(
+                substitute_ids, target_model_config.vocab_size
+            )
+        elif target_model_config.is_multimodal_active:
+            raise ValueError(
+                "Speculative decoding on a multimodal target requires draft "
+                "substitute tokens, but none could be resolved from the HF config."
+            )
 
     # ------------------------------------------------------------------
     # Diagnostics

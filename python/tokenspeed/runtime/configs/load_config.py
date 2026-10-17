@@ -33,6 +33,7 @@ class LoadFormat(str, enum.Enum):
     AUTO = "auto"
     PT = "pt"
     SAFETENSORS = "safetensors"
+    INSTANTTENSOR = "instanttensor"
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
@@ -51,6 +52,10 @@ class LoadConfig:
             not available.
         "pt" will load the weights in the pytorch bin format.
         "safetensors" will load the weights in the safetensors format.
+        "instanttensor" will load the safetensors weights on NVIDIA GPUs
+            using InstantTensor, which accelerates loading via distributed
+            loading, pipelined prefetching, and direct I/O (with optional
+            GPUDirect Storage support).
         "npcache" will load the weights in pytorch format and store
             a numpy cache to speed up the loading.
         "dummy" will initialize the weights with random values, which is
@@ -60,6 +65,11 @@ class LoadConfig:
         checkpoints.
     decryption_key_file: If set, decrypts the output files with a password read
         from this file (after PBKDF2).
+    checkpoint_load_group: Global ranks a distributed loader (InstantTensor)
+        synchronizes with when the model declares no ``checkpoint_load_group``
+        of its own; None means every rank. A model loaded on a subset of the
+        ranks -- a pipeline stage's draft -- must name that subset, or the
+        collective waits for ranks that never load it.
     """
 
     load_format: str | LoadFormat = LoadFormat.AUTO
@@ -68,7 +78,8 @@ class LoadConfig:
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None
     weight_loader_prefetch_checkpoints: bool = True
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
+    checkpoint_load_group: tuple[int, ...] | None = None
 
     ext_yaml: str | None = None
 
@@ -80,8 +91,8 @@ class LoadConfig:
 
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
             logger.info(
-                "Ignoring the following patterns when downloading weights: %s",
-                self.ignore_patterns,
+                "Ignoring the following patterns when downloading weights: "
+                f"{self.ignore_patterns!s}",
             )
         else:
             self.ignore_patterns = ["original/**/*"]

@@ -1,4 +1,8 @@
 import argparse
+import json
+import os
+import re
+import shlex
 import subprocess
 import textwrap
 from pathlib import Path
@@ -8,16 +12,24 @@ from slurm_submit import (
     Submission,
     Task,
     gpu_count,
+    harden_bootstrap,
     load_task,
+    main,
+    parse_args,
     parse_pr_number,
+    parse_runner_alias,
     pr_worktree,
     print_progress,
     print_target,
     queued_states,
     render_script,
     result_detail,
+    scontrol_states,
     select_tasks,
+    snapshot,
     source_pr_url,
+    submit,
+    wait_all,
     write_report,
 )
 
@@ -27,27 +39,56 @@ def write_task(
     runner: str = "gb200-1gpu",
     task_type: str = "eval",
     model: str = "example/model",
+    nodes: int | None = None,
+    gpus_per_node: int | None = None,
 ) -> str:
     workflow_stage = "unit-test" if task_type == "ut" else "model-test"
+    trigger = "slurm" if nodes and nodes > 1 else "manual"
     relative = Path(f"test/ci/{task_type}/example.yaml")
     path = repo / relative
     path.parent.mkdir(parents=True)
-    path.write_text(textwrap.dedent(f"""\
-            api_version: ci.tokenspeed.io/v1
-            name: example
-            type: {task_type}
-            workflow_stage: {workflow_stage}
-            triggers: [manual]
-            runner:
-              labels: [{runner}]
-            server:
-              command: ts serve --model {model}
-              ready:
-                url: http://127.0.0.1:8000/readiness
-            {task_type}:
-              command: run-eval
-            """))
+    lines = [
+        "api_version: ci.tokenspeed.io/v1",
+        "name: example",
+        f"type: {task_type}",
+        f"workflow_stage: {workflow_stage}",
+        f"triggers: [{trigger}]",
+    ]
+    if nodes is not None:
+        lines.extend(
+            [
+                "slurm:",
+                f"  nodes: {nodes}",
+                f"  gpus_per_node: {gpus_per_node}",
+            ]
+        )
+    lines.extend(
+        [
+            "runner:",
+            f"  labels: [{runner}]",
+            "server:",
+            f"  command: ts serve --model {model}",
+            "  ready:",
+            "    url: http://127.0.0.1:8000/readiness",
+            f"{task_type}:",
+            "  command: run-eval",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n")
     return relative.as_posix()
+
+
+def test_run_slurm_without_user(monkeypatch):
+    for name in ("USER", "TS_CI_ARTIFACT_ROOT", "TS_CI_CACHE_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    script = Path(__file__).resolve().parents[1] / "ci" / "run_slurm.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "usage: slurm_submit.py" in result.stdout
 
 
 def test_gpu_count():
@@ -63,10 +104,156 @@ def test_load_task(tmp_path):
     )
 
 
+def test_load_task_reads_multi_node_topology(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb200-4node-4gpu",
+        nodes=4,
+        gpus_per_node=4,
+    )
+
+    assert load_task(tmp_path, config) == Task(
+        config, "example", "eval", "slurm-gb200-4node-4gpu", 4, 4
+    )
+
+
+def test_load_task_rejects_gpu_topology_mismatch(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb200-4node-4gpu",
+        nodes=4,
+        gpus_per_node=2,
+    )
+
+    with pytest.raises(ValueError, match="does not match runner"):
+        load_task(tmp_path, config)
+
+
 def test_load_task_checks_runner(tmp_path):
     config = write_task(tmp_path)
     with pytest.raises(ValueError, match="not declared"):
         load_task(tmp_path, config, "gb200-4gpu")
+
+
+def test_load_task_supports_multi_node_gb300_runner(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb300-4gpu",
+        nodes=2,
+        gpus_per_node=4,
+    )
+
+    assert load_task(tmp_path, config, "slurm-gb300-4gpu") == Task(
+        config,
+        "example",
+        "eval",
+        "slurm-gb300-4gpu",
+        4,
+        2,
+    )
+
+
+@pytest.mark.parametrize("declared", ["b200-4gpu", "gb200-4gpu"])
+def test_load_task_maps_logical_blackwell_runner_to_gb300(tmp_path, declared):
+    config = write_task(tmp_path, runner=declared)
+
+    assert load_task(tmp_path, config, declared, "gb300-4gpu") == Task(
+        config,
+        "example",
+        "eval",
+        "gb300-4gpu",
+        4,
+        1,
+        declared,
+    )
+
+
+def test_load_task_maps_multinode_gb200_runner_to_gb300(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb200-4node-4gpu",
+        nodes=4,
+        gpus_per_node=4,
+    )
+
+    assert load_task(
+        tmp_path,
+        config,
+        "slurm-gb200-4node-4gpu",
+        "slurm-gb300-4node-4gpu",
+    ) == Task(
+        config,
+        "example",
+        "eval",
+        "slurm-gb300-4node-4gpu",
+        4,
+        4,
+        "slurm-gb200-4node-4gpu",
+    )
+
+
+def test_parse_runner_alias_rejects_incomplete_value():
+    with pytest.raises(ValueError, match="DECLARED=EFFECTIVE"):
+        parse_runner_alias("b200-4gpu")
+
+
+def test_select_config_rejects_duplicate_runner_alias(tmp_path):
+    config = write_task(tmp_path, runner="gb300-4gpu")
+    args = argparse.Namespace(
+        config=config,
+        runner=[],
+        runner_alias=[
+            "gb300-4gpu=gb300-4gpu",
+            "gb300-4gpu=gb300-4gpu",
+        ],
+        task_types=["eval"],
+        match=None,
+        trigger=None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate declared runner"):
+        select_tasks(args, tmp_path)
+
+
+def test_render_script_passes_declared_gb300_runner_unchanged():
+    script = render_script(
+        Task(
+            "test/ci/ut/example.yaml",
+            "example",
+            "ut",
+            "gb300-1gpu",
+            1,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--runner=gb300-1gpu" in script
+    assert "--runner-override" not in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+
+
+def test_render_script_passes_declared_and_effective_runners():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "gb300-4gpu",
+            4,
+            declared_runner="b200-4gpu",
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--runner=b200-4gpu" in script
+    assert "--runner-override=gb300-4gpu" in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
 
 
 def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
@@ -93,6 +280,53 @@ def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     assert select_tasks(args, tmp_path) == [
         Task(config, "example", "eval", "gb200-1gpu", 1)
     ]
+
+
+def test_select_all_keeps_logical_tasks_and_maps_only_effective_runners(
+    monkeypatch, tmp_path
+):
+    config = write_task(tmp_path, "gb200-1gpu", "eval")
+    unit_config = write_task(tmp_path, "b200-2gpu", "ut")
+    monkeypatch.setattr(
+        "slurm_submit.build_matrix",
+        lambda *_: {
+            "include": [
+                {"config": config, "type": "eval", "runner": "gb200-1gpu"},
+                {"config": unit_config, "type": "ut", "runner": "b200-2gpu"},
+            ]
+        },
+    )
+    args = argparse.Namespace(
+        config=None,
+        runner=[],
+        runner_alias=[
+            "gb200-1gpu=gb300-1gpu",
+            "b200-2gpu=gb300-2gpu",
+        ],
+        task_types=["eval", "ut"],
+        match=None,
+        trigger=None,
+    )
+
+    assert select_tasks(args, tmp_path) == [
+        Task(config, "example", "eval", "gb300-1gpu", 1, 1, "gb200-1gpu"),
+        Task(unit_config, "example", "ut", "gb300-2gpu", 2, 1, "b200-2gpu"),
+    ]
+
+
+def test_select_all_rejects_duplicate_runner_alias(monkeypatch, tmp_path):
+    monkeypatch.setattr("slurm_submit.build_matrix", lambda *_: {"include": []})
+    args = argparse.Namespace(
+        config=None,
+        runner=[],
+        runner_alias=["b200-4gpu=gb300-4gpu", "b200-4gpu=gb300-4gpu"],
+        task_types=["eval"],
+        match=None,
+        trigger=None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate runner alias"):
+        select_tasks(args, tmp_path)
 
 
 def test_select_all_supports_multiple_runners_types_and_model_match(
@@ -181,6 +415,106 @@ def test_print_target_distinguishes_pr_head_from_merge(monkeypatch, capsys, tmp_
     ]
 
 
+def test_print_target_without_pr_uses_current_checkout(capsys, tmp_path):
+    print_target(tmp_path, None, "branch-commit")
+
+    assert capsys.readouterr().out.splitlines() == [
+        "Target: current checkout",
+        "Target commit: branch-commit",
+    ]
+
+
+def test_print_target_accepts_non_merge_checkout(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        "slurm_submit.git",
+        lambda *_args: (_ for _ in ()).throw(subprocess.CalledProcessError(1, "git")),
+    )
+
+    print_target(tmp_path, "884", "pr-head")
+
+    assert capsys.readouterr().out.splitlines()[-1] == "Target commit: pr-head"
+
+
+def test_pr_and_source_pr_are_mutually_exclusive(tmp_path):
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--config=example.yaml",
+                "--pr=884",
+                "--source-pr=884",
+                f"--artifact-root={tmp_path}",
+                f"--cache-dir={tmp_path}",
+                "--container-image=example",
+            ]
+        )
+
+
+def test_source_pr_uses_current_checkout(monkeypatch, tmp_path):
+    captured = {}
+
+    def reject_worktree(*_args):
+        raise AssertionError("--source-pr must not create a PR worktree")
+
+    def capture_run(args, repo, _artifact_root, _cache):
+        captured.update(repo=repo, source_pr=args.source_pr)
+        return 0
+
+    monkeypatch.setattr("slurm_submit.pr_worktree", reject_worktree)
+    monkeypatch.setattr("slurm_submit.run", capture_run)
+
+    assert (
+        main(
+            [
+                "--config=example.yaml",
+                "--source-pr=884",
+                f"--repo-root={tmp_path}",
+                f"--artifact-root={tmp_path}",
+                f"--cache-dir={tmp_path}",
+                "--container-image=example",
+            ]
+        )
+        == 0
+    )
+    assert captured == {"repo": tmp_path.resolve(), "source_pr": "884"}
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_snapshot_preserves_published_archive(tmp_path, corrupt):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", repo, "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    (repo / "README.md").write_text("test\n")
+    subprocess.run(["git", "-C", repo, "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    target = tmp_path / "artifacts" / "snapshots" / f"{commit}.tar"
+    snapshot(repo, tmp_path / "artifacts", commit)
+    if corrupt:
+        target.write_bytes(b"stale")
+    original = target.read_bytes()
+    inode = target.stat().st_ino
+    with target.open("rb") as reader:
+        if corrupt:
+            with pytest.raises(ValueError, match="Existing snapshot does not match"):
+                snapshot(repo, tmp_path / "artifacts", commit)
+        else:
+            assert snapshot(repo, tmp_path / "artifacts", commit) == target
+        assert target.stat().st_ino == inode
+        assert os.fstat(reader.fileno()).st_nlink == 1
+        assert reader.read() == original == target.read_bytes()
+    assert not list(target.parent.glob("*.tmp"))
+
+
 def test_pr_worktree_rejects_shallow_checkout(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -213,6 +547,7 @@ def test_render_script_contains_cluster_requirements():
     )
     assert "--setup-mode=slurm" in script
     assert "--container-remap-root" in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' not in script
     assert "libcuda.so.1" in script
     assert "libcudart.so.13" in script
     assert "/usr/bin/nvidia-smi" in script
@@ -226,6 +561,229 @@ def test_render_script_contains_cluster_requirements():
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 
+@pytest.mark.parametrize("nodes", [1, 2])
+@pytest.mark.parametrize(
+    "yaml_status,failures,attempts,status",
+    [(0, 0, 0, 0), (1, 2, 3, 0), (1, 3, 3, 1)],
+)
+def test_retained_bootstrap_retries_and_stops_before_evaluation(
+    tmp_path, monkeypatch, nodes, yaml_status, failures, attempts, status
+):
+    original = render_script(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb200-4gpu", 4, nodes),
+        Path("/shared/original.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/original@sha256:abc",
+    )
+    script = harden_bootstrap(original)
+    assert harden_bootstrap(script) == script
+    pattern = r"^(?:container|server|client)_command=\(\n(.*?)\n\)$"
+    old_commands = [shlex.split(s) for s in re.findall(pattern, original, re.M | re.S)]
+    commands = [shlex.split(s) for s in re.findall(pattern, script, re.M | re.S)]
+    assert len(commands) == (1 if nodes == 1 else 2)
+    for old, new in zip(old_commands, commands):
+        assert old[:2] + old[3:] == new[:2] + new[3:]
+        assert new[2] == commands[0][2]
+    for before, after in zip(original.splitlines(), script.splitlines()):
+        if "python3 -m pip install" not in before:
+            assert before == after
+    pip_log, sleep_log, pipeline_log = (
+        tmp_path / name for name in ("pip", "sleep-log", "pipeline")
+    )
+    (tmp_path / "python3").write_text(textwrap.dedent("""\
+        #!/bin/bash
+        if [ "$1" = -c ]; then exit "$YAML_STATUS"; fi
+        if [ "$1" = -m ] && [ "$2" = pip ]; then
+          printf '%s\\n' "$*" >> "$PIP_LOG"
+          [ "$(wc -l < "$PIP_LOG")" -le "$PIP_FAILURES" ] && exit 7
+          exit 0
+        fi
+        printf '%s\\n' "$*" >> "$PIPELINE_LOG"
+        exit 0
+        """))
+    (tmp_path / "sleep").write_text(
+        '#!/bin/bash\nprintf "%s\\n" "$1" >> "$SLEEP_LOG"\n'
+    )
+    for name in ("python3", "sleep"):
+        (tmp_path / name).chmod(0o755)
+    for name, value in {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "YAML_STATUS": str(yaml_status),
+        "PIP_FAILURES": str(failures),
+        "PIP_LOG": str(pip_log),
+        "SLEEP_LOG": str(sleep_log),
+        "PIPELINE_LOG": str(pipeline_log),
+    }.items():
+        monkeypatch.setenv(name, value)
+    result = subprocess.run(commands[0], capture_output=True, text=True)
+    assert result.returncode == status
+    calls = pip_log.read_text().splitlines() if pip_log.exists() else []
+    assert len(calls) == attempts
+    for call in calls:
+        assert "--timeout 120" in call and "--progress-bar off" in call
+        assert "--target=/tmp/tokenspeed-ci-python PyYAML>=6,<7" in call
+        assert "--no-cache-dir" not in call
+    sleeps = sleep_log.read_text().splitlines() if sleep_log.exists() else []
+    assert sleeps == ["10"] * max(0, attempts - 1)
+    assert pipeline_log.exists() == (status == 0)
+
+
+def test_render_script_carries_the_tokenspeed_mla_override_into_the_container():
+    script = render_script(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4, nodes=2),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    container_env = [line for line in script.splitlines() if "--container-env=" in line]
+    assert len(container_env) == 2
+    assert all("INSTALL_TOKENSPEED_MLA_FROM_SOURCE," in line for line in container_env)
+
+
+def test_render_script_mounts_only_allocated_gb300_devices():
+    script = render_script(
+        Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+    assert 'device="/dev/nvidia$gpu"' in script
+    assert 'elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]' in script
+    assert "No NVIDIA device nodes matched Slurm GPU allocation" in script
+    assert "\n  /dev/nvidiactl \\\n" in script
+    assert "\n  /dev/nvidia-uvm \\\n" in script
+    assert "\n  /dev/nvidia-uvm-tools \\\n" in script
+    assert "\n  /dev/nvidia-nvswitchctl \\\n" in script
+    assert "\n  /dev/nvidia-caps \\\n" in script
+    assert "\n  /dev/nvidia-caps-imex-channels; do\n" in script
+    assert (
+        'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
+        in script
+    )
+    assert 'model_mounts+=("$local_model_root:/models:ro")' in script
+    assert '"${gpu_mounts[@]}" "${model_mounts[@]}" "${mounts[@]}"' in script
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    multinode_script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "slurm-gb300-4node-4gpu",
+            16,
+            nodes=4,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in multinode_script
+
+
+def test_render_multinode_gb300_keeps_devices_out_of_client_step():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "gb300-4gpu",
+            4,
+            nodes=2,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert (
+        'server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" '
+        '"${gpu_mounts[@]}" "${model_mounts[@]}" "${mounts[@]}")' in script
+    )
+    assert (
+        'client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" '
+        '"${mounts[@]}")' in script
+    )
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_render_script_orchestrates_multi_node_server_and_head_client():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "slurm-gb200-4node-4gpu",
+            4,
+            4,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--nodes=4" in script
+    assert "--ntasks=4" in script
+    assert "--ntasks-per-node=1" in script
+    assert "--gres=gpu:4" in script
+    assert (
+        'head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n \'1p\')"'
+        in script
+    )
+    assert 'client_prepare_args+=(--nodelist="$head_node")' in script
+    assert 'image_prepare_args+=(--nodelist="$head_node")' in script
+    image_prepare_block = script.split("image_prepare_args=(", 1)[1].split(")", 1)[0]
+    assert "--container-image=" in image_prepare_block
+    assert 'client_srun_args+=(--nodelist="$head_node")' in script
+    assert "--serve-only" in script
+    assert "--external-server" in script
+    assert "SLURM_STEP_NUM_NODES" in script
+    assert "tokenspeed-prepare" in script
+    assert "tokenspeed-client-prepare" in script
+    assert 'server_src="$scratch/server-src"' in script
+    assert 'client_src="$scratch/client-src"' in script
+    assert "tokenspeed-cleanup" in script
+    assert "trap cleanup EXIT" in script
+    assert 'srun "${image_prepare_args[@]}" true' in script
+    assert script.index('srun "${image_prepare_args[@]}" true') < script.index(
+        'srun "${server_srun_args[@]}"'
+    )
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_submit_requests_multi_node_allocation(capsys, tmp_path):
+    task = Task(
+        "test/ci/eval/example.yaml",
+        "example",
+        "eval",
+        "slurm-gb200-4node-4gpu",
+        4,
+        4,
+    )
+    args = argparse.Namespace(
+        partition="batch",
+        time="01:00:00",
+        nodelist=None,
+        render=True,
+    )
+
+    submit(task, "#!/bin/bash\n", tmp_path, args, "a" * 40)
+
+    command = capsys.readouterr().out.splitlines()[0]
+    assert "--nodes=4" in command
+    assert "--ntasks=4" in command
+    assert "--ntasks-per-node=1" in command
+    assert "--gres=gpu:4" in command
+
+
 def test_result_detail_reports_eval_score(tmp_path):
     result = tmp_path / "result.json"
     result.write_text(
@@ -234,7 +792,8 @@ def test_result_detail_reports_eval_score(tmp_path):
     assert result_detail(result) == "score=0.95, threshold=0.9"
 
 
-def test_write_report_collects_logs_and_results(tmp_path):
+def test_write_report_collects_logs_and_results(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
     log = tmp_path / "job.log"
     log.write_text("task output\n")
     run_root = tmp_path / "runs"
@@ -255,12 +814,26 @@ def test_write_report_collects_logs_and_results(tmp_path):
         },
         run_root,
         report,
+        source_pr="884",
     )
 
     assert (report / "123.log").read_text() == "task output\n"
     assert (report / "123-result.json").exists()
+    manifest_task = json.loads((report / "manifest.json").read_text())[0]["task"]
+    assert manifest_task == {
+        "config": "test/ci/eval/example.yaml",
+        "name": "example",
+        "task_type": "eval",
+        "runner": "gb200-1gpu",
+        "gpus": 1,
+        "nodes": 1,
+    }
     assert (
         "| 123 | eval | gb200-1gpu | example | ✅ |"
+        in (report / "summary.md").read_text()
+    )
+    assert (
+        "**Target PR:** [#884](https://github.com/lightseekorg/tokenspeed/pull/884)"
         in (report / "summary.md").read_text()
     )
 
@@ -301,6 +874,58 @@ def test_queued_states_queries_only_requested_jobs(monkeypatch):
     }
 
 
+def test_scontrol_states_parses_terminal_job(monkeypatch):
+    outputs = iter(
+        [
+            "JobId=123 JobState=COMPLETED RunTime=00:37:01 "
+            "DerivedExitCode=9:0 ExitCode=0:0\n",
+            "JobId=123 JobState=COMPLETING RunTime=00:37:01 ExitCode=0:0\n",
+        ]
+    )
+
+    def fake_run(command, **kwargs):
+        assert command == ["scontrol", "show", "job", "-o", "123"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=next(outputs),
+            stderr="",
+        )
+
+    monkeypatch.setattr("slurm_submit.subprocess.run", fake_run)
+
+    assert scontrol_states(["123"]) == {
+        "123": {
+            "state": "COMPLETED",
+            "elapsed": "00:37:01",
+            "exit_code": "0:0",
+        }
+    }
+    assert scontrol_states(["123"]) == {}
+
+
+def test_wait_all_uses_scontrol_when_accounting_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr("slurm_submit.queued_states", lambda _ids: {})
+    monkeypatch.setattr("slurm_submit.slurm_states", lambda _ids: {})
+    monkeypatch.setattr(
+        "slurm_submit.scontrol_states",
+        lambda _ids: {
+            "123": {
+                "state": "COMPLETED",
+                "elapsed": "00:01:00",
+                "exit_code": "0:0",
+            }
+        },
+    )
+
+    submission = Submission(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4),
+        "123",
+        tmp_path / "123.log",
+    )
+    assert wait_all([submission], tmp_path / "runs", tmp_path / "report")
+
+
 def test_print_progress_omits_running_node(capsys, tmp_path):
     submission = Submission(
         Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1),
@@ -322,3 +947,17 @@ def test_print_progress_omits_running_node(capsys, tmp_path):
     assert "123" in output
     assert "example" in output
     assert "node" not in output
+
+
+def test_print_progress_handles_accounting_delay(capsys, tmp_path):
+    submission = Submission(
+        Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
+        "123",
+        tmp_path / "job.log",
+    )
+
+    print_progress([submission], {"123": {}})
+
+    output = capsys.readouterr().out
+    assert "UNKNOWN" in output
+    assert "123" in output

@@ -20,18 +20,61 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
-from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    index_k_plane_dtype,
+    index_k_row_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
     _get_tensor_size_bytes,
 )
 
 _INDEX_K_FP8_GROUP_SIZE = 128
-_INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
+
+
+def split_index_k_rows(
+    packed: torch.Tensor, *, index_head_dim: int, index_k_format: str
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """View packed index-K rows as the keys (and scales) of their format.
+
+    The inverse of :meth:`DSATokenToKVPool.gather_index_k_rows`'s packing:
+    no copy, the views share ``packed``'s storage. The pair is what
+    ``dsa_prefill_topk`` takes as rows in workspace-row order:
+    ``index_k_fp8`` / ``index_k_scale`` for ``fp8_scaled``, ``index_k_bf16``
+    (scale ``None``) for ``bf16``.
+
+    Args:
+        packed: ``[rows, index_k_row_bytes(index_head_dim, index_k_format)]``
+            uint8 rows.
+        index_head_dim: Elements of one key.
+        index_k_format: The plane's format (``configs/dsa.py``
+            ``INDEX_K_FORMATS``).
+
+    Returns:
+        ``fp8_scaled``: ``[rows, index_head_dim]`` uint8 FP8 keys and
+        ``[rows, groups]`` fp32 scales. ``bf16``: ``[rows, index_head_dim]``
+        bf16 keys and ``None``.
+    """
+    row_bytes = index_k_row_bytes(index_head_dim, index_k_format)
+    if packed.dim() != 2 or packed.dtype != torch.uint8:
+        raise ValueError(f"packed index-K rows are 2-D uint8, got {packed.dtype}")
+    if packed.shape[1] != row_bytes:
+        raise ValueError(
+            f"packed {index_k_format} index-K rows are {packed.shape[1]} bytes "
+            f"wide, not {row_bytes}"
+        )
+    if index_k_format == "fp8_scaled":
+        return (
+            packed[:, :index_head_dim],
+            packed[:, index_head_dim:].view(torch.float32),
+        )
+    return packed.view(index_k_plane_dtype(index_k_format)), None
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
@@ -42,119 +85,102 @@ class DSATokenToKVPool(MLATokenToKVPool):
         **kwargs,
     ):
         self.index_head_dim = int(index_head_dim)
-        self.index_k_row_bytes = dsa_index_k_row_bytes(self.index_head_dim)
         super().__init__(*args, **kwargs)
 
-        with self.memory_saver_adapter.region():
-            self.index_k_buffer = [
-                self.field(f"layer.{layer_id}.index_k", torch.uint8).view(
-                    -1, self.index_k_row_bytes
-                )
-                for layer_id in range(self.layer_num)
-            ]
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        **MLATokenToKVPool.layer_plane_bindings,
+        "index_k": "index_k_buffer",
+    }
 
     def get_kv_size_bytes(self):
         return super().get_kv_size_bytes() + _get_tensor_size_bytes(self.index_k_buffer)
-
-    def has_index_k_buffer(self) -> bool:
-        return True
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self.index_k_buffer[layer_id]
 
+    def gather_index_k_rows(
+        self, layer_id: int, slots: torch.Tensor, *, index_k_format: str
+    ) -> torch.Tensor:
+        """Read index-K rows out of the plane as packed bytes, one row per slot.
+
+        The read side of :meth:`set_index_k_buffer`, for the rows a
+        query-context-parallel history gather contributes. The caller names
+        the format it packs rows in (``DSAConfig.index_k_format``) and the
+        plane must be that format's dtype (``index_k_plane_dtype``). An
+        ``fp8_scaled`` plane stores every page as its ``page_size`` FP8 rows
+        followed by their fp32 scales (``index_k_block_split_scatter``), and
+        each row comes back as its FP8 bytes followed by its scale bytes so
+        one gather moves both; a ``bf16`` plane's row is its key's bytes.
+        :func:`split_index_k_rows` views the packed rows apart again.
+
+        Args:
+            layer_id: The indexer layer whose plane to read.
+            slots: ``[rows]`` int64 local cache slots.
+            index_k_format: The format to pack rows in, one of
+                ``configs/dsa.py`` ``INDEX_K_FORMATS``.
+
+        Returns:
+            ``[rows, index_k_row_bytes(index_head_dim, index_k_format)]`` uint8
+            rows in ``slots`` order.
+        """
+        buf = self.get_index_k_buffer(layer_id)
+        plane_dtype = index_k_plane_dtype(index_k_format)
+        if buf.dtype != plane_dtype:
+            raise ValueError(
+                f"layer {layer_id} index-K plane is {buf.dtype}, not the "
+                f"{plane_dtype} of index_k_format={index_k_format!r}"
+            )
+        head_dim = self.index_head_dim
+        if index_k_format != "fp8_scaled":
+            # A plain plane: the row is the key's bytes.
+            return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
+        page_size = int(self.arena.kv_page_size)
+        row_bytes = index_k_row_bytes(head_dim, index_k_format)
+        scale_bytes = row_bytes - head_dim
+        page_bytes = page_size * row_bytes
+        num_pages = buf.numel() // page_bytes
+        pages = buf.reshape(-1)[: num_pages * page_bytes].view(num_pages, page_bytes)
+        fp8 = pages[:, : page_size * head_dim].view(num_pages, page_size, head_dim)
+        scale = pages[:, page_size * head_dim :].view(num_pages, page_size, scale_bytes)
+        page = torch.div(slots, page_size, rounding_mode="floor")
+        offset = slots - page * page_size
+        return torch.cat((fp8[page, offset], scale[page, offset]), dim=1)
+
     def set_index_k_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
     ) -> None:
+        """Write one layer's index keys into its plane, in the plane's format.
+
+        The plane's dtype is its format (``configs/dsa.py`` INDEX_K_FORMATS):
+        a uint8 plane takes FP8 keys with per-128 fp32 scales, a bf16 plane
+        takes the keys unquantized. Nothing is converted between formats.
+        """
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
-        self._set_index_k_buffer(layer_id, loc, index_k)
-
-    def _index_k_block_views(
-        self, buf: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return per-page block-split views into a packed FP8 index-K buffer.
-
-        DeepGEMM's ``fp8_paged_mqa_logits`` expects each page of ``page_size``
-        tokens to be laid out as ``[page_size * head_dim FP8 values]`` followed
-        by ``[page_size * num_groups FP32 scales]`` (block-split), NOT a
-        per-token ``[fp8 | scale]`` interleave. The two ``as_strided`` views
-        below alias the same storage as ``buf`` so writes land in place.
-
-        Args:
-            buf: Packed FP8 index-K buffer of shape ``[num_slots, row_bytes]``
-                and dtype ``uint8``, where ``row_bytes == head_dim +
-                scale_bytes`` and ``num_slots`` is a multiple of
-                ``page_size``.
-
-        Returns:
-            ``(fp8_view, scale_view)`` where ``fp8_view`` has shape
-            ``[num_pages, page_size, head_dim]`` (FP8 e4m3) and ``scale_view``
-            has shape ``[num_pages, page_size, num_groups]`` (float32), both
-            indexed as ``view[page, slot_in_page]``.
-        """
-        ps = self.page_size
-        hd = self.index_head_dim
-        ng = hd // _INDEX_K_FP8_GROUP_SIZE
-        row = hd + ng * _INDEX_K_SCALE_BYTES
-        num_pages = buf.shape[0] // ps
-        page_bytes = ps * row
-        flat = buf.reshape(-1)
-        fp8_view = torch.as_strided(
-            flat.view(torch.float8_e4m3fn),
-            (num_pages, ps, hd),
-            (page_bytes, hd, 1),
-        )
-        scale_view = torch.as_strided(
-            flat.view(torch.float32),
-            (num_pages, ps, ng),
-            (page_bytes // 4, ng, 1),
-            (ps * hd) // 4,
-        )
-        return fp8_view, scale_view
-
-    def gather_index_k(
-        self, layer_id: int, slots: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather per-token FP8 index-K values and scales from the cache.
-
-        The packed FP8 index-K buffer is stored block-split per page (see
-        :meth:`_index_k_block_views`), so the non-paged prefill
-        scoring kernel (``fp8_mqa_logits``), which consumes contiguous
-        ``(k_fp8, k_scale)`` tensors, must gather token rows through the
-        block-split views rather than indexing raw rows.
-
-        Args:
-            layer_id: Layer whose index-K cache to read.
-            slots: 1D int tensor of global token slot indices to gather.
-
-        Returns:
-            ``(k_fp8, k_scale)`` where ``k_fp8`` has shape
-            ``[num_slots, head_dim]`` (FP8 e4m3) and ``k_scale`` has shape
-            ``[num_slots, num_groups]`` (float32).
-        """
-        buf = self.get_index_k_buffer(layer_id)
-        fp8_view, scale_view = self._index_k_block_views(buf)
-        slots = slots.to(torch.long)
-        page = slots // self.page_size
-        slot_in_page = slots % self.page_size
-        k_fp8 = fp8_view[page, slot_in_page]
-        k_scale = scale_view[page, slot_in_page]
-        return k_fp8, k_scale
-
-    def _set_index_k_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        index_k: torch.Tensor,
-    ) -> None:
         buf = self.index_k_buffer[layer_id]
-        index_k_fp8, index_k_scale = quantize_fp8_with_scale(
+        if buf.dtype == torch.bfloat16:
+            rows = index_k.to(buf.dtype)
+            slots = loc.to(torch.int64)
+            if write_mask is not None:
+                # Rows this rank does not own keep what the plane holds; the
+                # gather keeps the shapes static for graph capture.
+                rows = torch.where(write_mask.unsqueeze(1), rows, buf[slots])
+            buf[slots] = rows
+            return
+        if buf.dtype != torch.uint8:
+            raise TypeError(
+                f"index-K plane dtype {buf.dtype} has no write path: uint8 "
+                "(fp8_scaled) or bfloat16 (bf16)"
+            )
+        index_k_fp8, index_k_scale = quantize_fp8(
             index_k,
             granularity="token_group",
             group_size=_INDEX_K_FP8_GROUP_SIZE,
@@ -167,29 +193,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k_fp8,
             index_k_scale,
             loc,
-            page_size=self.page_size,
+            page_size=self.arena.kv_page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
+            write_mask=write_mask,
         )
-
-    def get_contiguous_buf_infos(self):
-        data_ptrs, data_lens, item_lens = super().get_contiguous_buf_infos()
-        data_ptrs = list(data_ptrs)
-        data_lens = list(data_lens)
-        item_lens = list(item_lens)
-        for buf in self.index_k_buffer:
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes * self.page_size)
-        return data_ptrs, data_lens, item_lens
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        offsets = super().get_layerwise_buf_info_offsets(start_idx)
-        if self.quant_method == "per_token_head":
-            base_count = 3 * self.layer_num
-        else:
-            base_count = self.layer_num
-        return [
-            layer_offsets + [start_idx + base_count + layer_id]
-            for layer_id, layer_offsets in enumerate(offsets)
-        ]

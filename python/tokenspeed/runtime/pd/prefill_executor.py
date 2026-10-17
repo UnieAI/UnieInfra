@@ -20,48 +20,32 @@
 
 from __future__ import annotations
 
-import numpy as np
+import time
 
-from tokenspeed.runtime.execution.block_table import (
-    select_block_table,
-    unpadded_block_table_row,
-)
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
-    build_cache_page_manifest,
-    cache_manifest_page_ids,
-    validate_cache_manifest_pair,
+    build_cache_block_manifest,
+    build_cache_layerwise_block_selection,
 )
 from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
     MooncakeKVSender,
 )
-from tokenspeed.runtime.pd.utils import (
-    TransferBackend,
-    poll_and_all_reduce,
-)
+from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
+from tokenspeed.runtime.utils.network import join_host_port
 
 logger = get_colorful_logger(__name__)
 
 from tokenspeed_scheduler import PD, Forward
 
+# A request still bootstrapping this long after registration is reported.
+_BOOTSTRAP_STALL_SECONDS = 10.0
+
 
 class DisaggPrefillExecutor:
-    def __init__(
-        self, backend: TransferBackend, args, kv_args, gloo_group, page_size: int
-    ):
-        self.transfer_backend = backend
-        self.bootstrap_port = args.bootstrap_port
-        self.page_size = page_size
-        self._dispatcher = TypeBasedDispatcher(
-            [
-                (Forward.Batch, self._decode),
-            ]
-        )
-        self.uses_cache_contract = kv_args.cache_layout is not None
+    def __init__(self, args, kv_args, gloo_group):
         self.cache_layout = kv_args.cache_layout
         self.senders: dict[str, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
@@ -69,45 +53,7 @@ class DisaggPrefillExecutor:
         self._local_states = {}
         self._layerwise_enabled = False
         self._layerwise_interval = 1
-        # request_id -> bootstrap metadata, populated after the prefill forward pass.
-        # Request ids and bootstrap rooms are stable across request-pool slot reuse.
-        self._request_token: dict[str, int] = {}
-        self._request_spec_candidate_ids: dict[str, list[int]] = {}
-        self._layerwise_token_published = set()
-
-    def store_prefill_token(
-        self,
-        request_id: str,
-        aux_index: int,
-        token: int,
-        spec_candidate_ids: list[int] | None = None,
-    ) -> None:
-        """Called by event_loop after prefill forward to record the first output token."""
-        if self.uses_cache_contract and spec_candidate_ids is not None:
-            raise NotImplementedError(
-                "Paged cache PD does not support speculative/MTP bootstrap candidates"
-            )
-        if self.uses_cache_contract and (
-            isinstance(token, bool) or not isinstance(token, int) or token < 0
-        ):
-            raise ValueError("Paged cache PD requires a non-negative bootstrap token")
-        self._request_token[request_id] = token
-        if spec_candidate_ids is not None:
-            self._request_spec_candidate_ids[request_id] = spec_candidate_ids
-        if self._layerwise_enabled:
-            sender = self.senders.get(request_id)
-            if sender is None:
-                logger.warning(
-                    "Prefill token arrived before sender registration for request_id=%s",
-                    request_id,
-                )
-                return
-            self.kv_manager.set_prefill_metadata(
-                sender.bootstrap_room,
-                token,
-                spec_candidate_ids,
-            )
-            self._layerwise_token_published.add(request_id)
+        self._bootstrap_stall_logged_at: float | None = None
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
         self._layerwise_enabled = True
@@ -119,7 +65,7 @@ class DisaggPrefillExecutor:
     def _bootstrap(self, request_id, info):
         self.senders[request_id] = MooncakeKVSender(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{info.bootstrap_host}:{info.bootstrap_port}",
+            bootstrap_addr=join_host_port(info.bootstrap_host, info.bootstrap_port),
             bootstrap_room=info.bootstrap_room,
         )
 
@@ -130,257 +76,223 @@ class DisaggPrefillExecutor:
         # these entries would live until the engine restarts.
         sender = self.senders.pop(req_id, None)
         if sender is not None:
-            self.kv_manager.discard_expired_metadata_room(sender.bootstrap_room)
+            sender.clear()
+            self.kv_manager.discard_room(sender.bootstrap_room)
         self._local_states.pop(req_id, None)
-        self._request_token.pop(req_id, None)
-        self._request_spec_candidate_ids.pop(req_id, None)
-        self._layerwise_token_published.discard(req_id)
-
-    def _decode_prefix_len(self, bootstrap_room: int) -> int:
-        transfer_info = next(
-            t
-            for t in self.kv_manager.transfer_infos[bootstrap_room].values()
-            if not t.is_dummy
-        )
-        return transfer_info.decode_prefix_len
-
-    def _prefill_page_window(self, op, index: int, sender, table=None):
-        if table is None:
-            table = select_block_table(op)
-        pages = unpadded_block_table_row(table, index)
-        decode_prefix_len = self._decode_prefix_len(sender.bootstrap_room)
-        if decode_prefix_len % self.page_size != 0:
-            raise ValueError(
-                "decode_prefix_len must be divisible by page_size: "
-                f"{decode_prefix_len=} {self.page_size=}"
-            )
-
-        chunk_begin = op.extend_prefix_lens[index]
-        chunk_end = chunk_begin + op.input_lengths[index]
-        is_last = chunk_end >= op.prefill_lengths[index]
-
-        decode_prefix_pages = decode_prefix_len // self.page_size
-        # Transfer progress is relative to D's missing-page window. P's local
-        # prefix may be deeper and must not hide pages that D still needs.
-        start_page = decode_prefix_pages + sender.curr_idx
-        if is_last:
-            end_page = (chunk_end + self.page_size - 1) // self.page_size
-        else:
-            end_page = chunk_end // self.page_size
-        end_page = min(end_page, len(pages))
-        start_page = min(start_page, end_page)
-
-        index_slice = slice(
-            start_page - decode_prefix_pages,
-            end_page - decode_prefix_pages,
-        )
-        return (
-            np.array(pages[start_page:end_page], dtype=np.int64),
-            index_slice,
-            is_last,
-        )
 
     def prepare_prefill(self, op) -> None:
-        if not self._layerwise_enabled:
+        if not self._layerwise_enabled or op.num_extends() == 0:
             return
-        if self.uses_cache_contract:
-            self._cache_prepare_prefill(op)
-            return
-        if op.num_extends() == 0:
-            return
-        table = select_block_table(op)
-        begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
-        for i, request_id in enumerate(op.request_ids[: op.num_extends()]):
+        self._prepare_cache_prefill(op)
+
+    def _prepare_cache_prefill(self, op) -> None:
+        """Preflight and enqueue one group-aware CachePD chunk per request.
+
+        Decode's manifest is immutable for the request. Each Prefill chunk
+        selects newly ready source blocks and positions inside that manifest;
+        the producer step range is reserved once for the whole forward batch.
+        """
+        pending = []
+        for index, request_id in enumerate(op.request_ids[: op.num_extends()]):
             sender = self.senders.get(request_id)
             if sender is None:
                 logger.debug(
-                    "[prefill][prepare_prefill] skipping request_id=%s without sender",
-                    request_id,
+                    f"[prefill][prepare_prefill] skipping request_id={request_id!s} "
+                    "without sender",
                 )
                 self._drop_request_state(request_id)
                 continue
-            kv_indices, index_slice, is_last = self._prefill_page_window(
-                op, i, sender, table
+            transfer_infos = self.kv_manager.transfer_infos.get(
+                sender.bootstrap_room, {}
             )
-            if len(kv_indices) == 0 and not is_last:
+            if not transfer_infos:
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
+            destinations = tuple(
+                info for info in transfer_infos.values() if not info.is_dummy
+            )
+            # Idle representative ranks use the normal post-forward dummy
+            # completion path; they have no cache fields to overlap.
+            if not destinations:
                 continue
+            first = destinations[0]
+            if first.block_manifest is None:
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
+            prefix_len = first.block_manifest.prefix_len
+            prompt_len = first.block_manifest.prompt_len
+            chunk_begin = int(op.extend_prefix_lens[index])
+            chunk_end = chunk_begin + int(op.input_lengths[index])
+            if chunk_end > prompt_len:
+                raise ValueError(
+                    "Cache-transfer Prefill chunk extends past Decode's prompt manifest"
+                )
+            is_last = chunk_end == prompt_len
+            # On the first submitted chunk, include blocks that Prefill found in
+            # its local cache but Decode still needs. Once a chunk has been
+            # submitted, each later selection starts at its own chunk boundary
+            # so already transferred blocks are not sent again.
+            selection_start = chunk_begin
+            if not sender.layerwise_chunk_submitted():
+                selection_start = min(selection_start, prefix_len)
+            block_selection = build_cache_layerwise_block_selection(
+                op,
+                layout=self.cache_layout,
+                request_row=index,
+                prefix_len=prefix_len,
+                prompt_len=prompt_len,
+                chunk_start=selection_start,
+                chunk_end=chunk_end,
+                state_prefix_cached=first.block_manifest.state_prefix_cached,
+            )
+            for destination in destinations:
+                if destination.block_manifest is None:
+                    raise RuntimeError(
+                        "Cache-transfer destination metadata is unavailable"
+                    )
+                if (
+                    destination.block_manifest.prefix_len != prefix_len
+                    or destination.block_manifest.prompt_len != prompt_len
+                    or destination.block_manifest.state_prefix_cached
+                    != first.block_manifest.state_prefix_cached
+                ):
+                    raise ValueError(
+                        "Cache-transfer destinations disagree on the prompt window"
+                    )
+            if (
+                not any(group.source_block_ids for group in block_selection.groups)
+                and not is_last
+            ):
+                continue
+            pending.append(
+                (
+                    sender,
+                    is_last,
+                    block_selection,
+                )
+            )
+
+        # The attention backend records one producer range for every forward,
+        # including batches whose current chunk completes no history block.
+        begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
+        for sender, is_last, block_selection in pending:
             sender.send_layerwise(
-                kv_indices,
-                index_slice,
-                op.request_pool_indices[i],
                 is_last,
                 begin_cache_step=begin_cache_step,
                 layerwise_interval=self._layerwise_interval,
                 wait_for_bootstrap_token=is_last,
-                mamba_indices=None,
-            )
-
-    def _decode(self, op):
-        if self.uses_cache_contract:
-            self._cache_decode(op)
-            return
-        is_last = True
-        table = select_block_table(op)
-
-        for i, request_id in enumerate(op.request_ids):
-            sender = self.senders.get(request_id)
-            if sender is None:
-                logger.debug(
-                    "[prefill][_decode] skipping request_id=%s without sender",
-                    request_id,
-                )
-                self._drop_request_state(request_id)
-                continue
-            aux_index = op.request_pool_indices[i]
-            bootstrap_token = self._request_token.pop(request_id, -1)
-            spec_candidate_ids = self._request_spec_candidate_ids.pop(request_id, None)
-            if sender.has_layerwise_transfer():
-                if request_id not in self._layerwise_token_published:
-                    self.kv_manager.set_prefill_metadata(
-                        sender.bootstrap_room,
-                        bootstrap_token,
-                        spec_candidate_ids,
-                    )
-                self._layerwise_token_published.discard(request_id)
-                continue
-
-            bootstrap_room = sender.bootstrap_room
-            decode_prefix_len = self._decode_prefix_len(bootstrap_room)
-            if decode_prefix_len % self.page_size != 0:
-                raise ValueError(
-                    "decode_prefix_len must be divisible by page_size: "
-                    f"{decode_prefix_len=} {self.page_size=}"
-                )
-            kv_indices = np.array(
-                unpadded_block_table_row(table, i)[
-                    decode_prefix_len // self.page_size :
-                ],
-                dtype=np.int64,
-            )
-            logger.debug(
-                "[prefill][_decode] rid=%s aux_index=%d kv_indices(len=%d)=%s bootstrap_token=%d",
-                request_id,
-                aux_index,
-                len(kv_indices),
-                kv_indices,
-                bootstrap_token,
-            )
-            sender.send(
-                kv_indices,
-                aux_index,
-                is_last,
-                bootstrap_token=bootstrap_token,
-                spec_candidate_ids=spec_candidate_ids,
-                mamba_indices=None,
-            )
-
-    def _cache_request_manifest(self, op, index: int, sender):
-        """Build and validate the source page manifest + page-id vector for one
-        request against its single identity-routed destination. Returns
-        ``(manifest, page_ids)``; shared by the whole-request and layerwise
-        contract transfer paths."""
-        transfer_infos = self.kv_manager.transfer_infos.get(sender.bootstrap_room, {})
-        destinations = [info for info in transfer_infos.values() if not info.is_dummy]
-        if len(destinations) != 1:
-            raise RuntimeError(
-                "Paged cache PD requires exactly one identity-routed destination"
-            )
-        destination = destinations[0]
-        if destination.page_manifest is None or destination.peer_cache_layout is None:
-            raise RuntimeError("Paged cache destination metadata is unavailable")
-        manifest = build_cache_page_manifest(
-            op,
-            layout=self.cache_layout,
-            request_row=index,
-            prefix_len=destination.page_manifest.prefix_len,
-            prompt_len=destination.page_manifest.prompt_len,
-        )
-        validate_cache_manifest_pair(
-            manifest,
-            destination.page_manifest,
-            self.cache_layout,
-            dst_num_pages_with_null=destination.peer_cache_layout.num_pages_with_null,
-        )
-        page_ids = np.asarray(
-            cache_manifest_page_ids(
-                manifest,
-                layout=self.cache_layout,
-                peer="source",
-            ),
-            dtype=np.int64,
-        )
-        return manifest, page_ids
-
-    def _cache_prepare_prefill(self, op) -> None:
-        """Layerwise contract prefill: enqueue the whole-request raw-slab transfer
-        with a reserved per-layer cache-step window. Contract PD does not chunk the
-        prompt, so one transfer covers every page; the layer-by-layer overlap
-        happens inside the transfer worker, which blocks on the step counter per
-        layer window before shipping that window's segments. The last (only) chunk
-        waits for the bootstrap token, mirroring the whole-request path."""
-        if op.num_extends() == 0:
-            return
-        begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
-        for index, request_id in enumerate(op.request_ids[: op.num_extends()]):
-            sender = self.senders.get(request_id)
-            if sender is None:
-                self._drop_request_state(request_id)
-                continue
-            manifest, page_ids = self._cache_request_manifest(op, index, sender)
-            sender.send_layerwise(
-                page_ids,
-                slice(0, len(page_ids)),
-                op.request_pool_indices[index],
-                True,
-                begin_cache_step=begin_cache_step,
-                layerwise_interval=self._layerwise_interval,
-                wait_for_bootstrap_token=True,
-                page_manifest=manifest,
+                cache_block_selection=block_selection,
             )
 
     def _cache_decode(self, op) -> None:
-        if self._layerwise_enabled:
-            # Layerwise already streamed the KV during prepare_prefill; only the
-            # bootstrap token still needs publishing on the last chunk.
-            for request_id in op.request_ids:
-                sender = self.senders.get(request_id)
-                if sender is None or not sender.has_layerwise_transfer():
-                    continue
-                token = self._request_token.get(request_id)
-                if isinstance(token, bool) or not isinstance(token, int) or token < 0:
-                    raise RuntimeError("Paged cache bootstrap token is unavailable")
-                self.kv_manager.set_prefill_metadata(sender.bootstrap_room, token, None)
-                self._request_token.pop(request_id, None)
-            return
+        """Publish each request's bootstrap payload and finish its transfer.
+
+        ``op`` is the plan's remote-decode batch, and it is self-contained:
+        the scheduler emits a row only once the final chunk's result has
+        landed, so ``decode_input_ids[i]`` is the bootstrap token (the
+        sampled first decode token) and ``spec_candidate_ids[i]`` the
+        drafter's candidate rows (empty without speculation).
+        """
         pending = []
         for index, request_id in enumerate(op.request_ids):
             sender = self.senders.get(request_id)
             if sender is None:
                 continue
-            manifest, page_ids = self._cache_request_manifest(op, index, sender)
-            token = self._request_token.get(request_id)
-            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
-                raise RuntimeError("Paged cache bootstrap token is unavailable")
-            pending.append(
-                (
-                    request_id,
-                    sender,
-                    op.request_pool_indices[index],
-                    token,
-                    manifest,
-                    page_ids,
-                )
-            )
+            token = int(op.decode_input_ids[index])
+            if token < 0:
+                raise RuntimeError("Cache-transfer bootstrap token is unavailable")
+            spec_candidate_ids = list(op.spec_candidate_ids[index]) or None
 
-        for request_id, sender, aux_index, token, manifest, page_ids in pending:
+            if self._layerwise_enabled:
+                if not sender.layerwise_final_chunk_submitted():
+                    transfer_infos = self.kv_manager.transfer_infos.get(
+                        sender.bootstrap_room, {}
+                    )
+                    if transfer_infos and all(
+                        info.is_dummy for info in transfer_infos.values()
+                    ):
+                        # Idle representative ranks have no cache fields to
+                        # stream, but still participate in the Prefill TP
+                        # status collective. Submit their final no-op only
+                        # after the Prefill forward has completed.
+                        sender.send(
+                            True,
+                            bootstrap_token=token,
+                            spec_candidate_ids=spec_candidate_ids,
+                            block_manifest=None,
+                        )
+                    continue
+                # Layerwise already streamed the KV during prepare_prefill;
+                # only the bootstrap payload still needs publishing.
+                self.kv_manager.set_prefill_metadata(
+                    sender.bootstrap_room, token, spec_candidate_ids
+                )
+                continue
+
+            if sender.layerwise_final_chunk_submitted():
+                self.kv_manager.set_prefill_metadata(
+                    sender.bootstrap_room, token, spec_candidate_ids
+                )
+                continue
+            transfer_infos = self.kv_manager.transfer_infos.get(
+                sender.bootstrap_room, {}
+            )
+            if not transfer_infos:
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
+            destinations = [
+                info for info in transfer_infos.values() if not info.is_dummy
+            ]
+            if not destinations:
+                # A rank with no data edge still participates in the Prefill
+                # TP status collective. Decode TP rank zero sends it one dummy
+                # rendezvous; enqueueing a final no-op lets the existing
+                # transfer worker mark this rank successful without DMA.
+                pending.append((sender, token, spec_candidate_ids, None))
+                continue
+            destination = destinations[0]
+            if destination.block_manifest is None:
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
+            block_manifest = build_cache_block_manifest(
+                op,
+                layout=self.cache_layout,
+                request_row=index,
+                prefix_len=destination.block_manifest.prefix_len,
+                prompt_len=destination.block_manifest.prompt_len,
+                state_prefix_cached=destination.block_manifest.state_prefix_cached,
+            )
+            for destination in destinations:
+                if destination.block_manifest is None:
+                    raise RuntimeError(
+                        "Cache-transfer destination metadata is unavailable"
+                    )
+                if (
+                    destination.block_manifest.prefix_len != block_manifest.prefix_len
+                    or destination.block_manifest.prompt_len
+                    != block_manifest.prompt_len
+                    or destination.block_manifest.state_prefix_cached
+                    != block_manifest.state_prefix_cached
+                ):
+                    raise ValueError(
+                        "Cache-transfer destinations disagree on the prompt window"
+                    )
+            pending.append((sender, token, spec_candidate_ids, block_manifest))
+
+        for sender, token, spec_candidate_ids, block_manifest in pending:
             sender.send(
-                page_ids,
-                aux_index,
                 True,
                 bootstrap_token=token,
-                page_manifest=manifest,
+                spec_candidate_ids=spec_candidate_ids,
+                block_manifest=block_manifest,
             )
-            self._request_token.pop(request_id, None)
+
+    def record_cached_tokens(self, request_id: str, cached_tokens: int) -> None:
+        sender = self.senders.get(request_id)
+        if sender is not None:
+            self.kv_manager.record_cached_tokens(sender.bootstrap_room, cached_tokens)
+
+    def record_bootstrap_logprob(self, request_id: str, logprob: float) -> None:
+        """Publish the committed bootstrap token's logprob for the status message."""
+        sender = self.senders.get(request_id)
+        if sender is not None:
+            self.kv_manager.record_bootstrap_logprob(sender.bootstrap_room, logprob)
 
     def register(
         self,
@@ -401,28 +313,67 @@ class DisaggPrefillExecutor:
         )
 
     def execute(self, op):
-        self._dispatcher(op)
+        """Send this completed prompt's KV to the node that will decode it.
+
+        The P-role half of the plan's remote streams, submitted on the
+        forward thread like any forward; completion arrives as a transfer
+        event, not from here.
+        """
+        if not isinstance(op, Forward.Batch):
+            raise TypeError(f"Expected Batch, got {type(op).__name__}.")
+        self._cache_decode(op)
+
+    def _log_bootstrap_stalls(self, request_ids: list[str], polls: list[int]) -> None:
+        """Name requests that have waited on the PD handshake for too long.
+
+        A request bootstrapped locally whose global status is still
+        Bootstrapping is waiting for another rank's pre-allocation; that rank
+        never receives it when the decode side lost the room.
+        """
+        now = time.time()
+        stalled = [
+            f"{req_id}(room={sender.bootstrap_room}, age={now - sender.init_time:.0f}s)"
+            for req_id, poll in zip(request_ids, polls, strict=True)
+            if poll == TransferPoll.Bootstrapping
+            and (sender := self.senders.get(req_id)) is not None
+            and now - sender.init_time >= _BOOTSTRAP_STALL_SECONDS
+        ]
+        if not stalled or (
+            self._bootstrap_stall_logged_at is not None
+            and now - self._bootstrap_stall_logged_at < _BOOTSTRAP_STALL_SECONDS
+        ):
+            return
+        self._bootstrap_stall_logged_at = now
+        topology = self.kv_manager.topology
+        logger.warning(
+            "[prefill] %s request(s) still bootstrapping on global_rank=%s: %s",
+            len(stalled),
+            topology.global_rank,
+            stalled[:8],
+        )
 
     def generate_events(self):
         if not self.senders:
             return []
+        request_ids = list(self.senders)
         polls = poll_and_all_reduce(self.senders.values(), self.gloo_group)
+        self._log_bootstrap_stalls(request_ids, polls)
 
         events = []
         to_remove = []
-        for req_id, poll in zip(list(self.senders.keys()), polls):
+        for req_id, poll in zip(request_ids, polls):
             if (
                 self._local_states[req_id] == TransferPoll.Bootstrapping
                 and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
-                    "[prefill][generate_events] rid=%s -> BootstrappedEvent", req_id
+                    f"[prefill][generate_events] rid={req_id!s} -> BootstrappedEvent",
                 )
                 events.append(PD.BootstrappedEvent(req_id))
                 self._local_states[req_id] = TransferPoll.Bootstrapped
             elif poll == TransferPoll.Failed:
                 logger.warning(
-                    "[prefill][generate_events] rid=%s -> FailedEvent", req_id
+                    f"[prefill][generate_events] rid={req_id!s} -> FailedEvent",
                 )
                 events.append(PD.FailedEvent(req_id))
                 to_remove.append(req_id)
@@ -432,7 +383,7 @@ class DisaggPrefillExecutor:
             ):
                 self._local_states[req_id] = TransferPoll.Success
                 logger.debug(
-                    "[prefill][generate_events] rid=%s -> SucceededEvent", req_id
+                    f"[prefill][generate_events] rid={req_id!s} -> SucceededEvent",
                 )
                 events.append(PD.SucceededEvent(req_id))
                 to_remove.append(req_id)

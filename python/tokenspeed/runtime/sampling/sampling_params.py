@@ -20,6 +20,7 @@
 
 """Sampling parameters for text generation."""
 
+import copy
 import zlib
 from typing import Any
 
@@ -111,9 +112,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
-            # top_k = 1 means greedy sampling
             self.temperature = 1.0
             self.top_k = 1
+        if self.top_k == 1:
+            # top_k = 1 means greedy sampling — whether it came from a
+            # near-zero temperature or the caller asked for it directly.
+            # Greedy ignores randomness by definition, so pin the seed: the
+            # unified pool route breaks exact-tie logits with the request's
+            # random stream, and a request-derived seed would make two
+            # identical greedy requests disagree on tied tokens
+            # (dummy-weight tests hit ties routinely; bf16 serving can too).
+            self.seed = 0
         if self.top_k == -1:
             self.top_k = _TOP_K_DISABLED
 
@@ -221,6 +230,21 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         TP/DP ranks agree on the seed."""
         if self.seed is None:
             self.seed = zlib.crc32(rid.encode("utf-8")) & 0xFFFFFFFF
+
+    def for_parallel_sample(self, replica_index: int) -> "SamplingParams":
+        """Copy of these params for replica ``replica_index`` of an n > 1 request.
+
+        All replicas start from the same resolved seed, and some backends
+        (e.g. triton) sample from (seed, position) only, so without an offset
+        every replica returns the same tokens. Greedy requests keep their
+        pinned seed.
+        """
+        if self.seed is None:
+            raise ValueError("resolve_seed() must run before fan-out.")
+        replica = copy.copy(self)
+        if replica.top_k != 1:
+            replica.seed = self.seed + replica_index
+        return replica
 
     def normalize(self, tokenizer) -> None:
         # Process stop strings

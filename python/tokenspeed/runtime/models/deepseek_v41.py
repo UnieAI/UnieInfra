@@ -2192,6 +2192,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             )
         self.checkpoint_load_report = {"loaded": len(loaded), "skipped": dict(skipped)}
         logger.info(f"V4.1 checkpoint coverage: {self.checkpoint_load_report!s}")
+        # post_load_weights re-lays out the MoE experts into new Parameters. Any
+        # reference still held here to the loaded ones (the name->Parameter map
+        # and the MoE loader built over it) keeps every layer's original experts
+        # alive until this frame returns, so the re-layout peaks at twice the
+        # expert weights: ~63 GiB extra per rank at TP4, an OOM on 141 GB H200.
+        del params, moe_loader, pending
         self.post_load_weights()
 
     def _load_missing_engram_tables(self, loaded: set[str]) -> None:

@@ -328,6 +328,15 @@ class _Backend:
     def indexer_needs_scores(self, layer_id, positions, requests, mode):
         return True
 
+    def begin_indexer_forward(self):
+        pass
+
+    def end_indexer_forward(self):
+        pass
+
+    def begin_indexer_stage(self):
+        pass
+
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("fused", [False, True])
@@ -1025,6 +1034,9 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
 
     (expected, expected_aux), expected_ctx = whole()
 
+    stage_refresh = Mock(wraps=backend.begin_indexer_stage)
+    monkeypatch.setattr(backend, "begin_indexer_stage", stage_refresh)
+
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     ctx.bs = ctx.num_extends = 2
     ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
@@ -1040,6 +1052,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         engram_token_mask=mask,
         image_mask=None,
     )
+<<<<<<< HEAD
     # The layer-19 and layer-20 taps are taken at or below the candidate
     # source's input, on every row; so is the candidate source's head.
     assert state.rows == 6 and [tap.shape[0] for tap in state.captured] == [6, 6]
@@ -1048,6 +1061,11 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     def pad(t):
         return torch.cat((t, torch.zeros_like(t[:2])))
 
+=======
+    # The layer-19 tap is taken below the candidate source, on every row.
+    assert stage_refresh.call_count == 1
+    assert state.rows == 6 and [tap.shape[0] for tap in state.captured] == [6]
+>>>>>>> 69e6f9b2 (perf(dsv41): Reuse indexer metadata across attention layers (#2377))
     # An encoder graph output carries a padded tail past the real rows.
     padded = v41.V41RowState(
         torch.cat((state.hidden, torch.zeros_like(state.hidden[:2]))),
@@ -1060,6 +1078,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         [pad(t) for t in state.head],
     )
     narrowed = model.narrowing_forward(padded, ctx)
+    assert stage_refresh.call_count == 2
     assert narrowed.rows == 3
     assert narrowed.positions.tolist() == [3, 0, 1]
     assert narrowed.hashes is None and narrowed.engram_token_mask is None
@@ -1109,6 +1128,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
             landed_narrowed(DeepseekV41Attention._narrowed_attention),
         )
         hidden, captured = model.decoder_forward(statics, ctx)
+    assert stage_refresh.call_count == 3
     assert hidden.shape == (8, config.hidden_size)
     assert [tap.shape for tap in captured] == [(8, config.hidden_size)] * 3
     actual, aux = model.finish_forward(hidden[:3], [tap[:3] for tap in captured], ctx)

@@ -1219,7 +1219,9 @@ def index_topk(
     score_chunk_size,
     process_group,
     out,
+    index_metadata,
 ):
+    del index_metadata
     out = _index_topk_outputs(
         index_q,
         weights,

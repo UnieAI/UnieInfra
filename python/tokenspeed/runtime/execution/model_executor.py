@@ -58,6 +58,7 @@ from tokenspeed.runtime.execution.types import (
     ModelExecutionResult,
     PoolerForwardResult,
 )
+
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
@@ -92,6 +93,8 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
+
+PROF_GPU_ELAPSED = envs.TOKENSPEED_GPU_ELAPSED.get()
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
@@ -1447,7 +1450,7 @@ class ModelExecutor:
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
         self._active_positions_override = None
-        timing_enabled = LOG_MM_TIMING
+        timing_enabled = LOG_MM_TIMING or PROF_GPU_ELAPSED
         timing_start = time.perf_counter() if timing_enabled else 0.0
         input_fill_ms = 0.0
         mrope_ms = 0.0
@@ -1456,6 +1459,7 @@ class ModelExecutor:
         output_d2h_ms = 0.0
         graph_capable = False
         graph_padded_bs = 0
+        gpu_events = None
 
         with nvtx_range("pre_fill_setup", color="orange"):
             # Wait for previous iteration's runtime state updates
@@ -1653,6 +1657,14 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
+                    gpu_start = (
+                        torch.cuda.Event(enable_timing=True)
+                        if PROF_GPU_ELAPSED
+                        else None
+                    )
+                    gpu_end = torch.cuda.Event(enable_timing=True) if PROF_GPU_ELAPSED else None
+                    if gpu_start is not None:
+                        gpu_start.record()
                     step_result = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -1677,10 +1689,18 @@ class ModelExecutor:
                             forward_op if cache_metadata is not None else None
                         ),
                     )
+                    if gpu_end is not None:
+                        gpu_end.record()
                     if timing_enabled:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
+                    if PROF_GPU_ELAPSED:
+                        # Attach the events; the commit path reads elapsed_time
+                        # AFTER copy_event sync, so this adds NO device sync here
+                        # (the old torch.cuda.synchronize here serialized the
+                        # pipeline and only measured a single forward in flight).
+                        gpu_events = (gpu_start, gpu_end)
 
                 if isinstance(step_result, PoolerForwardResult):
                     output_embeddings = step_result.embeddings
@@ -1779,7 +1799,8 @@ class ModelExecutor:
                     "mm_timing forward_execute_ms total=%.3f input_fill=%.3f "
                     "mrope=%.3f sampling=%.3f forward_step=%.3f output_d2h=%.3f "
                     "mode=%s bs=%s total_tokens=%s graph=%s padded_bs=%s "
-                    "has_mm=%s mm_count=%s mm_delta_count=%s",
+                    "has_mm=%s mm_count=%s mm_delta_count=%s "
+                    "ext_prefix=%s",
                     (time.perf_counter() - timing_start) * 1000.0,
                     input_fill_ms,
                     mrope_ms,
@@ -1794,6 +1815,7 @@ class ModelExecutor:
                     has_mm,
                     mm_count,
                     mm_delta_count,
+                    list(getattr(forward_op, "extend_prefix_lens", [])[:bs]),
                 )
 
         return ModelExecutionResult(
@@ -1806,6 +1828,7 @@ class ModelExecutor:
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
             output_embeddings=output_embeddings,
+            gpu_events=gpu_events,
         )
 
     def write_remote_spec_candidate_ids(

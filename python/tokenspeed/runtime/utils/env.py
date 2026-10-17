@@ -305,6 +305,15 @@ class Envs:
     # engine.io_struct.
     TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
 
+    # Diagnostic: per-iteration wall split of the scheduler event loop.
+    TOKENSPEED_SCHED_LOOP_TIMING = EnvBool(False)
+
+    # Diagnostic: time each forward_step with CUDA events and report the device
+    # elapsed time. Pairs with TOKENSPEED_SCHED_LOOP_TIMING, which prints it as
+    # the `gpu=` field, because the loop's `dispatch` bucket cannot by itself
+    # separate GPU backpressure from host cost.
+    TOKENSPEED_GPU_ELAPSED = EnvBool(False)
+
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)

@@ -34,7 +34,7 @@ import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
 from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
-from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.model_config import ModelConfig, is_deepseek_v4
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -104,6 +104,9 @@ logger = get_colorful_logger(__name__)
 # Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
 # not busy-spin a CPU core waiting for /resume.
 _PAUSED_IDLE_SLEEP_S = 0.001
+
+# Diagnostic: per-iteration wall split of the scheduler event loop.
+_SCHED_LOOP_TIMING = os.environ.get("TOKENSPEED_SCHED_LOOP_TIMING") == "1"
 
 
 def _forward_op_executes_model_forward(forward_op, *, is_disagg_decode: bool) -> bool:
@@ -221,9 +224,18 @@ def model_may_use_fi_gdn(model_config) -> bool:
     guard for a model whose mixers have not been read here would be trading a
     correctness guard for a speedup on an untested path. Gemma is the case
     this fixes; the rest keep what they had.
+
+    DeepSeek-V4 is the one deliberate exception: it is MLA + compressor only
+    (``AttentionArch.MLA``), it never calls ``gdn_chunk_prefill`` (the only call
+    site is ``hybrid_linear_attn``, which this backend does not use), and its
+    config declares no ``layer_types``, so the default would wrongly strip its
+    prefill CUDA graph.
     """
     if model_config is None:
         return True
+    hf_cfg = getattr(model_config, "hf_config", None)
+    if hf_cfg is not None and is_deepseek_v4(hf_cfg):
+        return False
     for cfg in (
         getattr(model_config, "hf_text_config", None),
         getattr(model_config, "hf_config", None),
@@ -563,6 +575,7 @@ class EventLoop:
             context_chunk_policy=server_args.context_chunk_policy,
             context_chunk_unit=server_args.context_chunk_unit,
             max_cold_prefills=server_args.max_cold_prefills,
+            prefill_defer_window=server_args.prefill_defer_window,
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(
@@ -1858,16 +1871,38 @@ class EventLoop:
         )
         prev_results: ModelExecutionResult = None
         prev_forward_op = None
+        # True GPU time of the previous step, from the CUDA events that
+        # model_executor brackets forward_step with. Stays None (printed as
+        # -1.0) unless TOKENSPEED_GPU_ELAPSED=1. It is reported next to the
+        # loop split because `dispatch` alone cannot say whether a slow decode
+        # iteration is GPU work or host work: the launch of step N blocks on
+        # step N-1's execution stream, so GPU backpressure and host cost land
+        # in the same bucket.
+        prev_gpu_ms: float | None = None
+
+        _t_it0 = time.perf_counter() if _SCHED_LOOP_TIMING else 0.0
+        _t_prev_iter = 0.0
 
         while not self._shutdown_complete():
+            _t_phase = {}
+            def _pmark(name):
+                if _SCHED_LOOP_TIMING:
+                    now = time.perf_counter()
+                    _t_phase[name] = now
+            _pmark("start")
             # Order this iter's default-stream writes (prefix_cache page-table
             # writes) after the prev iter's forward on execution_stream that
             # reads the same tensor. Non-blocking on host.
             torch.cuda.default_stream().wait_stream(
                 self.model_executor.execution_stream
             )
+            _pmark("after_stream")
+
+            # ---- dispatch current forward first (async GPU launch) ----
+            _pmark("pre_newreq")
             self._process_new_requests()
             self._commit_cache_results()
+            _pmark("after_newreq")
             if self._pause.forward_blocked:
                 # Freeze: commit any in-flight (overlapped) step — a forward
                 # already on the GPU can't be un-launched — then idle.
@@ -1877,17 +1912,20 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
+            _pmark("after_plan")
 
             cache_zero_event = self.model_executor.zero_cache_pages(
                 execution_plan.pages_to_zero
             )
             self._submit_cache_ops(execution_plan)
+            _pmark("after_cache")
 
             forward_op = self._get_forward_op(execution_plan)
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
+            _pmark("after_get")
 
             grammar_inputs = None
             if forward_op is not None:
@@ -1898,6 +1936,7 @@ class EventLoop:
                 # forward_op.
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
+            _pmark("after_gather")
 
             # DP sync: all ranks must participate even when idle.
             dp_metadata = None
@@ -1961,11 +2000,22 @@ class EventLoop:
                     grammar_inputs=grammar_inputs,
                     cache_zero_event=cache_zero_event,
                 )
+            _pmark("after_dispatch")
 
             # ---- post-process previous step (overlapped with current forward) ----
             if prev_results is not None:
                 request_changes.extend(
                     self._commit_forward_results(prev_forward_op, prev_results)
+                )
+            _pmark("after_commit")
+
+            if _SCHED_LOOP_TIMING:
+                # Readable only now: elapsed_time() needs the end event
+                # completed, and the commit path above is what synchronises on
+                # it (post_process_forward_op -> sync()). Reading it at
+                # dispatch time would either raise or return a bogus value.
+                prev_gpu_ms = (
+                    prev_results.gpu_elapsed_ms() if prev_results is not None else None
                 )
 
             # ---- collect KV transfer events ----
@@ -1974,18 +2024,69 @@ class EventLoop:
                 request_changes.extend(
                     self._process_kv_transfer_events(kv_transfer_events)
                 )
+            _pmark("after_kv")
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
                 self._publish_scheduler_kv_events()
+            _pmark("after_advance")
 
             # Resolve a deferred abort/wait pause reply once in-flight work drains.
             self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+            _pmark("after_metrics")
+
+            if _SCHED_LOOP_TIMING and forward_op is not None and num_iter_tokens > 0:
+                _now = time.perf_counter()
+                _names = [
+                    "after_stream",
+                    "after_newreq",
+                    "after_plan",
+                    "after_cache",
+                    "after_get",
+                    "after_gather",
+                    "after_dispatch",
+                    "after_commit",
+                    "after_kv",
+                    "after_advance",
+                    "after_metrics",
+                ]
+                _ms = {}
+                _prev = _t_phase["start"]
+                for _name in _names:
+                    if _name in _t_phase:
+                        _ms[_name] = (_t_phase[_name] - _prev) * 1000.0
+                        _prev = _t_phase[_name]
+                _iter_ms = (_now - _t_it0) * 1000.0
+                logger.info(
+                    "SCHEDLOOP ntok=%d bs=%d ext=%d iter=%.1fms gap_prev=%.1fms "
+                    "newreq=%.1f plan=%.1f cache=%.1f get=%.1f gather=%.1f "
+                    "dispatch=%.1f commit=%.1f kv=%.1f advance=%.1f metrics=%.1f "
+                    "stream=%.1f gpu=%.1f",
+                    num_iter_tokens,
+                    len(forward_op.request_ids),
+                    forward_op.num_extends(),
+                    _iter_ms,
+                    (_now - _t_prev_iter) * 1000.0 if _t_prev_iter else 0.0,
+                    _ms.get("after_newreq", 0.0),
+                    _ms.get("after_plan", 0.0),
+                    _ms.get("after_cache", 0.0),
+                    _ms.get("after_get", 0.0),
+                    _ms.get("after_gather", 0.0),
+                    _ms.get("after_dispatch", 0.0),
+                    _ms.get("after_commit", 0.0),
+                    _ms.get("after_kv", 0.0),
+                    _ms.get("after_advance", 0.0),
+                    _ms.get("after_metrics", 0.0),
+                    _ms.get("after_stream", 0.0),
+                    -1.0 if prev_gpu_ms is None else prev_gpu_ms,
+                )
 
             prev_results = curr_results
             prev_forward_op = forward_op
+            _t_it0 = time.perf_counter() if _SCHED_LOOP_TIMING else 0.0
+            _t_prev_iter = time.perf_counter() if _SCHED_LOOP_TIMING else 0.0
 
     def close(self) -> None:
         # Best-effort: tell an attached SMG frontend this engine is going away

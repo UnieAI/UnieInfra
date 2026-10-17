@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import functools
 import gc
+import logging
 from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -60,6 +61,8 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "BreakableCapture",
@@ -258,10 +261,94 @@ class BreakableCapture:
                 before the following graph segment consumes them. ``None``
                 leaves handoff buffers unchanged.
         """
+        # One-shot torch.profiler on the eager replays (never capture), for
+        # per-kernel GPU attribution of the break cost. Gated on NVTXVISION /
+        # TOKENSPEED_PROFILE_PFCAP; writes per-rank JSON then disarms itself.
+        import os as _pfc_os
+        # One-shot per value-band of TOKENSPEED_PROFILE_PFCAP so the capture
+        # can be re-armed (e.g. "1" then "2") for a trace at a chosen phase
+        # instead of only the very first replay after boot.
+        _pfc_band = _pfc_os.environ.get("TOKENSPEED_PROFILE_PFCAP")
+        _pfc_state = globals().setdefault("_pfc_armed_band", None)
+        if _pfc_band == _pfc_state:
+            self._replay_segments(valid_rows)
+            return
+        if not (_pfc_band == "1" or _pfc_band == "2" or _pfc_band == "3"):
+            globals()["_pfc_armed_band"] = _pfc_band
+            self._replay_segments(valid_rows)
+            return
+        if (
+            _pfc_os.environ.get("TOKENSPEED_PROFILE_PFCAP") == "2"
+            and not self._capturing
+            and not getattr(self, "_smoke_test", False)
+        ):
+            # Band 2 only fires on a real multi-token decode batch (valid_rows
+            # >> 1) so the trace captures the throughput-critical path, not the
+            # 1-token warmup/EXTEND replay that band 1 grabs.
+            if valid_rows is None or valid_rows <= 4:
+                self._replay_segments(valid_rows)
+                return
+            import torch as _pfc_t
+            _pfc_rank = 0
+            try:
+                import torch.distributed as _pfc_dist
+                if _pfc_dist.is_initialized():
+                    _pfc_rank = _pfc_dist.get_rank()
+            except Exception:
+                pass
+            _pfc_prof = _pfc_t.profiler.profile(
+                activities=[
+                    _pfc_t.profiler.ProfilerActivity.CPU,
+                    _pfc_t.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=False,
+                record_shapes=False,
+            )
+            _pfc_prof.start()
+            try:
+                self._replay_segments(valid_rows)
+            finally:
+                _pfc_prof.stop()
+                _pfc_path = f"/tmp/pfc_prof_{_pfc_rank}.json"
+                try:
+                    _pfc_prof.export_chrome_trace(_pfc_path)
+                    _pfc_os.write(
+                        2, b"PFC_PROFILE: trace -> %s\n" % _pfc_path.encode()
+                    )
+                except Exception as _pfc_e:
+                    _pfc_os.write(2, b"PFC_PROFILE: export failed %s\n" % str(_pfc_e).encode())
+                    _pfc_os.environ["TOKENSPEED_PROFILE_PFCAP"] = "0"
+                globals()["_pfc_armed_band"] = _pfc_band
+                return
+        self._replay_segments(valid_rows)
+
+    def _replay_segments(self, valid_rows: int | None = None) -> None:
         previous_valid_rows = self._valid_rows
         self._valid_rows = valid_rows
         try:
-            deque((run() for run in self.segments), maxlen=0)
+            _g = 0.0
+            _e = 0.0
+            _n = 0
+            _env = __import__("os").environ.get("TOKENSPEED_PROFILE_REPLAY_SEG") == "1"
+            for run in self.segments:
+                _n += 1
+                if _env:
+                    _t0 = __import__("time").monotonic()
+                run()
+                if _env:
+                    _dt = __import__("time").monotonic() - _t0
+                    if run is getattr(run, "_is_eager", run) and callable(run):
+                        pass
+                    # classify by identity against graph .replay via name
+                    if run.__class__.__name__ == "method" and "replay" in run.__name__:
+                        _g += _dt
+                    else:
+                        _e += _dt
+            if _env:
+                logger.info(
+                    "[SEGREP] segs=%d graph=%.1fms eager=%.1fms total=%.1fms",
+                    _n, _g * 1000, _e * 1000, (_g + _e) * 1000,
+                )
         finally:
             self._valid_rows = previous_valid_rows
 
@@ -309,6 +396,8 @@ def _record_break(
 
     def replay_fn() -> torch.Tensor:
         live_ctx = current_forward_ctx()
+        _env = __import__("os").environ.get("TOKENSPEED_PROFILE_BREAKREPLAY") == "1"
+        _t = __import__("time").monotonic() if _env else 0.0
 
         def sub(a: Any) -> Any:
             return live_ctx if a is captured_ctx else a
@@ -317,12 +406,25 @@ def _record_break(
             *(sub(a) for a in weak_args),
             **{k: sub(v) for k, v in weak_kwargs.items()},
         )
+        if _env:
+            _tf = __import__("time").monotonic()
         dst = state.get("dst")
         if dst is None:
             dst = state["dst"] = resolve_dst(result)
         _land_in(dst, result)
+        if _env:
+            _tl = __import__("time").monotonic()
         if cap._valid_rows is not None:
             scrub_padding_tail(cap._valid_rows, dst)
+        if _env:
+            _ts = __import__("time").monotonic()
+            _qname = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", "?")
+            _mod = type(fn).__module__
+            logger.info(
+                "[BREAKREP] fn=%.3f land=%.3f scrub=%.3f total=%.3fms op=%s.%s",
+                (_tf - _t) * 1000, (_tl - _tf) * 1000, (_ts - _tl) * 1000,
+                (_ts - _t) * 1000, _mod, _qname,
+            )
         return dst
 
     return cap.add_eager(replay_fn)

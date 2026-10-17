@@ -28,7 +28,7 @@ import functools
 import logging
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 logger = logging.getLogger(__name__)
@@ -709,6 +709,212 @@ def deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
         HALF_BLOCK=DEEPSEEK_V4_MXFP4_BLOCK_SIZE // 2,
         TOKEN_STRIDE=DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
         SCALE_DIM=DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM,
+        KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
+        HADAMARD_SCALE=DEEPSEEK_V4_INDEXER_DIM**-0.5,
+        num_warps=4,
+    )
+
+
+@triton.jit(do_not_specialize=["block_table_stride", "block_table_width"])
+def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    token_to_req_indices_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    block_table_ptr,
+    block_table_base_offsets_ptr,
+    block_table_stride,
+    block_table_width,
+    state_block_size,
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_slot_mapping_ptr,
+    kv_cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    HADAMARD_SCALE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+
+    state_slot = tl.load(slot_mapping_ptr + token_idx)
+    if state_slot < 0:
+        return
+
+    position = tl.load(positions_ptr + token_idx)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+
+    kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot < 0:
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    if block_table_base_offsets_ptr is not None:
+        base_logical_page = tl.load(block_table_base_offsets_ptr + req_idx)
+    else:
+        base_logical_page = tl.full((), 0, tl.int32)
+
+    window: tl.constexpr = 2 * COMPRESS_RATIO
+    window_offsets = tl.arange(0, window)
+    pos = position - window + 1 + window_offsets
+    valid_pos = pos >= 0
+
+    table_idx = pos // state_block_size - base_logical_page
+    valid_pos = valid_pos & (table_idx >= 0) & (table_idx < block_table_width)
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + table_idx,
+        mask=valid_pos,
+        other=-1,
+    ).to(tl.int64)
+    pos_in_block = pos % state_block_size
+    head_offset = (window_offsets >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
+
+    dim = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = dim < HEAD_SIZE
+    row_base = (
+        state_cache_ptr
+        + block_numbers[:, None] * state_cache_stride0
+        + pos_in_block[:, None] * state_cache_stride1
+        + head_offset[:, None]
+    )
+    combined = valid_pos[:, None] & (block_numbers[:, None] >= 0) & mask[None, :]
+
+    score = tl.load(
+        row_base + STATE_WIDTH + dim[None, :],
+        mask=combined,
+        other=-1.0e30,
+    )
+    score = score - tl.max(score, axis=0)
+    score = libdevice.exp(score)
+    score = score / tl.sum(score, axis=0)
+    kv = tl.load(row_base + dim[None, :], mask=combined, other=0.0)
+    compressed = tl.sum(kv * score, axis=0)
+
+    rms_w = tl.load(rms_norm_weight_ptr + dim, mask=mask, other=0.0)
+    variance = tl.sum(compressed * compressed, axis=0) / HEAD_SIZE
+    normed = compressed * tl.rsqrt(variance + rms_norm_eps) * rms_w
+
+    NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
+    HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
+    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
+    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair = pair_idx - NOPE_PAIRS
+    is_rope = rope_pair >= 0
+    cs_idx = tl.maximum(rope_pair, 0)
+
+    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+    cs_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0)
+    sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+    new_even = even * cos_v - odd * sin_v
+    new_odd = odd * cos_v + even * sin_v
+    rotated = tl.interleave(new_even, new_odd)
+    rotated = rotated.to(tl.bfloat16).to(tl.float32)
+
+    in_idx = tl.arange(0, TRITON_BLOCK_SIZE)
+    out_idx = tl.arange(0, TRITON_BLOCK_SIZE)
+    bits = (in_idx[:, None] & out_idx[None, :]).to(tl.int32)
+    parity = bits ^ (bits >> 4)
+    parity = parity ^ (parity >> 2)
+    parity = parity ^ (parity >> 1)
+    parity = parity & 1
+    signs = tl.where(parity == 0, 1.0, -1.0)
+    hadamard = tl.sum(rotated[:, None] * signs, axis=0) * HADAMARD_SCALE
+    hadamard = hadamard.to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.max(tl.abs(hadamard))
+    scaled = amax / FP8_MAX
+    scaled = tl.maximum(scaled, 1.0e-10)
+    exponent = tl.ceil(tl.log2(scaled))
+    inv_divisor = tl.exp2(-exponent)
+    divisor = tl.exp2(exponent)
+    divisor_u32 = divisor.to(tl.uint32, bitcast=True)
+    quant = tl.clamp(hadamard * inv_divisor, -FP8_MAX, FP8_MAX)
+    quant_u8 = quant.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+
+    kv_block = kv_slot // kv_cache_block_size
+    kv_pos = kv_slot % kv_cache_block_size
+    cache_block_ptr = k_cache_ptr + kv_block.to(tl.int64) * KV_BLOCK_STRIDE
+    val_ptr = cache_block_ptr + kv_pos * TOKEN_STRIDE
+    scale_ptr = (
+        cache_block_ptr + kv_cache_block_size * TOKEN_STRIDE + kv_pos * SCALE_BYTES
+    )
+    tl.store(val_ptr + dim, quant_u8, mask=mask)
+    scale_ptr_u32 = scale_ptr.to(tl.pointer_type(tl.uint32))
+    tl.store(scale_ptr_u32, divisor_u32)
+
+
+def deepseek_v4_fused_csa_indexer_fp8_cache_insert(
+    *,
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    compressor_slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    compressor_block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    compress_ratio: int,
+    block_table_base_offsets: torch.Tensor | None = None,
+) -> None:
+    num_actual = min(
+        compressor_slot_mapping.numel(),
+        positions.numel(),
+        kv_slot_mapping.numel(),
+    )
+    if num_actual == 0:
+        return
+    block_table_i32 = _as_int32_block_table(block_table)
+    _deepseek_v4_fused_csa_indexer_fp8_cache_kernel[(num_actual,)](
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        token_to_req_indices[:num_actual],
+        positions[:num_actual],
+        compressor_slot_mapping[:num_actual],
+        block_table_i32,
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
+        block_table_i32.stride(0),
+        block_table_i32.shape[-1],
+        compressor_block_size,
+        rms_norm_weight,
+        rms_norm_eps,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        kv_cache_2d,
+        kv_slot_mapping[:num_actual],
+        kv_cache_block_size,
+        HEAD_SIZE=DEEPSEEK_V4_INDEXER_DIM,
+        TRITON_BLOCK_SIZE=triton.next_power_of_2(DEEPSEEK_V4_INDEXER_DIM),
+        STATE_WIDTH=state_cache.shape[-1] // 2,
+        COMPRESS_RATIO=compress_ratio,
+        ROPE_HEAD_DIM=DEEPSEEK_V4_ROPE_DIM,
+        FP8_MAX=DEEPSEEK_V4_FP8_MAX,
+        TOKEN_STRIDE=DEEPSEEK_V4_INDEXER_DIM,
+        SCALE_BYTES=4,
         KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
         HADAMARD_SCALE=DEEPSEEK_V4_INDEXER_DIM**-0.5,
         num_warps=4,

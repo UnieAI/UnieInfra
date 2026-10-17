@@ -146,6 +146,12 @@ def warmup_prefill_jit(
     (prefill indexer), and the paged ``fp8_fp4_paged_mqa_logits`` +
     ``get_paged_mqa_logits_metadata`` (decode indexer) kernels.
 
+    The compressor ``tf32_hc_prenorm_gemm`` kernel family exists for ``sm_90``
+    (Hopper) and ``sm_100`` (Blackwell), so it is warmed on both. The indexer
+    kernels ``fp8_fp4_mqa_logits`` / ``fp8_fp4_paged_mqa_logits`` only compile
+    for SM100+; Hopper runs a different indexer path, so those branches are
+    skipped there (running them would raise ``Unsupported architecture``).
+
     Args:
         hidden_size: model hidden dimension.
         num_attention_heads: total attention heads (before TP split).
@@ -166,6 +172,7 @@ def warmup_prefill_jit(
         device: CUDA device.
     """
     warmup_count = 0
+    is_blackwell = torch.cuda.get_device_capability(device)[0] >= 10
 
     if hc_mult and hc_mult > 1:
         hc_hidden_size = hc_mult * hidden_size
@@ -178,7 +185,7 @@ def warmup_prefill_jit(
         )
         warmup_count += 1
 
-    if index_n_heads > 0 and index_head_dim > 0:
+    if is_blackwell and index_n_heads > 0 and index_head_dim > 0:
         # Sparse-indexer kernels -- distinct cubins, not covered elsewhere:
         #   prefill: ragged  fp8_fp4_mqa_logits
         #   decode:  paged   fp8_fp4_paged_mqa_logits + get_paged_mqa_logits_metadata
@@ -186,7 +193,8 @@ def warmup_prefill_jit(
         # NOT TP-split), so gate on index_n_heads -- NOT kv_lora_rank, which is
         # absent for V4-Flash. Without these the kernels JIT-compile inline on
         # the first prefill/decode and stall the engine past the gRPC health
-        # probe.
+        # probe. The family is SM100+ only; on Hopper a different indexer path
+        # runs and these would raise ``Unsupported architecture``.
         _warmup_fp8_fp4_mqa_logits(
             num_heads=index_n_heads,
             index_head_dim=index_head_dim,
@@ -550,16 +558,34 @@ def warmup_fp8_gemm_nt_from_model(
 
     Call after ``quant_method.process_weights_after_loading()`` has run on all
     modules so the ``_use_deep_gemm_fp8`` flag is set.
+
+    DeepGEMM JIT-compiles one `fp8_gemm_nt` cubin per (M, N, K) tile via the
+    ``sm90_fp8_gemm_1d2d`` (or SM100 equivalent) family, so a cold prefill at an
+    un-warmed M JIT-compiles inline and stalls the serve thread for seconds.
+    The ``block_m`` heuristic lives in ``_C.so`` and is not exposed to Python,
+    so we cannot predict which tiles the runtime picks -- sweep M densely. This
+    applies on Hopper (``sm_90``) too: H200 serves ``deep_gemm_mm_fp8_blockscale``
+    through the very same kernel family, and previously this function returned
+    early for ``capability < 10``, leaving every projection tile to compile on
+    the first request.
+
+    ``wo_a`` (is_bmm, `fp8_einsum`) is warmed only on SM100+: its recipe and
+    scale layout are SM100-specific (INT32 UE8M0, recipe ``(1,1,block_n)``).
+    Hopper keeps FP32 block scales with recipe ``(1, block_n, block_k)`` (see
+    DeepseekV4Attention ``_o_tma_aligned``), which this warmup does not model, so
+    it would compile a kernel the runtime never launches and waste load time.
     """
-    if torch.cuda.get_device_capability()[0] < 10:
-        return
     shapes: set[tuple[int, int]] = set()
     bmm_layers: list[tuple[torch.Tensor, torch.Tensor, int, int]] = []
     bmm_seen: set[tuple] = set()
+    is_blackwell = torch.cuda.get_device_capability()[0] >= 10
     for module in model.modules():
         if not getattr(module, "_use_deep_gemm_fp8", False):
             continue
         if getattr(module, "is_bmm", False):
+            if not is_blackwell:
+                # Hopper fp8_einsum uses a different recipe/scale layout; skip.
+                continue
             n_groups = getattr(module, "bmm_batch_size", 0)
             block_size = getattr(module, "_deep_gemm_block_size", None)
             if not n_groups or not block_size:

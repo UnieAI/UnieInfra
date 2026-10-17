@@ -1237,6 +1237,21 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     ) -> None:
         if k is None:
             return
+        if os.getenv("TOKENSPEED_DUMP_STATE") == "1":
+            import torch as _t
+            if not (_t.cuda.is_available() and _t.cuda.is_current_stream_capturing()):
+                md = self.forward_decode_metadata
+                logger.info(
+                    "[MHAWRITE] layer=%d group=%s locs=%d krows=%d vrows=%d bs=%d seqlens=%s qlen=%d",
+                    layer.layer_id,
+                    getattr(layer, "group_id", ""),
+                    int(out_cache_loc.shape[0]),
+                    int(k.shape[0]),
+                    int(v.shape[0]),
+                    int(md.seq_lens.shape[0]) if md is not None else -1,
+                    (md.seq_lens.detach().cpu().tolist() if md is not None else []),
+                    int((k.shape[0] // max(md.seq_lens.shape[0], 1)) if md is not None else -1),
+                )
         k, v = self._trim_kv_to_locs(out_cache_loc, k, v)
 
         if self.is_mxfp8:

@@ -26,16 +26,27 @@ def _pct(vals, p):
     return vals[min(int(p * (len(vals) - 1)), len(vals) - 1)]
 
 
-def load(path):
+def load(path, tokenizer=None):
     d = json.loads(Path(path).read_text())
     rows = [r for r in d["rows"] if r.get("ttft") is not None and r.get("text")]
+    if tokenizer is not None:
+        empty = tokenizer.encode("").ids
+        for r in rows:
+            try:
+                r["tokens"] = len(tokenizer.encode(r["text"]).ids) - len(empty)
+            except Exception:
+                r["tokens"] = r.get("ntok") or 0
     return d, rows
 
 
 def row_metrics(d, rows):
+    def n(r):
+        """Prefer tokenizer-derived tokens when present, else SSE chunks."""
+        return r.get("tokens") or r.get("ntok") or 0
+
     dur = d["duration_s"]
     nok = len(rows)
-    ntok = sum(r.get("ntok") or 0 for r in rows)
+    ntok = sum(n(r) for r in rows)
     e2e = [r["ms"] for r in rows]
     ttft = [r["ttft"] for r in rows]
     tpot = [r.get("tpot") for r in rows if r.get("tpot") is not None]
@@ -46,14 +57,18 @@ def row_metrics(d, rows):
         "rpm": 60 * nok / dur if dur else None,
         "tps": ntok / dur if dur else None,
         "tps_per_req": statistics.mean(
-            [r.get("ntok", 0) / max(1e-9, r["ms"] / 1000) for r in rows]
+            [n(r) / max(1e-9, r["ms"] / 1000) for r in rows]
         ),
+        "token_source": "tokenizer" if "tokens" in (rows[0] if rows else {}) else "chunks",
         "mean_chunks": statistics.mean([r.get("ntok") or 0 for r in rows]),
+        "mean_tokens": statistics.mean([n(r) for r in rows]) if rows else None,
         "ttft_p50": _pct(ttft, 0.50),
         "ttft_p90": _pct(ttft, 0.90),
+        "ttft_p95": _pct(ttft, 0.95),
         "ttft_p99": _pct(ttft, 0.99),
         "tpot_p50": _pct(tpot, 0.50),
         "tpot_p90": _pct(tpot, 0.90),
+        "tpot_p95": _pct(tpot, 0.95),
         "tpot_p99": _pct(tpot, 0.99),
         "e2e_p50": _pct(e2e, 0.50),
         "e2e_p99": _pct(e2e, 0.99),
@@ -79,14 +94,35 @@ def agree(a_rows, b_rows):
     return matched, n
 
 
+def _load_tokenizer(path):
+    if not path:
+        return None
+    from tokenizers import Tokenizer
+
+    return Tokenizer.from_file(path)
+
+
 def main(argv):
-    if len(argv) < 2:
+    tokenizer_path = None
+    args = []
+    i = 1
+    while i < len(argv):
+        if argv[i] == "--tokenizer":
+            i += 1
+            if i >= len(argv):
+                return 2
+            tokenizer_path = argv[i]
+        else:
+            args.append(argv[i])
+        i += 1
+    if not args:
         print(
-            "usage: agentx_metrics.py <engine.json> [<vllm.json> ...]", file=sys.stderr
+            "usage: agentx_metrics.py [--tokenizer <json>] <engine.json> [<vllm.json> ...]",
+            file=sys.stderr,
         )
         return 2
-    names = argv[1:]
-    loaded = {p: load(p) for p in names}
+    tokenizer = _load_tokenizer(tokenizer_path)
+    loaded = {p: load(p, tokenizer) for p in args}
     for p, (d, rows) in loaded.items():
         m = row_metrics(d, rows)
         print(f"\n== {Path(p).name} ==")
@@ -97,20 +133,24 @@ def main(argv):
             "rpm",
             "tps",
             "tps_per_req",
+            "token_source",
             "mean_chunks",
+            "mean_tokens",
             "ttft_p50",
             "ttft_p90",
+            "ttft_p95",
             "ttft_p99",
             "tpot_p50",
             "tpot_p90",
+            "tpot_p95",
             "tpot_p99",
             "e2e_p50",
             "e2e_p99",
         ):
             print(f"  {k:12s} {m[k]}")
-    if len(names) == 2:
-        a = loaded[names[0]][1]
-        b = loaded[names[1]][1]
+    if len(args) == 2:
+        a = loaded[args[0]][1]
+        b = loaded[args[1]][1]
         m, n = agree(a, b)
         print(f"\ntext agreement (>50% LCP): {m}/{n} ({100 * m / max(1, n):.1f}%)")
     return 0

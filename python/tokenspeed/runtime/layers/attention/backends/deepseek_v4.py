@@ -289,6 +289,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
+        # Auxiliary stream for OVERLAPPING the prefill and decode attention
+        # inside one MIXED forward. The prefill and decode parts touch disjoint
+        # request rows / disjoint `out` slices / disjoint KV, so once each has
+        # its own metadata (host-sequential here) they may run on separate
+        # streams and be joined. Cached so a 43-layer forward reuses one stream
+        # instead of creating events per layer.
+        self._mixed_aux_stream: torch.cuda.Stream | None = None
+        self._mixed_fork_event = torch.cuda.Event()
+        self._mixed_join_event = torch.cuda.Event()
         self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
         self._decode_swa_window_size = 0
         self._decode_swa_block_size = 0
@@ -1480,6 +1489,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_decode_tokens = metadata.decode_token_count()
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
         saved_metadata = self.forward_metadata
+        # OVERLAP (diagnostic, gate behind TOKENSPEED_DSV4_MIXED_FORK): run the
+        # decode-attention on an auxiliary stream so it overlaps the prefill-attention
+        # on the main stream. Fork is recorded BEFORE the prefill block below so the
+        # aux stream does not wait on prefill's own kernels. Both parts use disjoint
+        # `q`/`positions`/`out` slices and disjoint KV rows; each has its own metadata
+        # (host-sequential), so the only shared mutable state is the workspace buffers,
+        # which prefill (_prefill_workspace_buffer) and decode (tile metadata) keep
+        # separate.
+        _fork = (
+            __import__("os").environ.get("TOKENSPEED_DSV4_MIXED_FORK") == "1"
+            and num_prefill_tokens > 0
+            and num_decode_tokens > 0
+        )
+        if _fork and self._mixed_aux_stream is None:
+            self._mixed_aux_stream = torch.cuda.Stream()
+        if _fork:
+            self._mixed_fork_event.record(torch.cuda.current_stream())
         try:
             if num_prefill_tokens > 0:
                 self.forward_metadata = self._metadata_slice(
@@ -1521,27 +1547,39 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     token_end=decode_end,
                     forward_mode=ForwardMode.DECODE,
                 )
-                decode_out = self.forward_deepseek_v4_decode(
-                    q=q[num_prefill_tokens:decode_end],
-                    positions=positions[num_prefill_tokens:decode_end],
-                    token_to_kv_pool=token_to_kv_pool,
-                    layer_id=layer_id,
-                    kind=kind,
-                    compress_ratio=compress_ratio,
-                    num_local_heads=num_local_heads,
-                    padded_heads=padded_heads,
-                    head_dim=head_dim,
-                    window_size=window_size,
-                    softmax_scale=softmax_scale,
-                    attn_sink=attn_sink,
-                    topk_indices=(
-                        topk_indices[num_prefill_tokens:decode_end]
-                        if topk_indices is not None
-                        else None
-                    ),
+                # OVERLAP: when armed, launch the decode-attention on the aux
+                # stream (which already waited the pre-launch fork) so it runs
+                # concurrently with the prefill-attention on the main stream.
+                _dec_stream = (
+                    self._mixed_aux_stream if _fork else torch.cuda.current_stream()
                 )
-                with nvtx_range(f"attn_{kind}_mixed_decode_copy"):
-                    out[num_prefill_tokens:decode_end].copy_(decode_out)
+                with torch.cuda.stream(_dec_stream):
+                    decode_out = self.forward_deepseek_v4_decode(
+                        q=q[num_prefill_tokens:decode_end],
+                        positions=positions[num_prefill_tokens:decode_end],
+                        token_to_kv_pool=token_to_kv_pool,
+                        layer_id=layer_id,
+                        kind=kind,
+                        compress_ratio=compress_ratio,
+                        num_local_heads=num_local_heads,
+                        padded_heads=padded_heads,
+                        head_dim=head_dim,
+                        window_size=window_size,
+                        softmax_scale=softmax_scale,
+                        attn_sink=attn_sink,
+                        topk_indices=(
+                            topk_indices[num_prefill_tokens:decode_end]
+                            if topk_indices is not None
+                            else None
+                        ),
+                    )
+                    with nvtx_range(f"attn_{kind}_mixed_decode_copy"):
+                        out[num_prefill_tokens:decode_end].copy_(decode_out)
+                if _fork:
+                    # Join the aux stream back to the main stream before the
+                    # caller (or the resumed graph segment) reads `out`.
+                    self._mixed_join_event.record(self._mixed_aux_stream)
+                    torch.cuda.current_stream().wait_event(self._mixed_join_event)
         finally:
             self.forward_metadata = saved_metadata
         return out
@@ -1573,15 +1611,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if cache_metadata.swa_block_table is None:
             raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
         swa_block_table = cache_metadata.swa_block_table
-        max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
+        # `max_gather_len`/`compressed_base` are derived only from
+        # `seq_lens`/`query_lens`/`compress_ratio`, so they are invariant across
+        # the per-layer prefill attention calls of one forward. Caching them on
+        # the metadata object (recreated per forward/chunk) avoids 2 GPU->CPU
+        # syncs per layer (43x per prefill), which otherwise dominate the
+        # prefill wall time.
         compressed_lens = (
             torch.div(metadata.seq_lens, compress_ratio, rounding_mode="floor")
             if compress_ratio > 1
             else torch.zeros_like(metadata.seq_lens)
         )
-        compressed_base = (
-            int(compressed_lens.max().item()) if compress_ratio > 1 and num_reqs else 0
-        )
+        cache_key = compress_ratio
+        cached = getattr(metadata, "_prefill_scalar_cache", None)
+        if isinstance(cached, dict) and cache_key in cached:
+            max_gather_len, compressed_base = cached[cache_key]
+        else:
+            max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
+            compressed_base = (
+                int(compressed_lens.max().item())
+                if compress_ratio > 1 and num_reqs
+                else 0
+            )
+            if not isinstance(cached, dict):
+                cached = {}
+                metadata._prefill_scalar_cache = cached  # type: ignore[attr-defined]
+            cached[cache_key] = (max_gather_len, compressed_base)
         workspace_width = max(1, compressed_base + max_gather_len)
         kv_workspace = self._get_prefill_workspace(
             num_reqs=num_reqs,
@@ -1844,6 +1899,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
             )
 
+        _stage_dbg = __import__("os").environ.get("TOKENSPEED_DSV4_PREFILL_STAGE") == "1"
+        _stage_ts = [0.0, 0.0, 0.0]
+        if _stage_dbg and layer_id % 11 == 0:
+            _t0 = __import__("time").monotonic()
+        else:
+            _t0 = None
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
             if q.shape[1] == padded_heads:
                 q_padded = q.contiguous()
@@ -1854,6 +1915,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     device=q.device,
                 )
                 q_padded[:, : q.shape[1]].copy_(q)
+        if _t0 is not None:
+            _t1 = __import__("time").monotonic()
+        else:
+            _t1 = None
         with nvtx_range(f"attn_{kind}_prefill_workspace"):
             kv_workspace, indices, lens = self._prefill_workspace(
                 positions=positions,
@@ -1864,6 +1929,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 head_dim=head_dim,
                 topk_indices=topk_indices,
             )
+        if _t1 is not None:
+            _t2 = __import__("time").monotonic()
+        else:
+            _t2 = None
         with nvtx_range(f"attn_{kind}_prefill_flashmla"):
             out, _, _ = flash_mla_sparse_fwd(
                 q=q_padded,
@@ -1872,6 +1941,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 sm_scale=softmax_scale,
                 attn_sink=attn_sink,
                 topk_length=lens,
+            )
+        if _t2 is not None:
+            _t3 = __import__("time").monotonic()
+            import logging as _log
+            _log.getLogger(__name__).info(
+                "DSV4_PREFILL_STAGE layer=%d tok=%d pad=%.1f workspace=%.1f flashmla=%.1f",
+                layer_id, q.shape[0],
+                (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000,
             )
         return out[:, :num_local_heads]
 

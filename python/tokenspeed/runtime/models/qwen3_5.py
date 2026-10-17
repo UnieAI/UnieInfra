@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import os
+
 import logging
 from collections.abc import Iterable
 
@@ -119,6 +121,32 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
+
+# TEMP per-layer assembly profiler. Gated by TOKENSPEED_PROFILE_ASSEMBLY=1;
+# accumulates the CPU time of every `layer(...)` call in the decoder loop and
+# dumps per-forward (48 layers) plus time between calls (the dense/attn break).
+_LAYER_N = [0]
+_LAYER_ACCT: dict[int, float] = {}
+_LAYER_TOT = [0.0]
+_LAYER_GPU_DONE = [0]
+
+
+def _layer_acc(layer_idx: int, dt_s: float) -> None:
+    _LAYER_ACCT[layer_idx] = _LAYER_ACCT.get(layer_idx, 0.0) + dt_s
+    _LAYER_TOT[0] += dt_s
+    _LAYER_N[0] += 1
+    if _LAYER_N[0] % 48 == 0:
+        pts = " ".join(
+            f"L{i}={v * 1000:.2f}ms"
+            for i, v in sorted(_LAYER_ACCT.items(), key=lambda kv: -kv[1])[:10]
+        )
+        logger.info(
+            "[ASM] layers=%d total=%.1fms gpu_done=%d%% top=%s",
+            _LAYER_N[0], _LAYER_TOT[0] * 1000, _LAYER_GPU_DONE[0], pts,
+        )
+        _LAYER_ACCT.clear()
+        _LAYER_TOT[0] = 0.0
+        _LAYER_GPU_DONE[0] = 0
 
 
 def _gdn_group_unquantized(prefix, shard_names, ignored_layers) -> bool:
@@ -1053,6 +1081,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
+                _layer_in = __import__("time").monotonic()
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
@@ -1060,6 +1089,22 @@ class Qwen3_5ForCausalLM(nn.Module):
                     ctx=ctx,
                     out_cache_loc=out_cache_loc,
                 )
+                if os.getenv("TOKENSPEED_PROFILE_ASSEMBLY") == "1":
+                    _capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+                    _capt = bool(_capturing()) if _capturing else False
+                    _gpu_done = 0
+                    if not _capt:
+                        try:
+                            _ev = torch.cuda.Event()
+                            _ev.record(torch.cuda.current_stream())
+                            _gpu_done = int(_ev.query())
+                        except Exception:
+                            _gpu_done = 0
+                    _layer_acc(
+                        layer_idx,
+                        __import__("time").monotonic() - _layer_in,
+                    )
+                    _LAYER_GPU_DONE[0] += _gpu_done
 
             # Process deepstack embeddings if provided
             if (

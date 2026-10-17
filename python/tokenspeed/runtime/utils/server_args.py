@@ -208,6 +208,10 @@ class ServerArgs:
     # step prefills the same prefix once per request. Measured cold vs warm
     # TTFT p50 on gemma-4-31B / RAG c=64: 4,022 ms against 1,837 ms.
     max_cold_prefills: int = 0
+    # Rounds to defer a lone new prefill so it batches with siblings admitted by
+    # decode completions, amortising the fixed eager-attention prefill cost
+    # (see SchedulerConfig::prefill_defer_window). 0 disables the policy.
+    prefill_defer_window: int = 0
     # Kernel page size. Flat scheduler logical pages come from the LCM
     # runtime contract and must not overwrite this value.
     block_size: int = 64
@@ -1315,6 +1319,18 @@ class ServerArgs:
                 "missed the cache entirely (0 = unlimited). Lets the first one "
                 "publish its prefix before the rest probe, instead of every "
                 "request in the step prefilling the same prefix independently."
+            ),
+        )
+        parser.add_argument(
+            "--prefill-defer-window",
+            type=int,
+            default=ServerArgs.prefill_defer_window,
+            help=(
+                "Rounds to defer a single runnable new prefill when decodes are "
+                "waiting, so it batches with siblings admitted by their "
+                "completions. Amortises the fixed eager-attention prefill cost "
+                "instead of paying it per request and stealing a step from "
+                "decode. 0 disables the policy."
             ),
         )
         parser.add_argument(

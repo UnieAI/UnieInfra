@@ -484,7 +484,9 @@ class PrefillGraph:
             self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
+        cap._smoke_test = True
         cap.replay()  # capture records kernels without executing; smoke-test replay
+        cap._smoke_test = False
         self._captures[bucket] = cap
 
     def _run_inner(self, num_tokens: int):
@@ -766,7 +768,47 @@ class PrefillGraph:
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
         with self._padded_to(ctx, bucket):
+            _r_t0 = 0.0
+            _r_pending = -1
+            _r_capt = False
+            _r_gstart = _r_gend = None
+            if __import__("os").environ.get("TOKENSPEED_PROFILE_REPLAY") == "1":
+                _r_t0 = __import__("time").monotonic()
+                _r_capt = bool(
+                    getattr(__import__("torch").cuda, "is_current_stream_capturing", lambda: False)()
+                )
+                try:
+                    import torch as _torch
+                    _r_gstart = _torch.cuda.Event(enable_timing=True)
+                    _r_gend = _torch.cuda.Event(enable_timing=True)
+                    _r_gstart.record()
+                except Exception:
+                    _r_gstart = _r_gend = None
             self._captures[bucket].replay(valid_rows=num_tokens)
+            if __import__("os").environ.get("TOKENSPEED_PROFILE_REPLAY") == "1":
+                _dt = (__import__("time").monotonic() - _r_t0) * 1000
+                _r_gpu = -1.0
+                if _r_gstart is not None and not _r_capt:
+                    try:
+                        import torch as _torch
+                        _r_gend.record(_torch.cuda.current_stream())
+                        _torch.cuda.synchronize()
+                        _r_gpu = _r_gstart.elapsed_time(_r_gend)
+                    except Exception:
+                        _r_gpu = -1.0
+                _r_pending = -2
+                if _r_gend is not None and not _r_capt:
+                    try:
+                        import torch as _torch
+                        _ev = _torch.cuda.Event()
+                        _ev.record(_torch.cuda.current_stream())
+                        _r_pending = int(_ev.query())  # 1 => GPU idled _behind* replay
+                    except Exception:
+                        _r_pending = -2
+                logger.info(
+                    "[RPLAY] bucket=%d tok=%d real_tok=%d wall=%.1fms gpu=%.1fms idle_after=%d",
+                    bucket, ctx.input_num_tokens, num_tokens, _dt, _r_gpu, _r_pending,
+                )
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         if self._pools:
             # The eager pooling tail of BaseCausalLM.forward. A pooling model
@@ -801,19 +843,27 @@ class PrefillGraph:
         so the padded bucket -- hence the baked EP all-to-all shape under DP --
         is identical on prefix and non-prefix ranks.
         """
+        import os as _os
+        _d = bool(_os.environ.get("TOKENSPEED_LOG_MM_TIMING"))
         if self.disable or ctx.forward_mode is None:
+            if _d: logger.info("PFG reject common ctx.forward_mode=%s disable=%s", ctx.forward_mode, self.disable)
             return None
         if ctx.num_extends <= 0:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
+            if _d: logger.info("PFG reject not-extend/mixed mode=%s", ctx.forward_mode)
             return None
         if ctx.accept_lengths is not None:
+            if _d: logger.info("PFG reject accept_lengths mode=%s ne=%d nin=%d", ctx.forward_mode, ctx.num_extends, ctx.input_num_tokens)
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
+            if _d: logger.info("PFG reject hidden_mode ctx=%s cap=%s", ctx.capture_hidden_mode, self._captured_hidden_mode)
             return None
         bucket = self._select_bucket(ctx)
         if bucket is None or bucket not in self._captures:
+            if _d: logger.info("PFG reject bucket mode=%s nin=%d bucket=%s caps=%s", ctx.forward_mode, ctx.input_num_tokens, bucket, list(self._captures.keys()))
             return None
+        if _d: logger.info("PFG OK bucket=%d mode=%s ne=%d nin=%d", bucket, ctx.forward_mode, ctx.num_extends, ctx.input_num_tokens)
         return bucket
 
     def _select_bucket(self, ctx: ForwardContext) -> int | None:

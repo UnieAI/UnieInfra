@@ -165,6 +165,30 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+    // Rounds of the step. When a step has FEWER than this many runnable new
+    // prefills and there are decodes to serve, those prefills are deferred
+    // (left in Submitted) so they accumulate into a single prefill batch rather
+    // than running one at a time. The window is BOTH dimensions of the wait:
+    // prefills accumulate until either `prefill_defer_window` of them are
+    // runnable (a full batch) or the oldest has waited `prefill_defer_window`
+    // rounds.
+    //
+    // Rationale: a DeepSeek-V4 cache-hit prefill costs roughly 140 ms of fixed
+    // eager-attention host time no matter how few NEW tokens it holds, because
+    // the breakable prefill graph replays norms/MoE but re-executes each of the
+    // 43 DSA attention layers eagerly (unieinfra/xref/30-prefill.md: launch
+    // count, not compute, is the prefill cost). With `enable_mixed_prefill_decode`
+    // off a step is EITHER prefill OR decode, so running a lone prefill not
+    // only pays the 140 ms, it also steals the step from every decode waiting
+    // behind it. Deferring it for a round lets the decodes fill the step while
+    // the prefill accumulates siblings, amortising the fixed cost and freeing
+    // the next step for what would otherwise be lost decode throughput.
+    //
+    // Bounds: the request stays in its Submitted state, so if the window lapses
+    // or no decode is runnable it runs exactly as before. Deferral only changes
+    // WHEN requests are grouped, never WHAT the forward computes, so it cannot
+    // corrupt output. 0 disables the policy (default).
+    std::int32_t prefill_defer_window{0};
 };
 
 }  // namespace tokenspeed

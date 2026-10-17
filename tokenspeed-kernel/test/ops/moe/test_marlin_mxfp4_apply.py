@@ -31,6 +31,8 @@ import pytest
 import torch
 from kimi3_reference import a16w4_mxfp4_moe_reference
 from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
+    _block_size_m,
+    _marlin_workspace,
     marlin_mxfp4_moe_weights,
     marlin_mxfp4_precomputed_moe_apply,
 )
@@ -182,3 +184,37 @@ def test_marlin_mxfp4_ep_masks_nonlocal_experts() -> None:
         ).float()
 
     torch.testing.assert_close(acc, expected.float(), atol=5e-2, rtol=5e-2)
+
+
+def test_block_size_m_floors_at_16_like_vllm() -> None:
+    """The Marlin block size must match vLLM's loop plus its 16 floor.
+
+    vLLM runs the same candidate loop and then applies
+    ``block_size_m = max(block_size_m, 16)``. Without the floor a tiny batch
+    picks an 8-row block, so the two engines pad the expert schedule
+    differently. The floor is the value that makes them agree.
+    """
+    for num_tokens, top_k, experts in (
+        (1, 8, 128),
+        (8, 8, 128),
+        (128, 8, 128),
+        (1024, 8, 128),
+        (8192, 8, 128),
+    ):
+        expected = 8
+        for candidate in (8, 16, 32, 48, 64):
+            expected = candidate
+            if num_tokens * top_k / experts / candidate < 0.9:
+                break
+        expected = max(expected, 16)
+        assert _block_size_m(num_tokens, top_k, experts) == expected
+
+
+def test_marlin_workspace_is_a_per_device_singleton() -> None:
+    """One workspace per device, reused across layers and steps."""
+    _requires_sm90()
+    device = torch.device("cuda", torch.cuda.current_device())
+    first = _marlin_workspace(device)
+    assert _marlin_workspace(device) is first
+    assert first.dtype == torch.int32
+    assert first.numel() >= 1

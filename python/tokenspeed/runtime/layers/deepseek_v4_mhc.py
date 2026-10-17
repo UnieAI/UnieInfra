@@ -18,6 +18,11 @@ except Exception:
     deep_gemm = None  # type: ignore[assignment]
 
 
+# The fused pre-mix/collapse/norm epilogue keeps one hidden row in registers to
+# reduce it in a single program, so it only applies while a row still fits.
+_MHC_FUSED_NORM_MAX_HIDDEN = 8192
+
+
 @cache
 def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     device_props = torch.cuda.get_device_properties(0)
@@ -196,6 +201,170 @@ def _mhc_pre_layer_triton_kernel(
 
 
 @triton.jit
+def _mhc_pre_norm_triton_kernel(
+    gemm_out_mul,
+    gemm_out_sqrsum,
+    hc_scale,
+    hc_base,
+    residual,
+    norm_weight,
+    post_mix,
+    comb_mix,
+    layer_input,
+    hidden_size: tl.constexpr,
+    norm_eps: tl.constexpr,
+    rms_eps: tl.constexpr,
+    hc_eps: tl.constexpr,
+    sinkhorn_iters: tl.constexpr,
+    n_splits: tl.constexpr,
+    hc_mult: tl.constexpr,
+    hc_mult2: tl.constexpr,
+    hc_mult3: tl.constexpr,
+    block_comb: tl.constexpr,
+    block_h: tl.constexpr,
+    num_tokens,
+):
+    """Fused pre-mix epilogue, residual collapse and RMSNorm.
+
+    mHC's unstable formulation spends three launches on what one program can
+    finish: the pre gate, the collapse it feeds, and the norm applied to the
+    collapsed row. Fusing them needs a row-wide reduction for the norm, so the
+    grid is one program per token instead of one per (token, hidden block), and
+    the gate is recomputed inside the collapse rather than read back from
+    memory. The gate is six floats -- four reduced GEMM columns and one 4x4
+    Sinkhorn -- so recomputing it costs nothing next to the collapse.
+
+    This is the same fusion ``mhc_pre_big_fuse_with_norm`` performs in vLLM,
+    which is why their mHC is two kernels per seam against our four.
+    """
+    token_id = tl.program_id(0)
+
+    rms_sum = tl.full((), 0.0, tl.float32)
+    for split_id in tl.static_range(0, n_splits):
+        rms_sum += tl.load(gemm_out_sqrsum + split_id * num_tokens + token_id)
+    rms = tl.rsqrt(rms_sum / (hc_mult * hidden_size) + rms_eps)
+
+    post_scale = tl.load(hc_scale + 1)
+    for hc_id in tl.static_range(0, hc_mult):
+        mix = _load_reduced_mix(
+            gemm_out_mul,
+            token_id,
+            hc_mult + hc_id,
+            num_tokens,
+            hc_mult3,
+            n_splits,
+        )
+        post = (
+            tl.sigmoid(mix * rms * post_scale + tl.load(hc_base + hc_mult + hc_id))
+            * 2.0
+        )
+        tl.store(post_mix + token_id * hc_mult + hc_id, post)
+
+    comb_offsets = tl.arange(0, block_comb)
+    comb_mask = comb_offsets < hc_mult2
+    comb_scale = tl.load(hc_scale + 2)
+    comb_values = tl.zeros((block_comb,), tl.float32)
+    for split_id in tl.static_range(0, n_splits):
+        split_base = split_id * num_tokens * hc_mult3 + token_id * hc_mult3
+        comb_values += tl.load(
+            gemm_out_mul + split_base + hc_mult * 2 + comb_offsets,
+            mask=comb_mask,
+            other=0.0,
+        )
+    comb_values = comb_values * rms * comb_scale + tl.load(
+        hc_base + hc_mult * 2 + comb_offsets, mask=comb_mask, other=0.0
+    )
+    rows = comb_offsets // hc_mult
+    cols = comb_offsets - rows * hc_mult
+
+    for row_id in tl.static_range(0, hc_mult):
+        row_values = tl.where(
+            (rows == row_id) & comb_mask, comb_values, -float("inf")
+        )
+        row_max = tl.max(row_values, axis=0)
+        comb_values = tl.where(
+            (rows == row_id) & comb_mask,
+            tl.exp(comb_values - row_max),
+            comb_values,
+        )
+    for row_id in tl.static_range(0, hc_mult):
+        row_sum = tl.sum(
+            tl.where((rows == row_id) & comb_mask, comb_values, 0.0), axis=0
+        )
+        comb_values = tl.where(
+            (rows == row_id) & comb_mask,
+            comb_values / row_sum + hc_eps,
+            comb_values,
+        )
+    for col_id in tl.static_range(0, hc_mult):
+        col_sum = tl.sum(
+            tl.where((cols == col_id) & comb_mask, comb_values, 0.0), axis=0
+        )
+        comb_values = tl.where(
+            (cols == col_id) & comb_mask,
+            comb_values / (col_sum + hc_eps),
+            comb_values,
+        )
+    for _ in tl.static_range(1, sinkhorn_iters):
+        for row_id in tl.static_range(0, hc_mult):
+            row_sum = tl.sum(
+                tl.where((rows == row_id) & comb_mask, comb_values, 0.0), axis=0
+            )
+            comb_values = tl.where(
+                (rows == row_id) & comb_mask,
+                comb_values / (row_sum + hc_eps),
+                comb_values,
+            )
+        for col_id in tl.static_range(0, hc_mult):
+            col_sum = tl.sum(
+                tl.where((cols == col_id) & comb_mask, comb_values, 0.0), axis=0
+            )
+            comb_values = tl.where(
+                (cols == col_id) & comb_mask,
+                comb_values / (col_sum + hc_eps),
+                comb_values,
+            )
+    tl.store(
+        comb_mix + token_id * hc_mult2 + comb_offsets,
+        comb_values,
+        mask=comb_mask,
+    )
+
+    hidden_offsets = tl.arange(0, block_h)
+    hidden_mask = hidden_offsets < hidden_size
+    pre_scale = tl.load(hc_scale)
+    layer_acc = tl.zeros((block_h,), tl.float32)
+    for hc_id in tl.static_range(0, hc_mult):
+        mix = _load_reduced_mix(
+            gemm_out_mul,
+            token_id,
+            hc_id,
+            num_tokens,
+            hc_mult3,
+            n_splits,
+        )
+        pre = tl.sigmoid(mix * rms * pre_scale + tl.load(hc_base + hc_id)) + hc_eps
+        residual_offsets = (
+            token_id * hc_mult * hidden_size + hc_id * hidden_size + hidden_offsets
+        )
+        residual_values = tl.load(
+            residual + residual_offsets, mask=hidden_mask, other=0.0
+        ).to(tl.float32)
+        layer_acc += pre * residual_values
+
+    square_sum = tl.sum(layer_acc * layer_acc, axis=0)
+    rstd = tl.rsqrt(square_sum / hidden_size + norm_eps)
+    weight = tl.load(
+        norm_weight + hidden_offsets, mask=hidden_mask, other=0.0
+    ).to(tl.float32)
+    tl.store(
+        layer_input + token_id * hidden_size + hidden_offsets,
+        layer_acc * rstd * weight,
+        mask=hidden_mask,
+    )
+
+
+@triton.jit
 def _mhc_post_triton_kernel(
     comb,
     residual,
@@ -316,8 +485,13 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused post_mapping(prev) + pre_mapping(curr).
+
+    When ``norm_weight`` is given the returned layer input is already
+    normalised and the caller must skip its own RMSNorm.
 
     Returns (residual_cur, layer_input, post_cur, comb_cur).
     """
@@ -330,6 +504,8 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight,
+        norm_eps,
     )
     return residual_cur, layer_input, post_cur, comb_cur
 
@@ -342,7 +518,29 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collapse the residual streams into one hidden row.
+
+    Args:
+        residual: Residual stream bank, ``[..., hc_mult, hidden_size]`` bf16.
+        fn: Projection that produces the mHC mixes, fp32.
+        hc_scale: Per-mix scales, fp32 ``[3]``.
+        hc_base: Per-mix biases, fp32 ``[hc_mult * 2 + hc_mult**2]``.
+        rms_eps: Epsilon of the mHC row norm.
+        hc_eps: Epsilon of the Sinkhorn normalisation.
+        sinkhorn_iters: Number of Sinkhorn iterations.
+        norm_weight: When given, the collapsed row is also normalised by this
+            RMSNorm weight before being returned, so the caller must not apply
+            the norm again. The fused epilogue saves two kernel launches per
+            seam; ``None`` keeps the unfused three-launch path.
+        norm_eps: Epsilon of that RMSNorm.
+
+    Returns:
+        The collapsed (and, when requested, normalised) hidden row, the post
+        mix, and the combine mix.
+    """
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
     if not residual.is_cuda:
@@ -387,9 +585,6 @@ def mhc_pre(
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
-    pre_mix = torch.empty(
-        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
-    )
     comb_mix = torch.empty(
         num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
     )
@@ -410,37 +605,79 @@ def mhc_pre(
         gemm_out_sqrsum,
         n_splits,
     )
-    block_h = 1024
     block_comb = triton.next_power_of_2(hc_mult2)
-    _mhc_pre_mix_triton_kernel[(num_tokens,)](
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        pre_mix,
-        post_mix,
-        comb_mix,
-        hidden_size=hidden_size,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters,
-        n_splits=n_splits,
-        hc_mult=hc_mult,
-        hc_mult2=hc_mult2,
-        hc_mult3=hc_mult3,
-        block_comb=block_comb,
-        num_tokens=num_tokens,
-        num_warps=1,
+    block_h_full = triton.next_power_of_2(hidden_size)
+    use_fused_epilogue = (
+        norm_weight is not None and block_h_full <= _MHC_FUSED_NORM_MAX_HIDDEN
     )
-    _mhc_pre_layer_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
-        pre_mix,
-        residual_flat,
-        layer_input,
-        hidden_size=hidden_size,
-        hc_mult=hc_mult,
-        block_h=block_h,
-        num_warps=4,
-    )
+
+    if use_fused_epilogue:
+        _mhc_pre_norm_triton_kernel[(num_tokens,)](
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_flat,
+            norm_weight,
+            post_mix,
+            comb_mix,
+            layer_input,
+            hidden_size=hidden_size,
+            norm_eps=norm_eps,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            n_splits=n_splits,
+            hc_mult=hc_mult,
+            hc_mult2=hc_mult2,
+            hc_mult3=hc_mult3,
+            block_comb=block_comb,
+            block_h=block_h_full,
+            num_tokens=num_tokens,
+            num_warps=8,
+        )
+    else:
+        pre_mix = torch.empty(
+            num_tokens, hc_mult, dtype=torch.float32, device=residual.device
+        )
+        block_h = 1024
+        _mhc_pre_mix_triton_kernel[(num_tokens,)](
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            post_mix,
+            comb_mix,
+            hidden_size=hidden_size,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            n_splits=n_splits,
+            hc_mult=hc_mult,
+            hc_mult2=hc_mult2,
+            hc_mult3=hc_mult3,
+            block_comb=block_comb,
+            num_tokens=num_tokens,
+            num_warps=1,
+        )
+        _mhc_pre_layer_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+            pre_mix,
+            residual_flat,
+            layer_input,
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            block_h=block_h,
+            num_warps=4,
+        )
+        if norm_weight is not None:
+            # Hidden rows too wide for one program: renormalise in torch so the
+            # documented "returns a normalised row" contract still holds.
+            normed = layer_input.float()
+            normed = normed * torch.rsqrt(
+                normed.pow(2).mean(-1, keepdim=True) + norm_eps
+            )
+            layer_input = (normed * norm_weight.float()).to(torch.bfloat16)
 
     return (
         layer_input.view(*outer_shape, hidden_size),

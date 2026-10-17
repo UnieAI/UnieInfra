@@ -390,6 +390,18 @@ bool KvCacheCoordinator::CanAdmitAfterReleasing(
 
 std::int32_t KvCacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
     const std::int32_t matched_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
+    if (matched_tokens == 0) {
+        // No reusable prefix survives the cross-group min, so there is no cached
+        // state to promote a request through: prefill is cold work from
+        // position 0 and must be allowed to take the whole chunk. Returning
+        // `prefix_closed_tokens` here (which can be large even when the state
+        // group refused the match) caps every fresh request at that boundary
+        // via AlignPrefillChunk, so N concurrent 8-10k prompts each crawl
+        // forward ~1152 tokens/step and none completes in one round -- measured
+        // as ~1.3 s TTFT at conc-8 versus vLLM's ~0.5 s. Only a match we can
+        // actually reuse needs a boundary.
+        return 0;
+    }
     const std::int32_t prefix_closed_tokens =
         std::max(prefix.device.prefix_closed_tokens, prefix.host.prefix_closed_tokens);
     return prefix_closed_tokens > matched_tokens ? prefix_closed_tokens : 0;

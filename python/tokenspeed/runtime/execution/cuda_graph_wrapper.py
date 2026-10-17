@@ -104,6 +104,17 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(config: ModelExecutorConfig):
+    """Decide which decode batch sizes get a captured CUDA graph.
+
+    Args:
+        config: Executor config; ``cudagraph_capture_sizes`` overrides the
+            ladder, ``max_num_seqs`` and ``data_parallel_size`` bound it, and
+            ``max_cudagraph_capture_size`` truncates it.
+
+    Returns:
+        Ascending batch sizes to capture. The largest entry is the widest
+        decode step that can still use a graph; anything wider runs eagerly.
+    """
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -118,6 +129,22 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
 
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
     capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
+    # A cap below max_num_seqs is a silent cliff, not a memory saving: decode
+    # steps wider than effective_max drop to the eager path, and nothing else
+    # in the engine reports it. It cost 2.08x total tok/s at AgentX c64 (262
+    # vs 547) and quadrupled TPOT (229 ms vs 82 ms) while looking like a
+    # memory knob. Say so rather than let it hide.
+    if effective_max < max_bs:
+        logger.warning(
+            "Decode CUDA graphs cover batch sizes up to %d but max_num_seqs is "
+            "%d, so every decode step wider than %d runs EAGER -- a silent "
+            "throughput cliff under load. Raise max_cudagraph_capture_size to "
+            "at least %d to close it, or set it this low deliberately.",
+            effective_max,
+            max_bs,
+            effective_max,
+            max_bs,
+        )
     return capture_bs
 
 
@@ -1253,7 +1280,41 @@ class CudaGraphWrapper:
 
             graph_key = self._cuda_graph_key(padded_bs)
             with nvtx_range("graph_replay", color="red"):
-                self.graphs[graph_key].replay()
+                _dc_band = __import__("os").environ.get("TOKENSPEED_PROFILE_DECODE")
+                _dc_armed = globals().setdefault("_dc_armed_band", None)
+                if _dc_band and _dc_band != _dc_armed and padded_bs >= 8:
+                    import torch as _dc_t
+                    _dc_rank = 0
+                    try:
+                        import torch.distributed as _dc_d
+                        if _dc_d.is_initialized():
+                            _dc_rank = _dc_d.get_rank()
+                    except Exception:
+                        pass
+                    _dc_prof = _dc_t.profiler.profile(
+                        activities=[
+                            _dc_t.profiler.ProfilerActivity.CPU,
+                            _dc_t.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack=False,
+                        record_shapes=False,
+                    )
+                    globals()["_dc_armed_band"] = _dc_band
+                    _dc_prof.start()
+                    try:
+                        self.graphs[graph_key].replay()
+                    finally:
+                        _dc_prof.stop()
+                        _dc_path = f"/tmp/dcg_prof_{_dc_rank}.json"
+                        try:
+                            _dc_prof.export_chrome_trace(_dc_path)
+                            __import__("os").write(
+                                2, b"DECODE_PROFILE: trace -> %s\n" % _dc_path.encode()
+                            )
+                        except Exception:
+                            pass
+                else:
+                    self.graphs[graph_key].replay()
 
             (
                 output_tokens,

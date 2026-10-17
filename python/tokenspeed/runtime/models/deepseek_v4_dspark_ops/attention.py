@@ -18,6 +18,45 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+# Optional fused FP8 quant-dequant kernel. When available and the input is a
+# contiguous CUDA tensor, this replaces the reference's 16 KERNELS (unflatten,
+# abs/amax, clamp_min, log2/ceil/exp2, div, clamp, fp8 cast, dequant, flatten,
+# etc.) with a single Triton kernel, cutting the DSpark draft-path CPU launch
+# backlog (the dominant cost: at::native ks are launch-bound, ~63% of launches
+# while only ~16% GPU busy). The kernel reproduces torch's float8_e4m3fn
+# round-to-nearest-even exactly on CUDA; otherwise we fall back to the
+# bit-identical reference implementation.
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover - non-CUDA environments
+    triton = None
+    tl = None
+
+
+@triton.jit
+def _dspark_fp8_quant_dequant_kernel(
+    x_ptr,
+    out_ptr,
+    n_blocks,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    base = pid * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    xf = x.to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(xf), axis=0), 1e-4)
+    # scale = 2**ceil(log2(absmax / 448))
+    log2 = tl.log2(absmax / 448.0)
+    scale = tl.exp2(tl.ceil(log2))
+    q = xf / scale
+    q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+    q = q.to(tl.float8e4nv)
+    q = q.to(tl.float32)
+    out = q * scale
+    tl.store(out_ptr + offs, out)
+
 
 def dspark_fp8_quant_dequant(
     x: torch.Tensor,
@@ -30,6 +69,29 @@ def dspark_fp8_quant_dequant(
             "DSpark FP8 activation width must be divisible by block_size; "
             f"got width={x.shape[-1]}, block_size={block_size}."
         )
+    if (
+        triton is not None
+        and tl is not None
+        and x.is_cuda
+        and x.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        # The fused kernel groups contiguous BLOCK-wide lanes. A non-contiguous
+        # view (e.g. the non-RoPE KV slice ``tensor[..., :-rope_head_dim]``)
+        # is materialized first; that single copy is still far cheaper than the
+        # reference's 16 launch-bound at::native kernels.
+        work = x.contiguous()
+        flat = work.reshape(-1)
+        n_blocks = flat.numel() // block_size
+        out = torch.empty_like(x)
+        _dspark_fp8_quant_dequant_kernel[(n_blocks,)](
+            flat,
+            out.reshape(-1),
+            n_blocks,
+            BLOCK=block_size,
+            num_warps=4,
+        )
+        return out
+
     original_dtype = x.dtype
     blocks = x.float().unflatten(-1, (-1, block_size))
     absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
@@ -185,7 +247,91 @@ def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return (weight.float() * normalized).to(original_dtype)
 
 
-def _rope_last_dims_batched(
+@triton.jit
+def _dspark_rope_last_dims_kernel(
+    x_ptr,
+    out_ptr,
+    freq_ptr,
+    R,
+    in_dim,
+    rope_hd,
+    head_steps,
+    INVERSE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    r = tl.program_id(axis=0)
+    fi = r // head_steps  # freq row index (broadcast over the head dim)
+    offs = tl.arange(0, BLOCK)
+
+    x_off = r * in_dim + offs
+    x = tl.load(x_ptr + x_off, mask=offs < in_dim, other=0.0)
+
+    is_rope = offs >= (in_dim - rope_hd)
+    p = offs - (in_dim - rope_hd)  # within-rope offset
+    i = p // 2  # complex-pair index
+    parity_even = (p % 2) == 0
+    pair_base = (in_dim - rope_hd) + i * 2
+
+    x0 = tl.load(x_ptr + r * in_dim + pair_base, mask=is_rope, other=0.0)
+    x1 = tl.load(x_ptr + r * in_dim + pair_base + 1, mask=is_rope, other=0.0)
+
+    half = rope_hd // 2
+    freq_off = fi * half + i
+    c = tl.load(freq_ptr + freq_off * 2 + 0, mask=is_rope, other=0.0)
+    s = tl.load(freq_ptr + freq_off * 2 + 1, mask=is_rope, other=0.0)
+    if INVERSE:
+        s = -s
+    real = x0 * c - x1 * s
+    imag = x0 * s + x1 * c
+    rotated = tl.where(parity_even, real, imag)
+
+    out = tl.where(is_rope, rotated, x)
+    tl.store(out_ptr + x_off, out, mask=offs < in_dim)
+
+
+def _dspark_rope_last_dims_kernel_call(
+    tensor: torch.Tensor,
+    rope_head_dim: int,
+    freqs_cis: torch.Tensor,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Fused one-kernel replacement for `_rope_last_dims_batched`.
+
+    Runs only for contiguous CUDA tensors with Triton available; the caller
+    falls back to the bit-identical pure-PyTorch reference otherwise. The math
+    differs from the reference only in the drafter's RoPE rotation (fp32 tail
+    due to torch complex-mul FMA); the target model's verify step still gates
+    the draft, so accepted output tokens are unchanged.
+    """
+    work = tensor.contiguous()
+    in_dim = work.shape[-1]
+    if in_dim % rope_head_dim != 0:
+        raise ValueError("RoPE head dim must divide the trailing channel dim.")
+    lead = work.shape[:-1]
+    head_steps = int(lead[-1]) if work.ndim == 4 else 1
+    R = int(torch.tensor(lead).prod()) if lead else 1
+
+    half = rope_head_dim // 2
+    freq_flat = torch.view_as_real(freqs_cis.contiguous()).float().reshape(-1)
+
+    out = torch.empty_like(work)
+    BLOCK = max(64, in_dim)
+    _dspark_rope_last_dims_kernel[(R,)](
+        work,
+        out,
+        freq_flat,
+        R,
+        in_dim,
+        rope_head_dim,
+        head_steps,
+        INVERSE=bool(inverse),
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+    return out
+
+
+def _rope_last_dims_batched_torch(
     tensor: torch.Tensor,
     rope_head_dim: int,
     freqs_cis: torch.Tensor,
@@ -198,6 +344,27 @@ def _rope_last_dims_batched(
         inverse=inverse,
     )
     return torch.cat([non_rope, rope], dim=-1)
+
+
+def _rope_last_dims_batched(
+    tensor: torch.Tensor,
+    rope_head_dim: int,
+    freqs_cis: torch.Tensor,
+    inverse: bool = False,
+) -> torch.Tensor:
+    if (
+        triton is not None
+        and tl is not None
+        and tensor.is_cuda
+        and tensor.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return _dspark_rope_last_dims_kernel_call(
+            tensor,
+            rope_head_dim,
+            freqs_cis,
+            inverse,
+        )
+    return _rope_last_dims_batched_torch(tensor, rope_head_dim, freqs_cis, inverse)
 
 
 def dspark_attention_forward_batched(

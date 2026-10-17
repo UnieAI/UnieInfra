@@ -393,6 +393,8 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_pre(
         residual,
@@ -402,6 +404,8 @@ def mhc_pre(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight,
+        norm_eps,
     )
 
 
@@ -425,6 +429,8 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_fused_hc(
         x_prev,
@@ -437,6 +443,8 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        norm_weight,
+        norm_eps,
     )
 
 
@@ -2307,11 +2315,19 @@ class DeepseekV4MLP(nn.Module):
             )
             out, _ = self.down_proj(x_fp8, scale=scale)
         else:
-            gate, up = gate_up.float().chunk(2, dim=-1)
             if self.swiglu_limit is not None and self.swiglu_limit > 0:
+                gate, up = gate_up.float().chunk(2, dim=-1)
                 gate = torch.clamp(gate, max=self.swiglu_limit)
                 up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            x = (F.silu(gate) * up).to(x.dtype)
+                x = (F.silu(gate) * up).to(x.dtype)
+            else:
+                # No clamp, so the fused activation is the whole computation:
+                # it evaluates SiLU(gate) * up in float32 and rounds once, the
+                # same arithmetic the separate float()/silu/mul/cast chain
+                # performs, in one kernel instead of four.
+                from tokenspeed_kernel.ops.activation.triton import silu_and_mul
+
+                x = silu_and_mul(gate_up).to(x.dtype)
             out, _ = self.down_proj(x)
         return out
 
@@ -2764,7 +2780,16 @@ class DeepseekV4MoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
         fmt = getattr(self.experts, "topk_output_format", None)
-        need_scores = fmt is not None and not fmt.is_bypassed()
+        # Only a plan that routes from logits itself reads `router_logits`.
+        # A plan that takes precomputed top-k weights (`support_routing` is
+        # false) reads neither it nor the scores tensor, so materialising
+        # sqrt(softplus(logits)) for it costs a float cast plus two
+        # elementwise kernels on every layer and feeds nobody.
+        need_scores = (
+            fmt is not None
+            and not fmt.is_bypassed()
+            and self.experts.support_routing
+        )
         return deepseek_v4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
@@ -4148,6 +4173,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
         else:
             residual = hidden_states
@@ -4160,9 +4187,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
-        with nvtx_range("attn_norm"):
-            hidden_states = self.attn_norm(hidden_states)
+        # The mHC pre epilogue already applied self.attn_norm in its own
+        # kernel, folding the norm into the collapse it was going to read.
 
         with nvtx_range("attn_total"):
             hidden_states = self.attn(
@@ -4186,9 +4215,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_sinkhorn_iters,
+                norm_weight=self.ffn_norm.weight,
+                norm_eps=self.ffn_norm.variance_epsilon,
             )
-        with nvtx_range("ffn_norm"):
-            hidden_states = self.ffn_norm(hidden_states)
+        # As above: self.ffn_norm is folded into the same kernel.
 
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
@@ -4830,8 +4860,12 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def _warmup_prefill_jit(self) -> None:
         if deep_gemm is None:
             return
-        if torch.cuda.get_device_capability()[0] < 10:
-            return
+        # warmup_prefill_jit is itself capability-aware: the compressor
+        # tf32_hc_prenorm_gemm runs on Hopper+Blackwell, while the SM100-only
+        # indexer family (fp8_fp4_mqa_logits etc.) is skipped on Hopper. Do NOT
+        # blanket-return on capability<10 -- that left the compressor (and the
+        # projection fp8_gemm_nt tiles via post_quant_warmup) to JIT-compile
+        # inline on the first request, stalling prefill TTFT for seconds.
         config = self.config
         tp_size = self.mapping.attn.tp_size if self.mapping else 1
         logger.info("Pre-compiling DeepGEMM prefill kernel variants...")

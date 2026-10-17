@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os as _os
 import time
 from typing import TYPE_CHECKING
 
@@ -668,8 +669,27 @@ class OutputProcesser:
             forward_op.request_ids,
             forward_op.extend_prefix_lens,
         )
+        _diag_post = bool(_os.environ.get("TOKENSPEED_LOG_MM_TIMING"))
+        _t_post0 = time.perf_counter() if _diag_post else 0.0
         with nvtx_range("commit:sync", color="red"):
             model_execution_results.sync()
+        _t_post1 = time.perf_counter() if _diag_post else 0.0
+        if _diag_post:
+            # Split the commit wall into (a) the unavoidable wait for this
+            # forward's GPU work+D2H (copy_event.synchronize) vs (b) pure host
+            # post-processing. Under the overlap design (b) runs while the next
+            # forward is already queued on the GPU, so only (a) directly eats
+            # run wall; if (b) dominates we are CPU-bound in the commit path.
+            _ne = forward_op.num_extends()
+            _gms = model_execution_results.gpu_elapsed_ms()
+            logger.info(
+                "DIAG commit-sync ext=%d bs=%d sync_ms=%.1f post_ms=%.1f gpu_ms=%s",
+                _ne,
+                len(forward_op.request_ids),
+                (_t_post1 - _t_post0) * 1000.0,
+                (time.perf_counter() - _t_post1) * 1000.0,
+                ("%.1f" % _gms) if _gms is not None else "-",
+            )
 
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
@@ -833,6 +853,13 @@ class OutputProcesser:
                 else -1
             )
             new_ids = []
+            if _os.environ.get("TOKENSPEED_DUMP_STATE") == "1" and is_decode_slot:
+                logger.info(
+                    "[TOKSTEP] rid=%s input_len=%s outlen=%s ids=%s",
+                    rid, forward_op.input_lengths[i],
+                    len(request_state.output_ids),
+                    model_output_ids,
+                )
             for j, model_output_id in enumerate(model_output_ids):
                 request_state.output_ids.append(model_output_id)
                 if advance_grammar:

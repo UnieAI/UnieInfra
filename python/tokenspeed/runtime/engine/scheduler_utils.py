@@ -218,6 +218,7 @@ def make_config(
     context_chunk_unit: int = 0,
     prefix_replay_tokens: int = 0,
     max_cold_prefills: int = 0,
+    prefill_defer_window: int = 0,
 ) -> SchedulerConfig:
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -294,6 +295,7 @@ def make_config(
             f"got {max_cold_prefills}."
         )
     cfg.max_cold_prefills = max_cold_prefills
+    cfg.prefill_defer_window = prefill_defer_window
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
     return cfg

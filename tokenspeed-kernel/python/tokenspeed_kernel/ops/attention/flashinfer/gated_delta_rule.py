@@ -93,31 +93,31 @@ def _l2norm(x: torch.Tensor) -> torch.Tensor:
 
 _chunk_gated_delta_rule = error_fn
 _chunk_gated_delta_rule_raw = error_fn
-_has_blackwell_prefill = False
+_has_fi_gdn_prefill = False
 
-# `is_blackwell` is `arch_version.major == 10`, which excludes sm_120 (major
-# 12) even though flashinfer ships a kernel for it. Gate on "has a kernel for
-# this device" instead of on a family name.
-if platform.is_blackwell_plus:
+# `is_blackwell` is `arch_version.major == 10`, which excludes sm_90 (major 9)
+# and sm_120 (major 12) even though flashinfer ships a kernel for each. Gate on
+# "has a kernel for this device" instead of on a family name, and probe the
+# arch-specific symbol rather than a version-specific availability flag:
+# flashinfer 0.6.15 ships `chunk_gated_delta_rule_sm90`/
+# `chunk_gated_delta_rule_sm120` and no longer exports the
+# `_has_blackwell_prefill` symbol this used to import -- and because the symbol
+# was imported *before* the kernel, its ImportError skipped the whole block and
+# left `_chunk_gated_delta_rule` as `error_fn`. The sm_90 and sm_120 kernels
+# were present and working the entire time; nothing said so.
+if platform.is_hopper_plus:
     try:
-        # Ask for the arch-specific kernel this device would dispatch to, rather
-        # than for a version-specific availability flag. flashinfer 0.6.15 ships
-        # `chunk_gated_delta_rule_sm120` and no longer exports the
-        # `_has_blackwell_prefill` symbol this used to import -- and because the
-        # symbol was imported *before* the kernel, its ImportError skipped the
-        # whole block and left `_chunk_gated_delta_rule` as `error_fn`. The
-        # sm_120 kernel was present and working the entire time; nothing said so.
         from flashinfer import gdn_kernels as _fi_gdn
         from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
 
+        _chunk_gated_delta_rule = _fi_chunk
         _arch_major = platform.arch_version.major
         _chunk_gated_delta_rule_raw = getattr(
             _fi_gdn, f"chunk_gated_delta_rule_sm{_arch_major}0", None
         )
-        _has_blackwell_prefill = _chunk_gated_delta_rule_raw is not None
+        _has_fi_gdn_prefill = _chunk_gated_delta_rule_raw is not None
         if _chunk_gated_delta_rule_raw is None:
             _chunk_gated_delta_rule_raw = error_fn
-        _chunk_gated_delta_rule = _fi_chunk
     except ImportError:
         pass
 
@@ -158,24 +158,49 @@ if platform.is_hopper_plus:
 def is_available() -> bool:
     """Whether flashinfer's fused GDN chunk-prefill kernel can run here.
 
-    flashinfer dispatches per compute-capability major: sm100/sm103 (B200,
-    B300) and sm120 (RTX PRO 6000) have separate kernels. The sm10x path is
-    additionally gated on CUDA>=13 upstream and raises NotImplementedError
-    otherwise, so that check is kept -- but only for sm10x. sm120 is served by
-    `chunk_gated_delta_rule_sm120`, which was measured working on this box
-    under a CUDA 12.9 torch build: called with the wrapper's own convention
-    (decay in linear space, q/k pre-normalised) it agrees with the Triton
-    chunked scan to max|diff| = 3.1e-4, far inside the 2e-2 the GDN tests use.
+    flashinfer dispatches per compute-capability major: sm90 (H100/H200/H20),
+    sm100/sm103 (B200, B300) and sm120 (RTX PRO 6000) have separate kernels.
+    The sm10x path is additionally gated on CUDA>=13 upstream and raises
+    NotImplementedError otherwise, so that check is kept -- but only for
+    sm10x. sm120 is served by `chunk_gated_delta_rule_sm120`, which was
+    measured working on this box under a CUDA 12.9 torch build: called with
+    the wrapper's own convention (decay in linear space, q/k pre-normalised)
+    it agrees with the Triton chunked scan to max|diff| = 3.1e-4, far inside
+    the 2e-2 the GDN tests use. sm90 is served by
+    `chunk_gated_delta_rule_sm90` (the Hopper C++ kernel), the same entry
+    point vLLM dispatches to; it is enabled below and validated by A/B (the
+    GDN prefill must stay off the CUDA graph -- this kernel plans from
+    host-visible batch data and is not graph-safe, so the runtime keeps
+    hybrid prefill eager).
 
-    The point of `_has_blackwell_prefill` is "flashinfer has a kernel for this
+    The point of `_has_fi_gdn_prefill` is "flashinfer has a kernel for this
     device", which is now answered by probing for the arch-specific symbol
     rather than by importing a flag that later versions stopped exporting.
     """
-    if _chunk_gated_delta_rule is error_fn or not _has_blackwell_prefill:
+    if _chunk_gated_delta_rule is error_fn or not _has_fi_gdn_prefill:
         return False
     if platform.arch_version.major == 10:
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
         return cuda_major >= 13
+    if platform.arch_version.major == 9:
+        # 2026-10-04 root-caused defect in FlashInfer's Hopper GDN prefill
+        # kernel (`chunk_gated_delta_rule_sm90`): on a MIXED batch the runtime
+        # appends length-1 per-step decode rows to the same varlen cu_seqlens
+        # as the prefill segments, and the sm90 kernel mishandles those
+        # length-1 segments (output `!`-repetition / short garbage). 2026-10-04
+        # follow-up: fixed at the call site instead of by disabling the kernel
+        # globally. `gdn_chunk_prefill` now takes a `pure_prefill` trait that
+        # must be true for this kernel to be selected -- the runtime computes it
+        # as "no decode rows (num_extends == bs) AND every prefill row > 1 AND
+        # not inside a CUDA-graph capture". Any batch that is not provably pure
+        # prefill (or is being captured) falls through to the portable Triton
+        # scan, so this kernel only ever receives >1-length segments. The
+        # prefill-only (no length-1) feeding was already validated to agree with
+        # the Triton scan, and the kernel is not graph-safe (it plans from
+        # host-visible batch data), which the caller's capture check also
+        # excludes. Re-enabling is the algorithm fix (a pure-prefill fast path),
+        # not a config preference.
+        return True
     # sm120: the kernel EXISTS and is CORRECT -- measured against the Triton
     # chunked scan at max|diff| = 3.1e-4, well inside the 2e-2 the GDN tests
     # use -- but it is slower, and the gap widens with sequence length. Host
@@ -234,14 +259,17 @@ def is_available() -> bool:
 def _use_raw_kernel() -> bool:
     """Whether to call the arch-specific kernel instead of the public API.
 
-    Only sm120 for now: that is where the public wrapper's per-call Python cost
-    was measured (see the call site) and where the raw entry point's contract
-    was verified against the Triton scan. The sm10x path keeps the public API
-    until the same two things are checked there.
+    sm90 and sm120: both expose an arch-specific kernel from the same cubin
+    loader with the same raw arg order (verified live for sm120; the sm90 path
+    is the kernel vLLM dispatches the public API to, and this wrapper keeps the
+    same conversions). The public wrapper's per-call Python cost was measured
+    at the call site; on sm90 a 30-GDN-layer model pays ~10 ms of it per chunk,
+    on sm120 a 48-layer model ~16 ms. The sm10x path keeps the public API until
+    the same two things are checked there.
     """
     return (
         _chunk_gated_delta_rule_raw is not error_fn
-        and platform.arch_version.major == 12
+        and platform.arch_version.major in (9, 12)
     )
 
 
@@ -296,7 +324,7 @@ if is_available():
         # repository has hit before with capability tables keyed by family.
         # `is_available()` above is what decides whether a kernel exists.
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
@@ -308,6 +336,10 @@ if is_available():
             "num_v_gte_num_q": frozenset({True}),
             "qk_l2norm": frozenset({False, True}),
             "output_h": frozenset({False, True}),
+            # Only selected for a batch the caller proved is pure prefill (no
+            # length-1 varlen segments) and that is not under graph capture;
+            # mixed/decode or captured batches stay on the Triton scan.
+            "pure_prefill": frozenset({True}),
         },
         tags={"hopper", "blackwell", "latency"},
     )

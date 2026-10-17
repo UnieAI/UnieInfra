@@ -347,7 +347,30 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         }
     }
 
-    std::int32_t tokens_this_round = std::min(remaining, unscheduled);
+    // A pooling request reduces over the whole prompt: a partial first chunk
+    // would produce a well-formed vector over the wrong tokens. The runtime
+    // refuses that on the output side (`generation_output_processor.py`), so
+    // the scheduler must never hand it one. `MaxNewTokens()==0` is set for
+    // pooling at admission (`request_handler.py`).
+    //
+    // `max_scheduled_tokens` is a *chunked-prefill* budget: it bounds how far
+    // the scheduler advances mid-prompt continuations. For pooling the atomic
+    // unit IS the whole prompt, so clamping the first chunk by the leftover
+    // budget is the wrong quantity -- it slices a prompt, and the output side
+    // refuses a partial pooling prefill. Grant the whole prompt when it fits
+    // and otherwise defer the request (return nullopt) so NextExecutionPlan
+    // re-collects it next cycle once the budget is freed, matching vLLM and
+    // sglang treating atomic requests as indivisible.
+    const bool whole_prompt_or_defer = request->MaxNewTokens() == 0;
+    if (whole_prompt_or_defer && remaining < unscheduled) {
+        // The whole prompt does not fit the leftover budget. Defer the request
+        // (return nullopt, NOT a 0-token grant: 0 is treated as "still
+        // prefilling" and schedules a partial) so it is re-collected by
+        // NextExecutionPlan next cycle, when the budget has been freed.
+        return std::nullopt;
+    }
+    std::int32_t tokens_this_round =
+        whole_prompt_or_defer ? unscheduled : std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
         tokens_this_round = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.CacheBlockTokens(),
                                               promotion_boundary_tokens);
@@ -813,6 +836,29 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     // global, and it broke both of us today, once in each direction.
     std::int32_t cold_prefills = 0;
     std::int32_t rej_cold_cap = 0;
+    std::int32_t trace_prefill_deferred = 0;
+
+    // --- prefill-defer batching ---------------------------------------------
+    // A cache-hit prefill costs a fixed ~140 ms of eager-attention host time
+    // no matter how few NEW tokens it carries, because the breakable prefill
+    // graph replays norms/MoE but re-executes all 43 DSA attention layers
+    // eagerly (see unieinfra/xref/30-prefill.md: launch count, not compute, is
+    // the prefill cost). With `enable_mixed_prefill_decode` off a step is
+    // EITHER prefill OR decode, so a lone prefill both pays that fixed cost and
+    // steals the step from every decode queued behind it. Count the runnable
+    // candidates so the Submitted branch below can defer a lone prefill until
+    // the decodes' completions admit siblings (SchedulerConfig::
+    // prefill_defer_window).
+    const bool can_defer_prefill = config_.prefill_defer_window > 0 && config_.role == Role::kFused;
+    std::int32_t submit_candidates = 0;
+    std::int32_t decode_candidates = 0;
+    for (const Request* request : candidates) {
+        if (request->Is<fsm::Submitted>()) {
+            ++submit_candidates;
+        } else if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
+            ++decode_candidates;
+        }
+    }
 
     auto push_operation = [&](auto operation) {
         scheduled_this_step.insert(operation.request_id);
@@ -1092,6 +1138,35 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 ++rej_cold_cap;
                 continue;
             }
+            // One runnable new prefill and decodes to serve: defer this
+            // prefill for a round so it batches with the prefills the decodes'
+            // completions admit, rather than paying the fixed eager-attention
+            // cost alone AND stealing the step from those decodes. Bounded by
+            // `prefill_defer_window` (the request stays Submitted, so once the
+            // window lapses it runs exactly as before). `submit_candidates`
+            // grows as prefills accumulate, so we keep deferring every new
+            // prefill until either the step has `prefill_defer_window` runnable
+            // prefills (a full batch) or the oldest has waited `window` rounds
+            // -- the decode completions over those rounds are what feed the
+            // batch.
+            //
+            // Gated on `decode_candidates > 0` on purpose, measured not
+            // guessed. Removing the gate (so the wave-start prefills batch too)
+            // dropped 605 -> 564 tok/s at conc=16: batching more prefills into
+            // one forward does not pay off when it delays the whole new wave
+            // behind `window` rounds, because those deferred requests are not
+            // decoding and the fixed cost it saves is host launch time that the
+            // lone runs were already overlapping with decode. Deferral therefore
+            // only helps when there IS decode to protect; without decodes, run
+            // the prefill now.
+            if (can_defer_prefill && !pushed_prefill && decode_candidates > 0 &&
+                submit_candidates < config_.prefill_defer_window &&
+                request->PrefillDeferRounds() < config_.prefill_defer_window) {
+                request->MarkPrefillDeferred();
+                ++trace_prefill_deferred;
+                trace_stop = "deferred lone prefill to batch (prefill_defer_window)";
+                continue;
+            }
             ++st_submitted;
             const std::int32_t uncapped_budget =
                 config_.role == Role::kD ? request->PrefillSize() : token_budget;
@@ -1160,7 +1235,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                          "decode_ops=%d waiting=%zu skipped(retract=%d reserve=%d) "
                          "state(sub=%d pre=%d dec=%d other=%d) "
                          "rejected(firstchunk=%d prefill=%d decode=%d unmatched=%d cold_cap=%d) cold=%d "
-                         "stop=\"%s\"\n",
+                         "deferred=%d stop=\"%s\"\n",
                          trace_budget_start, token_budget, trace_budget_start - token_budget,
                          trace_candidates, trace_prefill_ops, trace_first_chunk_tokens,
                          trace_decode_ops,
@@ -1168,7 +1243,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                          trace_skip_retract, trace_skip_reserve,
                          st_submitted, st_prefilling, st_decode, st_other,
                          rej_firstchunk, rej_prefill, rej_decode, rej_unmatched, rej_cold_cap,
-                         cold_prefills, trace_stop);
+                         cold_prefills, trace_prefill_deferred, trace_stop);
             std::fflush(trace_file);
         }
     }

@@ -835,6 +835,7 @@ def gdn_chunk_prefill(
     output_final_state: bool = True,
     output_h: bool = False,
     h_dtype: torch.dtype | None = None,
+    pure_prefill: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> GdnChunkPrefillResult:
@@ -864,6 +865,12 @@ def gdn_chunk_prefill(
             and a resumed prefill then disagrees with a cold one. Costs one
             extra byte per element of ``h``, which is why it is not the
             default.
+        pure_prefill: Whether the batch is provably pure prefill (every varlen
+            segment is > 1 token and the batch carries no decode rows). Only
+            true here lets a flashinfer solution that is not safe for length-1
+            decode segments be selected; defaults to ``False`` so an unknown
+            batch stays on the portable Triton scan. Never true during CUDA
+            graph capture (those kernels are not graph-safe).
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -883,6 +890,7 @@ def gdn_chunk_prefill(
         "num_v_gte_num_q": num_v_heads >= num_q_heads,
         "qk_l2norm": qk_l2norm,
         "output_h": output_h,
+        "pure_prefill": pure_prefill,
     }
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(

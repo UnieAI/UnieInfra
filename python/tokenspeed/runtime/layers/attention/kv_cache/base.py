@@ -82,6 +82,14 @@ class CachePool:
             self.store_dtype = dtype
         self.device = device
         self.plan = memory_plan
+        # `_block_byte_segments` resolves a field, its group and its plane for
+        # every (block, field) pair. All three are fixed by the plan, so the
+        # per-group resolution is memoized here and the per-block loop below is
+        # left with integer arithmetic. The plan is assigned once, above, so
+        # this never goes stale.
+        self._group_field_specs: dict[
+            str, tuple[int, list[tuple[int, int, int]]]
+        ] = {}
         self._field_layer_offset = int(field_layer_offset)
         if self._field_layer_offset < 0:
             raise ValueError("field_layer_offset must be non-negative")
@@ -305,16 +313,58 @@ class CachePool:
     def _block_byte_segments(
         self, group_id: str, block_ids: list[int]
     ) -> list[tuple[int, int]]:
-        self.plan.group(group_id)
-        fields = [field for field in self.plan.fields if field.group_id == group_id]
-        return [
-            (
-                self._field_block_byte_offset(field.field_id, block_id),
-                field.payload_bytes,
+        page_count, field_specs = self._group_field_segment_specs(group_id)
+        if not field_specs:
+            # The per-pair expansion below this used to run its bounds check
+            # inside the field loop, so a group with no fields returned no
+            # segments even for an out-of-range block. Preserve that.
+            return []
+        segments: list[tuple[int, int]] = []
+        for block_id in block_ids:
+            if block_id < 0 or block_id >= page_count:
+                raise IndexError(
+                    f"block_id {block_id} outside [0, {page_count}) for "
+                    f"group {group_id!r}"
+                )
+            segments.extend(
+                (base_offset + block_id * page_stride, payload)
+                for base_offset, page_stride, payload in field_specs
             )
-            for block_id in block_ids
-            for field in fields
-        ]
+        return segments
+
+    def _group_field_segment_specs(
+        self, group_id: str
+    ) -> tuple[int, list[tuple[int, int, int]]]:
+        """Resolve one group's fields to `(base_offset, page_stride, payload)`.
+
+        `_field_block_byte_offset(field, block)` is affine in `block`:
+        `_field_block_byte_offset(field, 0) + block * field.page_stride_bytes`.
+        Resolving the invariant part once per group, rather than once per
+        (block, field) pair, is what keeps the segment build off the prefill
+        step's critical path -- DeepSeek-V4 expands ~80k pairs per step, and
+        each pair's three plan lookups were linear scans.
+
+        Returns:
+            The group's `page_count`, for the caller's bounds check, and the
+            per-field specs in plan order.
+        """
+        cached = self._group_field_specs.get(group_id)
+        if cached is None:
+            group = self.plan.group(group_id)
+            cached = (
+                group.page_count,
+                [
+                    (
+                        self._field_block_byte_offset(field.field_id, 0),
+                        field.page_stride_bytes,
+                        field.payload_bytes,
+                    )
+                    for field in self.plan.fields
+                    if field.group_id == group_id
+                ],
+            )
+            self._group_field_specs[group_id] = cached
+        return cached
 
     def register_layerwise_load_tracker(
         self, layerwise_load_tracker: LayerwiseLoadTracker

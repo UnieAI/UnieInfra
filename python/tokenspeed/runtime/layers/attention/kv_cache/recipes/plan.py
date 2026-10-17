@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -30,6 +31,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import pairwise
+from typing import TypeVar
 
 # Planner/runtime limits, not model layout inputs.
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
@@ -37,6 +39,19 @@ _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
 
 
 logger = logging.getLogger(__name__)
+
+_ItemT = TypeVar("_ItemT")
+
+
+def _index_first(items: tuple[_ItemT, ...], attr: str) -> dict[str, _ItemT]:
+    """Map each item's `attr` to the first item carrying that value.
+
+    First-wins so the result matches a linear scan over `items`.
+    """
+    index: dict[str, _ItemT] = {}
+    for item in items:
+        index.setdefault(getattr(item, attr), item)
+    return index
 
 
 @dataclass(frozen=True)
@@ -63,7 +78,10 @@ class CacheFieldLayout:
     field_offset_bytes: int
     page_stride_bytes: int
 
-    @property
+    # Cached: the extent is pure geometry, and the page-zeroing path asks for it
+    # once per (block, field) pair -- hundreds of thousands of times per prefill
+    # step -- where recomputing `math.prod` dominated the segment build.
+    @functools.cached_property
     def payload_bytes(self) -> int:
         return math.prod(self.shape) * self.element_size
 
@@ -86,23 +104,41 @@ class CacheMemoryPlan:
     def arena_bytes(self) -> int:
         return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
 
+    # The three accessors below run once per (block, field) pair while building
+    # byte ranges to zero -- ~80k ranges per prefill step on DeepSeek-V4, each
+    # resolving a field, its group and its plane. As linear scans over ~258
+    # fields they cost ~1.7us per `field()` call and ~2.5ms per step of pure
+    # string comparison. Index once instead. `setdefault` keeps the first match,
+    # which is what the scans returned when ids were duplicated.
+    @functools.cached_property
+    def _groups_by_id(self) -> dict[str, CacheGroupLayout]:
+        return _index_first(self.groups, "group_id")
+
+    @functools.cached_property
+    def _fields_by_id(self) -> dict[str, CacheFieldLayout]:
+        return _index_first(self.fields, "field_id")
+
+    @functools.cached_property
+    def _planes_by_id(self) -> dict[str, CachePlaneLayout]:
+        return _index_first(self.planes, "plane_id")
+
     def group(self, group_id: str) -> CacheGroupLayout:
-        for group in self.groups:
-            if group.group_id == group_id:
-                return group
-        raise KeyError(group_id)
+        try:
+            return self._groups_by_id[group_id]
+        except KeyError:
+            raise KeyError(group_id) from None
 
     def field(self, field_id: str) -> CacheFieldLayout:
-        for field in self.fields:
-            if field.field_id == field_id:
-                return field
-        raise KeyError(field_id)
+        try:
+            return self._fields_by_id[field_id]
+        except KeyError:
+            raise KeyError(field_id) from None
 
     def plane(self, plane_id: str) -> CachePlaneLayout:
-        for plane in self.planes:
-            if plane.plane_id == plane_id:
-                return plane
-        raise KeyError(plane_id)
+        try:
+            return self._planes_by_id[plane_id]
+        except KeyError:
+            raise KeyError(plane_id) from None
 
     def capacity_report(
         self,

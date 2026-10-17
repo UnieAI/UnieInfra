@@ -510,3 +510,45 @@ sub-dict is needed; the fields are top-level (`vision_n_layers`=32,
 `vision_patch_size`=14, `vision_rope_theta`=10000,
 `vision_downsample_ratio`=3, `vision_max_n_token`=384,
 `vision_min_pixels`=147456, `vision_max_wh_ratio`=8).
+
+## Live TTFT re-measure (2026-10-08, fresh `eng-dsv4` / GPU6,7, DSPARK config
+from `dsv4_serve.sh`, OpenAI HTTP :30101)
+
+Re-ran text load on a harness that records per-request TTFT (conc16, n=48,
+max_tokens=128, temperature 0, ~600-token prompts, streamed):
+
+| metric | value |
+| --- | --- |
+| requests | 48 (39 ok, 9 rejected) |
+| TTFT mean / p50 / p90 / p99 (ms) | 5248 / 1820 / 23355 / 23357 |
+| E2E mean / p50 / p90 (ms) | 29122 / 29371 / 37663 |
+| TPOT mean / p50 (ms) | 475 / 505 |
+| aggregate | ~0.49 req/s, ~49 gen tok/s |
+
+The aggregate gate is already claimed by the AgentX cell above (engine 1.27x
+the vLLM reference). This run targets the *remaining* weakness, the first-token
+tail.
+
+**Root cause of the TTFT tail (engine's own diagnostic,
+`model_executor.py` mix/prefill batch):** the first wave is packed — one
+`Mix batch #new-seq: 15 #new-token: 5286` — but the staggered tail drains
+requests one or two at a time and each is pre-filled in its own tiny batch
+(`#new-seq: 1 #new-token: 437/441/430`, logged seconds apart across
+05:54:35→05:54:52). A request that arrives late waits behind ~an entire wave
+of these single-seq prefills, so its TTFT lands at the 23 s p90. The engine has
+no prefill batch-accumulation window: it launches a prefill the moment a
+request is admitted, so staggered arrivals never coalesce. vLLM / sglang let a
+few requests accumulate into one forward. This is the same defect class as the
+embedding micro-batch fragmentation (h200-five-models Round-25/26), so the fix
+is shared: accumulate concurrent cold prefills into one batched forward before
+launching. `max_cold_prefills` is *not* the window — it is a per-plan cap on
+cold prefill admission (default 0 = unlimited), and lowering it only fragments
+further.
+
+**Separate availability defect:** 9/48 requests were rejected with HTTP 404
+from the serving stack — `smg::routers::grpc::common::stages::worker_selection`
+(`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:101`)
+`No available workers for model /models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`.
+All nine fired in one second under load (05:55:15). The engine itself generated
+correctly (Paris smoke test, temperature 0); this is a gateway worker-selection
+availability bug in the HTTP-to-engine path, not a model/kernel defect.

@@ -78,8 +78,17 @@ class ModelExecutionResult:
     # Mutually exclusive with output_tokens -- a pooling forward samples
     # nothing, so output_tokens is empty when this is set.
     output_embeddings: torch.Tensor | None = None
+    # TEMP profiling: (start, end) CUDA events bracketing forward_step on the
+    # execution stream. elapsed_time() is only valid AFTER copy_event has been
+    # synchronised; the commit path reads it then (no extra device sync).
+    gpu_events: tuple | None = None
 
     def sync(self) -> None:
         if self.copy_event is None:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
+
+    def gpu_elapsed_ms(self) -> float | None:
+        if self.gpu_events is None:
+            return None
+        return self.gpu_events[0].elapsed_time(self.gpu_events[1])

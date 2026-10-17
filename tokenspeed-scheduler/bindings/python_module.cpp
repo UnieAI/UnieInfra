@@ -181,7 +181,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("new_token_ratio_decay_steps",
                 &tokenspeed::SchedulerConfig::new_token_ratio_decay_steps)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
-        .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
+        .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
+        .def_rw("prefill_defer_window", &tokenspeed::SchedulerConfig::prefill_defer_window);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())

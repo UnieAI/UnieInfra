@@ -110,6 +110,13 @@ public:
             state_);
     }
 
+    // How many scheduler rounds this request's first-chunk prefill was deferred
+    // by `prefill_defer_window`. Used to bound the deferral so a lone prefill
+    // that never gains a sibling still makes forward progress (see the policy
+    // at SchedulerConfig::prefill_defer_window).
+    std::int32_t PrefillDeferRounds() const { return prefill_defer_rounds_; }
+    void MarkPrefillDeferred() { ++prefill_defer_rounds_; }
+
     std::string StateName() const {
         return std::visit(Overloaded{
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
@@ -136,6 +143,7 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t page_size_{};
     fsm::State state_;
+    std::int32_t prefill_defer_rounds_{0};
 };
 
 }  // namespace tokenspeed

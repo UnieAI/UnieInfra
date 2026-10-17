@@ -61,7 +61,33 @@ def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
         block = candidate
         if num_tokens * top_k / num_experts / candidate < 0.9:
             break
-    return block
+    # Marlin's aligned kernel takes a multiple-of-16 block. vLLM applies
+    # ``block_size_m = max(block_size_m, 16)`` after the same loop, so floor
+    # here too: two engines that pad to the same block schedule identically.
+    return max(block, 16)
+
+
+_WORKSPACE: dict[torch.device, torch.Tensor] = {}
+
+
+def _marlin_workspace(device: torch.device) -> torch.Tensor:
+    """Return the process-wide Marlin inter-block sync workspace for a device.
+
+    The workspace is a launch-scoped lock array, so one buffer per device is
+    shared safely across the layers of a step. Allocating it per call instead
+    would add a device memset launch to every expert layer of every step.
+
+    Args:
+        device: CUDA device the workspace lives on.
+
+    Returns:
+        A per-device int32 workspace tensor of ``sms * 4`` elements.
+    """
+    workspace = _WORKSPACE.get(device)
+    if workspace is None:
+        workspace = marlin_make_workspace(device)
+        _WORKSPACE[device] = workspace
+    return workspace
 
 
 def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
@@ -238,7 +264,7 @@ def marlin_mxfp4_precomputed_moe_apply(
         local_topk_ids, block_m, align_num_experts
     )
 
-    workspace = marlin_make_workspace(x.device)
+    workspace = _marlin_workspace(x.device)
 
     gemm1_n = 2 * ispp
     intermediate1 = moe_wna16_marlin_gemm(
@@ -260,9 +286,13 @@ def marlin_mxfp4_precomputed_moe_apply(
         size_k=hidden,
     ).view(-1, gemm1_n)
 
-    beta = float(getattr(w, "activation_situ_beta", 1.0))
-    linear_beta = getattr(w, "activation_situ_linear_beta", None)
     if activation == "situ":
+        # Both attributes always exist on the expert module, but stay None
+        # unless the model really is SiTU (DeepSeek-V4 routes swiglu here), so
+        # the getattr default never fires and None must be mapped explicitly.
+        beta = getattr(w, "activation_situ_beta", None)
+        beta = 1.0 if beta is None else float(beta)
+        linear_beta = getattr(w, "activation_situ_linear_beta", None)
         intermediate2 = situ_and_mul(
             intermediate1,
             beta=beta,

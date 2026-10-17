@@ -25,6 +25,8 @@ from __future__ import annotations
 import functools
 import logging
 import os
+
+_FWD_SEQ = [0]
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -69,6 +71,63 @@ from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 
 logger = logging.getLogger(__name__)
+
+# TEMP per-op cumulative profiler for the GDN prefill eager break. Gated by
+# TOKENSPEED_PROFILE_GDN_LAYERS=1; dumps a compact per-op breakdown every 96
+# layer calls (roughly one prefill forward's 48 layers, x2 ranks).
+_PROF_N = [0]
+_PROF_ACCT: dict[str, float] = {}
+
+
+def _prof_add(name: str, dt_s: float) -> None:
+    if not os.getenv("TOKENSPEED_PROFILE_GDN_LAYERS") == "1":
+        return
+    _PROF_ACCT[name] = _PROF_ACCT.get(name, 0.0) + dt_s
+    _PROF_N[0] += 1
+    if _PROF_N[0] % 96 == 0:
+        total = sum(_PROF_ACCT.values())
+        parts = " ".join(
+            f"{k}={v * 1000:.1f}ms"
+            for k, v in sorted(_PROF_ACCT.items(), key=lambda kv: -kv[1])
+        )
+        logger.info(
+            "[GDNLAYER] calls=%d total=%.1fms %s",
+            _PROF_N[0], total * 1000, parts,
+        )
+        _PROF_ACCT.clear()
+        _PROF_N[0] = 0
+
+
+def _prof_t(name: str, prev: float) -> float:
+    """Call as ``p = _prof_t(name, p)`` to time elapsed since ``p``.
+    Returns monotonic() after accumulating the span."""
+    now = __import__("time").monotonic()
+    _prof_add(name, now - prev)
+    return now
+
+
+# TEMP per-break profiler for the hybrid wrapper's eager break (both sub-kinds).
+_BREAK_N = [0]
+_BREAK_ACCT: dict[str, float] = {}
+
+
+def _break_add(name: str, dt_s: float) -> None:
+    if not os.getenv("TOKENSPEED_PROFILE_BREAK") == "1":
+        return
+    _BREAK_ACCT[name] = _BREAK_ACCT.get(name, 0.0) + dt_s
+    _BREAK_N[0] += 1
+    if _BREAK_N[0] % 48 == 0:
+        total = sum(_BREAK_ACCT.values())
+        parts = " ".join(
+            f"{k}={v * 1000:.2f}ms"
+            for k, v in sorted(_BREAK_ACCT.items(), key=lambda kv: -kv[1])
+        )
+        logger.info(
+            "[BREAK] calls=%d total=%.1fms %s",
+            _BREAK_N[0], total * 1000, parts,
+        )
+        _BREAK_ACCT.clear()
+        _BREAK_N[0] = 0
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -167,6 +226,15 @@ def _gather_state_page_indices(
     if out_slots_safe is None:
         out_slots_safe = plan.out_slots.clamp(min=0, max=max_slots - 1)
 
+    if os.getenv("TOKENSPEED_DUMP_STATE") == "1":
+        import logging as _lg
+        _lg.getLogger("tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn").info(
+            "[SPLAN] g=%s bs=%d before=%s after=%s in_slot=%s out_slot=%s crossing=%s",
+            group_id, bs, plan.before.tolist(), plan.after.tolist(),
+            plan.in_slots.tolist(), out_slots_safe.tolist(),
+            (plan.has_history & (plan.in_slots != out_slots_safe)).tolist(),
+        )
+
     state_in = rows.gather(1, plan.in_slots.unsqueeze(1)).squeeze(1)
     state_in = torch.where(plan.has_history, state_in, torch.zeros_like(state_in))
     state_out = rows.gather(1, out_slots_safe.unsqueeze(1)).squeeze(1)
@@ -262,12 +330,46 @@ def _prepare_cache_prefill_state_inputs(
 
     # A fresh row copies its working page to itself. Only a resumed row reads
     # the checkpoint named by state_in_pages.
+    #
+    # A fresh row's working page is recycled BlockPool memory that may still
+    # hold the previous tenant's conv/ssm bytes. The kernel contract
+    # ``has_initial_state=False`` only governs whether the *source* is read;
+    # it never clears the destination, so stale bytes would survive the prefill
+    # and poison the first decode. Zero both target pages for every fresh row
+    # before the copy (the scan writes the ssm page, but the conv window starts
+    # from these bytes for the first W-1 positions).
+    fresh_rows = ~has_initial_state & (state_out_pages > 0)
+    # Zero only the fresh rows. The boolean advanced index
+    # ``state_out_pages[fresh_rows]`` is a GPU->CPU sync. Note: hoisting this
+    # to once per forward (and replacing it with a device-side ``index_put_``)
+    # were both MEASURED slower end-to-end on this corpus (31.7s / 35.4s vs
+    # 27.6s) — the trace's ~150 ms `nonzero`+`index` is CPU waiting on GPU work
+    # that still has to run, and the syncs act as back-pressure the scheduler
+    # overlaps against. Leave the algorithm alone; the pole is GPU throughput.
+    _zero_rows = state_out_pages[fresh_rows].to(torch.int64)
+    if _zero_rows.numel():
+        conv_states[_zero_rows].zero_()
+        ssm_states[_zero_rows].zero_()
     conv_states[state_out_pages] = conv_states[safe_input_pages]
     recurrent_state = ssm_states[safe_input_pages]
     broadcast_mask = has_initial_state.reshape(
         (-1,) + (1,) * (recurrent_state.ndim - 1)
     )
     recurrent_state.masked_fill_(~broadcast_mask, 0)
+    if os.getenv("TOKENSPEED_DUMP_STATE") == "1":
+        import torch as _t
+
+        if not (_t.cuda.is_available() and _t.cuda.is_current_stream_capturing()):
+            _sout = state_out_pages.detach().cpu().tolist()
+            _rs = recurrent_state.detach().float()
+            _cs = conv_states[state_out_pages].detach().float()
+            logger.info(
+                "[STATEDUMP][prefill] sin=%s sout=%s hasinit=%s state_absmean=%.4g "
+                "state_absmax=%.4g conv_absmax=%.4g",
+                state_in_pages.detach().cpu().tolist(), _sout,
+                has_initial_state.detach().cpu().tolist(),
+                float(_rs.abs().mean()), float(_rs.abs().max()), float(_cs.abs().max()),
+            )
     return recurrent_state, has_initial_state
 
 
@@ -294,6 +396,12 @@ class MambaForwardMetadata:
     mamba_output_indices: torch.Tensor | None = None
     extend_prefix_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
+    # Number of prefill ("extend") rows of the batch; decode rows are appended
+    # after these as length-1 segments on a MIXED forward. ``num_extends == bs``
+    # therefore means the batch is pure prefill (no length-1 decode segments),
+    # which is the host-side, sync-free shape check that lets the flashinfer
+    # sm90 GDN prefill kernel be selected (it corrupts length-1 varlen rows).
+    num_extends: int | None = None
     # Per-state-group metadata is gathered once per group and batch;
     # layers select their entry via ``pool.group_id_for_layer(layer_id)``.
     state_in_pages_by_group: dict[str, torch.Tensor] | None = None
@@ -774,6 +882,47 @@ class MambaAttnBackend(AttentionBackend):
             )
             state_in_pages[group_id] = state_in
             state_out_pages[group_id] = state_out
+            if os.getenv("TOKENSPEED_DUMP_STATE") == "1":
+                import torch as _t
+                if not (_t.cuda.is_available() and _t.cuda.is_current_stream_capturing()):
+                    _FWD_SEQ[0] += 1
+                    _rpi = getattr(forward_batch, "request_pool_indices", None)
+                    _rids = getattr(forward_batch, "request_ids", None)
+                    logger.info(
+                        "[PAGEDUMP] fwd=%d group=%s P=%d before=%s after=%s "
+                        "in_slot=%s out_slot=%s sin=%s sout=%s rpi=%s rid=%s",
+                        _FWD_SEQ[0], group_id, self._state_page_size,
+                        before.detach().cpu().tolist(),
+                        after.detach().cpu().tolist(),
+                        plan.in_slots.detach().cpu().tolist(),
+                        plan.out_slots.detach().cpu().tolist(),
+                        state_in.detach().cpu().tolist(),
+                        state_out.detach().cpu().tolist(),
+                        list(_rpi) if _rpi is not None else None,
+                        list(_rids) if _rids is not None else None,
+                    )
+                    logger.info(
+                        "[PAGEDUMPROW] fwd=%d group=%s row=%s",
+                        _FWD_SEQ[0], group_id,
+                        rows[0].detach().cpu().tolist(),
+                    ) if bool((plan.has_history & (plan.in_slots != out_slots_safe)).any()) else None
+            if os.getenv("TOKENSPEED_DUMP_STATE") == "1":
+                import torch as _t
+                if not (_t.cuda.is_available() and _t.cuda.is_current_stream_capturing()):
+                    fa_gid = getattr(cache_metadata, "full_attention_group_id", None)
+                    if fa_gid is not None:
+                        fa = cache_metadata.require_table(
+                            fa_gid, active_forward_op=forward_batch
+                        )
+                        fa_live = int((after[0] + self._state_page_size - 1) // self._state_page_size)
+                        fa_pages = fa[0, :fa_live].detach().cpu().tolist()
+                        logger.info(
+                            "[PAGEDUMP][full_attn] gid=%s P=%d seq_after=%s "
+                            "fa_live_pages=%s fa_rows=%s",
+                            fa_gid, self._state_page_size,
+                            after.detach().cpu().tolist(),
+                            fa_pages, fa.shape,
+                        )
         return state_in_pages, state_out_pages
 
     def init_forward_metadata(
@@ -914,11 +1063,26 @@ class MambaAttnBackend(AttentionBackend):
                     state_out_pages_by_group,
                 ) = self._cache_contract_state_pages(bs, seq_lens, forward_mode, kwargs)
 
+        if os.getenv("TOKENSPEED_DUMP_STATE") == "1":
+            import torch as _t
+            if not (_t.cuda.is_available() and _t.cuda.is_current_stream_capturing()):
+                logger.info(
+                    "[MIXMETAD] bs=%d mode=%s num_extends=%d spec=%d "
+                    "seq_lens=%s extend_seq_lens_cpu=%s ext_pref=%s query_start_loc=%s "
+                    "rids=%s",
+                    bs, forward_mode, num_extends, self.spec_num_tokens,
+                    seq_lens.detach().cpu().tolist(),
+                    None if extend_seq_lens_cpu is None else [int(x) for x in extend_seq_lens_cpu],
+                    None if kwargs.get("extend_prefix_lens") is None else [int(x) for x in kwargs.get("extend_prefix_lens")],
+                    query_start_loc.detach().cpu().tolist(),
+                    list(kwargs.get("request_ids", [])),
+                )
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_output_indices=mamba_output_indices,
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            num_extends=num_extends,
             state_in_pages_by_group=state_in_pages_by_group,
             state_out_pages_by_group=state_out_pages_by_group,
         )
@@ -1224,6 +1388,22 @@ class MambaAttnBackend(AttentionBackend):
                 regs[Reg(Reg.PTR0 + i)] = rows
                 regs[Reg(Reg.USER0 + i)] = rows.shape[1]
             tape.run(regs)
+            if os.getenv("TOKENSPEED_DUMP_STATE") == "1" and real_bs > 0 and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            ):
+                _seq = seq_lens[:real_bs].detach().cpu().tolist()
+                _parts = []
+                for gid in gids:
+                    _si = self.state_in_by_group[gid][bs - 1][:real_bs].detach().cpu().tolist()
+                    _so = self.state_out_by_group[gid][bs - 1][:real_bs].detach().cpu().tolist()
+                    _parts.append(f"{gid}:sin={_si},sout={_so}")
+                _fb = kwargs.get("forward_batch")
+                logger.info(
+                    "[REPLAYSTATE][tape] bs=%d real=%d seq=%s %s rpi=%s rid=%s",
+                    bs, real_bs, _seq, " ".join(_parts),
+                    list(getattr(_fb, "request_pool_indices", [])) if _fb is not None else None,
+                    list(getattr(_fb, "request_ids", [])) if _fb is not None else None,
+                )
             return (
                 {g: self.state_in_by_group[g][bs - 1] for g in gids},
                 {g: self.state_out_by_group[g][bs - 1] for g in gids},
@@ -1251,6 +1431,22 @@ class MambaAttnBackend(AttentionBackend):
                 state_out_pages[real_bs:].fill_(self.pad_slot_id)
             in_by_group[gid] = state_in_pages
             out_by_group[gid] = state_out_pages
+        if os.getenv("TOKENSPEED_DUMP_STATE") == "1" and real_bs > 0 and not (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        ):
+            _seq = seq_lens[:real_bs].detach().cpu().tolist()
+            _parts = []
+            for gid in gids:
+                _si = in_by_group[gid][:real_bs].detach().cpu().tolist()
+                _so = out_by_group[gid][:real_bs].detach().cpu().tolist()
+                _parts.append(f"{gid}:sin={_si},sout={_so}")
+            _fb = kwargs.get("forward_batch")
+            logger.info(
+                "[REPLAYSTATE] bs=%d real=%d seq=%s %s rpi=%s rid=%s",
+                bs, real_bs, _seq, " ".join(_parts),
+                list(getattr(_fb, "request_pool_indices", [])) if _fb is not None else None,
+                list(getattr(_fb, "request_ids", [])) if _fb is not None else None,
+            )
         return in_by_group, out_by_group
 
     # ---- Forward ----
@@ -1331,6 +1527,27 @@ class MambaAttnBackend(AttentionBackend):
             layer_id
         )
         read_indices = state_in_pages
+        if os.getenv("TOKENSPEED_DUMP_STATE") == "1" and layer_id == self._state_layer_ids()[0]:
+            import torch as _t
+
+            if not (_t.cuda.is_available() and _t.cuda.is_current_stream_capturing()):
+                _si_a = state_in_pages.detach().cpu().tolist()
+                _so_a = state_out_pages.detach().cpu().tolist()
+                _active = [
+                    (k, int(v)) for k, v in enumerate(_si_a) if int(v) >= 0
+                ]
+                _act_si = [v for _, v in _active]
+                _act_so = [_so_a[k] for k, _ in _active]
+                _v = ssm_states[state_in_pages.clamp(min=0).to(torch.int64)].detach().float()
+                _cv = conv_states[state_in_pages.clamp(min=0).to(torch.int64)].detach().float()
+                _fb = kwargs.get("forward_batch")
+                _rpi = list(getattr(_fb, "request_pool_indices", [])) if _fb is not None else None
+                logger.info(
+                    "[STATEDUMP][decode] layer=%d rows=%s sin=%s sout=%s state_absmean=%.4g state_absmax=%.4g conv_absmax=%.4g rpi=%s",
+                    layer_id, [k for k, _ in _active], _act_si, _act_so,
+                    float(_v.abs().mean()), float(_v.abs().max()), float(_cv.abs().max()),
+                    _rpi,
+                )
 
         if self.is_kda and f_a_out is not None:
             num_value_heads = value_dim // attn_tp_size // head_v_dim
@@ -1479,6 +1696,7 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
+        _gent = __import__("time").monotonic()
 
         # `q` is None for hybrid linear-attn layers; the token count comes
         # from seq_len carried in kwargs.
@@ -1563,6 +1781,8 @@ class MambaAttnBackend(AttentionBackend):
             # needn't contiguous here.
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
+            _break_add("gdn_pre", __import__("time").monotonic() - _gent)
+            _tp = __import__("time").monotonic()
             state_in_pages, state_out_pages, conv_states, ssm_states = (
                 self._layer_state(layer_id)
             )
@@ -1573,6 +1793,7 @@ class MambaAttnBackend(AttentionBackend):
                 state_in_pages,
                 state_out_long,
             )
+            _tp = _prof_t("state_prep", _tp)
             conv_cache_indices = state_out_pages
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
             if extend_prefix_lens is None:
@@ -1599,6 +1820,7 @@ class MambaAttnBackend(AttentionBackend):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
+            _tp = _prof_t("conv", _tp)
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -1614,6 +1836,8 @@ class MambaAttnBackend(AttentionBackend):
             head_k=head_k_dim,
             head_v=head_v_dim,
         )
+        if not is_target_verify:
+            _tp = _prof_t("split", _tp)
 
         if is_target_verify:
             if self.is_kda:
@@ -1725,10 +1949,12 @@ class MambaAttnBackend(AttentionBackend):
             # Extend indices never carry pad(-1) — unguarded like the GDN write below.
             ssm_states[state_out_long] = last_recurrent_state
         else:
+            _tg = __import__("time").monotonic()
             beta = b.sigmoid()
             g = fused_gdn_gating(A_log, a, dt_bias)
             g = g.unsqueeze(0)
             beta = beta.unsqueeze(0)
+            _tg = _prof_t("gating", _tg)
 
             if _gdn_trace_enabled():
                 import torch as _t
@@ -1744,6 +1970,28 @@ class MambaAttnBackend(AttentionBackend):
                     state_id=id(recurrent_state),
                     cu_id=id(query_start_loc),
                 )
+            # FlashInfer's Hopper GDN prefill kernel plans from host-visible
+            # batch data and corrupts length-1 varlen segments (mixed decode
+            # rows), so it may only run on a provably pure-prefill batch and
+            # never under CUDA-graph capture (it is not graph-safe, and the
+            # wrapper raises there anyway). `num_extends == bs` + every prefill
+            # row > 1 is a host-side, sync-free shape check; anything else
+            # stays on the Triton chunked scan.
+            _meta = self.forward_metadata
+            _num_extends = _meta.num_extends if _meta is not None else None
+            _ext_lens = _meta.extend_seq_lens_cpu if _meta is not None else None
+            _bs = int(query_start_loc.numel() - 1)
+            _capturing = bool(
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+            pure_prefill = bool(
+                not _capturing
+                and _num_extends is not None
+                and _num_extends == _bs
+                and _ext_lens is not None
+                and _ext_lens.numel() == _num_extends
+                and (_ext_lens > 1).all()
+            )
             gdn_result = gdn_chunk_prefill(
                 query,
                 key,
@@ -1756,7 +2004,9 @@ class MambaAttnBackend(AttentionBackend):
                 qk_l2norm=True,
                 output_final_state=True,
                 output_h=False,
+                pure_prefill=pure_prefill,
             )
+            _tg = _prof_t("scan", _tg)
             if _gdn_trace_enabled():
                 _o = gdn_result.out
                 _gdn_trace(
@@ -1772,6 +2022,7 @@ class MambaAttnBackend(AttentionBackend):
             last_recurrent_state = gdn_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[state_out_long] = last_recurrent_state
+            _tg = _prof_t("state_write", _tg)
 
         return core_attn_out
 
@@ -1988,6 +2239,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # See AttentionBackend.forward for the record_kv_cache contract; the step
         # is recorded in this wrapper (not the child backends) to keep one step
         # per model layer across full-attn + mamba. Idle already returned above.
+        _bk_t0 = __import__("time").monotonic()
         with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
                 ret = backend.forward_decode(
@@ -2002,6 +2254,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
+                _ext_t0 = __import__("time").monotonic()
                 ret = backend.forward_extend(
                     q,
                     k,
@@ -2014,6 +2267,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                     forward_mode=forward_mode,
                     **kwargs,
                 )
+                _break_add("lin_ext", __import__("time").monotonic() - _ext_t0)
+        _break_add(
+            "full" if layer_id in self.full_attn_layers else "linear",
+            __import__("time").monotonic() - _bk_t0,
+        )
         # Collapse the GDN scan's batched [1, T, Hv, D] to z-shaped (see docstring).
         if ret is not None and ret.dim() == 4:
             # Strictly [1, T, Hv, D]: a genuine B>1 must fail loud, not corrupt the handoff.

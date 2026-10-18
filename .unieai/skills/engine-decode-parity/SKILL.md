@@ -1,6 +1,6 @@
 ---
 name: engine-decode-parity
-description: "Read this skill when an inference engine (or a fork of one) has to match or beat a reference engine on decode — phrasings like '追平 vLLM', '輸 sglang', 'total tps 差多少', 'TTFT tail 爆炸', 'throughput 飽和', 'why is our decode slower', or a request to port an upstream engine's optimizations. It chains step-level measurement (device-busy ms/step, launches/step, family attribution) to an arithmetic floor, then applies the strategy catalogue distilled from Tokenspeed/vLLM upstream commits: fold epilogues, one launch per seam, recompute instead of materialize, select instead of sort, compute over the visible set, produce in the consumer's dtype, hoist per-step metadata, prepare weights once at load, pick kernels per token bucket, overlap independent branches, collapse collective chains. It covers how to port 1:1 without replacing the existing path, how to declare and gate kernel capabilities, and how to verify with ULP-relative bounds. It is not for prefill-only tuning, single-kernel micro-benchmarks, or flag/scheduler-parameter sweeps. Before kernel work on a new model, run model-structure-optimization first (work the model never needed is the bigger lever); for bringing a model up from scratch use model-bring-up."
+description: "Read this skill when an inference engine (or a fork of one) has to match or beat a reference engine on decode — phrasings like '追平 vLLM', '輸 sglang', 'total tps 差多少', 'TTFT tail 爆炸', 'throughput 飽和', 'why is our decode slower', 'agent workload 比 vLLM 慢', 'GPU 沒吃滿', or a request to port an upstream engine's optimizations. It chains step-level measurement (device-busy ms/step, launches/step, family attribution, per-rank idle vs collective wait, py-spy on the forward thread when the step is host-bound, e2e = TTFT + per-token decode under load) to an arithmetic floor, then applies the strategy catalogue distilled from Tokenspeed/vLLM upstream commits: fold epilogues, one launch per seam, recompute instead of materialize, select instead of sort, compute over the visible set, produce in the consumer's dtype, hoist per-step metadata, prepare weights once at load, pick kernels per token bucket, overlap independent branches, collapse collective chains, keep eager graph breaks to the metadata-reading ops, cover the batched prefill size with a captured bucket, re-profile after every fix. It covers how to port 1:1 without replacing the existing path, how to declare and gate kernel capabilities, and how to verify with ULP-relative bounds. It is not for single-request prefill-only tuning, single-kernel micro-benchmarks, or flag/scheduler-parameter sweeps. Before kernel work on a new model, run model-structure-optimization first (work the model never needed is the bigger lever); for bringing a model up from scratch use model-bring-up."
 ---
 
 > Companion skills: **model-bring-up** (new model → correct engine path),
@@ -86,6 +86,38 @@ loop in the backend's `forward_v41`) as the source of 27% of all launches, plus
 the `torch.where` / `cat` / `copy_` / `zeros_like` it issued per request per
 layer — a per-request Python loop inside a per-layer call is O(requests ×
 layers) launches per step.
+
+**Rank idle + collective wait is constant → the step is bounded by host time.**
+After the per-request loop was batched, V4.1 prefill steps still ran ~145 ms
+wall for ~45 ms of GPU work. Per step, one rank showed 10-150 ms idle and
+another 5-120 ms of all-reduce, but the *sum* was ~100 ms on every rank: the
+slowest rank's host decides, and which rank that is changes step to step. Then
+find where the host goes:
+
+- **The torch profiler cannot see it.** tokenspeed runs the model on a
+  `tokenspeed::forward` thread whose Python ops the profiler does not record;
+  you only see `cudaLaunch*` runtime calls with 100+ µs of nothing between them
+  (119 of 137 ms per step on V4.1). Use py-spy on the live server:
+  `docker run --cap-add SYS_PTRACE …`, then
+  `docker exec --privileged <c> py-spy record -d 20 -r 200 -p <pid> --threads --idle -f raw`
+  (py-spy lives in the image, not on the host). Never sample while the torch
+  profiler is exporting — every sample lands in `stop_trace`.
+- **Read the forward thread and the main thread together.** Forward thread
+  busy 64% + main thread 73% in `pending.result()` means the launches are the
+  bottleneck and the overlap schedule is already doing its job; the 36% forward
+  idle is the main thread's stream sync, cache polling and gloo collectives.
+- **Group samples by the deepest model frame.** On V4.1 41% of forward-thread
+  time sat under one `replay_fn` (the eager break of a breakable prefill graph),
+  and its children were the q/kv projections, norms, RoPE, o-proj and
+  all-reduce — none of which needed to be eager (strategy P).
+
+**Decompose end-to-end per request before choosing.** e2e = TTFT +
+(out − 1) × per-token decode. At c16 V4.1 was 2.81 s = 0.43 + 127 × 18.6 ms
+while pure decode at the same batch was 7.9 ms/token: the gap was prefill steps
+interleaved with decode, not decode kernels. Probe single-request TTFT at sizes
+that straddle every graph bucket boundary (128…8192 new tokens, cold and with a
+cached prefix) — a flat floor (130 ms for 128 to 1024 tokens) is per-step host
+cost, a jump at a size is a capture bucket ending.
 
 ## 2. Turn the gap into a work list by subtraction
 
@@ -230,6 +262,33 @@ recompiles mid-serving and stalls 100+ ms. Constexpr only for values fixed at
 startup; batch-varying values go to runtime args or fixed buckets. Gate with a
 no-recompile sweep test and serve CI with the compile check set to error.
 
+**P. An eager break holds only the ops that read per-request metadata.**
+Breakable prefill graphs replay captured segments and re-run each break's
+Python. A break on the whole attention module re-runs the token-local work too.
+Split it: projections/norms/RoPE/indexer projections in the graph on the
+bucket's padded rows → a narrow break with cache writes, selection, attention →
+o-proj and all-reduce back in the graph. The split only matters at capture
+(replay never runs the dispatcher), so the eager path stays byte-identical; a
+mixed extend+decode batch replays the same graph, so check that the token-local
+part is identical across those modes. V4.1 H200 TP4 (b647604c): AgentX
+66.7/45.3/37.9 → 52.2/36.6/33.0 s at c8/16/32, short-prefill TTFT 130 → 70 ms,
+GPU busy 77 → 91%. Padded rows must be safe for every graphed op (positions
+zeroed, RoPE clamps negatives).
+
+**Q. Cover the batched prefill size with a captured bucket.** Above the largest
+prefill-graph bucket the whole forward runs eager (`graphs=0` in a per-step
+count of `cudaGraphLaunch`). The default cap was min(2048, chunk); an agent
+workload batches several 1-2k-token prompts per step, so many steps fell off the
+cliff (2083 tokens: 216 ms; with a 4096 cap: 91 ms). `--prefill-graph-max-tokens
+4096` took c32 from 33.0 to 27.5 s. 8192 OOMed during decoder capture on
+141 GB H200 (the reserve estimate undercounted) — size it to memory, and log
+the decision.
+
+**R. Re-profile after every fix; the bottleneck moves.** After P and Q the same
+trace said MoE 36% and all-reduce 21% with 10 ms idle per prefill step: the
+host problem was gone and the next work is GPU kernels. Doing kernel work first
+would have bought nothing, because the GPU was idle 40% of the step.
+
 ## 4. Laws that keep the measurement honest
 
 - **A parameter sweep is a diagnostic, never a deliverable.** If a flag changes
@@ -292,7 +351,11 @@ Order matters: numeric equivalence, then no perf regression, then win.
 8. **Accuracy gate on the served model** (GSM8K >= 0.90 on DeepSeek-class
    models, full set when the checkpoint changes) in addition to temperature-0
    token agreement against a reference engine. Lossy speedups (FP8 activations
-   for FP4 experts) ship opt-in, behind a flag, after this gate.
+   for FP4 experts) ship opt-in, behind a flag, after this gate. Measured:
+   V4.1 `--moe-mxfp4-fp8-activation` GSM8K 0.9287 vs 0.928 BF16; AgentX
+   49.0/33.5/27.5 → 43.3/32.8/27.7 s, bs16 TPOT 7.33 → 6.64 ms — a real win at
+   c8 and decode, noise at c16/c32 until repeated. Run the gate from the repo's
+   CI config (`test/ci/eval/*gsm8k*.yaml`) so the numbers compare to CI.
 9. **State what was not measured** in the write-up ("kernel microbenchmark
    only; end-to-end not measured"). An unmeasured claim is a follow-up, not a
    result.

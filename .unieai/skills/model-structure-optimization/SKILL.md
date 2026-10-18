@@ -108,10 +108,21 @@ workload before implementing it.
    max_num_seqs × window (13657d1d, `NarrowingPrefillModel`). Eager and graphed
    must be one composition so they cannot drift. Under attention-DP row counts
    are rank-local — keep it off there.
-3. **Separate graph memory pools** for draft and target; reserve graph pools
+3. **Keep each eager break to the ops that read per-request metadata.** A
+   `@break_point` on the whole attention module also re-runs its projections,
+   norms, RoPE, o-proj and the TP all-reduce from Python on every replay. On
+   V4.1 H200 TP4 that was ~3 ms of host time per layer and prefill steps ran
+   ~145 ms wall for ~45 ms of GPU work (b647604c splits it: graphed
+   projections → break holding cache writes, selection, attention → graphed
+   o-proj + all-reduce). Symptom in a trace: per-rank idle and all-reduce
+   wait trade off between ranks while their sum stays constant — the step is
+   bounded by the slowest rank's host. Confirm with py-spy on the forward
+   thread (`docker exec --privileged … py-spy record --threads -f raw`), not
+   the torch profiler, which records no Python ops on that thread.
+4. **Separate graph memory pools** for draft and target; reserve graph pools
    inside the KV budget; warm on the capture stream (fcbfd646, b121eb08).
-4. **Capture failure is fatal**, never a silent eager fallback.
-5. **No JIT on the serving path**: constexpr only for startup-fixed values; a
+5. **Capture failure is fatal**, never a silent eager fallback.
+6. **No JIT on the serving path**: constexpr only for startup-fixed values; a
    no-recompile sweep test per batch-shaped kernel.
 
 ## 4. Numerics rules for structural changes

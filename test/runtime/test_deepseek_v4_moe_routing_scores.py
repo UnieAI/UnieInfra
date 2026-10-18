@@ -104,9 +104,7 @@ def _record_need_scores(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
         empty = torch.zeros(1, dtype=torch.float32)
         return empty, empty.to(torch.int32), empty
 
-    monkeypatch.setattr(
-        model_module, "deepseek_v4_select_experts", fake_select_experts
-    )
+    monkeypatch.setattr(model_module, "deepseek_v4_select_experts", fake_select_experts)
     return calls
 
 

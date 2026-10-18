@@ -12,12 +12,12 @@ Run in-container on GPUs 6,7 (see the command in the accompanying notes).
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.triton import deepseek_v4 as kernel_ops
 
 from tokenspeed.runtime.layers.attention import deepseek_v4_ops as ops
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
     deepseek_v4_indexer_fp8_scale_bytes,
 )
-from tokenspeed_kernel.ops.attention.triton import deepseek_v4 as kernel_ops
 
 HEAD = kernel_ops.DEEPSEEK_V4_INDEXER_DIM
 ROPE = kernel_ops.DEEPSEEK_V4_ROPE_DIM
@@ -75,7 +75,9 @@ def build(
         # The live window dump shows every row reading the same state slot.
         compressor_slot = torch.full((m,), 7, device=dev, dtype=torch.int32)
     else:
-        compressor_slot = (torch.arange(m, device=dev, dtype=torch.int32) + 5).contiguous()
+        compressor_slot = (
+            torch.arange(m, device=dev, dtype=torch.int32) + 5
+        ).contiguous()
     if dup_slots:
         # The engine's verifier logs valid_slots=[64..127] with only 58 distinct
         # slots for 2048 valid rows: many rows target the SAME kv slot.  The
@@ -86,7 +88,9 @@ def build(
             torch.arange(m, device=dev, dtype=torch.int32) % dup_slots + KV_BLOCK
         ).contiguous()
     else:
-        kv_slot = (torch.arange(m, device=dev, dtype=torch.int32) + KV_BLOCK).contiguous()
+        kv_slot = (
+            torch.arange(m, device=dev, dtype=torch.int32) + KV_BLOCK
+        ).contiguous()
     rms_weight = torch.rand(HEAD, device=dev) + 0.5
     # A real RoPE table, not noise: the live divergence is in the rotation.
     half = ROPE // 2
@@ -102,7 +106,9 @@ def build(
         )
         kv_cache = kv_arena[:, :kv_width]
     else:
-        kv_cache = torch.full((n_blocks, kv_width), SENTINEL, dtype=torch.uint8, device=dev)
+        kv_cache = torch.full(
+            (n_blocks, kv_width), SENTINEL, dtype=torch.uint8, device=dev
+        )
     return {
         "state": state,
         "block_table": block_table,
@@ -304,7 +310,9 @@ def check_determinism(label, reps=6, **kw):
 
     ref = eager_write(inp, rot, valid, num)
     e_bad = sum(
-        1 for _ in range(reps) if not torch.equal(eager_write(inp, rot, valid, num), ref)
+        1
+        for _ in range(reps)
+        if not torch.equal(eager_write(inp, rot, valid, num), ref)
     )
     print(f"  eager: {e_bad}/{reps} repeats differ from the first")
 

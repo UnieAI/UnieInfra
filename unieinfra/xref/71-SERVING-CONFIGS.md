@@ -10,7 +10,7 @@ that is load-bearing for one is a no-op or a regression for the other. The
 engine has **no per-model default layer at the `ServerArgs` level** — measured
 2026-08-28, the resolved args for gemma-4-31B and Qwen3.5-27B differ only in
 `model`, `tokenizer`, `port`, `rl_control_port` and `seed`. Everything else,
-including `chunked_prefill_size`, `admission_reserve` and `block_size`, is
+including `chunked_prefill_size`, `max_num_seqs` and `block_size`, is
 identical for a 60-layer SWA dense model and a 64-layer GDN hybrid.
 
 ---
@@ -194,7 +194,7 @@ restates the default and reads as tuning that is not happening).
 | dtype / KV dtype | `auto` / `auto` (bf16) | `torch.bfloat16` / `auto` |
 | quantization | `None` | none |
 | scheduler block size | `block_size=64` (gemma) — the cache recipe derives P=64 for gemma, P=128 for Qwen | — |
-| admission | `admission_reserve='generation-full'` | — |
+| admission | `admission_reserve='generation-full'` before the 2026-10-18 upstream merge; the merged scheduler reserves per cache group from each request's own demand and the flag no longer exists (see `72-PARITY-STRATEGY.md` §2) | — |
 | recurrent checkpoints | `state_checkpoint_stride_blocks=0` (derive; `_MAX_STATE_CHECKPOINTS=2`) | — |
 | host KV tier | `kvstore_ratio=2.0` | — |
 | CUDA graph | `max_cudagraph_capture_size=160`, `enforce_eager=False` | default |

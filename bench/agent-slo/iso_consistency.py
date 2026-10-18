@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Isolated self-consistency: call ONE prompt K times, nothing else in flight."""
+
 from __future__ import annotations
 
 import collections
@@ -41,7 +42,8 @@ def main():
     tokens = json.load(open("engine_input.json"))
     tok = AutoTokenizer.from_pretrained(
         "/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
-        use_fast=True, local_files_only=True,
+        use_fast=True,
+        local_files_only=True,
     )
     ch = grpc.insecure_channel(HOST)
     stub = pbg.TokenSpeedSchedulerStub(ch)
@@ -66,9 +68,13 @@ def main():
         for b in range(a + 1, len(keys)):
             if keys[a] == keys[b]:
                 continue
-            d = next((i for i, (x, y) in enumerate(zip(keys[a], keys[b])) if x != y),
-                     min(len(keys[a]), len(keys[b])))
-            print(f"  diff rep{a} vs rep{b} at pos {d}  a={list(keys[a][max(0,d-2):d+3])} b={list(keys[b][max(0,d-2):d+3])}")
+            d = next(
+                (i for i, (x, y) in enumerate(zip(keys[a], keys[b])) if x != y),
+                min(len(keys[a]), len(keys[b])),
+            )
+            print(
+                f"  diff rep{a} vs rep{b} at pos {d}  a={list(keys[a][max(0,d-2):d+3])} b={list(keys[b][max(0,d-2):d+3])}"
+            )
 
 
 if __name__ == "__main__":

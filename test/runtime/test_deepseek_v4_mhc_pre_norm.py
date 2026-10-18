@@ -44,10 +44,10 @@ What this test pins, and why each half matters:
 
 from __future__ import annotations
 
+from test.runtime.conftest import requires_cuda
+
 import pytest
 import torch
-
-from test.runtime.conftest import requires_cuda
 
 from tokenspeed.runtime.layers import deepseek_v4_mhc as mhc
 

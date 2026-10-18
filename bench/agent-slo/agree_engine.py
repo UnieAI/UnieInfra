@@ -9,6 +9,7 @@ Usage (inside roy-h200g):
     python3 agree_engine.py <engine_input.json> <out.json> [max_new_tokens]
 where engine_input.json is a JSON list of token-id lists.
 """
+
 from __future__ import annotations
 
 import json

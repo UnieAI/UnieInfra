@@ -39,11 +39,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.triton import deepseek_v4 as kernel_ops
+
 from tokenspeed.runtime.layers.attention import deepseek_v4_ops as ops
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
     deepseek_v4_indexer_fp8_scale_bytes,
 )
-from tokenspeed_kernel.ops.attention.triton import deepseek_v4 as kernel_ops
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
@@ -204,9 +205,7 @@ def test_fused_matches_eager_on_written_rows(m):
         ev, es = _row_view(eager, slot)
         fv, fs = _row_view(fused, slot)
         assert torch.equal(es, fs), f"slot {slot}: quant scale bytes differ"
-        _assert_value_bytes_equivalent(
-            ev.view(torch.uint8), fv.view(torch.uint8), slot
-        )
+        _assert_value_bytes_equivalent(ev.view(torch.uint8), fv.view(torch.uint8), slot)
 
 
 def _fp8_step(magnitude: torch.Tensor) -> torch.Tensor:
@@ -330,9 +329,9 @@ def test_shipped_entry_point_matches_the_oracle():
     for slot in slots.tolist():
         ref_val, ref_scale = _row_view(reference, slot)
         ship_val, ship_scale = _row_view(shipped, slot)
-        assert torch.equal(ref_scale, ship_scale), (
-            f"slot {slot}: the shipped arm chose a different quant divisor"
-        )
+        assert torch.equal(
+            ref_scale, ship_scale
+        ), f"slot {slot}: the shipped arm chose a different quant divisor"
         _assert_value_bytes_equivalent(
             ref_val.view(torch.uint8), ship_val.view(torch.uint8), slot
         )
@@ -354,7 +353,9 @@ def test_decode_shaped_batch_has_no_aliased_slots():
         assert kv_slot.unique().numel() == batch
 
 
-def _replay_eager_write_under_capture(cache, index_k, slots, valid, block_size=KV_BLOCK):
+def _replay_eager_write_under_capture(
+    cache, index_k, slots, valid, block_size=KV_BLOCK
+):
     """Run the shipped eager write inside a real CUDA graph, then replay it.
 
     The eager write only redirects invalid rows to slot 0 when the stream is
@@ -414,9 +415,9 @@ def test_capturable_eager_write_leaves_the_dummy_slot_alone():
     _replay_eager_write_under_capture(cache, index_k, slots, valid)
 
     val, scale = _row_view(cache, 0)
-    assert torch.equal(val, torch.full_like(val, 0x11)), (
-        "slot 0 was overwritten by rows that were masked out of this step"
-    )
+    assert torch.equal(
+        val, torch.full_like(val, 0x11)
+    ), "slot 0 was overwritten by rows that were masked out of this step"
     assert torch.equal(scale, torch.full_like(scale, 0x22))
 
     # The one eligible row must still have landed.

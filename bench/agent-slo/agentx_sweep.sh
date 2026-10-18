@@ -52,8 +52,16 @@ case "$KIND" in
       --disable-kvstore \
       --gpu-memory-utilization 0.87 --max-num-seqs 80 --max-model-len 32768 \
       --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
-      --admission-reserve generation-full --block-size 64 \
+      --block-size 64 \
       --prefill-graph-max-tokens 8192)
+    # No --admission-reserve here. Upstream (merged 2026-10-18) deleted that
+    # flag: it was a knob over a quantity the admission code computed wrongly.
+    # The merged scheduler reserves per cache group from each request's own
+    # demand (ReservePrefillDemands in
+    # tokenspeed-scheduler/csrc/scheduler/operations/forward.cpp), so there is
+    # no global mode to select. Passing the old flag fails to boot
+    # ("unrecognized arguments"); the audit for it lives in
+    # unieinfra/xref/72-PARITY-STRATEGY.md §2 instead of an A/B.
     # Do NOT pass --prefill-graph-capture-sizes here. That flag replaces the
     # prefill token-bucket ladder with an explicit list, and a single entry
     # (e.g. "8192") collapses it to one rung -- so every prefill step replays

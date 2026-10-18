@@ -11,7 +11,9 @@ import sys
 
 import torch
 
-DUMP = sys.argv[1] if len(sys.argv) > 1 else "/workspace/roy/logs/live_indexer_inputs.pt"
+DUMP = (
+    sys.argv[1] if len(sys.argv) > 1 else "/workspace/roy/logs/live_indexer_inputs.pt"
+)
 d = torch.load(DUMP, map_location="cuda:0", weights_only=False)
 head = int(d["rms_norm_weight"].numel())
 ratio = int(d["compress_ratio"])
@@ -24,14 +26,23 @@ slots = kslt[:n][valid]
 
 print("valid rows:", int(valid.sum().item()))
 print(
-    "target slots: distinct =", int(slots.unique().numel()),
-    " min =", int(slots.min()), " max =", int(slots.max()),
+    "target slots: distinct =",
+    int(slots.unique().numel()),
+    " min =",
+    int(slots.min()),
+    " max =",
+    int(slots.max()),
 )
 u, c = slots.unique(return_counts=True)
 print(
-    "claimants per slot: max =", int(c.max()),
-    " mean =", round(float(c.float().mean()), 2),
-    " slots with >1 claimant =", int((c > 1).sum()), " of", int(u.numel()),
+    "claimants per slot: max =",
+    int(c.max()),
+    " mean =",
+    round(float(c.float().mean()), 2),
+    " slots with >1 claimant =",
+    int((c > 1).sum()),
+    " of",
+    int(u.numel()),
 )
 print("first slots (target, claimants):", list(zip(u.tolist(), c.tolist()))[:8])
 print("last  slots (target, claimants):", list(zip(u.tolist(), c.tolist()))[-4:])

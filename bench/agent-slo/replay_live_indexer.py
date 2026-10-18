@@ -45,12 +45,18 @@ def main(path):
     num_actual = min(cslot.numel(), positions.numel())
 
     print("=== captured step ===")
-    print(f"  state_cache      {tuple(d['state_cache'].shape)} stride {d['state_cache'].stride()}")
+    print(
+        f"  state_cache      {tuple(d['state_cache'].shape)} stride {d['state_cache'].stride()}"
+    )
     print(f"  block_table      {tuple(d['block_table'].shape)}")
     base = d["block_table_base_offsets"]
     print(f"  base_offsets     {None if base is None else tuple(base.shape)}")
-    print(f"  positions        {positions.numel()}  range=[{int(positions.min())},{int(positions.max())}]")
-    print(f"  token_to_req     distinct={int(t2r.unique().numel())}  head={t2r[:8].tolist()}")
+    print(
+        f"  positions        {positions.numel()}  range=[{int(positions.min())},{int(positions.max())}]"
+    )
+    print(
+        f"  token_to_req     distinct={int(t2r.unique().numel())}  head={t2r[:8].tolist()}"
+    )
     print(
         f"  compressor_slot  distinct={int(cslot.unique().numel())} of {cslot.numel()}"
         f"  head={cslot[:8].tolist()}"
@@ -59,7 +65,9 @@ def main(path):
         f"  kv_slot          distinct={int(kslt.unique().numel())} of {kslt.numel()}"
         f"  head={kslt[:8].tolist()}"
     )
-    print(f"  compress_ratio={ratio} state_block={state_block} kv_block={block_size} head={head}")
+    print(
+        f"  compress_ratio={ratio} state_block={state_block} kv_block={block_size} head={head}"
+    )
 
     # Re-derive the eager chain and confirm it is reproducible from the dump.
     normed, valid = ops._compress_v4_state_windows_capturable(
@@ -80,7 +88,9 @@ def main(path):
         torch.div(positions[:num_actual].to(torch.int64), ratio, rounding_mode="floor")
         * ratio
     )
-    rot = ops._apply_gptj_rope_tail_rows(normed, cpos, d["cos_sin_cache"], int(d["cos_sin_cache"].shape[-1]))
+    rot = ops._apply_gptj_rope_tail_rows(
+        normed, cpos, d["cos_sin_cache"], int(d["cos_sin_cache"].shape[-1])
+    )
     rot = ops._deepseek_v4_hadamard_rotate(rot).float()
 
     same_rot = torch.equal(rot, d["rotated"])
@@ -147,4 +157,8 @@ def main(path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "/workspace/roy/logs/live_indexer_inputs.pt")
+    main(
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "/workspace/roy/logs/live_indexer_inputs.pt"
+    )

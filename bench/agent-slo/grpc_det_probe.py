@@ -18,9 +18,9 @@ import sys
 import uuid
 
 sys.path.insert(0, "/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/inference")
+import grpc  # noqa: E402
 import smg_grpc_proto.generated.tokenspeed_scheduler_pb2 as pb  # noqa: E402
 import smg_grpc_proto.generated.tokenspeed_scheduler_pb2_grpc as pbg  # noqa: E402
-import grpc  # noqa: E402
 
 HOST = os.environ.get("DET_HOST", "127.0.0.1:37189")
 PROMPT_IDX = int(os.environ.get("DET_PROMPT_IDX", "5"))
@@ -95,9 +95,7 @@ def main():
         key = tuple(o[:6])
         opens.setdefault(key, []).append(i)
     print(f"distinct opens: {len(opens)}")
-    self_eq = all(
-        tuple(o[:8]) == tuple(all_out[0][:8]) for o in all_out[1:]
-    )
+    self_eq = all(tuple(o[:8]) == tuple(all_out[0][:8]) for o in all_out[1:])
     print(f"self-eq (first8 all same): {self_eq}")
 
 

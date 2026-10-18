@@ -232,9 +232,7 @@ if platform.is_nvidia:
         )
         swiglu_alpha = getattr(w, "swiglu_alpha_t", None)
         activation_type = (
-            ActivationType.Swiglu
-            if swiglu_alpha is None
-            else ActivationType.SwigluBias
+            ActivationType.Swiglu if swiglu_alpha is None else ActivationType.SwigluBias
         )
         return cutlass_fused_moe(
             output=output,

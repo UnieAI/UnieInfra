@@ -23,8 +23,8 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from tokenspeed.runtime.execution import cuda_graph_wrapper  # noqa: E402
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (  # noqa: E402
+from tokenspeed.runtime.execution import forward_step  # noqa: E402
+from tokenspeed.runtime.execution.forward_step import (  # noqa: E402
     get_batch_sizes_to_capture,
 )
 
@@ -55,14 +55,14 @@ def test_default_ladder_has_no_wide_gap_at_the_top():
 
 
 def test_cap_below_max_num_seqs_truncates_the_ladder():
-    with mock.patch.object(cuda_graph_wrapper, "logger"):
+    with mock.patch.object(forward_step, "logger"):
         bs = get_batch_sizes_to_capture(_config(max_cudagraph_capture_size=40))
     assert max(bs) == 40
     assert 41 not in bs
 
 
 def test_cap_below_max_num_seqs_warns_with_both_numbers():
-    with mock.patch.object(cuda_graph_wrapper, "logger") as log:
+    with mock.patch.object(forward_step, "logger") as log:
         get_batch_sizes_to_capture(_config(max_cudagraph_capture_size=40))
     assert log.warning.call_count == 1
     assert "EAGER" in log.warning.call_args[0][0]
@@ -73,14 +73,14 @@ def test_cap_below_max_num_seqs_warns_with_both_numbers():
 
 @pytest.mark.parametrize("cap", [80, 160])
 def test_cap_covering_max_num_seqs_does_not_warn(cap):
-    with mock.patch.object(cuda_graph_wrapper, "logger") as log:
+    with mock.patch.object(forward_step, "logger") as log:
         bs = get_batch_sizes_to_capture(_config(max_cudagraph_capture_size=cap))
     assert log.warning.call_count == 0
     assert max(bs) == 80
 
 
 def test_explicit_capture_sizes_are_truncated_by_the_cap():
-    with mock.patch.object(cuda_graph_wrapper, "logger"):
+    with mock.patch.object(forward_step, "logger"):
         bs = get_batch_sizes_to_capture(
             _config(
                 cudagraph_capture_sizes=[8, 64, 128],

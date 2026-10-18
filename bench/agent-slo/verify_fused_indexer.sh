@@ -41,7 +41,7 @@ docker run -d --name "$NAME" --gpus '"device=6,7"' --shm-size 32g \
     --reasoning-parser deepseek_v31 --disable-kvstore \
     --gpu-memory-utilization 0.87 --max-num-seqs 80 --max-model-len 32768 \
     --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
-    --admission-reserve generation-full --block-size 64 \
+    --block-size 64 \
     --prefill-graph-max-tokens 8192" >/dev/null || true
 
 docker logs -f "$NAME" >>"$LOG" 2>&1 &

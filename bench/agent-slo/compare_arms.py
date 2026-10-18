@@ -9,6 +9,7 @@ either way.
 Usage:
     compare_arms.py <baseline.json> <candidate.json>
 """
+
 from __future__ import annotations
 
 import json
@@ -68,7 +69,15 @@ def main():
         if b.get("text") == c.get("text"):
             agree += 1
         elif len(mismatches) < 5:
-            mismatches.append((i, b["ntok"], c["ntok"], b.get("text", "")[:60], c.get("text", "")[:60]))
+            mismatches.append(
+                (
+                    i,
+                    b["ntok"],
+                    c["ntok"],
+                    b.get("text", "")[:60],
+                    c.get("text", "")[:60],
+                )
+            )
 
     n = len(b_rows)
     sb = summary(base)
@@ -89,8 +98,16 @@ def main():
     hdr = f"{'metric':<16}{'baseline':>14}{'fused':>14}{'ratio':>9}"
     print(hdr)
     print("-" * len(hdr))
-    for key in ("total tokens", "tot_tps", "tps_per_req", "ttft_p50", "ttft_p90",
-                "ttft_p95", "ttft_p99", "tpot_p50_ms"):
+    for key in (
+        "total tokens",
+        "tot_tps",
+        "tps_per_req",
+        "ttft_p50",
+        "ttft_p90",
+        "ttft_p95",
+        "ttft_p99",
+        "tpot_p50_ms",
+    ):
         k = "ntok" if key == "total tokens" else key
         bv, cv = sb[k], sc[k]
         ratio = cv / bv if bv else float("nan")

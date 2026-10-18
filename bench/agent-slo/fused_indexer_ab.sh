@@ -69,7 +69,7 @@ for CONC in $(echo "$CONCS" | tr ',' ' '); do
         --disable-kvstore \
         --gpu-memory-utilization 0.87 --max-num-seqs 80 --max-model-len 32768 \
         --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
-        --admission-reserve generation-full --block-size 64 \
+        --block-size 64 \
         --prefill-graph-max-tokens 8192" >/dev/null
 
     # `docker run -d` prints only the container id on its own stdout; the

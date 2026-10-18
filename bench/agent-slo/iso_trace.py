@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated self-consistency that ROTATES the engine qkv trace per rep so each
 rep gets a clean per-rank file, plus records per-rep token output."""
+
 from __future__ import annotations
 
 import json
@@ -53,7 +54,8 @@ def main():
     tokens = json.load(open("engine_input.json"))
     tok = AutoTokenizer.from_pretrained(
         "/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
-        use_fast=True, local_files_only=True,
+        use_fast=True,
+        local_files_only=True,
     )
     rotate("pre")  # stash any leftover from prior manual runs
     ch = grpc.insecure_channel(HOST)
@@ -76,7 +78,10 @@ def main():
             flush=True,
         )
     uniq = {tuple(o): tok.decode(o, skip_special_tokens=True) for o in allouts}
-    print(f"idx={idx} n_in={len(tokens[idx])} reps={reps} distinct={len(uniq)}", flush=True)
+    print(
+        f"idx={idx} n_in={len(tokens[idx])} reps={reps} distinct={len(uniq)}",
+        flush=True,
+    )
     for u in uniq:
         print(f"   uniq: gen={len(u)} head={uniq[u][:60]!r}", flush=True)
     with open("iso_trace_out.json", "w") as f:
@@ -86,8 +91,10 @@ def main():
         for b in range(a + 1, len(keys)):
             if keys[a] == keys[b]:
                 continue
-            d = next((i for i, (x, y) in enumerate(zip(keys[a], keys[b])) if x != y),
-                     min(len(keys[a]), len(keys[b])))
+            d = next(
+                (i for i, (x, y) in enumerate(zip(keys[a], keys[b])) if x != y),
+                min(len(keys[a]), len(keys[b])),
+            )
             print(
                 f"  diff rep{a} vs rep{b} at pos {d}  "
                 f"a={list(keys[a][max(0, d - 2):d + 3])} b={list(keys[b][max(0, d - 2):d + 3])}",

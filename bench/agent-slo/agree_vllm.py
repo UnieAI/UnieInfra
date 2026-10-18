@@ -11,6 +11,7 @@ byte-identical inputs; only the greedy continuation is compared.
 Usage (inside vllm-dsv4):
     python3 agree_vllm.py <prompts.json> <out.json> [max_new_tokens]
 """
+
 from __future__ import annotations
 
 import json
@@ -24,7 +25,8 @@ MAX_NEW = int(sys.argv[3]) if len(sys.argv) > 3 else 128
 
 def post(url, body):
     req = urllib.request.Request(
-        url, data=json.dumps(body).encode(),
+        url,
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=900) as r:
@@ -40,10 +42,15 @@ def tokenize(prompt):
 
 
 def complete(prompt):
-    j = post(COMP, {
-        "model": "dsv4", "prompt": prompt, "max_tokens": MAX_NEW,
-        "temperature": 0,
-    })
+    j = post(
+        COMP,
+        {
+            "model": "dsv4",
+            "prompt": prompt,
+            "max_tokens": MAX_NEW,
+            "temperature": 0,
+        },
+    )
     ch = j["choices"][0]
     return ch["text"], j.get("usage", {}).get("prompt_tokens"), ch.get("finish_reason")
 

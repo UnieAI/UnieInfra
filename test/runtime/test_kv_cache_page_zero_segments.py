@@ -197,12 +197,23 @@ class CachePlanAccessorTest(unittest.TestCase):
     def test_accessors_return_what_a_linear_scan_returned(self):
         plan = _build_plan(self.plan_module)
         for field in plan.fields:
-            self.assertIs(plan.field(field.field_id), _linear_scan(plan.fields, "field_id", field.field_id))
-            self.assertIs(plan.group(field.group_id), _linear_scan(plan.groups, "group_id", field.group_id))
-            self.assertIs(plan.plane(field.plane_id), _linear_scan(plan.planes, "plane_id", field.plane_id))
+            self.assertIs(
+                plan.field(field.field_id),
+                _linear_scan(plan.fields, "field_id", field.field_id),
+            )
+            self.assertIs(
+                plan.group(field.group_id),
+                _linear_scan(plan.groups, "group_id", field.group_id),
+            )
+            self.assertIs(
+                plan.plane(field.plane_id),
+                _linear_scan(plan.planes, "plane_id", field.plane_id),
+            )
 
     def test_accessor_keeps_the_first_of_duplicate_ids(self):
-        plan = _build_plan(self.plan_module, groups=("g",), planes=1, fields_per_group=3)
+        plan = _build_plan(
+            self.plan_module, groups=("g",), planes=1, fields_per_group=3
+        )
         duplicate = self.plan_module.CacheFieldLayout(
             group_id="g",
             field_id="g.layer.0",  # same id as the first field
@@ -224,7 +235,9 @@ class CachePlanAccessorTest(unittest.TestCase):
         self.assertIsNot(plan.field("g.layer.0"), duplicate)
 
     def test_unknown_ids_still_raise_keyerror(self):
-        plan = _build_plan(self.plan_module, groups=("g",), planes=1, fields_per_group=2)
+        plan = _build_plan(
+            self.plan_module, groups=("g",), planes=1, fields_per_group=2
+        )
         with self.assertRaises(KeyError):
             plan.field("nope")
         with self.assertRaises(KeyError):
@@ -233,7 +246,9 @@ class CachePlanAccessorTest(unittest.TestCase):
             plan.plane("nope")
 
     def test_payload_bytes_is_unchanged_by_caching(self):
-        plan = _build_plan(self.plan_module, groups=("g",), planes=1, fields_per_group=4)
+        plan = _build_plan(
+            self.plan_module, groups=("g",), planes=1, fields_per_group=4
+        )
         for field in plan.fields:
             expected = field.shape[0] * field.shape[1] * field.element_size
             self.assertEqual(field.payload_bytes, expected)
@@ -281,13 +296,17 @@ class BlockByteSegmentTest(unittest.TestCase):
 
     def test_segments_cover_disjoint_blocks_without_overlap(self):
         """Distinct blocks of one field must not alias once the affine form is used."""
-        plan = _build_plan(self.plan_module, groups=("g",), planes=1, fields_per_group=1)
+        plan = _build_plan(
+            self.plan_module, groups=("g",), planes=1, fields_per_group=1
+        )
         pool = _pool_stub(self.pool_base, plan)
         segments = dict(self._segments(pool, "g", [0, 1, 2, 3]))
         self.assertEqual(len(segments), 4)
 
     def test_out_of_range_block_raises_indexerror(self):
-        plan = _build_plan(self.plan_module, groups=("g",), planes=1, fields_per_group=2, page_count=4)
+        plan = _build_plan(
+            self.plan_module, groups=("g",), planes=1, fields_per_group=2, page_count=4
+        )
         pool = _pool_stub(self.pool_base, plan)
         for bad in (-1, 4, 99):
             with self.assertRaises(IndexError):
@@ -307,12 +326,16 @@ class BlockByteSegmentTest(unittest.TestCase):
         self.assertEqual(self._segments(pool, "empty", []), [])
 
     def test_empty_block_list_yields_no_segments(self):
-        plan = _build_plan(self.plan_module, groups=("g",), planes=1, fields_per_group=2)
+        plan = _build_plan(
+            self.plan_module, groups=("g",), planes=1, fields_per_group=2
+        )
         pool = _pool_stub(self.pool_base, plan)
         self.assertEqual(self._segments(pool, "g", []), [])
 
     def test_unknown_group_raises_keyerror(self):
-        plan = _build_plan(self.plan_module, groups=("g",), planes=1, fields_per_group=2)
+        plan = _build_plan(
+            self.plan_module, groups=("g",), planes=1, fields_per_group=2
+        )
         pool = _pool_stub(self.pool_base, plan)
         with self.assertRaises(KeyError):
             self._segments(pool, "nope", [0])

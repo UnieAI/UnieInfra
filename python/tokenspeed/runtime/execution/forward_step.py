@@ -109,6 +109,17 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(config: ModelExecutorConfig):
+    """Decide which decode batch sizes get a captured CUDA graph.
+
+    Args:
+        config: Executor config; ``cudagraph_capture_sizes`` overrides the
+            ladder, ``max_num_seqs`` and ``data_parallel_size`` bound it, and
+            ``max_cudagraph_capture_size`` truncates it.
+
+    Returns:
+        Ascending batch sizes to capture. The largest entry is the widest
+        decode step that can still use a graph; anything wider runs eagerly.
+    """
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -123,6 +134,22 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
 
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
     capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
+    # A cap below max_num_seqs is a silent cliff, not a memory saving: decode
+    # steps wider than effective_max drop to the eager path, and nothing else
+    # in the engine reports it. It cost 2.08x total tok/s at AgentX c64 (262
+    # vs 547) and quadrupled TPOT (229 ms vs 82 ms) while looking like a
+    # memory knob. Say so rather than let it hide.
+    if effective_max < max_bs:
+        logger.warning(
+            "Decode CUDA graphs cover batch sizes up to %d but max_num_seqs is "
+            "%d, so every decode step wider than %d runs EAGER -- a silent "
+            "throughput cliff under load. Raise max_cudagraph_capture_size to "
+            "at least %d to close it, or set it this low deliberately.",
+            effective_max,
+            max_bs,
+            effective_max,
+            max_bs,
+        )
     return capture_bs
 
 

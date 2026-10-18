@@ -181,7 +181,14 @@ charge 到完成讓搶佔在結構上不必發生，於是沒有重算成本、�
 實作在 `SchedulerConfig::reserve_full_prefill_at_admission` /
 `reserve_generation_at_admission` / `new_token_ratio_*`，由 server arg
 `--admission-reserve {chunk,prompt,generation-adaptive,generation-full}` 選擇，
-預設 `generation-full`。C++ 測試 `AdmissionChunkSuite` 與
+預設 `generation-full`。
+
+> 2026-10-18 併入 upstream/main 後，這一節描述的是**合併前**的介面：
+> upstream 刪掉了 `--admission-reserve`（`server_args.py` 0 命中），改成
+> `ReservePrefillDemands(demands, config_.cache_groups, reserve)` 依每個請求自己
+> 的需求逐 cache group 保留（`tokenspeed-scheduler/csrc/scheduler/operations/forward.cpp`）。
+> 三種模式不再是可選的旗標，而是路徑唯一。A/B 的對象因此從旗標變成
+> 「保留量算對了嗎」，見 `72-PARITY-STRATEGY.md` §2 的稽核表。C++ 測試 `AdmissionChunkSuite` 與
 `AdmissionGenerationFullSuite` 釘住「同一組請求、同一個池子，chunk 收 3 個、
 generation-full 收 1 個」。
 

@@ -1037,7 +1037,7 @@ _FINISH_TOPK_RUNTIME = ["S0", "I0", "C0", "C1", "O0", "WIDTH", "K"]
 @triton.jit(
     do_not_specialize=_FINISH_TOPK_RUNTIME,
     do_not_specialize_on_alignment=_FINISH_TOPK_RUNTIME
-    + ["Scores", "Ids", "Cands", "Out", "Lens"],
+    + ["Scores", "Ids", "Cands", "Out", "Lens", "Zeros"],
 )
 def _finish_topk_kernel(
     Scores,
@@ -1045,6 +1045,7 @@ def _finish_topk_kernel(
     Cands,
     Out,
     Lens,
+    Zeros,
     S0,
     I0,
     C0,
@@ -1054,9 +1055,14 @@ def _finish_topk_kernel(
     K,
     BLOCK_SIZE: tl.constexpr,
     HAS_CANDIDATES: tl.constexpr,
+    HAS_ZEROS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
+    if HAS_ZEROS:
+        # An empty candidate pool's lengths, written here instead of by a
+        # separate fill launch.
+        tl.store(Zeros + row, 0)
     i = tl.arange(0, BLOCK)
     taken = i < WIDTH
     score = tl.load(Scores + row * S0 + i, taken, other=-float("inf"))
@@ -1087,23 +1093,30 @@ def _finish_topk_block(width: int) -> int:
     return max(512, triton.next_power_of_2(max(1, width)))
 
 
-def _finish_topk(scores, ids, output, lengths, candidates=None):
+def _finish_topk(scores, ids, output, lengths, candidates=None, zeros=None):
     """Pack the selected ids into a sorted, -1 padded prefix and count them.
 
     ``scores``/``ids`` are one selector's unsorted picks; entries scoring -inf
     are padding. ``output`` is at least as wide as the picks, so one sorted
     pass covers it. With ``candidates``, ``ids`` index the compacted candidate
     pool and are resolved to row ids here rather than by the caller.
+    ``zeros``, a contiguous int32 ``[rows]`` tensor, is optionally zero-filled
+    in the same launch (a pass's empty candidate-pool lengths).
     """
     rows, width = scores.shape
     if rows == 0:
         return
+    if zeros is not None and (
+        zeros.shape != (rows,) or zeros.dtype != torch.int32 or zeros.stride(0) != 1
+    ):
+        raise ValueError("zeros must be a contiguous int32 [rows] tensor")
     _finish_topk_kernel[(rows,)](
         scores,
         ids,
         candidates if candidates is not None else ids,
         output,
         lengths,
+        zeros if zeros is not None else lengths,
         scores.stride(0),
         ids.stride(0),
         *(candidates.stride() if candidates is not None else (0, 0)),
@@ -1112,6 +1125,7 @@ def _finish_topk(scores, ids, output, lengths, candidates=None):
         output.shape[1],
         BLOCK_SIZE=8,
         HAS_CANDIDATES=candidates is not None,
+        HAS_ZEROS=zeros is not None,
         BLOCK=_finish_topk_block(output.shape[1]),
         num_warps=8,
     )
@@ -2199,12 +2213,26 @@ def pack_index_queries(values):
     return data, scales
 
 
+# Tables and lengths arrive as per-tile views at batch-dependent offsets.
 @triton.jit(
     do_not_specialize=["T0", "T1", "L0", "TC", "NP", "CAP"],
-    do_not_specialize_on_alignment=["T0", "T1", "L0", "TC", "NP", "CAP"],
+    do_not_specialize_on_alignment=["T", "L", "T0", "T1", "L0", "TC", "NP", "CAP"],
 )
 def _safe_metadata(
-    T, L, OT, OL, T0, T1, L0, TC, NP, CAP, P: tl.constexpr, B: tl.constexpr
+    T,
+    L,
+    OT,
+    OL,
+    OC,
+    T0,
+    T1,
+    L0,
+    TC,
+    NP,
+    CAP,
+    P: tl.constexpr,
+    B: tl.constexpr,
+    HAS_CONTEXT: tl.constexpr,
 ):
     row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
     column = tile * B + tl.arange(0, B)
@@ -2216,17 +2244,33 @@ def _safe_metadata(
             tl.maximum(tl.load(L + row * L0), 0), tl.minimum(CAP, TC * P)
         )
         tl.store(OL + row, length.to(tl.int32))
+        if HAS_CONTEXT:
+            tl.store(OC + row, tl.maximum(length, 1).to(tl.int32))
 
 
-def safe_metadata(table, lengths, pages, capacity, page_size):
+def safe_metadata(table, lengths, pages, capacity, page_size, context=None):
+    """Sanitize a page table and clamp lengths for kernels without bound checks.
+
+    Returns an int32 copy of ``table`` with invalid pages replaced by page 0 and
+    int32 lengths clamped to ``[0, min(capacity, table columns * page_size)]``.
+    ``context``, an optional contiguous int32 ``[rows]`` output, additionally
+    receives those lengths raised to at least 1 in the same launch.
+    """
     safe_table = torch.empty(table.shape, dtype=torch.int32, device=table.device)
     safe_lengths = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
+    if context is not None and (
+        context.shape != lengths.shape
+        or context.dtype != torch.int32
+        or not context.is_contiguous()
+    ):
+        raise ValueError("context must be a contiguous int32 tensor like lengths")
     if lengths.numel():
         _safe_metadata[(table.shape[0], triton.cdiv(table.shape[1], 256))](
             table,
             lengths,
             safe_table,
             safe_lengths,
+            context if context is not None else safe_lengths,
             table.stride(0),
             table.stride(1),
             lengths.stride(0),
@@ -2235,6 +2279,7 @@ def safe_metadata(table, lengths, pages, capacity, page_size):
             capacity,
             page_size,
             256,
+            context is not None,
             num_warps=4,
         )
     return safe_table, safe_lengths
@@ -2351,39 +2396,149 @@ def gather_index_cache(cache, slots, page_size):
     return data, scales
 
 
+_GATHER_INDEX_FP8_RUNTIME = ["C0", "T1", "NP", "CAP"]
+
+
 @triton.jit(
-    do_not_specialize=["L0", "N", "CAP"],
-    do_not_specialize_on_alignment=["L0", "N", "CAP"],
+    do_not_specialize=_GATHER_INDEX_FP8_RUNTIME,
+    do_not_specialize_on_alignment=_GATHER_INDEX_FP8_RUNTIME
+    + ["Cache", "Table", "Values", "Scales"],
 )
-def _dense_ranges(L, START, END, L0, N, CAP, B: tl.constexpr):
+def _gather_index_fp8_kernel(
+    Cache,
+    Table,
+    Values,
+    Scales,
+    C0,
+    T1,
+    NP,
+    CAP,
+    P: tl.constexpr,
+    D: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    inside = row < CAP
+    page = tl.load(Table + (row // P) * T1, inside, other=-1).to(tl.int64)
+    live = inside & (page >= 0) & (page < NP)
+    base = page * C0
+    offset = row % P
+    d = tl.arange(0, D)
+    # Page-planar rows: P x D E4M3 bytes, then P FP32 scales.
+    data = tl.load(
+        Cache + base[:, None] + offset[:, None] * D + d[None, :],
+        live[:, None],
+        other=0,
+    )
+    tl.store(Values + row[:, None] * D + d[None, :], data, inside[:, None])
+    b = tl.arange(0, 4)
+    sf = tl.load(
+        Cache + base[:, None] + P * D + offset[:, None] * 4 + b[None, :],
+        live[:, None],
+        other=0,
+    ).to(tl.uint32)
+    word = tl.sum(sf << (b[None, :] * 8).to(tl.uint32), 1)
+    tl.store(Scales + row, word.to(tl.int32, bitcast=True), inside)
+
+
+def gather_index_fp8(cache, pages, capacity):
+    """Gather one request's FP8 index rows into dense key and scale planes.
+
+    Args:
+        cache: uint8 ``[pages, 64, 132]`` page-planar ``index_v4`` field.
+        pages: Int ``[logical pages]`` physical page per 64 logical rows; any
+            page outside ``[0, cache pages)`` reads as zero rows.
+        capacity: Logical rows to gather, at most ``64 * pages.numel()``.
+
+    Returns:
+        (E4M3 ``[capacity, 128]``, FP32 ``[capacity]``) with zero values and
+        zero scales on unmapped pages, bit for bit the cache bytes elsewhere.
+        Like the DeepGEMM page view, each page's bytes are addressed from its
+        page stride alone.
+    """
+    if (
+        cache.dtype != torch.uint8
+        or cache.ndim != 3
+        or cache.shape[1:] != (64, 132)
+        or pages.ndim != 1
+        or capacity > 64 * pages.numel()
+    ):
+        raise ValueError("gather_index_fp8 requires an index_v4 field and page row")
+    values = torch.empty((capacity, 128), dtype=torch.uint8, device=cache.device)
+    scales = torch.empty((capacity,), dtype=torch.float32, device=cache.device)
+    if capacity:
+        _gather_index_fp8_kernel[(triton.cdiv(capacity, 32),)](
+            cache,
+            pages,
+            values,
+            scales.view(torch.int32),
+            cache.stride(0),
+            pages.stride(0),
+            cache.shape[0],
+            capacity,
+            64,
+            128,
+            32,
+            num_warps=4,
+        )
+    return values.view(torch.float8_e4m3fn), scales
+
+
+@triton.jit(
+    do_not_specialize=["L0", "N", "CAP", "FILL"],
+    do_not_specialize_on_alignment=["L", "L0", "N", "CAP", "FILL"],
+)
+def _dense_ranges(L, START, END, L0, N, CAP, FILL, B: tl.constexpr):
     row = tl.program_id(0) * B + tl.arange(0, B)
     length = tl.load(L + row * L0, row < N, other=0)
-    tl.store(START + row, 0, row < N)
+    tl.store(START + row, FILL, row < N)
     tl.store(END + row, tl.minimum(tl.maximum(length, 0), CAP).to(tl.int32), row < N)
 
 
-def dense_ranges(lengths, capacity):
-    starts = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
-    ends = torch.empty_like(starts)
+def _filled_lengths(lengths, capacity, fill):
+    filled = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
+    clamped = torch.empty_like(filled)
     if lengths.numel():
         _dense_ranges[(triton.cdiv(lengths.numel(), 256),)](
             lengths,
-            starts,
-            ends,
+            filled,
+            clamped,
             lengths.stride(0),
             lengths.numel(),
             capacity,
+            fill,
             256,
             num_warps=4,
         )
-    return starts, ends
+    return filled, clamped
 
 
-@triton.jit
+def dense_ranges(lengths, capacity):
+    """Per-query key ranges ``[0, clamp(length, 0, capacity))`` as int32."""
+    return _filled_lengths(lengths, capacity, 0)
+
+
+def pool_lengths(lengths, capacity, width):
+    """One launch for a candidate-pool selection's lengths.
+
+    Returns int32 ``(widths, visible)``: every row's pool width ``width`` (the
+    selector's row end) and ``lengths`` clamped to ``[0, capacity]``.
+    """
+    return _filled_lengths(lengths, capacity, width)
+
+
+_CANDIDATE_SCORES_RUNTIME = ["WIDTH", "COLUMNS", "L0", "L1", "C0", "C1", "O0"]
+
+
+@triton.jit(
+    do_not_specialize=_CANDIDATE_SCORES_RUNTIME,
+    do_not_specialize_on_alignment=_CANDIDATE_SCORES_RUNTIME + ["Logits", "Cands"],
+)
 def _candidate_scores_kernel(
     Logits,
     Cands,
     Out,
+    Ends,
     WIDTH,
     COLUMNS,
     L0,
@@ -2392,8 +2547,12 @@ def _candidate_scores_kernel(
     C1,
     O0,
     BLOCK: tl.constexpr,
+    HAS_ENDS: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
+    if HAS_ENDS:
+        if tl.program_id(1) == 0:
+            tl.store(Ends + token, COLUMNS.to(tl.int32))
     col = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     keep = col < COLUMNS
     block = tl.load(Cands + token * C0 + (col // 8) * C1, keep, other=-1).to(tl.int64)
@@ -2403,12 +2562,15 @@ def _candidate_scores_kernel(
     tl.store(Out + token * O0 + col, score, keep)
 
 
-def candidate_scores(logits, candidates):
+def candidate_scores(logits, candidates, ends=None):
     """Gather each query's candidate-block scores into one compact row.
 
     Args:
         logits: FP32 [tokens, width] scores addressed by row id.
         candidates: Int [tokens, blocks] request-local block ids, -1 padded.
+        ends: Optional contiguous int32 [tokens] output that receives the
+            compact row width (``blocks * 8``), the row end a selector over
+            the returned scores takes, in the same launch.
 
     Returns:
         FP32 [tokens, blocks * 8] scores in candidate order. A null block or a
@@ -2418,20 +2580,28 @@ def candidate_scores(logits, candidates):
     """
     tokens, width = logits.shape
     columns = candidates.shape[1] * 8
+    if ends is not None and (
+        ends.shape != (tokens,) or ends.dtype != torch.int32 or ends.stride(0) != 1
+    ):
+        raise ValueError("ends must be a contiguous int32 [tokens] tensor")
     out = torch.empty((tokens, columns), dtype=logits.dtype, device=logits.device)
     if tokens and columns:
         _candidate_scores_kernel[(tokens, triton.cdiv(columns, 512))](
             logits,
             candidates,
             out,
+            ends if ends is not None else out,
             width,
             columns,
             *logits.stride(),
             *candidates.stride(),
             out.stride(0),
             BLOCK=512,
+            HAS_ENDS=ends is not None,
             num_warps=4,
         )
+    elif ends is not None:
+        ends.fill_(columns)
     return out
 
 
@@ -3710,3 +3880,90 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
         BLOCK=1024,
         num_warps=8,
     )
+
+
+@triton.jit(do_not_specialize=["WS0", "LS0", "GS0", "OS0"])
+def _prefill_indices_kernel(
+    Swa,
+    Rows,
+    Logical,
+    Slots,
+    Base,
+    Out,
+    WS0,
+    LS0,
+    GS0,
+    OS0,
+    SWA: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
+):
+    i = tl.program_id(0).to(tl.int64)
+    row = tl.load(Rows + i).to(tl.int64) if HAS_ROWS else i
+    w = tl.arange(0, SWA)
+    tl.store(Out + i * OS0 + w, tl.load(Swa + row * WS0 + w))
+    k = tl.arange(0, BLOCK_K)
+    live = k < K
+    selected = tl.load(Logical + row * LS0 + k, live, other=-1)
+    slot = tl.load(Slots + row * GS0 + k, live, other=-1)
+    base = tl.load(Base + row)
+    index = tl.where((selected >= 0) & (slot >= 0) & (base >= 0), selected + base, -1)
+    tl.store(Out + i * OS0 + SWA + k, index.to(tl.int32), live)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_prefill_indices",
+    name="triton_dsv41_prefill_indices",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_prefill_indices(
+    swa_indices, logical_rows, global_slots, history_base, rows, out
+):
+    _same_device(swa_indices, (logical_rows, global_slots, history_base, rows, out))
+    n, swa_width = swa_indices.shape
+    k = logical_rows.shape[1]
+    if swa_width < 1 or swa_width & (swa_width - 1):
+        raise ValueError("SWA index width must be a power of two")
+    if (
+        logical_rows.shape != (n, k)
+        or global_slots.shape != (n, k)
+        or history_base.shape != (n,)
+    ):
+        raise ValueError(
+            "selected rows, slots and history bases need one row per query"
+        )
+    count = n if rows is None else rows.numel()
+    if out is None:
+        out = torch.empty(
+            (count, swa_width + k), dtype=torch.int32, device=swa_indices.device
+        )
+    if out.shape != (count, swa_width + k) or out.dtype != torch.int32:
+        raise ValueError("out must be int32 [rows, swa width + selected width]")
+    if any(
+        t.stride(-1) != 1 for t in (swa_indices, logical_rows, global_slots, out)
+    ) or (rows is not None and not rows.is_contiguous()):
+        raise ValueError("prefill index rows must have contiguous columns")
+    if count:
+        _prefill_indices_kernel[(count,)](
+            swa_indices,
+            rows,
+            logical_rows,
+            global_slots,
+            history_base.contiguous(),
+            out,
+            swa_indices.stride(0),
+            logical_rows.stride(0),
+            global_slots.stride(0),
+            out.stride(0),
+            SWA=swa_width,
+            K=k,
+            BLOCK_K=triton.next_power_of_2(k),
+            HAS_ROWS=rows is not None,
+            num_warps=4,
+        )
+    return out

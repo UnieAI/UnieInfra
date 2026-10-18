@@ -2262,3 +2262,242 @@ def test_open_prefill_chunk_has_no_decoder_or_logits_rows():
     assert view.metadata.positions.numel() == 0
     assert view.prefill.positions.numel() == 0
     assert view.spans == ()
+
+
+def _per_request_prefill_reference(
+    backend,
+    q,
+    swa_kv,
+    *,
+    layer_id,
+    positions,
+    request_indices,
+    forward_mode,
+    index_q,
+    index_weights,
+    attn_sink,
+    softmax_scale,
+    swa_rope_cache,
+):
+    """The former one-request-at-a-time prefill attention, kept as an oracle.
+
+    Each request gathers its SWA prefix and its whole global history into a
+    private BF16 workspace and runs the sparse kernel alone.
+    """
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+        V41_PREFILL_QUERY_TILE,
+    )
+
+    global_slots, _ = backend.select_global(
+        layer_id,
+        index_q,
+        index_weights,
+        positions,
+        request_indices,
+        forward_mode,
+        None,
+    )
+    owner = backend.spec.kv_owners[layer_id]
+    global_cache = backend.cache_pool.global_kv(owner) if owner >= 0 else None
+    cache = backend.cache_pool.swa(layer_id)
+    window = backend._window(positions, request_indices, forward_mode)
+    locations = (
+        window[0].swa_write_slots
+        if window is not None
+        else backend.cache_slots(SWA, positions, request_indices, forward_mode)
+    )
+    swa_format, global_format = backend.swa_format, backend.global_format
+    plan = backend._swa_query_plan(positions, request_indices, forward_mode)
+    prefixes = [
+        dsv41.cache_gather(cache, request.prefix_slots, swa_format, None)
+        for request in plan.requests
+    ]
+    if swa_rope_cache is None:
+        current = dsv41.cache_unpack(
+            dsv41.cache_pack(swa_kv, swa_format, None), swa_format, None
+        )
+    else:
+        current = torch.empty_like(swa_kv)
+        dsv41.swa_rope_scatter(
+            swa_kv,
+            positions,
+            swa_rope_cache,
+            cache,
+            locations,
+            swa_format,
+            current,
+        )
+    logical_rows = None
+    if owner >= 0:
+        record = backend.sparse_topk.prefill
+        selected = backend._selection_rows(record, positions, request_indices)
+        logical_rows = record.logical_rows[selected.clamp_min(0)].masked_fill(
+            selected[:, None] < 0, -1
+        )
+    out = torch.zeros_like(q)
+    for request, prefix in zip(plan.requests, prefixes, strict=True):
+        rows = request.rows
+        prefix_count = request.prefix_slots.numel()
+        swa_count = prefix_count + current[rows].shape[0]
+        history_slots = None
+        if owner >= 0:
+            ratio = backend.spec.compress_ratios[owner]
+            history = (
+                torch.arange((request.last_position + 1) // ratio, device=q.device)
+                * ratio
+            )
+            history_slots = backend.cache_slots(
+                backend._owner_group(owner),
+                history,
+                torch.full_like(history, request.request),
+                forward_mode,
+            )
+        history_count = history_slots.numel() if history_slots is not None else 0
+        workspace = current.new_empty((swa_count + history_count, 512))
+        workspace[:prefix_count].copy_(prefix)
+        workspace[prefix_count:swa_count].copy_(current[rows])
+        indices = request.swa_indices
+        if owner >= 0:
+            dsv41.cache_gather(
+                global_cache, history_slots, global_format, workspace[swa_count:]
+            )
+            selected = logical_rows[rows]
+            compressed = torch.where(
+                (selected >= 0) & (global_slots[rows] >= 0), selected + swa_count, -1
+            )
+            indices = torch.cat((indices, compressed), dim=-1).to(torch.int32)
+        out[rows] = dsv41.selected_attention(
+            q[rows].contiguous(),
+            cache,
+            None,
+            None,
+            global_cache,
+            None,
+            None,
+            attn_sink,
+            softmax_scale,
+            None,
+            V41_PREFILL_QUERY_TILE,
+            None,
+            workspace[:, None, :],
+            indices.contiguous(),
+        )
+    if swa_rope_cache is None:
+        dsv41.cache_scatter(swa_kv, cache, locations, swa_format)
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("fused_rope", [False, True])
+@pytest.mark.parametrize("window", ["full", "decoder", "subset", "split"])
+@pytest.mark.parametrize("layer_id", [0, 2, 20])
+def test_gpu_batched_prefill_matches_per_request_reference(
+    layer_id, window, fused_rope
+):
+    """One batched prefill pass reads the same rows as the per-request oracle.
+
+    Two requests with prefix hits (one replaying part of its window), for an
+    SWA-only, a ratio-2 owner and a ratio-1 owner layer, on the full window, the
+    CED decoder tail, an arbitrary row subset, and histories split into groups.
+    Outputs and the published SWA rows must agree.
+    """
+    backend = _backend("cuda", 2)
+    tables = _tables("cuda")
+    generator = torch.Generator(device="cuda").manual_seed(layer_id * 10 + len(window))
+    prefixes, counts, replays = [130, 64], [120, 150], [0, 32]
+    owner = backend.spec.kv_owners[layer_id]
+
+    def randn(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, device="cuda", generator=generator).to(dtype)
+
+    # History: SWA rows below each prefix, global rows below prefix + replay.
+    history_lens = [p + r for p, r in zip(prefixes, replays)]
+    meta = _extend(backend, tables, history_lens, [0, 0], [0, 0], history_lens)
+    cache = backend.cache_pool.swa(layer_id)
+    dsv41_slots = backend.cache_slots(
+        SWA, meta.positions, meta.request_indices, ForwardMode.EXTEND
+    )
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    dsv41.cache_scatter(
+        randn(meta.positions.numel(), 512), cache, dsv41_slots, backend.swa_format
+    )
+    if owner >= 0:
+        ratio = backend.spec.compress_ratios[owner]
+        rows = (meta.positions % ratio == 0).nonzero().squeeze(1)
+        backend.write_global(
+            owner,
+            randn(rows.numel(), 512),
+            randn(rows.numel(), 128),
+            meta.positions[rows],
+            meta.request_indices[rows],
+            ForwardMode.EXTEND,
+        )
+    meta = _extend(backend, tables, counts, prefixes, replays, _final(counts, prefixes))
+    n = meta.positions.numel()
+    if owner >= 0:
+        rows = (meta.positions % ratio == 0).nonzero().squeeze(1)
+        backend.write_global(
+            owner,
+            randn(rows.numel(), 512),
+            randn(rows.numel(), 128),
+            meta.positions[rows],
+            meta.request_indices[rows],
+            ForwardMode.EXTEND,
+        )
+    positions, requests = meta.positions, meta.request_indices
+    if window == "decoder":
+        view = backend.decoder_view()
+        positions, requests = view.prefill.positions, view.prefill.request_indices
+    elif window == "subset":
+        pick = torch.randperm(n, device="cuda", generator=generator)[: n // 3]
+        positions, requests = positions[pick], requests[pick]
+    elif window == "split":
+        # Requests' histories together exceed the workspace budget.
+        backend.context_len = 200
+    t = positions.numel()
+    q = randn(t, 2, 512)
+    swa = randn(t, 512)
+    index_q = randn(t, 2, 128) if layer_id in SOURCES else None
+    index_weights = (
+        torch.rand(t, 2, device="cuda", generator=generator).to(torch.bfloat16)
+        if layer_id in SOURCES
+        else None
+    )
+    angles = torch.rand(512, 32, device="cuda", generator=generator) * 6.28
+    rope = torch.cat((angles.cos(), angles.sin()), dim=1) if fused_rope else None
+    kwargs = dict(
+        layer_id=layer_id,
+        positions=positions,
+        request_indices=requests,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=index_q,
+        index_weights=index_weights,
+        attn_sink=torch.tensor([0.3, -0.7], device="cuda"),
+        softmax_scale=512**-0.5,
+        swa_rope_cache=rope,
+    )
+    arena = backend.cache_pool.arena.buffer
+    before = arena.clone()
+    got = backend.forward_v41(q, swa, index_process_group=None, **kwargs)
+    if window == "split":
+        plan = backend._swa_query_plan(positions, requests, ForwardMode.EXTEND)
+        if owner >= 0:
+            assert len(plan.histories[ratio].groups) == 2
+    published = arena.clone()
+    arena.copy_(before)
+    want = _per_request_prefill_reference(backend, q, swa, **kwargs)
+    torch.cuda.synchronize()
+    error = (got.float() - want.float()).abs()
+    print(
+        f"layer {layer_id} {window} rope={fused_rope}: max abs {error.max():.3e} "
+        f"max rel {(error / want.float().abs().clamp_min(1e-3)).max():.3e}"
+    )
+    # Both read the same quantized rows; only the accumulation order may differ.
+    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-8)
+    assert want.abs().amax() > 0.05
+    if owner >= 0:
+        assert bool((backend.sparse_topk.prefill.lengths > 0).any())
+    assert torch.equal(published, arena)

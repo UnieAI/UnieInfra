@@ -109,3 +109,17 @@ whether mapping it onto an existing fast path is lossy, instead of assuming:
 - The model registry imports every model module: one module that no longer
   imports breaks startup for every model. Run the registry import as the first
   test after a merge.
+
+## 7. Bring-up on a smaller GPU than upstream tested
+
+Upstream may only have run the model on bigger parts (V4.1: B200/B300 at 180+
+GB, H20 at TP8). On H200 TP4 it OOMed during weight post-processing, with or
+without host-resident Engram tables. Log allocated memory before every module's
+post-load hook (tokenspeed: `TOKENSPEED_TRACE_POSTPROCESS_MEM=1`) and look for
+growth that the hook's own allocation does not explain. The V4.1 cause: the
+checkpoint loader called the MoE re-layout while its local name->Parameter map
+was still alive, so every layer's original experts stayed resident — twice the
+expert weights at peak (~63 GiB per rank). The isolated hook freed correctly;
+only the in-process frame held the references. Regression test: replace the hook
+with one that drops the module's reference and assert via `weakref` + `gc` that
+nothing else keeps the old Parameter alive.

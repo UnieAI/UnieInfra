@@ -67,6 +67,26 @@ confident wrong answers:
 Also: count tokens from `usage.completion_tokens`, never by counting SSE chunks;
 and never quote torch-profiler `cpu_op` totals as GPU time (inflated ~3.6×).
 
+**A collective's kernel time is mostly waiting until you prove otherwise.** On
+DeepSeek-V4.1 at H200 TP4 (AgentX, c=16) the trace said all-reduce was 52% of
+GPU time. Per rank it was 10.3 / 9.9 / 6.0 / 5.0 s of a 20.4 s window while every
+rank's compute was identical (MoE 4.6-4.7 s, rest ~4.7 s). Equal compute with
+unequal collective time means the collective is spinning for the last rank to
+arrive. The ranks that wait least are the stragglers; look at *their* GPU idle
+gaps (here 5.6-6.6 s, almost all gaps < 1 ms between small eager kernels): the
+step was host-launch-bound, not NVLink-bound. Compare per-rank compute, per-rank
+collective time and per-rank idle before touching communication.
+
+**Attribute launches to source lines, not kernel names.** Profile a few dozen
+steps with `with_stack=True`, then map each `cudaLaunchKernel` /
+`cudaLaunchKernelExC` / `cudaMemcpyAsync` runtime event to the innermost
+`python_function` frame from your package that contains it (same tid, smallest
+enclosing interval). On V4.1 this named one function (the prefill attention
+loop in the backend's `forward_v41`) as the source of 27% of all launches, plus
+the `torch.where` / `cat` / `copy_` / `zeros_like` it issued per request per
+layer — a per-request Python loop inside a per-layer call is O(requests ×
+layers) launches per step.
+
 ## 2. Turn the gap into a work list by subtraction
 
 Convert the whole difference into **per-step milliseconds** (a c16 gap from
@@ -197,7 +217,14 @@ plus one all-gather of packed int64 (logit, token) candidates per draft
 position in upstream's DSpark sampler (e87f7267). Count collectives per step
 like launches; each is a few µs of latency plus a sync point.
 
-**O. No compilation on the serving path.** A Triton `constexpr` is a JIT cache
+**O. No compilation on the serving path.** Read the engine's own compile
+log first: tokenspeed prints `Triton JIT compiled <kernel> while serving in N ms
+(<which key changed>)`. Sum it per kernel over a measured cell. On V4.1 one
+kernel (`_finish_topk_kernel`, `BLOCK = next_power_of_2(width)` plus stride
+divisibility) recompiled 16 times for 23 s of stalls inside an 87 s cell; fixing
+it cut that cell's duration 19% and TTFT p99 from 8.8 s to 3.3 s.
+
+A Triton `constexpr` is a JIT cache
 key: a constexpr derived from batch size, chunk length or page-table width
 recompiles mid-serving and stalls 100+ ms. Constexpr only for values fixed at
 startup; batch-varying values go to runtime args or fixed buckets. Gate with a

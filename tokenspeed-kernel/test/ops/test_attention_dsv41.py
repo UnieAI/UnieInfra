@@ -1682,3 +1682,40 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
     with assert_no_triton_compile(implementation._dspark_anchors_kernel):
         run(0)
         run(2)
+
+
+def _prefill_indices_inputs(n, k, device, generator):
+    swa = torch.randint(-1, 900, (n, 128), device=device, generator=generator)
+    logical = torch.randint(-1, 300, (n, k), device=device, generator=generator)
+    slots = torch.randint(-1, 5000, (n, k), device=device, generator=generator)
+    base = torch.randint(-1, 2000, (n,), device=device, generator=generator)
+    return swa.to(torch.int32), logical.to(torch.int32), slots.to(torch.int32), base
+
+
+@pytest.mark.parametrize("subset", [False, True])
+@pytest.mark.parametrize("k", [4, 300, 512])
+def test_prefill_indices_join_swa_and_rebased_global_rows(device, k, subset):
+    generator = torch.Generator(device=device).manual_seed(k)
+    n = 37
+    swa, logical, slots, base = _prefill_indices_inputs(n, k, device, generator)
+    rows = (
+        torch.randperm(n, device=device, generator=generator)[:20] if subset else None
+    )
+    got = dsv41.prefill_indices(swa, logical, slots, base, rows, None)
+    picked = range(n) if rows is None else rows.tolist()
+    assert got.dtype == torch.int32 and got.shape == (len(picked), 128 + k)
+    for i, row in enumerate(picked):
+        assert got[i, :128].tolist() == swa[row].tolist()
+        for j in range(k):
+            sel, slot, start = int(logical[row, j]), int(slots[row, j]), int(base[row])
+            want = sel + start if sel >= 0 and slot >= 0 and start >= 0 else -1
+            assert int(got[i, 128 + j]) == want
+    # The portable fallback agrees, and an explicit destination is filled in place.
+    cpu = dsv41.prefill_indices(
+        *(t.cpu() for t in (swa, logical, slots, base)),
+        None if rows is None else rows.cpu(),
+        None,
+    )
+    out = torch.empty_like(got)
+    assert dsv41.prefill_indices(swa, logical, slots, base, rows, out) is out
+    torch.testing.assert_close(out.cpu(), cpu, rtol=0, atol=0)

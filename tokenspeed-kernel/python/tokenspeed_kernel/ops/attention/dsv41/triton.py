@@ -4059,3 +4059,90 @@ def compact_slots(slots, lengths):
             BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
         )
     return out, counts
+
+
+@triton.jit(do_not_specialize=["WS0", "LS0", "GS0", "OS0"])
+def _prefill_indices_kernel(
+    Swa,
+    Rows,
+    Logical,
+    Slots,
+    Base,
+    Out,
+    WS0,
+    LS0,
+    GS0,
+    OS0,
+    SWA: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
+):
+    i = tl.program_id(0).to(tl.int64)
+    row = tl.load(Rows + i).to(tl.int64) if HAS_ROWS else i
+    w = tl.arange(0, SWA)
+    tl.store(Out + i * OS0 + w, tl.load(Swa + row * WS0 + w))
+    k = tl.arange(0, BLOCK_K)
+    live = k < K
+    selected = tl.load(Logical + row * LS0 + k, live, other=-1)
+    slot = tl.load(Slots + row * GS0 + k, live, other=-1)
+    base = tl.load(Base + row)
+    index = tl.where((selected >= 0) & (slot >= 0) & (base >= 0), selected + base, -1)
+    tl.store(Out + i * OS0 + SWA + k, index.to(tl.int32), live)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_prefill_indices",
+    name="triton_dsv41_prefill_indices",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_prefill_indices(
+    swa_indices, logical_rows, global_slots, history_base, rows, out
+):
+    _same_device(swa_indices, (logical_rows, global_slots, history_base, rows, out))
+    n, swa_width = swa_indices.shape
+    k = logical_rows.shape[1]
+    if swa_width < 1 or swa_width & (swa_width - 1):
+        raise ValueError("SWA index width must be a power of two")
+    if (
+        logical_rows.shape != (n, k)
+        or global_slots.shape != (n, k)
+        or history_base.shape != (n,)
+    ):
+        raise ValueError(
+            "selected rows, slots and history bases need one row per query"
+        )
+    count = n if rows is None else rows.numel()
+    if out is None:
+        out = torch.empty(
+            (count, swa_width + k), dtype=torch.int32, device=swa_indices.device
+        )
+    if out.shape != (count, swa_width + k) or out.dtype != torch.int32:
+        raise ValueError("out must be int32 [rows, swa width + selected width]")
+    if any(
+        t.stride(-1) != 1 for t in (swa_indices, logical_rows, global_slots, out)
+    ) or (rows is not None and not rows.is_contiguous()):
+        raise ValueError("prefill index rows must have contiguous columns")
+    if count:
+        _prefill_indices_kernel[(count,)](
+            swa_indices,
+            rows,
+            logical_rows,
+            global_slots,
+            history_base.contiguous(),
+            out,
+            swa_indices.stride(0),
+            logical_rows.stride(0),
+            global_slots.stride(0),
+            out.stride(0),
+            SWA=swa_width,
+            K=k,
+            BLOCK_K=triton.next_power_of_2(k),
+            HAS_ROWS=rows is not None,
+            num_warps=4,
+        )
+    return out

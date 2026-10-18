@@ -892,11 +892,27 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
         return hook
 
     handles = [
-        model.layers[i].register_forward_pre_hook(observe(i)) for i in (19, 20, 21, 39)
+        model.layers[i].register_forward_pre_hook(observe(i)) for i in (19, 21, 39)
     ]
     handles.append(
         model.layers[20].attn.wq_a_wkv.register_forward_pre_hook(observe_qkv)
     )
+    # The candidate source runs split around its row selection: its head
+    # with the encoder stage, the rest with the decoder stage.
+    original_tail = v41.DeepseekV41DecoderLayer.narrowed_forward
+
+    def observe_tail(self, residual, head, layer_positions, image_mask, layer_ctx):
+        seen[self.layer_id] = (
+            residual.shape[0],
+            layer_positions.tolist(),
+            layer_ctx.collective_num_tokens,
+            [t.shape[0] for t in head],
+        )
+        return original_tail(
+            self, residual, head, layer_positions, image_mask, layer_ctx
+        )
+
+    monkeypatch.setattr(v41.DeepseekV41DecoderLayer, "narrowed_forward", observe_tail)
     previous = torch.tensor([[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]])
     previous = torch.cat((previous, previous[:2]))
     actual, aux = model(
@@ -914,7 +930,7 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     for handle in handles:
         handle.remove()
     assert seen[19] == (6, [0, 1, 2, 3, 0, 1], None, False)
-    assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, True)
+    assert seen[20] == (3, [3, 0, 1], 3, [3] * 6)
     assert seen[21] == (3, [3, 0, 1], 3, False)
     assert seen[39] == (3, [3, 0, 1], 3, False)
     # Changing these batch shapes can change split-K/quantized arithmetic
@@ -1006,8 +1022,14 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         engram_token_mask=mask,
         image_mask=None,
     )
-    # The layer-19 tap is taken below the candidate source, on every row.
-    assert state.rows == 6 and [tap.shape[0] for tap in state.captured] == [6]
+    # The layer-19 and layer-20 taps are taken at or below the candidate
+    # source's input, on every row; so is the candidate source's head.
+    assert state.rows == 6 and [tap.shape[0] for tap in state.captured] == [6, 6]
+    assert [t.shape[0] for t in state.head] == [6] * 6
+
+    def pad(t):
+        return torch.cat((t, torch.zeros_like(t[:2])))
+
     # An encoder graph output carries a padded tail past the real rows.
     padded = v41.V41RowState(
         torch.cat((state.hidden, torch.zeros_like(state.hidden[:2]))),
@@ -1016,7 +1038,8 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         None,
         torch.cat((state.hashes, torch.zeros_like(state.hashes[:2]))),
         torch.cat((state.engram_token_mask, torch.zeros(2, dtype=torch.bool))),
-        [torch.cat((tap, torch.zeros_like(tap[:2]))) for tap in state.captured],
+        [pad(tap) for tap in state.captured],
+        [pad(t) for t in state.head],
     )
     narrowed = model.narrowing_forward(padded, ctx)
     assert narrowed.rows == 3
@@ -1048,9 +1071,24 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
 
         return forward
 
+    def landed_narrowed(original):
+        def forward(self, q, swa, index_q, index_weights, ctx):
+            out = original(self, q, swa, index_q, index_weights, ctx)
+            pad = q.shape[0] - out.shape[0]
+            return (
+                torch.cat((out, out.new_zeros((pad, *out.shape[1:])))) if pad else out
+            )
+
+        return forward
+
     with active_forward(ctx), monkeypatch.context() as patched:
         patched.setattr(
             DeepseekV41Attention, "forward", landed(DeepseekV41Attention.forward)
+        )
+        patched.setattr(
+            DeepseekV41Attention,
+            "_narrowed_attention",
+            landed_narrowed(DeepseekV41Attention._narrowed_attention),
         )
         hidden, captured = model.decoder_forward(statics, ctx)
     assert hidden.shape == (8, config.hidden_size)
@@ -1070,6 +1108,19 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
                 statics.pre_mix,
                 statics.positions,
                 torch.zeros(8, dtype=torch.bool),
+                None,
+                None,
+                statics.captured,
+                statics.head,
+            )
+        )
+    with pytest.raises(ValueError, match="narrowing head"):
+        narrowed.land_into(
+            v41.V41RowState(
+                statics.hidden,
+                statics.pre_mix,
+                statics.positions,
+                None,
                 None,
                 None,
                 statics.captured,

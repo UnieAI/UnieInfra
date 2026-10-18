@@ -29,7 +29,7 @@ WARM=${1:?warm}; shift
 
 HERE=/workspace/roy
 MODEL=/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
-IMG_ENG=ts-env:gpu
+IMG_ENG=ts-env:gpu-sched39
 IMG_VLL=vllm/vllm-openai:nightly
 IMG_SGL=sglang-dsv4-vision:pr37257-fix
 NAME="agentx-${KIND}-${TAG}"

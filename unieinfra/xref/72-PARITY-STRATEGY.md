@@ -64,12 +64,22 @@ busy-ratio heuristic is only as good as the span.
 The merge changed the algorithm, the model file, and the C++ cache manager at
 once. Three things must be true before any item in §4 is started.
 
+G0 also runs in a different image. `ts-env:gpu` carried
+`tokenspeed-scheduler` 0.1.6 while the tree requires `>=0.1.39`, so its C++
+scheduler predated the merge; the numbers in §1 were produced that way. The
+wheel is rebuilt from `tokenspeed-scheduler/` and baked into
+`ts-env:gpu-sched39`, which is what the sweep scripts now use -- so G0 is a
+re-baseline in the literal sense, not a comparison against §1.
+
 1. **It runs.** Container boot on GPUs 6,7 reaches `/health`; `--help` parses;
    one c16 AgentX cell completes and produces a JSON.
-2. **It is numerically intact.** `test/runtime/test_deepseek_v4_mhc_pre_norm.py`
-   and the kernel ops tests for `mhc_big_fuse` / `dsv4_topk` pass; a
-   temperature-0 response is token-for-token comparable to the pre-merge engine
-   on a fixed prompt (skill §4: the corrupt arm can look faster).
+2. **It is numerically intact.** The kernel ops tests for `mhc_big_fuse` /
+   `dsv4_topk` pass, and a temperature-0 response is token-for-token comparable
+   to the pre-merge engine on a fixed prompt (skill §4: the corrupt arm can look
+   faster). Our own mHC equivalence test was removed with the merge -- it
+   targeted the layer module that no longer exists, and upstream does not test
+   its replacement -- so the token-agreement check is currently the *only* guard
+   on the fused mHC seam (`73-MERGE-LEDGER.md` §5).
 3. **No fix went missing in the merge.** Our three landed fixes were in files we
    resolved to upstream. Flag audit against
    `python/tokenspeed/runtime/utils/server_args.py`:

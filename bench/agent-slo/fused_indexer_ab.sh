@@ -26,7 +26,7 @@ ARMS=${3:-"0:0 1:1"}
 HERE=/workspace/roy
 HERE_SLO=$HERE/UnieInfra/bench/agent-slo
 MODEL=/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
-IMG_ENG=ts-env:gpu
+IMG_ENG=ts-env:gpu-sched39
 OUTDIR=$HERE/ab_real/agentx-sweep
 mkdir -p "$HERE/logs" "$OUTDIR"
 

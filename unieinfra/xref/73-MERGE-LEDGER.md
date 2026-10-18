@@ -88,3 +88,49 @@ an external `torch.profiler` / `nsys` wrapper around one bounded cell, which
 also cannot drift from the code it measures. If a number must be readable from
 inside the engine later, it gets a `docs/design/`-sanctioned diagnostic and a
 test — not a temporary print.
+
+## 5. The environment was two weeks behind, and four tests target code that is gone
+
+Collected the whole suite (`pytest test/ --collect-only`) after the merge. Three
+failure classes came out, and only one of them was ours:
+
+1. **The container had the wrong scheduler.** `ts-env:gpu` shipped
+   `tokenspeed-scheduler` **0.1.6**; the tree is **0.1.39** and
+   `python/pyproject.toml` requires `>=0.1.39`. Twenty test modules failed to
+   import `CacheGroupConfig` / `AttnKind`, which 0.1.6 does not export -- so the
+   mismatch had been invisible until something called those names. Worse than
+   the test noise: the image's C++ scheduler predates the merge by two weeks, so
+   *any* engine run in it (including every number quoted in
+   `72-PARITY-STRATEGY.md` §1) executed the old scheduler semantics while
+   running the new Python. Rebuilt the wheel from `tokenspeed-scheduler/` (pure
+   C++, no CUDA, no GPU needed) and committed a new image `ts-env:gpu-sched39`
+   with 0.1.39 installed; the import errors are gone. **Every pre-2026-10-18
+   measurement is scheduler-0.1.6 provenance and must be re-baselined before it
+   is compared against anything.** G0 runs in the new image.
+2. **301 modules need a GPU** to import at all
+   (`tokenspeed_kernel` refuses to load without one). Not a defect; collection
+   on a CPU-only host can only ever see the CUDA-free subset.
+3. **Four tests targeted code the merge removed**, all of them ours (absent from
+   `upstream/main`), and all of them referencing names that `grep` finds nowhere
+   in the merged tree: `build_image_spans_from_context`, `deepseek_v4_select_experts`
+   / `routing_score`, `layers/deepseek_v4_mhc`, and
+   `paged_cache_spec.resolve_layer_types_and_window`. Removed:
+   `test/runtime/models/test_deepseek_v4_image_span.py`,
+   `test/runtime/test_deepseek_v4_moe_routing_scores.py`,
+   `test/runtime/test_deepseek_v4_mhc_pre_norm.py`,
+   `test/runtime/test_resolve_layer_types_and_window.py`.
+
+The fourth of those was already dead before the merge: the function it loads
+from `paged_cache_spec.py` does not exist in that file in any snapshot
+(`HEAD`, the WIP snapshot, or the pre-merge safety branch), so it never ran.
+
+The mHC removal is the one with teeth. That test was the only guard on the
+property *fused mHC pre == unfused three-launch path plus a norm*, and upstream
+does not test its own replacement (`mhc_big_fuse`, reached through
+`ops/residual/deep_gemm.py::deep_gemm_mhc_pre`) anywhere under `test/`.
+Deleting our version therefore trades a stale guard for none, which is only
+acceptable because G0 replaces it at the level that matters: temperature-0
+token-for-token agreement against the pre-merge engine on the same prompts
+(§4's gate, and the argument in AGENTS.md that the corrupt arm can look faster).
+If G0's agreement check is not clean, the missing unit guard is the first thing
+to rebuild against the new API.

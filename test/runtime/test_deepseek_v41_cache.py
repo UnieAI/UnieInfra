@@ -3039,3 +3039,131 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
     record = backend.sparse_topk.prefill
     assert record.positions is meta.positions
     assert record.request_indices is meta.request_indices
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("fused_rope", [False, True])
+@pytest.mark.parametrize("window", ["full", "decoder", "subset", "split"])
+@pytest.mark.parametrize("layer_id", [0, 2, 20])
+def test_gpu_batched_prefill_matches_per_request_reference(
+    layer_id, window, fused_rope
+):
+    """One batched prefill pass reads the same rows as the per-request loop.
+
+    Two requests with prefix hits (one replaying part of its window), for an
+    SWA-only, a ratio-2 owner and a ratio-1 owner layer, on the full window, the
+    CED decoder tail, an arbitrary row subset, and histories split into groups.
+    Outputs and the published SWA rows must agree.
+    """
+    backend = _backend("cuda", 2)
+    tables = _tables("cuda")
+    generator = torch.Generator(device="cuda").manual_seed(layer_id * 10 + len(window))
+    prefixes, counts, replays = [130, 64], [120, 150], [0, 32]
+    owner = backend.spec.kv_owners[layer_id]
+
+    def randn(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, device="cuda", generator=generator).to(dtype)
+
+    # History: SWA rows below each prefix, global rows below prefix + replay.
+    history_lens = [p + r for p, r in zip(prefixes, replays)]
+    meta = _extend(backend, tables, history_lens, [0, 0], [0, 0], history_lens)
+    cache = backend.cache_pool.swa(layer_id)
+    dsv41_slots = backend.cache_slots(
+        SWA, meta.positions, meta.request_indices, ForwardMode.EXTEND
+    )
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    dsv41.cache_scatter(
+        randn(meta.positions.numel(), 512), cache, dsv41_slots, backend.swa_format
+    )
+    if owner >= 0:
+        ratio = backend.spec.compress_ratios[owner]
+        rows = (meta.positions % ratio == 0).nonzero().squeeze(1)
+        backend.write_global(
+            owner,
+            randn(rows.numel(), 512),
+            randn(rows.numel(), 128),
+            meta.positions[rows],
+            meta.request_indices[rows],
+            ForwardMode.EXTEND,
+            None,
+        )
+    meta = _extend(backend, tables, counts, prefixes, replays, _final(counts, prefixes))
+    n = meta.positions.numel()
+    if owner >= 0:
+        rows = (meta.positions % ratio == 0).nonzero().squeeze(1)
+        backend.write_global(
+            owner,
+            randn(rows.numel(), 512),
+            randn(rows.numel(), 128),
+            meta.positions[rows],
+            meta.request_indices[rows],
+            ForwardMode.EXTEND,
+            None,
+        )
+    positions, requests = meta.positions, meta.request_indices
+    if window == "decoder":
+        view = backend.decoder_view()
+        positions, requests = view.prefill.positions, view.prefill.request_indices
+    elif window == "subset":
+        pick = torch.randperm(n, device="cuda", generator=generator)[: n // 3]
+        positions, requests = positions[pick], requests[pick]
+    elif window == "split":
+        # Requests' histories together exceed the workspace budget.
+        backend.context_len = 200
+    t = positions.numel()
+    q = randn(t, 2, 512)
+    swa = randn(t, 512)
+    index_q = randn(t, 2, 128) if layer_id in SOURCES else None
+    index_weights = (
+        torch.rand(t, 2, device="cuda", generator=generator).to(torch.bfloat16)
+        if layer_id in SOURCES
+        else None
+    )
+    angles = torch.rand(512, 32, device="cuda", generator=generator) * 6.28
+    rope = torch.cat((angles.cos(), angles.sin()), dim=1) if fused_rope else None
+    kwargs = dict(
+        layer_id=layer_id,
+        positions=positions,
+        request_indices=requests,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=index_q,
+        index_weights=index_weights,
+        attn_sink=torch.tensor([0.3, -0.7], device="cuda"),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=rope,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
+    )
+    arena = backend.cache_pool.arena.buffer
+    before = arena.clone()
+    batched = patch.object(
+        backend,
+        "_forward_prefill_batched",
+        wraps=backend._forward_prefill_batched,
+    )
+    with batched as batched_call:
+        got = backend.forward_v41(q, swa, **kwargs)
+    assert batched_call.call_count == 1
+    if window == "split":
+        plan = backend._swa_query_plan(positions, requests, ForwardMode.EXTEND)
+        if owner >= 0:
+            assert len(plan.histories[ratio].groups) == 2
+    published = arena.clone()
+    arena.copy_(before)
+    # The per-request loop, still served for KVP and QCP, is the oracle.
+    backend._batch_prefill = False
+    want = backend.forward_v41(q, swa, **kwargs)
+    torch.cuda.synchronize()
+    error = (got.float() - want.float()).abs()
+    print(
+        f"layer {layer_id} {window} rope={fused_rope}: max abs {error.max():.3e} "
+        f"max rel {(error / want.float().abs().clamp_min(1e-3)).max():.3e}"
+    )
+    # Both read the same quantized rows; only the accumulation order may differ.
+    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-8)
+    assert want.abs().amax() > 0.05
+    if owner >= 0:
+        assert bool((backend.sparse_topk.prefill.lengths > 0).any())
+    assert torch.equal(published, arena)

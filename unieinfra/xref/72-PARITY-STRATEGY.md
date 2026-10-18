@@ -45,6 +45,15 @@ visible.
 | elementwise total | sum of kernel-node time | 2.88 | 0.14 |
 | mHC seam total | 2 seams/layer × 43 layers | 2.13 | 0.96 |
 
+How these are read now: `bench/agent-slo/profile_decode.sh PORT MODEL CONC DATA
+OUTDIR` drives a decode-only load against a live server, calls the engine's own
+`/start_profile` on the control port (`main + 1`), and runs
+`bench/agent-slo/trace_stats.py` over the resulting chrome trace to print
+ms/step, kernels/step, µs/kernel, device-busy and host remainder -- all on one
+span, from one file. The tooling is measured, not scaffolding: nothing has to be
+added to the hot path, and `--kernel mhc_big_fuse` answers G1's "is the fast path
+selected, or only registered" from the same trace.
+
 ⚠ vLLM's device-busy exceeds its own wall clock, which is impossible: those two
 figures come from different spans. **Do not use device-busy to argue "GPU-bound"
 until it is re-measured on the same window as ms/step.** The skill's 0.94

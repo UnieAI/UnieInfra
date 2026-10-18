@@ -111,6 +111,35 @@ find where the host goes:
   and its children were the q/kv projections, norms, RoPE, o-proj and
   all-reduce — none of which needed to be eager (strategy P).
 
+**Split every collective into transfer and wait, across ranks.** Load the
+traces of all ranks and align the i-th all-reduce of each. The smallest duration
+of a call across ranks is its transfer; the rest on each rank is waiting for the
+last arrival. On V4.1 c16 the all-reduce kernels were 3.47 s of an 11.4 s window
+on rank 0, of which 0.44 s was transfer. Then attribute each wait: if the last
+rank's GPU sat idle since the previous collective it was late on the host; if
+it was busy longer it had more work (EP imbalance). Here 84% was host lateness,
+16% MoE imbalance.
+
+**Classify steps by what they run, not by an entry kernel.** A kernel that
+"marks decode" (input prep, embedding) often also runs in prefill steps. Count
+the step's attention kernels instead (decode MLA vs prefill sparse kernels):
+the first V4.1 split put prefill steps in the decode bin and blamed decode for
+36 ms steps that were 24 ms.
+
+**Time host work per op with a wrapper, not a sampler.** py-spy attributes GIL
+and launch-queue waits to whatever C call is on the stack. A thin image whose
+modules wrap the backend's methods and the kernel wrappers in `perf_counter`
+accumulators (dumped every 10 s to stderr) gave exact per-call host cost on the
+live server: 1.2 ms per eager attention break, ~40 breaks per prefill step, and
+40-60 µs per kernel wrapper. A microbenchmark then split one wrapper into kernel
+selection (~18 µs in context), argument validation (~16 µs) and the Triton
+launch itself (~20 µs with 20 arguments).
+
+**Never read the duration of a profiled cell.** Exporting a 300-step trace
+stalls the server mid-cell (a 29.8 s cell read 82 s, with or without CPU
+activities). Use the trace for per-step attribution and an unprofiled run for
+the number.
+
 **Decompose end-to-end per request before choosing.** e2e = TTFT +
 (out − 1) × per-token decode. At c16 V4.1 was 2.81 s = 0.43 + 127 × 18.6 ms
 while pure decode at the same batch was 7.9 ms/token: the gap was prefill steps
@@ -288,6 +317,23 @@ the decision.
 trace said MoE 36% and all-reduce 21% with 10 ms idle per prefill step: the
 host problem was gone and the next work is GPU kernels. Doing kernel work first
 would have bought nothing, because the GPU was idle 40% of the step.
+
+**S. Memoize kernel selection on the eager path.** Selection is cached, but the
+cache key is a format signature built and hashed on every call -- ~18 µs per op
+in an eager break, as much as the launch it guards. Memoize the selected kernel
+per (op, dtype, traits) at the wrapper, invalidated by a registry generation
+counter (bumped on register and cache clear) and bypassed while an override is
+active. V4.1 AgentX c16 28.7 → 27.4 s, c8 42.6 → 38.5 s.
+
+**T. Match the reference's speculative width before comparing kernels.** vLLM
+ran DSPARK with 5 draft tokens (the checkpoint's block size); tokenspeed
+defaulted to 3. MoE decode is weight-bandwidth-bound, so verifying more tokens
+per step is nearly free: c8/c16/c32 43.5/29.8/23.6 → 42.6/28.7/22.0 s.
+
+**Measured dead ends (V4.1, H200 TP4, AgentX).** Mixed prefill+decode batches:
+50.7/38.9/33.4 s against 42.6/28.7/22.0 separate. A 0.5 ms GIL switch interval
+for the scheduler processes: within noise. Neither changes what bounds the
+step; check the step's bound (above) before trying a scheduling knob.
 
 ## 4. Laws that keep the measurement honest
 

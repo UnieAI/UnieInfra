@@ -97,6 +97,7 @@ from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
+    is_breakable_capture_active,
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import (
@@ -865,8 +866,117 @@ class DeepseekV41Attention(nn.Module):
             self.layer_id, main_k, index_k, row_positions, row_requests, mode
         )
 
-    @break_point
     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        # Under a prefill capture only the cache writes, selection and attention
+        # stay an eager break; the token-local projections around them are
+        # captured into the graph segments. The narrowing layer changes the row
+        # count inside the layer and keeps the whole-layer break.
+        if (
+            is_breakable_capture_active()
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_extend()
+            and self.layer_id != self.ced_decoder_start
+        ):
+            return self._captured_extend_forward(positions, hidden_states, ctx)
+        return self._layer_forward(positions, hidden_states, ctx)
+
+    def _captured_extend_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """The extend path of ``_layer_forward`` split around a narrow break.
+
+        Runs on the bucket's padded rows. The replayed graph also serves mixed
+        extend+decode batches; those take the same projections and RoPE as a
+        pure extend in ``_layer_forward`` (the decode-only query padding and
+        aux-stream overlap apply to pure decode alone).
+        """
+        qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
+        qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
+        qr = _attention_norm(qr, self.q_norm)
+        self.rotary_emb._prepare_cache(hidden_states.device)
+        index_q, index_weights = (
+            self.indexer(hidden_states, qr, positions, self.rotary_emb)
+            if self.indexer is not None
+            else (None, None)
+        )
+        q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
+        q = self.rotary_emb.apply_owned(
+            q.unflatten(-1, (self.n_local_heads, self.head_dim)), positions, False
+        )
+        swa = _attention_norm(swa, self.kv_norm)
+        if not self._fused_swa_rope():
+            swa = self.rotary_emb.apply_owned(swa, positions, False)
+        out = self._extend_attention(hidden_states, q, swa, index_q, index_weights, ctx)
+        return self._output_projection(out, positions)
+
+    def _fused_swa_rope(self) -> bool:
+        return self.head_dim == 512 and self.rotary_emb.dim == 64
+
+    @break_point
+    def _extend_attention(
+        self,
+        hidden_states: torch.Tensor,
+        q: torch.Tensor,
+        swa: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Cache writes, global selection and attention over the live rows."""
+        backend, mode = ctx.attn_backend, ctx.forward_mode
+        meta = _row_plan(self.layer_id, self.ced_decoder_start, ctx).source
+        hidden_states, q, swa, index_q, index_weights = slice_to_real_tokens(
+            meta.positions.numel(), hidden_states, q, swa, index_q, index_weights
+        )
+        positions, requests = meta.positions, meta.request_indices
+        self._write_global_kv(hidden_states, positions, requests, backend, mode)
+        self.rotary_emb._prepare_cache(q.device)
+        out = backend.forward_v41(
+            q,
+            swa,
+            layer_id=self.layer_id,
+            positions=positions,
+            request_indices=requests,
+            forward_mode=mode,
+            index_q=index_q,
+            index_weights=index_weights,
+            attn_sink=self._kernel_attn_sink(),
+            softmax_scale=self.head_dim**-0.5,
+            index_process_group=None,
+            swa_rope_cache=(
+                self.rotary_emb.cos_sin_cache if self._fused_swa_rope() else None
+            ),
+        )
+        return out[:, : self.n_local_heads]
+
+    def _output_projection(
+        self, out: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Inverse RoPE, grouped output LoRA and the TP reduction."""
+        out = self.rotary_emb.apply_owned(out, positions, True)
+        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
+        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+        out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+        out, _ = self.wo_b(out, scale=None)
+        if self.mapping.attn.has_tp:
+            out = all_reduce(
+                out,
+                group=self.mapping.attn.tp_group,
+                backend=None,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        return out
+
+    @break_point
+    def _layer_forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -983,19 +1093,7 @@ class DeepseekV41Attention(nn.Module):
             index_process_group=index_group,
             swa_rope_cache=swa_rope_cache,
         )
-        out = self.rotary_emb.apply_owned(out[:, : self.n_local_heads], positions, True)
-        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
-        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
-        out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
-        out, _ = self.wo_b(out, scale=None)
-        if self.mapping.attn.has_tp:
-            out = all_reduce(
-                out,
-                group=self.mapping.attn.tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        return out
+        return self._output_projection(out[:, : self.n_local_heads], positions)
 
 
 class DeepseekV41MoE(DeepseekV4MoE):

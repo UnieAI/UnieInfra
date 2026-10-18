@@ -112,6 +112,16 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
             return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
 
+        # An extend runs the candidate source split around its row selection.
+        def narrowing_head(self, hidden, pre_mix, ctx):
+            events.append(("layer", self.layer_id))
+            rows = v41._row_plan(self.layer_id, 20, ctx)
+            assert rows.keep_rows is None and rows.source is rows.query
+            return [pre_mix]
+
+        def narrowed_forward(self, hidden, head, positions, image_mask, ctx):
+            return embeddings[:, None, :] + streams + 10 * self.layer_id, head[0]
+
     target = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(target)
     target.model = DeepseekV41Model.__new__(DeepseekV41Model)
@@ -126,6 +136,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     )
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
+    target.model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=False))
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.engram_hash = Mock(return_value=torch.tensor([[0, 1, 2], [0, 1, 2]]))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)

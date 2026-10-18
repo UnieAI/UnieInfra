@@ -74,7 +74,7 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
 
     max_model_len: int = 0
     num_gpu_blocks: int = 0
-    block_size: int = 0
+    prefix_granularity: int = 0
     dp_stats_address: str | None = None
     dtype: str = "bfloat16"
     multimodal_encoder_dtype: str | None = None
@@ -83,6 +83,8 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
+    # The frontend's key for KV parallelism (``--kv-parallel-size``); the
+    # wire name is the frontend's contract, not this project's vocabulary.
     decode_context_parallel_size: int = 1
     data_parallel_rank: int = 0
     max_num_seqs: int = 0
@@ -98,6 +100,43 @@ _DEC_ABORT = msgspec.msgpack.Decoder(list[str])
 _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
 # Native tagged request decode, tensor/aux-frame aware for multimodal payloads.
 _DEC_ADD = MsgpackDecoder(TokenizedGenerateReqInput)
+
+
+# SMG decodes the ready response's dtype into a fixed enum of these strings, so
+# map tokenspeed's dtype onto the nearest one.
+_WIRE_DTYPE_MAP = {
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "float16": "float16",
+    "half": "float16",
+    "fp16": "float16",
+    "float32": "float32",
+    "float": "float32",
+    "fp32": "float32",
+}
+
+
+def wire_dtype(dtype) -> str:
+    """Map a tokenspeed/torch dtype onto SMG's wire dtype enum string.
+
+    Args:
+        dtype: A torch dtype or its string form (e.g. ``torch.bfloat16``,
+            ``"bf16"``).
+
+    Returns:
+        The wire enum string (``"bfloat16"`` / ``"float16"`` / ``"float32"``).
+
+    Raises:
+        ValueError: for unmapped dtypes — fail at handshake time: misreporting
+            the dtype to the frontend is worse than refusing to start.
+    """
+    key = str(dtype).lower().replace("torch.", "")
+    mapped = _WIRE_DTYPE_MAP.get(key)
+    if mapped is None:
+        raise ValueError(
+            f"dtype {dtype!r} has no SMG wire mapping; extend _WIRE_DTYPE_MAP"
+        )
+    return mapped
 
 
 def encode(obj: msgspec.Struct) -> bytes:

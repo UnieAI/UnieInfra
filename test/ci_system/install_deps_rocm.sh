@@ -6,6 +6,10 @@ set -e
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
+TORCH_VERSION=${TORCH_VERSION:-2.14.0}
+TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.29.0}
+TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm7.2}
+TORCH_DEVICE_PACKAGE=${TORCH_DEVICE_PACKAGE:-}
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -40,13 +44,14 @@ sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 pip install --upgrade pip "setuptools<82" wheel
 
-echo "=== Step 3: Check PyTorch for ROCm ==="
-if ! pip3 show torch >/dev/null 2>&1; then
-    echo "torch is not installed; installing PyTorch for ROCm 7.2"
-    pip3 install torch==2.13.0 torchvision==0.28.0 \
-        --index-url https://download.pytorch.org/whl/rocm7.2
+echo "=== Step 3: Install PyTorch for ROCm ==="
+torch_packages=("torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}")
+if [ -n "${TORCH_DEVICE_PACKAGE}" ]; then
+    torch_packages+=("${TORCH_DEVICE_PACKAGE}")
 fi
-python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.13.0"), torch.__version__; assert torchvision.__version__.startswith("0.28.0"), torchvision.__version__'
+pip_install_with_retry pip3 install --upgrade "${torch_packages[@]}" \
+    --index-url "${TORCH_INDEX_URL}"
+python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.14.0"), torch.__version__; assert torchvision.__version__.startswith("0.29.0"), torchvision.__version__'
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
@@ -65,7 +70,14 @@ pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
 
 echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
-pip_install_with_retry pip3 install tokenspeed-scheduler/
+# Scheduler changes intentionally accumulate without a version bump. Build in
+# a fresh directory so a persistent runner cannot reuse a same-version native
+# extension left by an earlier checkout.
+SCHEDULER_BUILD_DIR="$(mktemp -d)"
+pip_install_with_retry pip3 install --force-reinstall --no-deps \
+    tokenspeed-scheduler/ \
+    --config-settings="build-dir=${SCHEDULER_BUILD_DIR}"
+rm -rf "${SCHEDULER_BUILD_DIR}"
 
 echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in

@@ -33,6 +33,11 @@ public:
     struct Window {
         std::int32_t begin{0};
         std::int32_t size{0};
+        // Tokens before `begin` re-fed as model input on top of the window
+        // (bounded replay of replayable cache groups). They are not part of
+        // the window's progress: `begin` and `size` alone say which tokens
+        // this chunk computes, and TokenSlice ignores the field.
+        std::int32_t replay{0};
     };
 
     explicit TokenContainer(const std::vector<std::int32_t>& new_tokens)
@@ -43,11 +48,7 @@ public:
 
     void Extend(const std::vector<std::int32_t>& new_tokens);
 
-    // Retraction folds generated tokens into the prefill window so the
-    // requeued request prefills prompt + generated as one fresh extend.
-    void RebasePrefill() { num_prefill_tokens_ = static_cast<std::int32_t>(tokens_.size()); }
-
-    std::vector<std::span<const std::int32_t>> FullPagedTokens(std::int32_t page_size, bool except_last) const;
+    std::vector<std::span<const std::int32_t>> FullPrefixPages(std::int32_t prefix_granularity, bool except_last) const;
     std::int32_t Size() const { return static_cast<std::int32_t>(tokens_.size()); }
     std::int32_t PrefillSize() const { return num_prefill_tokens_; }
     std::span<const std::int32_t> TokenSlice(Window window) const;

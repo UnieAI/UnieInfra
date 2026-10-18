@@ -27,7 +27,9 @@
 // arbitrary interleavings of caching and eviction, a hit can never be
 // "cold" for one group while counted for another. These tests drive
 // randomized cache/evict sequences and check the converged prefix against
-// a per-group ground-truth replay.
+// a per-group ground-truth replay. The one group kind outside the invariant
+// is a replayable sliding group (bounded replay): it is never matched, and
+// the scheduler re-feeds its window before every hit instead.
 
 #include <gtest/gtest.h>
 
@@ -37,7 +39,7 @@
 #include <string>
 #include <vector>
 
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
 #include "cache_test_access.h"
@@ -61,15 +63,18 @@ CacheKey KeyFor(const std::string& content_hash, std::uint32_t group_id) {
 
 std::uint64_t g_epoch = 0;
 
-std::int32_t CacheBlockFor(KvCacheCoordinator& coordinator, BlockPool& pool, const std::string& content_hash,
+std::int32_t CacheBlockFor(CacheCoordinator& coordinator, BlockPool& pool, const std::string& content_hash,
                            std::uint32_t group_id) {
-    KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
-    CacheBlockRef block_ref = pool.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
+    const std::int32_t group_index = static_cast<std::int32_t>(group_id);
+    CacheBlockRef block_ref = pool.AcquireBlock(group_id);
     if (!block_ref) {
         return -1;
     }
     const std::int32_t id = block_ref->Location().lcm_block_id;
-    manager.RegisterCachedBlock(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch);
+    coordinator.GroupPrefixIndex(group_index)
+        .Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch, /*logical_block_index=*/-1,
+                  CacheBoundaryKind::kChunk,
+                  /*newly_cached=*/nullptr);
     block_ref.reset();
     return id;
 }
@@ -77,15 +82,17 @@ std::int32_t CacheBlockFor(KvCacheCoordinator& coordinator, BlockPool& pool, con
 // Ground truth for one group in isolation: the deepest prefix (in blocks)
 // this group alone can support, given which of its blocks are cached.
 // Full attention is prefix-closed; a sliding group needs its lookback run.
-std::int32_t GroupPrefixBlocks(const KvCacheCoordinator& coordinator, const BlockPool& pool,
+std::int32_t GroupPrefixBlocks(const CacheCoordinator& coordinator, const BlockPool& pool,
                                std::span<const std::string> hashes, std::uint32_t group_id, std::int32_t bound_blocks) {
-    const KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
+    const std::int32_t group_index = static_cast<std::int32_t>(group_id);
     std::vector<CacheKey> keys;
     keys.reserve(hashes.size());
     for (const std::string& hash : hashes) {
         keys.push_back(KeyFor(hash, group_id));
     }
-    const GroupPrefixProbe probe = manager.Probe(pool, keys, 0, bound_blocks);
+    const GroupPrefixProbe probe =
+        coordinator.GroupMatcher(group_index)
+            .Probe(coordinator.GroupPrefixIndex(group_index), pool, keys, 0, bound_blocks, /*extra_hits=*/nullptr);
     return static_cast<std::int32_t>(probe.hits.size());
 }
 
@@ -94,19 +101,27 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     constexpr std::int32_t kBlockTokens = 4;
     // full target group + a sliding "draft" group (window 8 -> lookback 2
     // blocks): the draft-SWA-under-full-target shape.
-    const std::vector<KvCacheSpec> specs = {
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        {.kind = AttnKind::kSlidingWindow, .sliding_window = 8, .cache_blocks_per_lcm_block = 1},
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
     };
 
     std::mt19937 rng(20260807);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     for (int round = 0; round < 200; ++round) {
-        BlockPool pool(64);
+        BlockPool pool(64, {1, 1});
         {
-            KvCacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
-
+            CacheCoordinator coordinator =
+                MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                /*snapshot_pool=*/nullptr,
+                                /*stream_device_cache_to_host=*/false);
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
             // sliding group's reclaim of slid-out blocks).
@@ -131,8 +146,8 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
                     if (to_evict-- <= 0 || lcm_block_id < 0) {
                         break;
                     }
-                    coordinator.GroupManager(static_cast<std::int32_t>(group))
-                        .EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = 0});
+                    coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group))
+                        .Evict(pool, CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = 0});
                 }
             }
 
@@ -158,19 +173,78 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     }
 }
 
+// A replayable group is the one deliberate exception to hit => warm: it is
+// left out of the joint convergence and re-warmed by the bounded replay the
+// scheduler issues before every hit, so the closed group alone decides the
+// boundary whatever the replayable group has cached (nothing, by contract).
+TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
+    constexpr std::int32_t kBlocks = 12;
+    constexpr std::int32_t kBlockTokens = 4;
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .replayable = true,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
+    };
+
+    std::mt19937 rng(20260916);
+    const std::vector<std::string> hashes = MakeHashes(kBlocks);
+    for (int round = 0; round < 200; ++round) {
+        BlockPool pool(64, {1, 1});
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false);
+        std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
+        const std::int32_t full_depth = depth_dist(rng);
+        for (std::int32_t i = 0; i < full_depth; ++i) {
+            CacheBlockFor(coordinator, pool, hashes[static_cast<std::size_t>(i)], 0);
+        }
+        // Whatever a test registers directly for the replayable group must
+        // neither lift nor lower the closed boundary.
+        const std::int32_t swa_depth = depth_dist(rng);
+        for (std::int32_t i = 0; i < swa_depth; ++i) {
+            CacheBlockFor(coordinator, pool, hashes[static_cast<std::size_t>(i)], 1);
+        }
+
+        const auto match = MatchPrefixForTest(coordinator, hashes).device;
+        EXPECT_EQ(match.num_common_tokens, full_depth * kBlockTokens) << "round " << round;
+        EXPECT_EQ(match.per_group[0].NumHitBlocks(), full_depth) << "round " << round;
+        EXPECT_TRUE(match.per_group[1].blocks.empty()) << "round " << round;
+        // The closed group still honours hit => warm on its own.
+        EXPECT_EQ(GroupPrefixBlocks(coordinator, pool, hashes, 0, full_depth), full_depth) << "round " << round;
+    }
+}
+
 TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     // Three groups: full target, target state-like full group with packing 2,
     // and a draft sliding group. The converged boundary must be supported by
     // all three — no group is special.
     constexpr std::int32_t kBlocks = 8;
     constexpr std::int32_t kBlockTokens = 4;
-    const std::vector<KvCacheSpec> specs = {
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
-        {.kind = AttnKind::kSlidingWindow, .sliding_window = 8, .cache_blocks_per_lcm_block = 1},
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
+        {.attn_kind = AttnKind::kFull,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 2,
+         .block_granularity = kBlockTokens},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
     };
-    BlockPool pool(64);
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+    BlockPool pool(64, {1, 2, 1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the

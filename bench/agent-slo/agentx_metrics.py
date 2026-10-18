@@ -59,7 +59,9 @@ def row_metrics(d, rows):
         "tps_per_req": statistics.mean(
             [n(r) / max(1e-9, r["ms"] / 1000) for r in rows]
         ),
-        "token_source": "tokenizer" if "tokens" in (rows[0] if rows else {}) else "chunks",
+        "token_source": (
+            "tokenizer" if "tokens" in (rows[0] if rows else {}) else "chunks"
+        ),
         "mean_chunks": statistics.mean([r.get("ntok") or 0 for r in rows]),
         "mean_tokens": statistics.mean([n(r) for r in rows]) if rows else None,
         "ttft_p50": _pct(ttft, 0.50),

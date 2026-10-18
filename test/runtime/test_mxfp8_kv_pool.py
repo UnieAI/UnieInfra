@@ -17,9 +17,10 @@
 
 """MXFP8 KV pool: quantize -> store -> verify layout and roundtrip error.
 
-Covers both scale layouts (interleaved for page 128, flat otherwise), the
-size accounting, and an end-to-end quantize_mxfp8 -> set_kv_buffer ->
-manual dequant roundtrip against the original bf16 K/V.
+Covers the interleaved scale layout (uniform and per-layer head counts), the
+size accounting, and an end-to-end set_kv_buffer -> manual dequant roundtrip
+against the original bf16 K/V, with the stored bytes equal to quantize_mxfp8's
+on finite inputs.
 """
 
 from __future__ import annotations
@@ -40,38 +41,36 @@ LAYERS = 2
 
 
 def _make_pool(page_size: int, size: int = 512):
-    from cache_pool_test_utils import make_mha_memory_plan
+    from test.runtime.cache_pool_test_utils import make_arena, make_mha_memory_plan
 
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,
     )
 
-    return MHATokenToKVPoolMXFP8(
-        size=size,
-        dtype=torch.bfloat16,
-        head_num=HEADS,
-        head_dim=HEAD_DIM,
-        layer_num=LAYERS,
-        device="cuda",
-        enable_memory_saver=False,
-        page_size=page_size,
-        rank=0,
-        layer_group_ids=("full_attention",) * LAYERS,
-        memory_plan=make_mha_memory_plan(
+    arena = make_arena(
+        make_mha_memory_plan(
             size=size,
-            page_size=page_size,
+            prefix_granularity=page_size,
             layer_num=LAYERS,
             kv_heads=HEADS,
             head_dim=HEAD_DIM,
             dtype=torch.bfloat16,
             mxfp8=True,
-        ),
+        )
+    )
+    return MHATokenToKVPoolMXFP8(
+        arena,
+        dtype=torch.bfloat16,
+        head_num=HEADS,
+        head_dim=HEAD_DIM,
+        layer_num=LAYERS,
+        rank=0,
     )
 
 
 def _quantize(x: torch.Tensor):
     """[T, H, D] bf16 -> (fp8 data, [T, H, sf] e8m0 scales) via the kernel op."""
-    from tokenspeed_kernel import quantize_mxfp8
+    from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
     t, h, d = x.shape
     q, sf = quantize_mxfp8(x.reshape(t * h, d))
@@ -85,43 +84,40 @@ def _dequant(q: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     return q.to(torch.float32) * scale
 
 
-@pytest.mark.parametrize("page_size", [128, 64])
-def test_store_and_roundtrip(page_size: int):
+def test_store_and_roundtrip():
+    """The mxfp8 pool is a P=128 pool; no recipe can plan its scales at any
+    other grain (test_config_rejects_non_128_page asserts the rejection)."""
     torch.manual_seed(0)
-    pool = _make_pool(page_size)
+    pool = _make_pool(128)
     layer = SimpleNamespace(layer_id=1)
 
     T = 96
     kv = torch.randn(T, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k_q, k_sf = _quantize(kv)
-    v_q, v_sf = _quantize(kv * 0.5)
-    loc = torch.randperm(pool.size, device="cuda")[:T].to(torch.int64)
+    v_q, _ = _quantize(kv * 0.5)
+    loc = torch.randperm(pool.arena.size, device="cuda")[:T].to(torch.int64)
 
-    pool.set_kv_buffer(layer, loc, k_q, v_q, k_scale=k_sf, v_scale=v_sf)
+    pool.set_kv_buffer(layer, loc, kv, kv * 0.5)
 
     # Data lands at loc.
     assert torch.equal(pool.k_buffer[1][loc].view(torch.uint8), k_q.view(torch.uint8))
     assert torch.equal(pool.v_buffer[1][loc].view(torch.uint8), v_q.view(torch.uint8))
 
     # Scales land in the layout's documented position.
-    k_sfbuf, v_sfbuf = pool.get_kv_scale_buffer(1)
-    if page_size == 128:
-        u32 = k_sfbuf.view(torch.uint8).reshape(-1, HEADS, 128, 4).view(torch.int32)
-        src = (
-            k_sf.view(torch.uint8)
-            .reshape(T, HEADS, 4)
-            .contiguous()
-            .view(torch.int32)
-            .reshape(T, HEADS)
-        )
-        for t in range(0, T, 17):  # sample positions
-            slot = int(loc[t])
-            page, off = divmod(slot, 128)
-            pos = (off % 32) * 4 + (off // 32)
-            assert torch.equal(u32[page, :, pos, 0], src[t])
-    else:
-        assert torch.equal(k_sfbuf[loc].view(torch.uint8), k_sf.view(torch.uint8))
-        assert torch.equal(v_sfbuf[loc].view(torch.uint8), v_sf.view(torch.uint8))
+    k_sfbuf, _v_sfbuf = pool.get_kv_scale_buffer(1)
+    u32 = k_sfbuf.view(torch.uint8).reshape(-1, HEADS, 128, 4).view(torch.int32)
+    src = (
+        k_sf.view(torch.uint8)
+        .reshape(T, HEADS, 4)
+        .contiguous()
+        .view(torch.int32)
+        .reshape(T, HEADS)
+    )
+    for t in range(0, T, 17):  # sample positions
+        slot = int(loc[t])
+        page, off = divmod(slot, 128)
+        pos = (off % 32) * 4 + (off // 32)
+        assert torch.equal(u32[page, :, pos, 0], src[t])
 
     # Roundtrip: dequantized K matches original within fp8 blockscale error.
     k_rt = _dequant(pool.k_buffer[1][loc], k_sf)
@@ -129,26 +125,64 @@ def test_store_and_roundtrip(page_size: int):
     assert rel < 0.13, f"roundtrip rel err {rel:.4f}"  # e4m3 mantissa ~2^-3
 
 
-def test_requires_prequantized_and_scales():
-    pool = _make_pool(128)
-    layer = SimpleNamespace(layer_id=0)
-    loc = torch.arange(4, device="cuda", dtype=torch.int64)
-    bf16 = torch.randn(4, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(AssertionError):
-        pool.set_kv_buffer(layer, loc, bf16, bf16, None, None)
-    q, _sf = _quantize(bf16)
-    with pytest.raises(AssertionError):
-        pool.set_kv_buffer(layer, loc, q, q, None, None)
-
-
 def test_size_accounting_includes_scales():
     pool = _make_pool(128)
     k_size, v_size = pool.get_kv_size_bytes()
-    slots = pool.size + pool.page_size
+    slots = pool.arena.size + pool.arena.prefix_granularity
     expect_data = slots * HEADS * HEAD_DIM * LAYERS  # 1 byte/elem
     expect_sf = slots * HEADS * SF_DIM * LAYERS
     assert k_size == expect_data + expect_sf
     assert v_size == expect_data + expect_sf
+
+
+def test_rejects_scale_planes_outside_the_interleaved_layout():
+    """The pool has one scale layout; a plan declaring any other shape for a
+    scale field fails when the planes are bound, not at the first store."""
+    from test.runtime.cache_pool_test_utils import make_arena, plan_fields
+
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+        MHATokenToKVPoolMXFP8,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheFieldSpec,
+    )
+
+    kv_shape = (128, HEADS, HEAD_DIM)
+    per_token_scales = (128, HEADS, SF_DIM)
+    plan = plan_fields(
+        {
+            "full_attention": (
+                CacheFieldSpec("layer.0.k", "unit.0.k", kv_shape, "float8_e4m3fn"),
+                CacheFieldSpec("layer.0.v", "unit.0.v", kv_shape, "float8_e4m3fn"),
+                CacheFieldSpec(
+                    "layer.0.k_scale",
+                    "unit.0.k_scale",
+                    per_token_scales,
+                    "float8_e8m0fnu",
+                ),
+                CacheFieldSpec(
+                    "layer.0.v_scale",
+                    "unit.0.v_scale",
+                    per_token_scales,
+                    "float8_e8m0fnu",
+                ),
+            )
+        },
+        prefix_granularity=128,
+        num_lcm_blocks=2,
+        cache_blocks_per_lcm_block={"full_attention": 1},
+        alignment=1,
+        max_padding_fraction=1.0,
+    )
+    with pytest.raises(ValueError, match="interleaved"):
+        MHATokenToKVPoolMXFP8(
+            make_arena(plan),
+            dtype=torch.bfloat16,
+            head_num=HEADS,
+            head_dim=HEAD_DIM,
+            layer_num=1,
+            rank=0,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -167,28 +201,16 @@ SHARED_KV_HEADS = (2, 4, 2, 4)
 
 
 def _make_shared_pool(size: int = 512):
-    from cache_pool_test_utils import make_mha_memory_plan
+    from test.runtime.cache_pool_test_utils import make_arena, make_mha_memory_plan
 
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,
     )
 
-    return MHATokenToKVPoolMXFP8(
-        size=size,
-        dtype=torch.float8_e4m3fn,
-        head_num=HEADS,
-        head_dim=HEAD_DIM,
-        layer_num=len(SHARED_LAYER_TYPES),
-        device="cuda",
-        enable_memory_saver=False,
-        page_size=128,
-        rank=0,
-        layer_types=SHARED_LAYER_TYPES,
-        layer_group_ids=SHARED_LAYER_TYPES,
-        layer_kv_head_counts=SHARED_KV_HEADS,
-        memory_plan=make_mha_memory_plan(
+    arena = make_arena(
+        make_mha_memory_plan(
             size=size,
-            page_size=128,
+            prefix_granularity=128,
             layer_num=len(SHARED_LAYER_TYPES),
             kv_heads=HEADS,
             head_dim=HEAD_DIM,
@@ -196,7 +218,16 @@ def _make_shared_pool(size: int = 512):
             layer_types=SHARED_LAYER_TYPES,
             sliding_window_tokens=512,
             mxfp8=True,
-        ),
+        )
+    )
+    return MHATokenToKVPoolMXFP8(
+        arena,
+        dtype=torch.float8_e4m3fn,
+        head_num=HEADS,
+        head_dim=HEAD_DIM,
+        layer_num=len(SHARED_LAYER_TYPES),
+        rank=0,
+        layer_kv_head_counts=SHARED_KV_HEADS,
     )
 
 
@@ -213,9 +244,11 @@ def test_shared_field_geometry_and_aliasing():
     assert pool.k_scale_buffer[0].data_ptr() != pool.k_scale_buffer[2].data_ptr()
     assert pool.k_buffer[0].dtype == torch.float8_e4m3fn
 
-    # One byte-uniform scale field per block: data bytes / 32 e8m0 each.
+    # One byte-uniform scale field per block: data bytes / 32 e8m0 each. The
+    # plan's own rank is the interleaved layout's; only the bytes are pinned.
     slot_sf = 128 * HEADS * HEAD_DIM // 32
-    assert pool.k_scale_buffer[0].shape == (num_blocks, slot_sf)
+    assert pool.k_scale_buffer[0].shape[0] == num_blocks
+    assert pool.k_scale_buffer[0][0].numel() == slot_sf
 
     # Layer views factorize the same bytes: full (h/2, k=2), swa (h, k=1).
     k_full, _ = pool.get_kv_scale_buffer(0)
@@ -238,10 +271,9 @@ def test_shared_field_store_matches_standalone_scatter(layer_id: int, heads_l: i
     T = 80
     kv = torch.randn(T, heads_l, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k_q, k_sf = _quantize(kv)
-    v_q, v_sf = _quantize(kv * 0.5)
     loc = torch.randperm(num_ids * page_tokens, device="cuda")[:T].to(torch.int64)
 
-    pool.set_kv_buffer(layer, loc, k_q, v_q, k_scale=k_sf, v_scale=v_sf)
+    pool.set_kv_buffer(layer, loc, kv, kv * 0.5)
 
     # Data: readable back through the layer's row view at the same locs.
     rows = pool.get_key_buffer(layer_id)
@@ -264,29 +296,34 @@ def test_shared_field_store_matches_standalone_scatter(layer_id: int, heads_l: i
     assert torch.equal(k_view.view(torch.uint8), ref.view(torch.uint8))
 
 
-def _make_config(page_size: int):
+def _make_config(prefix_granularity: int):
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
-    return MHAConfig(
-        device="cuda",
+    spec = MHAConfig(
         backend_name="mha",
         num_attention_heads=16,
         num_kv_heads=HEADS,
         head_dim=HEAD_DIM,
         attn_tp_size=1,
+    )
+    return AttnConfig(
+        device="cuda",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_mxfp8=True,
-        page_size=page_size,
+        prefix_granularity=prefix_granularity,
+        kernel_page_size=prefix_granularity,
         context_len=4096,
         max_bs=8,
-        max_graph_bs=8,
         kv_cache_quant_method="none",
+        components=(spec,),
     )
 
 
 def _create_config_pool(config):
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+        create_cache_arena,
         create_cache_pool,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
@@ -301,16 +338,64 @@ def _create_config_pool(config):
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=config.cache_cell_size() * LAYERS * 512,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
+    )
+    arena = create_cache_arena(
+        setup.spec, device=config.device, enable_memory_saver=False
     )
     return create_cache_pool(
         setup.spec,
         config,
+        arena,
         num_layers=LAYERS,
         rank=0,
-        enable_memory_saver=False,
     )
+
+
+@pytest.mark.parametrize("layer_id", range(len(SHARED_KV_HEADS)))
+def test_the_prologue_writes_through_the_pool_write_target(layer_id: int):
+    """The prologue's rows land where the pool's own quantize-and-store puts
+    them, for every per-layer head count of a shared field."""
+    from tokenspeed_kernel.ops.attention.prologue import gqa_prologue
+    from tokenspeed_kernel.ops.kvcache.triton import quantize_store_kv_mxfp8
+
+    heads, tokens = SHARED_KV_HEADS[layer_id], 37
+    g = torch.Generator(device="cuda").manual_seed(layer_id)
+    q, k, v = (
+        torch.randn(tokens, n * heads * HEAD_DIM, generator=g, device="cuda").bfloat16()
+        for n in (2, 1, 1)
+    )
+    prologue_pool, reference_pool = _make_shared_pool(), _make_shared_pool()
+    loc = torch.randperm(reference_pool.arena.size, generator=g, device="cuda")[:tokens]
+    quantize_store_kv_mxfp8(
+        k.view(tokens, heads, HEAD_DIM),
+        v.view(tokens, heads, HEAD_DIM),
+        reference_pool._layer_row_view(reference_pool.k_buffer[layer_id], layer_id),
+        reference_pool._layer_row_view(reference_pool.v_buffer[layer_id], layer_id),
+        reference_pool.k_scale_buffer[layer_id],
+        reference_pool.v_scale_buffer[layer_id],
+        loc,
+        page_tokens=reference_pool._layer_page_tokens(layer_id),
+    )
+    gqa_prologue(
+        q,
+        k,
+        v,
+        norm=None,
+        rotary=None,
+        cache=prologue_pool.kv_write_target(layer_id, loc, None),
+        return_kv=False,
+        solution=None,
+        override=None,
+    )
+    for name in ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer"):
+        for lid in range(len(SHARED_KV_HEADS)):
+            got = getattr(prologue_pool, name)[lid].view(torch.uint8)
+            assert torch.equal(
+                got, getattr(reference_pool, name)[lid].view(torch.uint8)
+            )
 
 
 def test_config_selects_mxfp8_pool_and_sizes():
@@ -318,7 +403,7 @@ def test_config_selects_mxfp8_pool_and_sizes():
         MHATokenToKVPoolMXFP8,
     )
 
-    config = _make_config(page_size=128)
+    config = _make_config(prefix_granularity=128)
     # fp8 data + 1 scale byte per 32: 33/32 of the fp8 cell.
     assert (
         config.cache_cell_size() == HEADS * HEAD_DIM * 2 + (HEADS * HEAD_DIM * 2) // 32
@@ -328,8 +413,8 @@ def test_config_selects_mxfp8_pool_and_sizes():
 
 
 def test_config_rejects_non_128_page():
-    config = _make_config(page_size=64)
-    with pytest.raises(AssertionError, match="block-size 128"):
+    config = _make_config(prefix_granularity=64)
+    with pytest.raises(AssertionError, match="prefix-granularity 128"):
         _create_config_pool(config)
 
 

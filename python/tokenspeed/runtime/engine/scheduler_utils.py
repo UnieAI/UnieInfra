@@ -20,181 +20,322 @@
 
 """Helper functions for constructing scheduler specs and events."""
 
-import logging
-import math
 import os
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
-
-logger = logging.getLogger(__name__)
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
 from tokenspeed_scheduler import (
     Cache,
+    CacheGroupConfig,
     ExecutionEvent,
     ForwardEvent,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
-    PagedCacheTransferPolicy,
     RequestSpec,
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.cache.transfer.ops import (
+    CacheTransfer,
+    HostTier,
+    PrefetchOp,
+    PrefetchRow,
+    RestoreOp,
+    SnapshotOp,
+)
+from tokenspeed.runtime.execution.types import (
+    InputLogprobPlan,
+    NGramInputs,
+    RequestHistorySeeds,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    cache_group_config,
+    scheduler_role,
+)
 
+# The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
+# load-back ticket, an L3 prefetch (with the prefix pages it landed), a
+# retraction image's snapshot store, a restore. The hooks carry them across
+# ranks as ``(kind, op_id)`` payloads and rebuild the binding event from the
+# payload.
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
+    "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
+    "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
+    "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
+    "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
-# Emitted only by the host tier. Keep the lookup guarded so an older extension
-# still imports this module and fails later with a targeted compatibility error.
-if hasattr(Cache, "LoadBackDoneEvent"):
-    _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
-# Pool-spec string -> scheduler enum (pool_to_paged_cache_groups).
-_RETENTION_MAP = {
-    "full_history": PagedCacheRetention.FullHistory,
-    "sliding_window": PagedCacheRetention.SlidingWindow,
-}
-_FAMILY_MAP = {
-    "history": PagedCacheGroupFamily.History,
-    "state": PagedCacheGroupFamily.State,
-}
-_TRANSFER_POLICY_MAP = {
-    "full_suffix": PagedCacheTransferPolicy.FullSuffix,
-    "latest_snapshot": PagedCacheTransferPolicy.LatestSnapshot,
-}
+
+def engram_context_len(text_config) -> int:
+    """Select caller-owned Engram inputs, not Qwen4's LCM-owned PLE state."""
+    if not getattr(text_config, "engram_layer_ids", ()):
+        return 0
+    if getattr(text_config, "ngram_context_len", None) != 3:
+        raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
+    return text_config.ngram_context_len
+
+
+def ngram_inputs_for_forward(
+    forward_op, rid_to_state: Mapping, context_len: int
+) -> NGramInputs | None:
+    """Snapshot one bounded seed window per request, including empty prefills.
+
+    Each row is [current, prev1..3] at the extend prefix or the newest committed
+    decode token. Prompt/output lists contain physical IDs, unlike the unpadded
+    detokenizer prompt. The executor uses these immutable windows to seed/reset
+    its accepted input tail; ongoing decode and proposed predecessors stay on
+    the device, even when an entire verify result awaits its host commit.
+    """
+    if context_len == 0:
+        return None
+    tokens, positions = [], []
+    num_extends = forward_op.num_extends()
+    for i, rid in enumerate(forward_op.request_ids):
+        state = rid_to_state[rid]
+        prompt, output = state.prompt_input_ids, state.output_ids
+        prompt_len = len(prompt)
+        total = prompt_len + len(output)
+        length = forward_op.input_lengths[i]
+        if i < num_extends:
+            start = forward_op.extend_prefix_lens[i]
+            if start < 0 or start + length > total:
+                raise ValueError(f"N-gram prefill exceeds physical tokens for {rid}")
+        else:
+            start = total - 1
+            if start < 0:
+                raise ValueError(f"N-gram decode requires physical tokens for {rid}")
+        tokens.append(
+            tuple(
+                (
+                    -1
+                    if p < 0 or p >= total
+                    else prompt[p] if p < prompt_len else output[p - prompt_len]
+                )
+                for p in range(start, start - context_len - 1, -1)
+            )
+        )
+        positions.append(start)
+    return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
+
+
+def input_logprob_plan_for_forward(
+    forward_op, rid_to_state: Mapping
+) -> InputLogprobPlan | None:
+    """Name the prompt rows of this forward whose next-token logprob is wanted.
+
+    An extend row ``i`` feeds prompt positions ``[extend_prefix_lens[i],
+    extend_prefix_lens[i] + input_lengths[i])`` (bounded replay re-feeds the
+    leading rows; they never reach ``logprob_start_len`` because the admission
+    probe is capped there). The request wants position ``p`` when
+    ``logprob_start_len <= p < input_length - 1``: the last prompt position
+    predicts the first generated token, which is the output logprob's job.
+    Positions past the prompt and requests that already finalized their
+    prompt logprobs contribute nothing.
+    The plan is one triple per extend slot; the targets (each row's next
+    prompt token) are read on the device from the scheduler's shifted input
+    ids, which cover the chunk boundary, so nothing per row crosses here.
+
+    The plan's ``top_k`` is the largest ``top_logprobs_num`` among the
+    planned slots: every gathered row returns that many alternatives, and the
+    commit path keeps each request's own count.
+
+    Returns:
+        The plan, or None when no row of the batch needs a prompt logprob.
+    """
+    num_extends = forward_op.num_extends()
+    if num_extends <= 0:
+        return None
+    row_starts: list[int] = []
+    counts: list[int] = []
+    position_starts: list[int] = []
+    top_k = 0
+    row_offset = 0
+    for i in range(num_extends):
+        state = rid_to_state[forward_op.request_ids[i]]
+        chunk_start = forward_op.extend_prefix_lens[i]
+        chunk_len = forward_op.input_lengths[i]
+        lo = max(chunk_start, state.logprob_start_len)
+        hi = min(chunk_start + chunk_len, state.input_length - 1)
+        if (
+            not state.wants_input_logprobs
+            or state.input_token_logprobs_val is not None
+            or lo >= hi
+        ):
+            row_starts.append(0)
+            counts.append(0)
+            position_starts.append(0)
+        else:
+            row_starts.append(row_offset + lo - chunk_start)
+            counts.append(hi - lo)
+            position_starts.append(lo)
+            top_k = max(top_k, state.top_logprobs_num)
+        row_offset += chunk_len
+    if not any(counts):
+        return None
+    return InputLogprobPlan(
+        row_starts=tuple(row_starts),
+        counts=tuple(counts),
+        position_starts=tuple(position_starts),
+        top_k=top_k,
+    )
+
+
+def sampled_top_k_for_forward(forward_op, rid_to_state: Mapping) -> int:
+    """How many alternatives this forward's prefill samples are reported with.
+
+    The largest ``top_logprobs_num`` among the extend slots of requests that
+    return logprobs; 0 when none asks, which leaves the forward as it was.
+    The ingress takes a top-k request only when each of its tokens is sampled
+    in a prefill (``max_new_tokens <= 1``), so decode rows never need one.
+    """
+    num_extends = forward_op.num_extends()
+    if num_extends == 0:
+        return 0
+    # One read: each read of the binding's ``request_ids`` builds a new list.
+    request_ids = forward_op.request_ids
+    top_k = 0
+    for i in range(num_extends):
+        state = rid_to_state.get(request_ids[i])
+        if state is not None and state.return_logprob:
+            top_k = max(top_k, state.top_logprobs_num)
+    return top_k
+
+
+class RequestHistoryRows:
+    """Which request's committed tokens each executor history row holds.
+
+    Every forward appends its inputs to its slot's row at the committed
+    frontier, so a row holds request ``rid``'s tokens from position 0 once
+    rid has started there at position 0 or been seeded there, until another
+    request runs in the slot. That ownership decides when a forward must
+    seed its committed prefix: a prefix-cache hit, a slot handoff, a
+    retracted request's restore into another slot (its history row is
+    token-derived and not part of its image), or a PD decode landing, whose
+    first local forward is a decode over a remotely prefilled prompt. Later
+    chunks of one prefill and ordinary decode steps never reseed.
+
+    Ownership is recorded per admission — the request's state object, held
+    weakly — not per request id: clients may reuse a finished request's id,
+    and a later request landing in the same slot must not inherit the row.
+    A restored request keeps its state object but lands in a new slot, so
+    the row ownership check reseeds it there.
+
+    Call :meth:`seeds_for_forward` exactly once per forward the executor
+    runs, in dispatch order (the executor runs forwards in that order).
+    """
+
+    def __init__(self) -> None:
+        self._owners: dict[int, weakref.ref] = {}
+
+    def seeds_for_forward(
+        self, forward_op, rid_to_state: Mapping
+    ) -> RequestHistorySeeds | None:
+        """Record the batch's slot ownership; snapshot the prefixes it needs.
+
+        Prompt/output lists hold physical IDs. A decode's input is the
+        request's newest token, so its row must already hold every token
+        before it. Returns None when no row in the batch needs a seed.
+        """
+        slots: list[int] = []
+        prefix_lengths: list[int] = []
+        tokens: list[tuple[int, ...]] = []
+        num_extends = forward_op.num_extends()
+        for i, rid in enumerate(forward_op.request_ids):
+            slot = int(forward_op.request_pool_indices[i])
+            state = rid_to_state[rid]
+            owner = self._owners.get(slot)
+            held = owner is not None and owner() is state
+            self._owners[slot] = weakref.ref(state)
+            prompt, output = state.prompt_input_ids, state.output_ids
+            total = len(prompt) + len(output)
+            boundary = (
+                int(forward_op.extend_prefix_lens[i]) if i < num_extends else total - 1
+            )
+            if boundary <= 0 or held:
+                continue
+            if boundary > total:
+                raise ValueError(
+                    f"Request history prefix {boundary} exceeds the physical "
+                    f"tokens of {rid}"
+                )
+            if boundary <= len(prompt):
+                prefix = tuple(prompt[:boundary])
+            else:
+                prefix = tuple(prompt) + tuple(output[: boundary - len(prompt)])
+            slots.append(slot)
+            prefix_lengths.append(boundary)
+            tokens.append(prefix)
+        if not slots:
+            return None
+        return RequestHistorySeeds(
+            slots=tuple(slots),
+            prefix_lengths=tuple(prefix_lengths),
+            tokens=tuple(tokens),
+        )
 
 
 @dataclass(frozen=True)
 class SchedulerCacheGeometry:
-    page_size: int
+    prefix_granularity: int
     num_device_pages: int
     num_usable_pages: int
     token_capacity: int
 
 
-def scheduler_cache_geometry_from_pool(
-    pool: Any,
-    *,
-    fallback_token_capacity: int,
-    fallback_page_size: int,
-) -> SchedulerCacheGeometry:
-    contract = getattr(pool, "runtime_contract", None)
-    num_lcm_blocks = getattr(pool, "num_lcm_blocks", None)
-    if num_lcm_blocks is not None:
-        num_lcm_blocks = require_positive_int("num_lcm_blocks", num_lcm_blocks)
-        if contract is not None and contract.num_lcm_blocks != num_lcm_blocks:
-            raise ValueError("pool and runtime contract disagree on num_lcm_blocks")
-        return SchedulerCacheGeometry(
-            page_size=require_positive_int(
-                "contract.block_size" if contract is not None else "fallback_page_size",
-                contract.block_size if contract is not None else fallback_page_size,
-            ),
-            # Parent 0 is reserved as the null LCM block.
-            num_device_pages=num_lcm_blocks + 1,
-            num_usable_pages=num_lcm_blocks,
-            token_capacity=require_positive_int(
-                (
-                    "contract.token_capacity"
-                    if contract is not None
-                    else "fallback_token_capacity"
-                ),
-                (
-                    contract.token_capacity
-                    if contract is not None
-                    else fallback_token_capacity
-                ),
-            ),
-        )
-    if contract is not None:
-        num_lcm_blocks = require_positive_int(
-            "contract.num_lcm_blocks", contract.num_lcm_blocks
-        )
-        return SchedulerCacheGeometry(
-            page_size=contract.block_size,
-            num_device_pages=num_lcm_blocks + 1,
-            num_usable_pages=num_lcm_blocks,
-            token_capacity=contract.token_capacity,
-        )
-    if fallback_page_size <= 0 or fallback_token_capacity <= 0:
-        raise ValueError("fallback scheduler cache geometry must be positive")
-    if fallback_token_capacity % fallback_page_size:
-        raise ValueError(
-            "fallback token capacity must be divisible by fallback page size"
-        )
-    pages = fallback_token_capacity // fallback_page_size
+def scheduler_cache_geometry_from_pool(pool: Any) -> SchedulerCacheGeometry:
+    """Project the arena's published contract onto scheduler page counts.
+
+    The contract is the only source: the arena publishes it for every pool,
+    so there is no pool-side copy to prefer and no server-args fallback to
+    reconcile against.
+    """
+    contract = pool.arena.runtime_contract
+    num_lcm_blocks = require_positive_int(
+        "contract.num_lcm_blocks", contract.num_lcm_blocks
+    )
     return SchedulerCacheGeometry(
-        page_size=fallback_page_size,
-        # Ordinary pools allocate page 0 separately from their profiled,
-        # usable token capacity, just like LCM pools reserve parent 0.
-        num_device_pages=pages + 1,
-        num_usable_pages=pages,
-        token_capacity=fallback_token_capacity,
+        prefix_granularity=contract.prefix_granularity,
+        # Parent 0 is reserved as the null LCM block.
+        num_device_pages=num_lcm_blocks + 1,
+        num_usable_pages=num_lcm_blocks,
+        token_capacity=contract.token_capacity,
     )
 
 
-def aligned_max_scheduled_tokens(
-    max_scheduled_tokens: int,
-    paged_cache_groups,
-) -> int:
-    """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
+# "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
+UNBOUNDED_CACHED_PREFIX_TOKENS = 2**31 - 1
 
-    Recurrent-state groups (family=State, retention=FullHistory — the C++
-    ``final_state_manager`` criterion) register their state snapshot only when
-    a prefill chunk ends exactly on a CacheBlock boundary
-    (``RegistersAlignedFinalPageOnly``); interior boundaries never received a
-    state write. A chunk size that is not a multiple of every such group's
-    CacheBlock token span therefore never registers a state block. Since the
-    admission probe takes the minimum hit across groups, prefix-cache reuse
-    silently degrades to zero for the whole model.
+
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    *,
+    max_cached_prefix_tokens: int,
+    max_new_tokens: int = 0,
+) -> RequestSpec:
+    """Build the C++ scheduler's admission record for one request.
 
     Args:
-        max_scheduled_tokens: Requested per-step token budget
-            (``--chunked-prefill-size``).
-        paged_cache_groups: Scheduler ``PagedCacheGroupConfig`` sequence, or
-            None/empty when the model declares no paged cache groups.
-    Returns:
-        ``max_scheduled_tokens`` floored to the LCM of the state groups'
-        CacheBlock token spans. Returned unchanged when no such group exists
-        or the value is already aligned.
-
-    Raises:
-        ValueError: If the configured budget is smaller than one state CacheBlock.
-            Raising is safer than increasing a limit that may already have
-            sized executor buffers.
+        rid: Request id.
+        tokens: Prompt token ids.
+        max_cached_prefix_tokens: Longest prompt prefix the admission probe may
+            claim from the prefix cache. ``UNBOUNDED_CACHED_PREFIX_TOKENS``
+            keeps the ordinary rule; a request returning prompt logprobs from
+            position ``s`` passes ``s`` so those positions are recomputed.
+        max_new_tokens: Declared generation budget (0 = undeclared).
     """
-    require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
-    grain = 1
-    for group in paged_cache_groups or ():
-        if group.family != PagedCacheGroupFamily.State:
-            continue
-        if group.retention == PagedCacheRetention.SlidingWindow:
-            continue
-        grain = math.lcm(
-            grain,
-            int(group.rows_per_page) * int(group.entry_stride_tokens),
-        )
-    if grain == 1:
-        return max_scheduled_tokens
-    if max_scheduled_tokens < grain:
-        raise ValueError(
-            "chunked_prefill_size must be at least one recurrent-state CacheBlock: "
-            f"got {max_scheduled_tokens}, minimum {grain}"
-        )
-    return max_scheduled_tokens - max_scheduled_tokens % grain
-
-
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    spec.max_cached_prefix_tokens = max_cached_prefix_tokens
     return spec
 
 
@@ -202,67 +343,101 @@ def make_config(
     num_device_pages: int,
     max_scheduled_tokens: int,
     max_batch_size: int,
-    page_size: int,
+    prefix_granularity: int,
     num_host_pages: int,
     disable_l2_cache: bool,
     enable_l3_storage: bool,
     role: str,
+    *,
+    num_snapshot_pages: int,
+    max_retracted_requests: int,
+    l3_prefetch_min_pages: int,
+    debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
-    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+    cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
-    admission_reserve: str = "generation-full",
-    context_chunk_policy: str = "fcfs",
-    context_chunk_unit: int = 0,
     prefix_replay_tokens: int = 0,
-    max_cold_prefills: int = 0,
-    prefill_defer_window: int = 0,
 ) -> SchedulerConfig:
+    """Build the C++ scheduler's configuration.
+
+    Args:
+        num_device_pages: Device LCM blocks including the null page.
+        max_scheduled_tokens: Per-step prefill token budget.
+        max_batch_size: Per-rank batch slots -- the most requests this rank
+            runs at once (``--max-num-seqs`` over the attention-DP ranks).
+        prefix_granularity: Prefix-hash page size in tokens.
+        num_host_pages: Host L2 LCM blocks including the null page; 0 without
+            the L2 tier.
+        disable_l2_cache: No Host L2 tier.
+        enable_l3_storage: An L3 store backs the L2 tier.
+        role: ``server_args.disaggregation_mode``.
+        num_snapshot_pages: The retraction snapshot pool's LCM blocks
+            including the null page (``DeviceSpecs.num_snapshot_pages``).
+            Required on every role: 1 -- the null page alone -- means no
+            image can be taken, so a capacity-blocked round aborts the newest
+            resident instead of suspending anyone; more enables suspend and
+            restore on the fused and decode roles (the prefill role refuses a
+            pool).
+        max_retracted_requests: Slot-state arena rows, hence the most
+            requests suspended at once; positive exactly when a pool exists.
+            A victim whose image does not fit the Host (L2 pins, pool, rows)
+            is aborted by the scheduler instead of imaged.
+        l3_prefetch_min_pages: ``--kvstore-prefetch-min-pages``: the shortest
+            L3 prefix, in prefix pages, worth a pre-admission prefetch
+            (``Cache.PrefetchOp``); a shorter L3 hit is simply computed.
+            Required with L3 storage, 0 without it.
+        debug_force_retraction_interval: ``--debug-force-retraction-interval``:
+            0 is off; every ``|N|`` plans the scheduler retracts the oldest
+            quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
+            without capacity pressure. A test knob, never set in serving.
+        enable_kv_cache_events: Publish KV cache events.
+        decode_input_tokens: Verify width per decode step.
+        overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
+        disable_prefix_cache: No prefix matching at admission.
+        cache_groups: The arena's scheduler group configs.
+        enable_mixed_prefill_decode: Mixed prefill/decode batches.
+        prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
+    """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
             "prefix_replay_tokens must fit a non-negative int32; "
             f"got {prefix_replay_tokens}."
         )
+    if num_snapshot_pages < 1:
+        raise ValueError(
+            "num_snapshot_pages must include the null page (1 = no pool); "
+            f"got {num_snapshot_pages}."
+        )
+    if (num_snapshot_pages > 1) != (max_retracted_requests > 0):
+        raise ValueError(
+            "a retraction snapshot pool and its slot-state rows go together; got "
+            f"num_snapshot_pages={num_snapshot_pages}, "
+            f"max_retracted_requests={max_retracted_requests}."
+        )
+    if (l3_prefetch_min_pages > 0) != enable_l3_storage or l3_prefetch_min_pages < 0:
+        raise ValueError(
+            "l3_prefetch_min_pages is the L3 prefetch threshold: positive exactly "
+            f"with L3 storage; got {l3_prefetch_min_pages} with "
+            f"enable_l3_storage={enable_l3_storage}."
+        )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
-    # How the step budget is split among mid-prefill requests. See
-    # SchedulerConfig::ContextChunkPolicy -- "fcfs" is what we have always
-    # done; "equal-progress" is TRT-LLM's kEQUAL_PROGRESS ported 1:1.
-    from tokenspeed_scheduler import ContextChunkPolicy as _Policy
-
-    if _Policy is None:
-        # Extension predates the policy. Refuse loudly if it was asked for, and
-        # stay silent otherwise -- a request for equal-progress that silently
-        # ran FCFS would produce exactly the clean null result the experiment
-        # might legitimately return.
-        if context_chunk_policy != "fcfs":
-            raise RuntimeError(
-                "--context-chunk-policy=%s needs a scheduler extension that "
-                "exports ContextChunkPolicy; the installed one does not"
-                % context_chunk_policy
-            )
-    else:
-        cfg.context_chunk_policy = {
-            "fcfs": _Policy.kFirstComeFirstServed,
-            "equal-progress": _Policy.kEqualProgress,
-        }[context_chunk_policy]
-        cfg.context_chunk_unit = context_chunk_unit
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
-    cfg.block_size = page_size
+    cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
+    cfg.num_snapshot_pages = num_snapshot_pages
+    cfg.max_retracted_requests = max_retracted_requests
+    cfg.debug_force_retraction_interval = debug_force_retraction_interval
+    cfg.l3_prefetch_min_pages = l3_prefetch_min_pages
     cfg.enable_l3_storage = enable_l3_storage
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
-    if role == "prefill":
-        cfg.role = SchedulerConfig.Role.P
-    elif role == "decode":
-        cfg.role = SchedulerConfig.Role.D
-    else:
-        cfg.role = SchedulerConfig.Role.Fused
+    cfg.role = scheduler_role(role)
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
@@ -270,98 +445,26 @@ def make_config(
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
-    # One policy name, translated to the two switches and the ratio the C++
-    # side reads. Keeping the translation here means the scheduler config stays
-    # a mechanism and the choice stays a documented, measured option.
-    if admission_reserve == "chunk":
-        cfg.reserve_full_prefill_at_admission = False
-        cfg.reserve_generation_at_admission = False
-    elif admission_reserve == "prompt":
-        cfg.reserve_full_prefill_at_admission = True
-        cfg.reserve_generation_at_admission = False
-    elif admission_reserve == "generation-adaptive":
-        cfg.reserve_full_prefill_at_admission = True
-        cfg.reserve_generation_at_admission = True
-        cfg.new_token_ratio_init = 0.7
-    elif admission_reserve == "generation-full":
-        cfg.reserve_full_prefill_at_admission = True
-        cfg.reserve_generation_at_admission = True
-        cfg.new_token_ratio_init = 1.0
-    else:
-        raise ValueError(f"unknown admission_reserve {admission_reserve!r}")
-    if not 0 <= max_cold_prefills <= (1 << 31) - 1:
-        raise ValueError(
-            "max_cold_prefills must fit a non-negative int32; "
-            f"got {max_cold_prefills}."
-        )
-    cfg.max_cold_prefills = max_cold_prefills
-    cfg.prefill_defer_window = prefill_defer_window
-    if paged_cache_groups:
-        cfg.paged_cache_groups = list(paged_cache_groups)
+    if cache_groups:
+        cfg.cache_groups = list(cache_groups)
     return cfg
 
 
-def pool_to_paged_cache_groups(pool: Any) -> list:
-    """Convert authoritative contract specs, or legacy pool properties."""
-    contract = getattr(pool, "runtime_contract", None)
-    if contract is not None:
-        specs = contract.group_specs
-        counts = contract.group_page_counts
-    else:
-        specs = pool.paged_cache_group_specs
-        counts = pool.paged_cache_group_page_counts
-    if not specs:
-        return []
-    out = []
-    for spec in specs:
-        retention = _RETENTION_MAP.get(spec.retention)
-        if retention is None:
-            raise ValueError(
-                f"pool_to_paged_cache_groups: unsupported retention "
-                f"{spec.retention!r} for group {spec.group_id!r}"
-            )
-        family = _FAMILY_MAP.get(spec.family)
-        if family is None:
-            raise ValueError(
-                f"pool_to_paged_cache_groups: unsupported family "
-                f"{spec.family!r} for group {spec.group_id!r}"
-            )
-        kwargs = dict(
-            group_id=spec.group_id,
-            rows_per_page=int(spec.rows_per_page),
-            entry_stride_tokens=int(spec.entry_stride_tokens),
-            total_pages=int(counts[spec.group_id]),
-            retention=retention,
-            family=family,
-            cache_blocks_per_lcm_block=int(
-                getattr(spec, "cache_blocks_per_lcm_block", 1)
-            ),
-            # State groups only. 1 keeps a snapshot in every page, which is
-            # what a hybrid has always done; the scheduler nulls the pages
-            # between checkpoints at higher strides.
-            checkpoint_stride_blocks=int(getattr(spec, "checkpoint_stride_blocks", 1)),
+def pool_to_cache_groups(pool: Any) -> list:
+    """Convert a cache's published contract into scheduler group configs."""
+    # The arena is the sole publisher, so there is exactly one source here --
+    # no fallback to pool-side copies of the same specs.
+    contract = pool.arena.runtime_contract
+    counts = contract.virtual_block_counts
+    packing = contract.virtual_packing
+    return [
+        cache_group_config(
+            spec,
+            total_pages=counts[spec.group_id],
+            cache_blocks_per_lcm_block=packing[spec.group_id],
         )
-        transfer_policy = getattr(spec, "transfer_policy", None)
-        if transfer_policy is not None:
-            mapped_policy = _TRANSFER_POLICY_MAP.get(transfer_policy)
-            if mapped_policy is None:
-                raise ValueError(
-                    "pool_to_paged_cache_groups: unsupported transfer policy "
-                    f"{transfer_policy!r} for group {spec.group_id!r}"
-                )
-            kwargs["transfer_policy"] = mapped_policy
-        if spec.retention == "sliding_window":
-            kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
-        if os.environ.get("TOKENSPEED_LOG_CACHE_PACKING"):
-            logger.info(
-                "paged cache group %s: ckpt_stride=%s rows=%s entry_stride=%s",
-                spec.group_id,
-                kwargs.get("checkpoint_stride_blocks"),
-                kwargs.get("rows_per_page"),
-                kwargs.get("entry_stride_tokens"),
-            )
-        out.append(PagedCacheGroupConfig(**kwargs))
-    return out
+        for spec in contract.group_specs
+    ]
 
 
 def should_use_overlap_schedule(
@@ -391,39 +494,44 @@ def resolve_dspark_prefix_replay_tokens(
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
     DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``. Same-checkpoint DSpark configurations without that
-    capability remain fail-closed. External generic DSpark configurations keep
-    their existing scheduler behavior until they advertise an equivalent
-    contract.
+    ``ModelConfig``; V4.1 advertises zero because its windows are cache
+    resident. Same-checkpoint DSpark configurations without that capability
+    remain fail-closed. External generic DSpark configurations keep their
+    existing scheduler behavior until they advertise an equivalent contract.
     """
 
-    if not enable_prefix_caching or speculative_algorithm != "DSPARK":
+    if speculative_algorithm != "DSPARK":
         return 0
     if draft_model_config is None:
-        raise ValueError(
-            "DSPARK prefix caching requires a resolved draft model configuration."
-        )
+        raise ValueError("DSPARK requires a resolved draft model configuration.")
 
     replay_tokens = getattr(draft_model_config, "dspark_prefix_replay_tokens", None)
     if replay_tokens is None:
         if draft_model_path_use_base:
             raise ValueError(
-                "DSPARK same-checkpoint prefix caching requires a draft model "
-                "that advertises captured-context replay support."
+                "DSPARK same-checkpoint decoding requires a draft model that "
+                "advertises captured-context replay support."
             )
         return 0
 
     replay_tokens = int(replay_tokens)
-    if not 0 < replay_tokens <= (1 << 31) - 1:
+    if not 0 <= replay_tokens <= (1 << 31) - 1:
         raise ValueError(
-            "DSPARK captured-context replay requirement must fit a positive int32; "
-            f"got {replay_tokens}."
+            "DSPARK captured-context replay requirement must fit a non-negative "
+            f"int32; got {replay_tokens}."
         )
+    if replay_tokens == 0:
+        # The draft's context lives in the KV cache and follows the prefix.
+        return 0
+    # A drafter-private context cannot be restored from the host tier, with or
+    # without prefix reuse.
     if enable_kvstore:
         raise ValueError(
             "DSPARK captured-context replay does not support KVStore; "
             "use --disable-kvstore."
         )
+    if not enable_prefix_caching:
+        return 0
     if disaggregation_mode != "null":
         raise ValueError(
             "DSPARK captured-context replay does not support disaggregated "
@@ -433,11 +541,17 @@ def resolve_dspark_prefix_replay_tokens(
 
 
 def make_extend_result_event(
-    request_id: str, tokens: Sequence[int] = ()
+    request_id: str,
+    tokens: Sequence[int] = (),
+    spec_candidate_ids: Sequence[int] | None = None,
 ) -> "ForwardEvent.ExtendResult":
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id
     fe.tokens = list(tokens)
+    if spec_candidate_ids:
+        # P-side final chunk: the drafter candidates ride to the scheduler so
+        # its remote-decode operation is self-contained.
+        fe.spec_candidate_ids = list(spec_candidate_ids)
     return fe
 
 
@@ -465,30 +579,291 @@ def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: in
     return fe
 
 
-def advance_forward(scheduler, forward_events: list) -> None:
+def scheduler_pd_lifecycle(scheduler):
+    """Return a query for the PD request lifecycle counts.
+
+    ``(bootstrapping, prefilling, remote_prefilling, decoding, pd_pinned)``
+    -- five state counts over the request table, bound to the scheduler once
+    so the batch logger reads them only when it emits a line.
+
+    Args:
+        scheduler: The engine's C++ scheduler.
+    """
+
+    def lifecycle() -> tuple[int, int, int, int, int]:
+        return (
+            scheduler.bootstrapping_size(),
+            scheduler.prefilling_size(),
+            scheduler.remote_prefilling_size(),
+            scheduler.decoding_size(),
+            scheduler.pd_transfer_size(),
+        )
+
+    return lifecycle
+
+
+def scheduler_cache_group_pages(scheduler):
+    """Return a ``group_id -> (total, available)`` page-count query.
+
+    Two counter reads, bound to the scheduler once, so the batch logger holds
+    a query rather than a reference to the loop that owns the scheduler.
+
+    Args:
+        scheduler: The engine's C++ scheduler.
+
+    Returns:
+        A callable taking a cache-group id and returning its total and
+        available page counts.
+    """
+
+    def pages(group_id: str) -> tuple[int, int]:
+        return (
+            scheduler.cache_group_total_pages(group_id),
+            scheduler.cache_group_available_pages(group_id),
+        )
+
+    return pages
+
+
+def advance_scheduler(scheduler, events: list) -> None:
+    """Feed completion events (forward results or cache-op results) back into
+    the C++ scheduler. The ONLY caller of ``scheduler.advance``.
+
+    Design principle: this is only invoked explicitly and directly from the
+    ``EventLoop.event_loop`` body — never from helpers. Helpers RETURN their
+    events; the loop applies them, so every scheduler state change is visible
+    by reading the loop alone.
+    """
     ec = ExecutionEvent()
-    for fe in forward_events:
-        ec.add_event(fe)
-    scheduler.advance(ec)
+    for event in events:
+        ec.add_event(event)
+    # nanobind calls emit no Python-tracer or Kineto events, so without this
+    # annotation the C++ time is an unlabeled gap in the profiler timeline.
+    with torch.profiler.record_function("scheduler.advance"):
+        scheduler.advance(ec)
 
 
 def cache_event_to_payload(event) -> dict:
+    """A cache ACK as the rank-synchronizing payload the hooks gather.
+
+    ``(kind, op_id)`` identifies the ACK; a ``PrefetchDoneEvent`` adds the
+    pages it landed, identical on every rank because the hooks converged it
+    before the ACK was produced.
+    """
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
-    return {
+    payload = {
         "kind": kind,
         "op_id": int(event.op_id),
     }
+    if kind == "PrefetchDoneEvent":
+        payload["landed_pages"] = int(event.landed_pages)
+    return payload
 
 
 def cache_event_from_payload(payload: dict):
     kind = payload["kind"]
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
+    if kind == "LoadBackDoneEvent":
+        return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]))
+    if kind == "PrefetchDoneEvent":
+        return _CACHE_EVENT_TYPES[kind](
+            int(payload["op_id"]), int(payload["landed_pages"])
+        )
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
     return event
+
+
+def _check_batch_rows(op, columns: Sequence[Sequence]) -> int:
+    """The row count of a wire batch whose per-op columns must all agree."""
+    lengths = {len(column) for column in columns}
+    if len(lengths) != 1:
+        raise ValueError(
+            f"ragged {type(op).__name__} batch: column lengths {sorted(lengths)}"
+        )
+    return lengths.pop()
+
+
+def _wire_transfers(
+    op_id: int,
+    groups: Sequence[int],
+    sources: Sequence[int],
+    destinations: Sequence[int],
+    hashes: Sequence[str] | None,
+    offsets: Sequence[int] | None,
+) -> tuple[CacheTransfer, ...]:
+    """One op's rows of a wire batch as ``CacheTransfer`` values."""
+    if hashes is None:
+        hashes = [""] * len(groups)
+        offsets = [0] * len(groups)
+    if not (
+        len(groups) == len(sources) == len(destinations) == len(hashes) == len(offsets)
+    ):
+        raise ValueError(f"ragged cache operation {op_id}")
+    return tuple(
+        CacheTransfer(
+            group_id=int(group),
+            source_page=int(source),
+            destination_page=int(destination),
+            content_hash=str(content_hash),
+            page_offset=int(page_offset),
+        )
+        for group, source, destination, content_hash, page_offset in zip(
+            groups, sources, destinations, hashes, offsets
+        )
+    )
+
+
+def _snapshot_batch_columns(op) -> tuple[Sequence, ...]:
+    return (
+        op.op_ids,
+        op.request_ids,
+        op.request_pool_indices,
+        op.snapshot_slots,
+        op.group_ids,
+        op.src_pages,
+        op.dst_pages,
+    )
+
+
+def snapshot_ops_from_wire(op) -> list[SnapshotOp]:
+    """One ``SnapshotOp`` per request of a ``Cache.SnapshotOp`` batch."""
+    rows = _check_batch_rows(op, _snapshot_batch_columns(op))
+    return [
+        SnapshotOp(
+            op_id=int(op.op_ids[i]),
+            request_id=str(op.request_ids[i]),
+            request_pool_index=int(op.request_pool_indices[i]),
+            snapshot_slot=int(op.snapshot_slots[i]),
+            transfers=_wire_transfers(
+                int(op.op_ids[i]),
+                op.group_ids[i],
+                op.src_pages[i],
+                op.dst_pages[i],
+                None,
+                None,
+            ),
+        )
+        for i in range(rows)
+    ]
+
+
+def restore_ops_from_wire(op) -> list[RestoreOp]:
+    """One ``RestoreOp`` per request of a ``Cache.RestoreOp`` batch."""
+    rows = _check_batch_rows(
+        op,
+        _snapshot_batch_columns(op)
+        + (op.content_hashes, op.page_offsets, op.source_tiers),
+    )
+    ops = []
+    for i in range(rows):
+        transfers = _wire_transfers(
+            int(op.op_ids[i]),
+            op.group_ids[i],
+            op.src_pages[i],
+            op.dst_pages[i],
+            op.content_hashes[i],
+            op.page_offsets[i],
+        )
+        tiers = tuple(HostTier(int(tier)) for tier in op.source_tiers[i])
+        if len(tiers) != len(transfers):
+            raise ValueError(f"ragged cache operation {op.op_ids[i]}")
+        ops.append(
+            RestoreOp(
+                op_id=int(op.op_ids[i]),
+                request_id=str(op.request_ids[i]),
+                request_pool_index=int(op.request_pool_indices[i]),
+                snapshot_slot=int(op.snapshot_slots[i]),
+                transfers=transfers,
+                source_tier=tiers,
+            )
+        )
+    return ops
+
+
+def prefetch_ops_from_wire(op) -> list[PrefetchOp]:
+    """One ``PrefetchOp`` per request of a ``Cache.PrefetchOp`` batch."""
+    rows = _check_batch_rows(
+        op,
+        (
+            op.op_ids,
+            op.request_ids,
+            op.first_pages,
+            op.num_pages,
+            op.group_ids,
+            op.host_pages,
+            op.content_hashes,
+            op.page_offsets,
+            op.page_indices,
+        ),
+    )
+    ops = []
+    for i in range(rows):
+        groups = op.group_ids[i]
+        pages = op.host_pages[i]
+        hashes = op.content_hashes[i]
+        offsets = op.page_offsets[i]
+        indices = op.page_indices[i]
+        if not (
+            len(groups) == len(pages) == len(hashes) == len(offsets) == len(indices)
+        ):
+            raise ValueError(f"ragged cache operation {op.op_ids[i]}")
+        ops.append(
+            PrefetchOp(
+                op_id=int(op.op_ids[i]),
+                request_id=str(op.request_ids[i]),
+                first_page=int(op.first_pages[i]),
+                num_pages=int(op.num_pages[i]),
+                rows=tuple(
+                    PrefetchRow(
+                        group_id=int(group),
+                        host_page=int(page),
+                        content_hash=str(content_hash),
+                        page_offset=int(page_offset),
+                        page_index=int(page_index),
+                    )
+                    for group, page, content_hash, page_offset, page_index in zip(
+                        groups, pages, hashes, offsets, indices
+                    )
+                ),
+            )
+        )
+    return ops
+
+
+def cache_ops_from_plan(execution_plan) -> list:
+    """The plan's cache ops as the runtime consumes them, in plan order.
+
+    The one adapter between the scheduler's wire batches and the Host cache
+    executor. An L2 ``Cache.WriteBackOp`` / ``Cache.LoadBackOp`` batch passes
+    through: the executor consumes its lists-of-lists as one ticket per
+    ``op_ids`` entry. A ``Cache.SnapshotOp`` / ``Cache.RestoreOp`` /
+    ``Cache.PrefetchOp`` batch becomes one ``SnapshotOp`` / ``RestoreOp`` /
+    ``PrefetchOp`` per request (``cache/transfer/ops.py``): the executor
+    exports or imports one slot, or runs one prefetch job, per request, so
+    the per-request op is its unit of work and its ACK. Each consumer
+    evaluates it once per plan: the binding copies the ops out of C++ on
+    every read of ``plan.cache``.
+
+    Raises:
+        TypeError: The plan carries a cache op kind the runtime cannot run.
+    """
+    ops: list = []
+    for op in execution_plan.cache:
+        if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
+            ops.append(op)
+        elif isinstance(op, Cache.SnapshotOp):
+            ops.extend(snapshot_ops_from_wire(op))
+        elif isinstance(op, Cache.RestoreOp):
+            ops.extend(restore_ops_from_wire(op))
+        elif isinstance(op, Cache.PrefetchOp):
+            ops.extend(prefetch_ops_from_wire(op))
+        else:
+            raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
+    return ops
 
 
 def cache_event_key(payload: dict) -> tuple[str, int]:
@@ -522,6 +897,19 @@ def cache_sync_debug_enabled() -> bool:
     return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
+class PackedBlockTables(NamedTuple):
+    """One batch's per-group block tables, staged once and uploaded once.
+
+    Attributes:
+        tables: Per-group int32 views into the one device storage.
+        tables_cpu: The same tables as views into the pinned host stage they
+            were uploaded from, for planning that must not wait on the device.
+    """
+
+    tables: dict[str, torch.Tensor]
+    tables_cpu: dict[str, torch.Tensor]
+
+
 def block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
@@ -531,6 +919,26 @@ def block_tables_from_forward_op(
     max_page_id: int | None = None,
     max_page_ids: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """The device tables of :func:`packed_block_tables_from_forward_op`."""
+    return packed_block_tables_from_forward_op(
+        forward_op,
+        device,
+        num_reqs=num_reqs,
+        expected_group_ids=expected_group_ids,
+        max_page_id=max_page_id,
+        max_page_ids=max_page_ids,
+    ).tables
+
+
+def packed_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+    expected_group_ids: tuple[str, ...] | None = None,
+    max_page_id: int | None = None,
+    max_page_ids: Mapping[str, int] | None = None,
+) -> PackedBlockTables:
     """Bridge the per-group block tables to GPU int32 tensors: absolute
     page indices, null hole = 0 preserved, ragged-row padding -1. No
     base-offset companion -- the cache path never compacts.
@@ -540,7 +948,8 @@ def block_tables_from_forward_op(
     precondition of the backends' one-launch packed replay fill
     (``_try_packed_group_unpack``). Per-group uploads would fail its
     same-storage check and fall back to per-group copy/fill chains
-    (~40 tiny transfers per decode step).
+    (~40 tiny transfers per decode step). The host stage is returned too,
+    so a backend planning from the tables reads them without a D2H sync.
 
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
@@ -551,8 +960,8 @@ def block_tables_from_forward_op(
         max_page_ids: Optional per-group inclusive upper bounds.
 
     Returns:
-        Per-group tensor views in ``expected_group_ids`` order when supplied,
-        otherwise preserving producer order.
+        Device and host per-group tensor views in ``expected_group_ids``
+        order when supplied, otherwise preserving producer order.
 
     Raises:
         ValueError: If strict contract validation fails before device transfer.
@@ -633,6 +1042,7 @@ def block_tables_from_forward_op(
                     )
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
+    out_cpu: dict[str, torch.Tensor] = {}
     packable: list[tuple[str, Any, int]] = []
     total = 0
     for key, arr in ordered_items:
@@ -647,11 +1057,12 @@ def block_tables_from_forward_op(
             # Kept out of the pack: a zero-width table must stay loud in the
             # replay fill's cols >= 1 assert, not be silently tail-padded.
             out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
+            out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
             continue
         packable.append((key, arr, total))
         total += arr.shape[0] * arr.shape[1]
     if not packable:
-        return out
+        return PackedBlockTables(out, out_cpu)
     # Fresh pinned stage per step (event-fenced; reuse races overlap).
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensor (never writes back).
@@ -662,12 +1073,17 @@ def block_tables_from_forward_op(
     packed = staged.to(device, non_blocking=True)
     for key, arr, offset in packable:
         out[key] = packed[offset : offset + arr.size].view(arr.shape[0], arr.shape[1])
-    return out
+        out_cpu[key] = staged[offset : offset + arr.size].view(
+            arr.shape[0], arr.shape[1]
+        )
+    return PackedBlockTables(out, out_cpu)
 
 
 def _classify_param(name: str) -> str:
     """Bucket a parameter/buffer name into a weight group for the memory
     summary. Names follow the Kimi-K3 / DeepSeek module layout."""
+    if ".engram." in name:
+        return "engram_weights"
     if "self_attn" in name or ".attn." in name or "kv_a" in name or "q_a" in name:
         return "attention_weights"
     if (
@@ -691,32 +1107,28 @@ def _classify_param(name: str) -> str:
 def _kv_pool_bytes(*pools) -> int:
     """Best-effort total KV-buffer bytes across the given pools, deduped.
 
-    A draft pool is a ``LayerMappedKVPool`` view of the target's merged pool
-    (draft KV lives in the target arena), and its ``get_kv_size_bytes`` forwards
-    to that same inner pool -- so counting target + draft naively would double
-    the KV. Dedupe by the underlying (unwrapped) pool identity first.
+    Target and draft are two compute views of the ONE arena (draft KV lives
+    in the target's arena), so counting both naively would double the KV.
+    Dedupe by arena identity -- the allocation each view reports on.
 
-    Return types differ (int, or a tuple like MSA's (kv, index); a hybrid pool
-    may nest several) -- sum any numeric leaves.
+    Arena-backed pools report actual device allocations, including residency
+    workspace and excluding authoritative host history. Legacy pools may
+    report nested numeric totals.
     """
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+
     seen: set[int] = set()
     total = 0
     for pool in pools:
         if pool is None:
             continue
-        underlying = getattr(pool, "inner", pool)
-        if id(underlying) in seen:
+        arena = getattr(pool, "arena", pool)
+        if id(arena) in seen:
             continue
-        seen.add(id(underlying))
-        # A pool that owns an LCM arena has one allocation, and the per-layer
-        # k/v views into it overlap -- summing their nbytes reported 52.79 GB
-        # against a 28.34 GB arena on gemma-4, which is what an operator would
-        # size a deployment from. Measure the allocation instead.
-        if getattr(underlying, "_backing_pool", None) is None:
-            arena = getattr(underlying, "buffer", None)
-            if arena is not None and getattr(underlying, "plan", None) is not None:
-                total += arena.numel() * arena.element_size()
-                continue
+        seen.add(id(arena))
+        if isinstance(arena, CacheArena):
+            total += arena.allocated_device_bytes
+            continue
         getter = getattr(pool, "get_kv_size_bytes", None)
         if getter is None:
             continue
@@ -744,27 +1156,31 @@ def log_gpu_memory_summary(
     draft_model=None,
     kv_pool=None,
     draft_kv_pool=None,
+    device: str = "cuda",
 ) -> None:
-    """Log a per-rank GPU memory breakdown after model + KV pool are built.
+    """Log a per-rank accelerator memory breakdown after cache allocation.
 
     Weight groups are summed from the model's parameters and buffers (deduped
     by storage pointer). A draft model (speculative decoding) is summed
-    separately into its own row. KV cache / CUDA graphs / non-torch (context,
-    NCCL, DeepEP) are derived from the torch allocator and driver views, so the
-    summary is backend-agnostic. Best-effort: never raises into startup.
+    separately into its own row. KV cache, graph allocations, and non-torch
+    allocations are derived from the selected device's allocator and driver
+    views. Best-effort: never raises into startup.
     """
     try:
         GB = 1024**3
+        device_type = torch.device(device).type
+        device_module = torch.get_device_module(device_type)
         groups = {
             "attention_weights": 0,
             "moe_weights": 0,
             "dense_mlp_weights": 0,
+            "engram_weights": 0,
             "other_weights": 0,
         }
         seen: set[int] = set()
 
         def _accumulate(name, tensor, sink):
-            if tensor is None or not tensor.is_cuda:
+            if tensor is None or tensor.device.type != device_type:
                 return
             ptr = tensor.data_ptr()
             if ptr in seen:
@@ -792,9 +1208,9 @@ def log_gpu_memory_summary(
             draft_total = sum(draft_sink.values())
         draft_gb = draft_total / GB
 
-        free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
-        allocated = torch.cuda.memory_allocated(gpu_id) / GB
-        reserved = torch.cuda.memory_reserved(gpu_id) / GB
+        free_bytes, total_bytes = device_module.mem_get_info(gpu_id)
+        allocated = device_module.memory_allocated(gpu_id) / GB
+        reserved = device_module.memory_reserved(gpu_id) / GB
         device_total = total_bytes / GB
         device_free = free_bytes / GB
         device_used = device_total - device_free
@@ -815,22 +1231,26 @@ def log_gpu_memory_summary(
             ("Dense/MLP weights", groups["dense_mlp_weights"] / GB),
             ("Other weights (embed/head/norm)", groups["other_weights"] / GB),
         ]
+        # Engram tables are only listed when resident on the device; with
+        # --engram-host-table they live in host memory and are not counted.
+        if groups["engram_weights"]:
+            rows.append(("Engram weights (tables/wkv)", groups["engram_weights"] / GB))
         if draft_model is not None:
             rows.append(("Draft model weights", draft_gb))
         rows += [
             ("KV cache", kv_cache_gb),
-            ("Activations + CUDA graphs", activations_and_graphs),
+            ("Activations + device graphs", activations_and_graphs),
             ("Torch allocated (total)", allocated),
             ("Torch reserved (allocator pool)", reserved),
-            ("Non-torch (context/NCCL/DeepEP)", non_torch),
-            ("Device used (nvidia-smi view)", device_used),
+            ("Non-torch (context/collectives)", non_torch),
+            ("Device used (driver view)", device_used),
             ("Device free", device_free),
             ("Device total", device_total),
         ]
         name_width = max(len(n) for n, _ in rows)
         sep = "+" + "-" * (name_width + 2) + "+" + "-" * 12 + "+"
         lines = [
-            f"GPU memory summary (rank {rank}, gpu {gpu_id}, GB):",
+            f"Device memory summary (rank {rank}, {device_type} {gpu_id}, GB):",
             sep,
             f"| {'Component'.ljust(name_width)} | {'GB'.rjust(10)} |",
             sep,

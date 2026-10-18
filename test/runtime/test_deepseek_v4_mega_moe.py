@@ -11,25 +11,33 @@
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-import unittest
 
+import sys
+
+import pytest
 import torch
+from torch import nn
 
-from tokenspeed.runtime.models.deepseek_v4 import DeepseekV4MegaMoEExperts
+from tokenspeed.runtime.layers.moe.types import MoELayerSpec
+from tokenspeed.runtime.layers.moe.weights.mxfp4 import create_mxfp4_weight_pair
 
 
-class TestDeepseekV4MegaMoE(unittest.TestCase):
-    def test_weight_loader_places_expert_shards(self):
-        experts = DeepseekV4MegaMoEExperts(
+class TestDeepseekV4MegaMoE:
+    def test_standard_mxfp4_weights_load_expert_shards(self):
+        experts = nn.Module()
+        spec = MoELayerSpec(
+            top_k=2,
             num_experts=4,
             num_local_experts=2,
-            top_k=2,
             hidden_size=128,
             intermediate_size=128,
-            mapping=None,
-            prefix="layers.0.ffn.experts",
-            swiglu_limit=None,
+            activation="swiglu",
+            tp_rank=0,
+            tp_size=1,
+            ep_rank=0,
+            ep_size=2,
         )
+        create_mxfp4_weight_pair(spec, experts)
 
         w1 = torch.full((128, 64), 1, dtype=torch.uint8)
         w3 = torch.full((128, 64), 3, dtype=torch.uint8)
@@ -38,12 +46,22 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
         s3 = torch.full((128, 4), 13, dtype=torch.uint8)
         s2 = torch.full((128, 4), 12, dtype=torch.uint8)
 
-        experts.weight_loader(experts.w13_weight, w1, "w1", local_expert_id=1)
-        experts.weight_loader(experts.w13_weight, w3, "w3", local_expert_id=1)
-        experts.weight_loader(experts.w2_weight, w2, "w2", local_expert_id=1)
-        experts.weight_loader(experts.w13_weight_scale, s1, "w1", local_expert_id=1)
-        experts.weight_loader(experts.w13_weight_scale, s3, "w3", local_expert_id=1)
-        experts.weight_loader(experts.w2_weight_scale, s2, "w2", local_expert_id=1)
+        experts.w13_weight.weight_loader(
+            experts.w13_weight, w1, "w1", local_expert_id=1
+        )
+        experts.w13_weight.weight_loader(
+            experts.w13_weight, w3, "w3", local_expert_id=1
+        )
+        experts.w2_weight.weight_loader(experts.w2_weight, w2, "w2", local_expert_id=1)
+        experts.w13_weight_scale.weight_loader(
+            experts.w13_weight_scale, s1, "w1", local_expert_id=1
+        )
+        experts.w13_weight_scale.weight_loader(
+            experts.w13_weight_scale, s3, "w3", local_expert_id=1
+        )
+        experts.w2_weight_scale.weight_loader(
+            experts.w2_weight_scale, s2, "w2", local_expert_id=1
+        )
 
         torch.testing.assert_close(experts.w13_weight[1, :128], w1)
         torch.testing.assert_close(experts.w13_weight[1, 128:], w3)
@@ -52,22 +70,6 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
         torch.testing.assert_close(experts.w13_weight_scale[1, 128:], s3)
         torch.testing.assert_close(experts.w2_weight_scale[1], s2)
 
-    def test_init_stores_swiglu_limit(self):
-        # swiglu_limit is a DeepGEMM compile-time template arg; the experts
-        # module must carry the served value so warmup_jit_variants()
-        # pre-compiles the matching mega-MoE tiles (see deepseek_v4.py).
-        experts = DeepseekV4MegaMoEExperts(
-            num_experts=4,
-            num_local_experts=2,
-            top_k=2,
-            hidden_size=128,
-            intermediate_size=128,
-            mapping=None,
-            prefix="layers.0.ffn.experts",
-            swiglu_limit=10.0,
-        )
-        self.assertEqual(experts.swiglu_limit, 10.0)
-
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

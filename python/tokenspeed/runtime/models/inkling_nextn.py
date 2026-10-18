@@ -44,7 +44,6 @@ weight loading, and pool sizing (see ``inkling_mtp_text_config``).
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 
 import torch
@@ -122,7 +121,6 @@ class InklingMultiTokenPredictorLayer(nn.Module):
         token_embeds: torch.Tensor,
         previous_hidden: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Checkpoint order: [hidden, embed] (mtp_model.py reference).
         fused, _ = self.input_proj(
@@ -131,7 +129,7 @@ class InklingMultiTokenPredictorLayer(nn.Module):
                 dim=-1,
             )
         )
-        return self.transformer_block(fused, None, ctx, out_cache_loc)
+        return self.transformer_block(fused, None, ctx)
 
 
 class InklingMultiTokenPredictor(nn.Module):
@@ -183,7 +181,6 @@ class InklingMultiTokenPredictor(nn.Module):
         self,
         input_ids: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
@@ -195,9 +192,7 @@ class InklingMultiTokenPredictor(nn.Module):
             if self.base_embed_norm is not None:
                 input_embeds = self.base_embed_norm(input_embeds)
         layer = self.layers[spec_step_idx % self.num_mtp_layers]
-        hidden, residual = layer(
-            input_embeds, captured_hidden_states, ctx, out_cache_loc
-        )
+        hidden, residual = layer(input_embeds, captured_hidden_states, ctx)
         if ctx.forward_mode.is_idle():
             return hidden
         if residual is None:
@@ -211,24 +206,6 @@ class InklingMultiTokenPredictor(nn.Module):
 
 
 class InklingForConditionalGenerationNextN(nn.Module):
-    # Catch-up runs the full padded window; ctx.gather_ids narrows to one row per request.
-    draft_first_step_reduce_for_catchup = True
-    # Full-sequence depths: re-run each depth over the whole verify window
-    # (mtp.py window mode); the trained dataflow, not optional.
-    draft_multi_depth_windows = True
-    # Prompt catch-up: at EXTEND rounds run depths
-    # 1..steps-1 over the prompt rows too (inputs shifted d+1, chaining the
-    # previous depth's full-row hidden), so every used depth gets dense
-    # prompt KV and sconv prompt state.
-    draft_extend_depth_catchup = True
-    # Provisional-tail recompute: decode windows carry D=steps-1
-    # lookback rows so the previous round's provisional tail entries (written
-    # from then-unverified drafts) are recomputed from committed tokens.
-    # Kept as an A/B knob for further experiments:
-    # INKLING_MTP_DECODE_LOOKBACK=0 reverts (depth-d KV/conv then keeps
-    # ~d/<a>*(1-p) stale slots).
-    draft_decode_lookback = os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-
     def __init__(
         self,
         config: InklingMMConfig,
@@ -275,11 +252,18 @@ class InklingForConditionalGenerationNextN(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_hot_token_id(self):
         # MTP drafts over the full vocab (EAGLE3-only optimization).
         return None
+
+    @property
+    def num_mtp_layers(self) -> int:
+        """Depth layers built (the multi-depth drafter's contract attribute:
+        step ``d`` runs ``layers[d % num_mtp_layers]``)."""
+        return self.model.num_mtp_layers
 
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -298,7 +282,6 @@ class InklingForConditionalGenerationNextN(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
@@ -317,7 +300,6 @@ class InklingForConditionalGenerationNextN(nn.Module):
         hidden_states = self.model(
             input_ids,
             ctx,
-            out_cache_loc,
             captured_hidden_states,
             input_embeds=input_embeds,
             spec_step_idx=spec_step_idx,

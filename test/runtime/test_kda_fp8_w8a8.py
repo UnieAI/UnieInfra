@@ -1,0 +1,336 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""KDA merged qkvgb projection, FP8-resident (w8a8) mode.
+
+Covers the FP8 buffer + segment-concatenated scale-grid loading of
+``KimiKDAMergedProj`` (codes bitwise, pad rows zero, direct scale placement)
+and the w8a8 blockscale GEMM branch of ``kimi3_qkvfab_projection`` against a
+dequantized reference, including the flashinfer kernel-path pin. bf16 mode is
+asserted structurally unchanged.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA for the w8a8 GEMM path"
+)
+
+# Scaled-down K3 geometry with the same alignment properties: proj_local=512
+# (4 x 128-blocks per q/k/v/g), head_dim=128, 4 local heads -> used rows
+# 4*512 + 128 + 4 = 2180, padded to 2304 (18 x 128).
+HIDDEN = 256
+TP_SIZE = 2
+NUM_HEADS = 8
+HEAD_DIM = 128
+PROJ = NUM_HEADS * HEAD_DIM  # 1024 global, 512 per rank
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+def _quantize_per_block(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    n, k = w.shape
+    nb, kb = (n + 127) // 128, (k + 127) // 128
+    padded = torch.zeros(nb * 128, kb * 128, dtype=torch.float32, device=w.device)
+    padded[:n, :k] = w.float()
+    blocks = padded.view(nb, 128, kb, 128)
+    scales = (blocks.abs().amax(dim=(1, 3)).clamp(min=1e-12) / _FP8_MAX).contiguous()
+    q = (blocks / scales[:, None, :, None]).clamp(-_FP8_MAX, _FP8_MAX)
+    return (
+        q.view(nb * 128, kb * 128)[:n, :k].to(torch.float8_e4m3fn).contiguous(),
+        scales,
+    )
+
+
+def _make_ckpt_segments(generator: torch.Generator) -> dict:
+    """Checkpoint-shaped fp8 tensors: q/k/v/g [PROJ,H], f_a [128,H], b [8,H]."""
+    ckpt = {}
+    for name, rows in (
+        ("q", PROJ),
+        ("k", PROJ),
+        ("v", PROJ),
+        ("g", PROJ),
+        ("f_a", HEAD_DIM),
+        ("b", NUM_HEADS),
+    ):
+        w = (torch.randn(rows, HIDDEN, generator=generator) * 0.5).cuda()
+        ckpt[name] = _quantize_per_block(w)
+    return ckpt
+
+
+def _build_fp8_merged(rank: int):
+    from tokenspeed.runtime.models.kimi_k3 import KimiKDAMergedProj
+
+    module = KimiKDAMergedProj(
+        hidden_size=HIDDEN,
+        proj=PROJ,
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        tp_rank=rank,
+        tp_size=TP_SIZE,
+        fp8_block_quant=True,
+        fp8_channel_quant=False,
+    ).cuda()
+    return module
+
+
+def _load(module, ckpt) -> None:
+    for name, (codes, scales) in ckpt.items():
+        module.weight.weight_loader(module.weight, codes, name)
+        module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
+
+
+def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+    from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "trtllm_cutedsl")
+    if not current_platform().is_blackwell:
+        pytest.skip("TRT-LLM CuTe-DSL preparation requires Blackwell")
+    module = _build_fp8_merged(0)
+    _load(module, _make_ckpt_segments(torch.Generator().manual_seed(42)))
+    module.verify_fp8_load_complete()
+    method = Fp8LinearMethod(
+        Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=None,
+            weight_block_size=[128, 128],
+            scale_fmt=None,
+        )
+    )
+    method.process_weights_after_loading(module)
+    x = torch.randn(32, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    output = method.apply(module, x, bias=None, block_scale=None, output_dtype=None)
+    reference = x.float() @ _dequant(module.weight, module.weight_scale_inv).T
+    assert (output.float() - reference).norm() / reference.norm() < 0.06
+    assert torch.count_nonzero(output[:, module.used_rows :]) == 0
+    module.quant_method = method
+    attention = SimpleNamespace(
+        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
+    )
+    parts = KimiLinearKDA._project_qkvfab(
+        attention, x, ctx=None, attnres_partial_args=None
+    )
+    torch.testing.assert_close(
+        torch.cat(parts, dim=-1), output[:, : module.used_rows], rtol=0, atol=0
+    )
+
+
+def _dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    n, k = codes.shape
+    sf = scales.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)[:, :k]
+    return codes.float() * sf
+
+
+def test_fp8_merged_loading_codes_scales_and_pad() -> None:
+    torch.manual_seed(0)
+    ckpt = _make_ckpt_segments(torch.Generator().manual_seed(20260818))
+    for rank in range(TP_SIZE):
+        module = _build_fp8_merged(rank)
+        _load(module, ckpt)
+        module.verify_fp8_load_complete()  # full load passes the bitmap check
+        p = module.proj_local
+        assert module.weight.dtype == torch.float8_e4m3fn  # FP8-resident
+        assert module.weight.shape[0] % 128 == 0  # padded to the block grid
+        # Codes land bitwise per segment (row-sharded except replicated f_a);
+        # the scale grid is the direct concatenation of the ckpt grids.
+        for name, rows in module._rows.items():
+            codes, scales = ckpt[name]
+            start = module._offsets[name]
+            src = codes if name == "f_a" else codes.narrow(0, rank * rows, rows)
+            assert torch.equal(
+                module.weight.data[start : start + rows].view(torch.uint8),
+                src.view(torch.uint8),
+            ), name
+            block_start = start // 128
+            if name in ("f_a", "b"):
+                expected_scale = scales[:1]
+            else:
+                nblocks = rows // 128
+                expected_scale = scales.narrow(0, rank * nblocks, nblocks)
+            assert torch.equal(
+                module.weight_scale_inv.data[
+                    block_start : block_start + expected_scale.shape[0]
+                ],
+                expected_scale,
+            ), name
+        # Pad rows carry zero codes -> exact-zero dequant under b's scale.
+        assert torch.all(module.weight.data[module.used_rows :].view(torch.uint8) == 0)
+        # Full-buffer dequant matches the per-segment manual dequant.
+        dq = _dequant(module.weight.data, module.weight_scale_inv.data)
+        for name, rows in module._rows.items():
+            codes, scales = ckpt[name]
+            start = module._offsets[name]
+            src_codes = codes if name == "f_a" else codes.narrow(0, rank * rows, rows)
+            if name in ("f_a", "b"):
+                seg_ref = (
+                    src_codes.float()
+                    * scales[:1]
+                    .repeat_interleave(128, 0)[:rows]
+                    .repeat_interleave(128, 1)[:, :HIDDEN]
+                )
+            else:
+                nblocks = rows // 128
+                seg_ref = _dequant(src_codes, scales.narrow(0, rank * nblocks, nblocks))
+            assert torch.equal(dq[start : start + rows], seg_ref), name
+
+
+def test_fp8_merged_rejects_bf16_refit_shard() -> None:
+    module = _build_fp8_merged(rank=0)
+    with pytest.raises(TypeError, match="bf16 refit"):
+        module.weight.weight_loader(
+            module.weight,
+            torch.zeros(PROJ, HIDDEN, dtype=torch.bfloat16, device="cuda"),
+            "q",
+        )
+
+
+def test_fp8_merged_incomplete_load_raises() -> None:
+    """Zero-init buffers must not mask a dropped shard (explicit bitmap)."""
+    ckpt = _make_ckpt_segments(torch.Generator().manual_seed(7))
+    module = _build_fp8_merged(rank=0)
+    for name, (codes, scales) in ckpt.items():
+        module.weight.weight_loader(module.weight, codes, name)
+        if name != "b":  # drop one scale shard
+            module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
+    with pytest.raises(RuntimeError, match="scale shards \\['b'\\]"):
+        module.verify_fp8_load_complete()
+
+
+def test_bf16_mode_unchanged() -> None:
+    """mxfp4/bf16 checkpoints construct exactly the pre-FP8 module."""
+    from tokenspeed.runtime.models.kimi_k3 import KimiKDAMergedProj
+
+    module = KimiKDAMergedProj(
+        hidden_size=HIDDEN,
+        proj=PROJ,
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        tp_rank=0,
+        tp_size=TP_SIZE,
+        fp8_channel_quant=False,
+    )
+    assert module.weight.dtype == torch.bfloat16
+    used = module.used_rows
+    assert module.weight.shape[0] == (used + 15) // 16 * 16  # 16-row align
+    assert not hasattr(module, "weight_scale_inv")
+    assert module.fp8_block_quant is False
+
+
+def test_qkvfab_fp8_w8a8_matches_dequant_reference() -> None:
+    from tokenspeed_kernel.ops.gemm import kimi3_qkvfab_projection
+
+    torch.manual_seed(1)
+    ckpt = _make_ckpt_segments(torch.Generator().manual_seed(20260819))
+    module = _build_fp8_merged(rank=0)
+    _load(module, ckpt)
+    n, k = module.weight.shape
+    assert n % 128 == 0 and k % 128 == 0
+
+    w_dq = _dequant(module.weight.data, module.weight_scale_inv.data)
+    for m in (1, 32):
+        x = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.2
+        ref32 = x.float() @ w_dq.t()
+        out = kimi3_qkvfab_projection(
+            x,
+            module.weight,
+            weight_scale=module.weight_scale_inv,
+        )
+        torch.cuda.synchronize()
+        assert out.shape == (m, n) and out.dtype == torch.bfloat16
+        rel = ((out.float() - ref32).abs().amax() / ref32.abs().amax()).item()
+        assert rel < 5e-2, f"M={m}: {rel=:.3e}"  # w8a8 activation-quant band
+        # Pad rows produce exact zeros.
+        assert torch.all(out[:, module.used_rows :] == 0)
+
+
+def _quantize_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = w.float().abs().amax(dim=1).clamp(min=1e-12) / _FP8_MAX
+    codes = (w.float() / scale[:, None]).clamp(-_FP8_MAX, _FP8_MAX)
+    return codes.to(torch.float8_e4m3fn), scale
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_per_channel_merged_projection_matches_dequantized_reference(rank) -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    from tokenspeed.runtime.models.kimi_k3 import KimiKDAMergedProj, KimiLinearKDA
+
+    platform = current_platform()
+    if not (platform.is_cdna4_plus or platform.is_blackwell):
+        pytest.skip("per-token x per-channel FP8 GEMM needs CDNA4+ or Blackwell")
+    generator = torch.Generator().manual_seed(7)
+    rows = {"q": PROJ, "k": PROJ, "v": PROJ, "g": PROJ, "f_a": HEAD_DIM}
+    rows["b"] = NUM_HEADS
+    ckpt = {
+        name: _quantize_per_channel(
+            (torch.randn(n, HIDDEN, generator=generator) * 0.5).cuda()
+        )
+        for name, n in rows.items()
+    }
+    module = KimiKDAMergedProj(
+        hidden_size=HIDDEN,
+        proj=PROJ,
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        tp_rank=rank,
+        tp_size=TP_SIZE,
+        fp8_channel_quant=True,
+    ).cuda()
+    for name, (codes, scale) in ckpt.items():
+        module.weight.weight_loader(module.weight, codes, name)
+        module.weight_scale.weight_loader(module.weight_scale, scale, name)
+    module.verify_fp8_load_complete()
+
+    # This rank's rows of each segment, concatenated in [q|k|v|g|f_a|b] order.
+    def local(name):
+        codes, scale = ckpt[name]
+        n = module._rows[name]
+        start = 0 if name == "f_a" else rank * n
+        return codes[start : start + n], scale[start : start + n]
+
+    order = ("q", "k", "v", "g", "f_a", "b")
+    codes = torch.cat([local(name)[0] for name in order])
+    scales = torch.cat([local(name)[1] for name in order])
+    used = module.used_rows
+    assert torch.equal(module.weight[:used].view(torch.uint8), codes.view(torch.uint8))
+    torch.testing.assert_close(module.weight_scale[:used, 0], scales, rtol=0, atol=0)
+    assert torch.count_nonzero(module.weight[used:].view(torch.uint8)) == 0
+
+    x = torch.randn(33, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    attention = SimpleNamespace(
+        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
+    )
+    parts = KimiLinearKDA._project_qkvfab(
+        attention, x, ctx=None, attnres_partial_args=None
+    )
+    reference = x.float() @ (codes.float() * scales[:, None]).T
+    output = torch.cat(parts, dim=-1).float()
+    # Per-token FP8 activation rounding bounds the error.
+    assert (output - reference).norm() / reference.norm() < 0.05

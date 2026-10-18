@@ -1,53 +1,68 @@
 """Draft seq_lens must stay visible to the backend now that it owns the buffer.
 
 The drafter edits ``draft_seq_lens_buf`` in place inside the captured graph --
-``add_(1)`` per multi-step iteration, and ``_apply_correction`` trimming the
-rejected tail at step 0. Backends read their own buffer, so both edits must be
-published via ``advance_draft_forward_metadata`` or the draft attends over a
-stale prefix and the accept rate silently drops. CPU-only: drives the metadata
-builders and the hook directly, no GPU or KV pool.
+``add_(1)`` per multi-step iteration -- and publishes the accepted frontier
+for step 0 through ``AcceptedPrefixPublisher`` (the ``ctx.draft_narrowing``
+handle the draft model fires when it switches to its live rows). Backends read
+their own buffer, so both must land via ``advance_draft_forward_metadata`` or
+the draft attends over a stale prefix and the accept rate silently drops.
+CPU-only: drives the leaf metadata builders and the hook directly, no GPU or
+KV pool.
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import (
-    init_backend_cuda_graph_state,
-)
-from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.msa import (
+from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.msa import (
     MSAAttnBackend,
     MSAHybridAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.trtllm import (
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
     TRTLLMMHAAttnBackend,
+)
+from tokenspeed.runtime.layers.attention.configs.base import (
+    AttnConfig,
+    SoftmaxAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 
+MAX_NUM_PAGES = 64  # context 4096 / kernel page 64
 
-def _cfg() -> MHAConfig:
-    return MHAConfig(
-        device="cpu",
+
+def _cfg() -> AttnConfig:
+    spec = MHAConfig(
         backend_name="mha",
         num_attention_heads=8,
         num_kv_heads=8,
         head_dim=128,
         attn_tp_size=1,
+    )
+    return AttnConfig(
+        device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         context_len=4096,
         max_bs=8,
-        max_graph_bs=8,
         kv_cache_quant_method="none",
         speculative_num_steps=3,
         speculative_num_draft_tokens=4,
         is_draft=True,
+        components=(spec,),
     )
+
+
+def _mha_backend(backend_cls=MHAAttnBackend):
+    cfg = _cfg()
+    return backend_cls(cfg, cfg.component(SoftmaxAttnConfig), kernel_page_size=64)
 
 
 def _seqlens_field(be, metadata):
@@ -57,27 +72,186 @@ def _seqlens_field(be, metadata):
     return metadata.seq_lens
 
 
+def _capture(be, bs, seq_lens):
+    page_table = torch.zeros((bs, be.max_num_pages), dtype=torch.int32)
+    be.init_forward_metadata_capture_cuda_graph(bs, seq_lens, page_table)
+
+
+def test_trtllm_mixed_prefill_metadata_uses_extend_rows():
+    be = _mha_backend(TRTLLMMHAAttnBackend)
+    be.init_cuda_graph_state(8)
+    seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+    extend_lens = torch.tensor([3, 5], dtype=torch.int32)
+    prefix_lens = torch.tensor([7, 15], dtype=torch.int32)
+    page_table = torch.arange(3 * MAX_NUM_PAGES, dtype=torch.int32).reshape(
+        3, MAX_NUM_PAGES
+    )
+
+    be.init_forward_metadata(
+        bs=3,
+        num_extends=2,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=extend_lens,
+        extend_seq_lens_cpu=extend_lens,
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=True,
+        query_shard=None,
+        page_table_cpu=None,
+    )
+
+    metadata = be.forward_prefill_metadata
+    assert metadata.cache_seqlens_int32.tolist() == [10, 20]
+    assert metadata.cu_seqlens_q.tolist() == [0, 3, 8]
+    assert metadata.cu_seqlens_k.tolist() == [0, 10, 30]
+    assert metadata.max_seq_len_q == 5
+    assert torch.equal(metadata.page_table, page_table[:2])
+
+    be.refresh_decode_metadata(3, 3, seq_lens, page_table, num_extends=2)
+    assert be.forward_prefill_metadata is metadata
+    assert torch.equal(be.forward_decode_metadata.cache_seqlens_int32, seq_lens)
+
+
+def test_trtllm_target_mixed_metadata_keeps_decode_rows():
+    cfg = replace(_cfg(), is_draft=False, speculative_num_draft_tokens=1)
+    be = TRTLLMMHAAttnBackend(
+        cfg, cfg.component(SoftmaxAttnConfig), kernel_page_size=64
+    )
+    # With no cached prefixes, the target context kernel handles the whole
+    # packed batch, including the final single-token decode request.
+    seq_lens = torch.tensor([3, 5, 1], dtype=torch.int32)
+    prefix_lens = torch.zeros(2, dtype=torch.int32)
+    page_table = torch.zeros((3, MAX_NUM_PAGES), dtype=torch.int32)
+    be.init_forward_metadata(
+        bs=3,
+        num_extends=2,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=seq_lens[:2],
+        extend_seq_lens_cpu=seq_lens[:2],
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=False,
+        query_shard=None,
+        page_table_cpu=None,
+    )
+
+    metadata = be.forward_prefill_metadata
+    assert metadata.cu_seqlens_q.tolist() == [0, 3, 8, 9]
+    assert torch.equal(metadata.cache_seqlens_int32, seq_lens)
+    assert torch.equal(metadata.page_table, page_table)
+
+
+def _trtllm_leaf(is_draft: bool, width: int) -> TRTLLMMHAAttnBackend:
+    cfg = replace(_cfg(), is_draft=is_draft, speculative_num_draft_tokens=width)
+    return TRTLLMMHAAttnBackend(
+        cfg, cfg.component(SoftmaxAttnConfig), kernel_page_size=64
+    )
+
+
+def _init_round(be, mode, extends, decode_kv_lens, width):
+    """Extend requests ``(prefix, chunk)`` first, then decode requests holding
+    ``decode_kv_lens`` committed tokens plus ``width`` new ones."""
+    seq_lens = torch.tensor(
+        [p + c for p, c in extends] + [kv + width for kv in decode_kv_lens],
+        dtype=torch.int32,
+    )
+    prefix_lens = torch.tensor([p for p, _ in extends], dtype=torch.int32)
+    chunk_lens = torch.tensor([c for _, c in extends], dtype=torch.int32)
+    bs = len(seq_lens)
+    page_table = torch.arange(bs * MAX_NUM_PAGES, dtype=torch.int32).reshape(
+        bs, MAX_NUM_PAGES
+    )
+    be.init_forward_metadata(
+        bs=bs,
+        num_extends=len(extends),
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=mode,
+        extend_seq_lens=chunk_lens,
+        extend_seq_lens_cpu=chunk_lens,
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=bool(prefix_lens.any()),
+        query_shard=None,
+        page_table_cpu=None,
+    )
+    return seq_lens, page_table
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize(
+    "extends, decode_kv_lens, width, cu_seqlens_q",
+    [
+        # Two prompt chunks, one continuing a prefix, beside verify rows.
+        ([(100, 7), (0, 5)], [40, 33], 4, [0, 7, 12, 16, 20]),
+        # One chunk continuing a prefix.
+        ([(64, 9)], [40, 33], 4, [0, 9, 13, 17]),
+        # Fresh chunks only.
+        ([(0, 6), (0, 3)], [40], 4, [0, 6, 9, 13]),
+        # A chunk shorter than the verify width.
+        ([(128, 2)], [40], 4, [0, 2, 6]),
+        # A 16-token verify block.
+        ([(2048, 300), (0, 200)], [1200, 900], 16, [0, 300, 500, 516, 532]),
+        # No speculation: one new token per decode request.
+        ([(0, 3), (0, 5)], [6], 1, [0, 3, 8, 9]),
+    ],
+)
+def test_trtllm_mixed_decode_rows_query_only_their_new_tokens(
+    is_draft, extends, decode_kv_lens, width, cu_seqlens_q
+):
+    be = _trtllm_leaf(is_draft, width)
+    seq_lens, page_table = _init_round(
+        be, ForwardMode.MIXED, extends, decode_kv_lens, width
+    )
+    # The target's context kernel runs the whole packed batch: each extend
+    # request's chunk, then each decode request's ``width`` new rows at the
+    # end of its cache, the rows that request verifies in a decode round.
+    # The draft's prefill slot keeps only the extend requests.
+    rows = len(extends) if is_draft else len(seq_lens)
+    metadata = be.forward_prefill_metadata
+    assert metadata.cu_seqlens_q.tolist() == cu_seqlens_q[: rows + 1]
+    assert metadata.cu_seqlens_k.tolist() == [
+        0,
+        *torch.cumsum(seq_lens[:rows], 0).tolist(),
+    ]
+    assert torch.equal(metadata.cache_seqlens_int32, seq_lens[:rows])
+    assert torch.equal(metadata.page_table, page_table[:rows])
+    chunks = [c for _, c in extends]
+    assert metadata.max_seq_len_q == max(chunks if is_draft else chunks + [width])
+
+
+@pytest.mark.parametrize("extends", [[(100, 7), (0, 5)], [(0, 6), (0, 3)]])
+def test_trtllm_target_extend_metadata_has_only_the_chunks(extends):
+    be = _trtllm_leaf(is_draft=False, width=16)
+    _init_round(be, ForwardMode.EXTEND, extends, [], 16)
+    metadata = be.forward_prefill_metadata
+    assert metadata.cu_seqlens_q.tolist() == [
+        0,
+        *torch.cumsum(torch.tensor([c for _, c in extends]), 0).tolist(),
+    ]
+    assert metadata.max_seq_len_q == max(c for _, c in extends)
+    if not any(p for p, _ in extends):
+        assert metadata.cu_seqlens_q is metadata.cu_seqlens_k
+
+
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
 def test_advance_updates_draft_decode_metadata(backend_cls):
-    be = backend_cls(_cfg())
+    be = _mha_backend(backend_cls)
     max_bs, bs = 8, 4
     be.init_cuda_graph_state(max_bs)
 
     # Capture single-token decode metadata (plain draft path, is_draft=True).
-    req_pool_indices = torch.arange(1, bs + 1, dtype=torch.int32)
     capture_seq_lens = torch.full((max_bs,), 5, dtype=torch.int32)
-    be.init_forward_metadata_capture_cuda_graph(
-        bs, req_pool_indices, capture_seq_lens, ForwardMode.DECODE
-    )
+    _capture(be, bs, capture_seq_lens)
     field = _seqlens_field(be, be.forward_decode_metadata)
 
-    # The metadata field must be a view of the owned buffer.
-    owned = (
-        be.cuda_graph_cache_seqlens
-        if isinstance(be, TRTLLMMHAAttnBackend)
-        else be.cuda_graph_seq_lens
-    )
-    assert field.data_ptr() == owned[:bs].data_ptr()
+    # The metadata field must be a view of the owned buffer (one home for
+    # every leaf: decode_seq_lens_buffer).
+    assert field.data_ptr() == be.decode_seq_lens_buffer[:bs].data_ptr()
 
     # Simulate the drafter advancing lengths in-graph across draft steps.
     for step_len in (11, 12, 13):
@@ -91,91 +265,85 @@ def test_advance_updates_draft_decode_metadata(backend_cls):
 
 
 def test_advance_does_not_mutate_caller_tensor():
-    be = MHAAttnBackend(_cfg())
+    be = _mha_backend()
     be.init_cuda_graph_state(8)
     draft_seq_lens = torch.tensor([7, 8, 9, 10], dtype=torch.int32)
     original = draft_seq_lens.clone()
     be.advance_draft_forward_metadata(draft_seq_lens)
     # advance copies OUT of the caller tensor; it must not be written to.
     assert torch.equal(draft_seq_lens, original)
-    assert torch.equal(be.cuda_graph_seq_lens[:4], original)
+    assert torch.equal(be.decode_seq_lens_buffer[:4], original)
 
 
 def _msa_backend() -> MSAAttnBackend:
-    return MSAAttnBackend(
-        MSAConfig(
-            device="cpu",
-            backend_name="msa",
-            num_attention_heads=8,
-            num_kv_heads=8,
-            head_dim=128,
-            attn_tp_size=1,
-            dtype=torch.bfloat16,
-            kv_cache_dtype=torch.bfloat16,
-            page_size=64,
-            context_len=4096,
-            max_bs=8,
-            max_graph_bs=8,
-            kv_cache_quant_method="none",
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=4,
-            is_draft=True,
-        )
+    spec = MSAConfig(
+        backend_name="msa",
+        num_attention_heads=8,
+        num_kv_heads=8,
+        head_dim=128,
+        attn_tp_size=1,
     )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        prefix_granularity=64,
+        kernel_page_size=64,
+        context_len=4096,
+        max_bs=8,
+        kv_cache_quant_method="none",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        is_draft=True,
+        components=(spec,),
+    )
+    return MSAAttnBackend(config, spec, kernel_page_size=64)
 
 
-def test_msa_init_cuda_graph_state_matches_helper_signature():
-    """msa must take the post-ownership signature (no seq_lens_buf).
-
-    It was left on the old signature while the shared parameter was dropped
-    from init_backend_cuda_graph_state, so every MiniMax cuda-graph startup
-    raised TypeError: missing 1 required positional argument: 'seq_lens_buf'.
-    """
+def test_msa_owns_its_graph_seqlens_buffer():
     be = _msa_backend()
-    init_backend_cuda_graph_state(be, 8, paged_cache_group_specs=())
-    # And it must own the buffer rather than alias a controller tensor.
-    assert be.cuda_graph_seq_lens.shape[0] == 8
-    assert be.cuda_graph_seq_lens.dtype == torch.int32
+    be.init_cuda_graph_state(8)
+    # It must own the buffer rather than alias a controller tensor.
+    assert be.decode_seq_lens_buffer.shape[0] == 8
+    assert be.decode_seq_lens_buffer.dtype == torch.int32
 
 
 def test_msa_inherits_default_advance():
-    """msa's buffer uses the default name, so the base implementation applies."""
+    """One buffer name for every leaf, so the base implementation applies."""
     be = _msa_backend()
-    init_backend_cuda_graph_state(be, 8, paged_cache_group_specs=())
+    be.init_cuda_graph_state(8)
     seq_lens = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
     be.advance_draft_forward_metadata(seq_lens)
-    assert torch.equal(be.cuda_graph_seq_lens[:4], seq_lens)
+    assert torch.equal(be.decode_seq_lens_buffer[:4], seq_lens)
 
 
-def test_msa_hybrid_composes_cache_contract_from_children():
-    class ChildBackend:
-        def __init__(self, families):
-            self.cache_consumer_families = frozenset(families)
+def test_msa_hybrid_fans_pool_binding_out_to_both_routers():
+    class ChildRouter:
+        def __init__(self):
             self.cache_pool = None
+
+        def validate_cache_pool(self, cache_pool):
+            del cache_pool
 
         def set_cache_pool(self, cache_pool):
             self.cache_pool = cache_pool
 
-    dense = ChildBackend({"history"})
-    sparse = ChildBackend({"history"})
+        def _bind(self, cache_pool):
+            self.set_cache_pool(cache_pool)
+
+    dense = ChildRouter()
+    sparse = ChildRouter()
     backend = object.__new__(MSAHybridAttnBackend)
-    backend.full_attn_backend = dense
-    backend.sparse_attn_backend = sparse
+    backend._init_pool_binding()
+    backend.full_router = dense
+    backend.sparse_router = sparse
     pool = object()
 
     backend.set_cache_pool(pool)
 
-    assert backend.cache_consumer_families == frozenset({"history"})
     assert backend.cache_pool is pool
     assert dense.cache_pool is pool
     assert sparse.cache_pool is pool
-
-
-def test_default_advance_is_a_noop_before_graph_state_exists():
-    """The hook may fire before init_cuda_graph_state (eager runs); it must not
-    raise, just do nothing."""
-    be = MHAAttnBackend(_cfg())
-    be.advance_draft_forward_metadata(torch.tensor([5, 6], dtype=torch.int32))
 
 
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
@@ -186,29 +354,54 @@ def test_capture_seeds_owned_seqlens(backend_cls):
     without seeding the warmup/capture forward attends over seq_len 0 (empty
     causal span -> NaN, or a schedule recorded against zero lengths).
     """
-    be = backend_cls(_cfg())
+    be = _mha_backend(backend_cls)
     max_bs, bs = 8, 4
     be.init_cuda_graph_state(max_bs)
     capture_seq_lens = torch.full((max_bs,), 37, dtype=torch.int32)
-    be.init_forward_metadata_capture_cuda_graph(
-        bs,
-        torch.arange(1, bs + 1, dtype=torch.int32),
-        capture_seq_lens,
-        ForwardMode.DECODE,
-    )
+    _capture(be, bs, capture_seq_lens)
     got = _seqlens_field(be, be.forward_decode_metadata)[:bs]
     assert torch.equal(
         got, torch.full((bs,), 37, dtype=torch.int32)
     ), f"{backend_cls.__name__}: capture left seqlens at {got.tolist()}"
 
 
+def test_router_fans_advance_out_to_every_leaf():
+    """The runner-facing router owns no buffer; it must fan out to leaves."""
+    from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
+        CacheGroupGeometry,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
+    )
+
+    leaf = _mha_backend()
+    leaf.init_cuda_graph_state(8)
+    router = CacheGroupRouter(
+        None, is_draft=True, spec_num_tokens=4, device="cpu", consumed_group_ids=None
+    )
+    router.bind(
+        CacheGroupGeometry(
+            granularities={"full_attention": 64},
+            attn_kinds={"full_attention": "full_history"},
+            full_history_group_id="full_attention",
+            row_geometry={"full_attention": (64, 1)},
+            windows={"full_attention": None},
+        ),
+        {"full_attention": leaf},
+    )
+
+    seq_lens = torch.tensor([21, 22, 23, 24], dtype=torch.int32)
+    router.advance_draft_forward_metadata(seq_lens)
+    assert torch.equal(leaf.decode_seq_lens_buffer[:4], seq_lens)
+
+
 def test_hybrid_composite_forwards_advance_to_full_attn_child():
     """Composite backends own no buffer; they must forward to the child."""
-    from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
     )
 
-    full = MHAAttnBackend(_cfg())
+    full = _mha_backend()
     full.init_cuda_graph_state(8)
     hybrid = object.__new__(HybridLinearAttnBackend)
     hybrid.full_attn_backend = full
@@ -216,65 +409,115 @@ def test_hybrid_composite_forwards_advance_to_full_attn_child():
 
     seq_lens = torch.tensor([21, 22, 23, 24], dtype=torch.int32)
     hybrid.advance_draft_forward_metadata(seq_lens)
-    assert torch.equal(full.cuda_graph_seq_lens[:4], seq_lens)
+    assert torch.equal(full.decode_seq_lens_buffer[:4], seq_lens)
 
 
-# Step 0: `_apply_correction` trims the rejected tail (vc + N -> vc + a).
+def test_hybrid_composite_forwards_every_draft_length_hook_to_full_attn_child():
+    """The MTP frontier re-anchor and the block drafter's in-graph seq_lens
+    reach the full-attention router through the composite, like the Eagle
+    advance does; the composite's base class would otherwise swallow them."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
 
-
-def _correction_models():
-    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3DraftAttentionMLA
-    from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
-    from tokenspeed.runtime.models.llama_eagle3 import LlamaAttention
-    from tokenspeed.runtime.models.qwen3_5_nextn import (
-        Qwen3_5DraftAttentionDecoderLayer,
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
     )
 
-    return [
-        ("llama_eagle3", LlamaAttention._apply_correction),
-        ("qwen3_5_nextn", Qwen3_5DraftAttentionDecoderLayer._apply_correction),
-        ("deepseek_v3", DeepseekV3DraftAttentionMLA._apply_correction),
-        ("glm5_nextn", GlmMoeDsaForCausalLMNextN._apply_first_step_correction),
-    ]
+    router = SimpleNamespace(
+        update_draft_forward_metadata=Mock(),
+        fill_block_decode_seq_lens=Mock(),
+    )
+    hybrid = object.__new__(HybridLinearAttnBackend)
+    hybrid.full_attn_backend = router
+    hybrid.linear_attn_backend = None
+
+    frontier = torch.tensor([7, 3], dtype=torch.int32)
+    block_seq_lens = torch.tensor([9, 5, -1], dtype=torch.int32)
+    hybrid.update_draft_forward_metadata(frontier)
+    hybrid.fill_block_decode_seq_lens(2, block_seq_lens)
+
+    router.update_draft_forward_metadata.assert_called_once_with(frontier)
+    router.fill_block_decode_seq_lens.assert_called_once_with(2, block_seq_lens)
 
 
-@pytest.mark.parametrize("name,correction", _correction_models())
-def test_first_step_correction_reaches_backend(name, correction):
+# Step 0: the drafter publishes the accepted frontier (vc + N -> vc + a); the
+# model only names the moment.
+
+
+def _make_eagle_for_frontier(bs: int, seq_lens, req_pool_indices, valid_cache_lengths):
     from types import SimpleNamespace
 
-    be = MHAAttnBackend(_cfg())
+    from tokenspeed.runtime.execution.drafter.eagle import Eagle
+
+    drafter = Eagle.__new__(Eagle)
+    drafter.input_buffers = SimpleNamespace(
+        seq_lens_buf=torch.tensor(seq_lens, dtype=torch.int32),
+        req_pool_indices_buf=torch.tensor(req_pool_indices, dtype=torch.int64),
+    )
+    drafter.runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.tensor(valid_cache_lengths, dtype=torch.int32)
+    )
+    return drafter
+
+
+def test_accepted_frontier_is_vc_plus_accept_for_decode_rows():
+    from types import SimpleNamespace
+
+    # Target verify left seq_lens at vc + N (vc=100, N=4); prompt rows keep
+    # their own lengths.
+    drafter = _make_eagle_for_frontier(
+        bs=4,
+        seq_lens=[17, 104, 104, 104],
+        req_pool_indices=[3, 0, 1, 2],
+        valid_cache_lengths=[100, 100, 100, 5],
+    )
+    draft_input = SimpleNamespace(
+        num_extends=1,
+        accept_lengths=torch.tensor([1, 2, 1, 4], dtype=torch.int32),
+    )
+
+    frontier = drafter._accepted_frontier(4, draft_input)
+
+    assert frontier.tolist() == [17, 102, 101, 104]
+    # A fresh tensor: publishing it must not alias the runner's seq_lens buffer.
+    assert frontier.data_ptr() != drafter.input_buffers.seq_lens_buf.data_ptr()
+
+
+def test_publish_accepted_prefix_reaches_backend_and_is_idempotent():
+    from tokenspeed.runtime.execution.drafter.eagle import AcceptedPrefixPublisher
+
+    be = _mha_backend()
     max_bs, bs = 8, 4
     be.init_cuda_graph_state(max_bs)
 
-    # Target verify left seq_lens at vc + N (vc=100, N=4).
     draft_seq_lens = torch.full((bs,), 104, dtype=torch.int32)
-    be.init_forward_metadata_capture_cuda_graph(
-        bs,
-        torch.arange(1, bs + 1, dtype=torch.int32),
-        draft_seq_lens,
-        ForwardMode.DECODE,
-    )
+    _capture(be, bs, draft_seq_lens)
 
-    accept_lengths = torch.tensor([2, 1, 4, 3], dtype=torch.int32)
-    ctx = SimpleNamespace(
-        draft_seq_lens_buf=draft_seq_lens,
-        accept_lengths=accept_lengths,
-        num_extends=0,
-        bs=bs,
-        attn_backend=be,
+    frontier = torch.tensor([102, 101, 104, 103], dtype=torch.int32)  # vc + a
+    narrowing = AcceptedPrefixPublisher(be, frontier)
+    narrowing.publish_accepted_prefix()
+    assert torch.equal(be.forward_decode_metadata.seq_lens[:bs], frontier), (
+        "accepted frontier never reached the backend; draft step 0 would "
+        "attend over the rejected tail"
     )
-    # Bound methods on the class need an explicit (unused) self.
-    try:
-        correction(ctx)
-    except TypeError:
-        correction(None, ctx)
+    # Every layer of a multi-layer draft may fire it: no double trim.
+    narrowing.publish_accepted_prefix()
+    assert torch.equal(be.forward_decode_metadata.seq_lens[:bs], frontier)
+    # The drafter's own buffer is untouched -- the backend owns the copy.
+    assert torch.equal(draft_seq_lens, torch.full((bs,), 104, dtype=torch.int32))
 
-    expected = torch.tensor([102, 101, 104, 103], dtype=torch.int32)  # vc + a
-    assert torch.equal(draft_seq_lens, expected), f"{name}: correction wrong"
-    assert torch.equal(be.forward_decode_metadata.seq_lens[:bs], expected), (
-        f"{name}: trimmed seqlens never reached the backend; draft step 0 "
-        f"would attend over the rejected tail"
-    )
+
+def test_draft_narrowing_is_the_only_step0_flag_on_forward_context():
+    """The drafter tensors left ForwardContext: the narrowing handle is the
+    step-0 discriminator, with no ``accept_lengths`` / ``draft_seq_lens_buf``
+    fields to fall back on."""
+    from dataclasses import fields
+
+    from tokenspeed.runtime.execution.context import ForwardContext
+
+    names = {f.name for f in fields(ForwardContext)}
+    assert "draft_narrowing" in names
+    assert not {"accept_lengths", "draft_seq_lens_buf"} & names
 
 
 if __name__ == "__main__":

@@ -20,23 +20,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
-import json
 import logging
 import math
 import os
-import pickle
-import subprocess
+import site
 import sys
-import tempfile
-from dataclasses import dataclass
-from functools import lru_cache
-from itertools import product
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
+from functools import cache, lru_cache
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +43,55 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "max_active_ctas",
+    "prepare_cuda_toolkit_env",
 ]
+
+
+def prepare_cuda_toolkit_env() -> None:
+    """Expose a wheel-provided CUDA toolkit to extensions that require nvcc."""
+    site_paths = []
+    try:
+        site_paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    site_paths.extend(sys.path)
+
+    candidates = []
+    requested_cuda_home = os.environ.get("CUDA_HOME")
+    if requested_cuda_home:
+        candidates.append(Path(requested_cuda_home))
+    for base in site_paths:
+        candidates.extend(sorted((Path(base) / "nvidia").glob("cu*"), reverse=True))
+
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if not (
+            (candidate / "include" / "cuda_runtime.h").exists()
+            and (candidate / "bin" / "nvcc").exists()
+        ):
+            continue
+
+        os.environ["CUDA_HOME"] = str(candidate)
+        _prepend_env_path("CPATH", candidate / "include")
+        _prepend_env_path("PATH", candidate / "bin")
+        return
+
+
+def _prepend_env_path(name: str, path: Path) -> None:
+    value = str(path)
+    entries = [entry for entry in os.environ.get(name, "").split(os.pathsep) if entry]
+    if value not in entries:
+        os.environ[name] = os.pathsep.join([value, *entries])
+
+
+def _npu_is_available() -> bool:
+    """Return whether torch-npu is installed and an Ascend device is visible."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(torch.npu.is_available())
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +136,7 @@ class InterconnectInfo:
 class PlatformInfo:
     """Complete description of a compute platform."""
 
-    vendor: str  # "nvidia", "amd"
+    vendor: str  # "nvidia", "amd", "ascend"
     arch_version: ArchVersion
     device_name: str
     device_count: int
@@ -143,6 +187,10 @@ class PlatformInfo:
         return self.vendor == "amd"
 
     @property
+    def is_npu(self) -> bool:
+        return self.vendor == "ascend"
+
+    @property
     def is_cdna4(self) -> bool:
         return self.is_amd and self.arch_version == ArchVersion(9, 5)
 
@@ -164,7 +212,7 @@ class PlatformInfo:
 
     @property
     def is_cdna4_plus(self) -> bool:
-        return self.is_amd and self.arch_version >= ArchVersion(9, 5)
+        return self.is_cdna4 or self.is_cdna5_plus
 
     @property
     def is_cdna5_plus(self) -> bool:
@@ -192,6 +240,28 @@ class PlatformInfo:
             return _hip_host_get_device_pointer(ptr)
         return ptr
 
+    @contextlib.contextmanager
+    def restore_stack_limit(self) -> Iterator[None]:
+        """Restore, when the block exits normally, the stack limit its kernels raised.
+
+        CUDA raises the current context's limit to fit each kernel at launch and
+        keeps local memory reserved for it on every SM until the limit is set
+        lower again. A no-op on other vendors.
+        """
+        if not self.is_nvidia:
+            yield
+            return
+        from cuda.bindings import driver
+
+        stack = driver.CUlimit.CU_LIMIT_STACK_SIZE
+        error, limit = driver.cuCtxGetLimit(stack)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxGetLimit failed with {error!s}")
+        yield
+        (error,) = driver.cuCtxSetLimit(stack, limit)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxSetLimit failed with {error!s}")
+
     @property
     def generation_name(self) -> str:
         """Human-readable generation name."""
@@ -208,6 +278,7 @@ class PlatformInfo:
         if self.is_amd:
             names = {
                 (9, 5): "CDNA4",  # MI350
+                (12, 0): "RDNA4",
                 (12, 5): "CDNA5",
             }
             return names.get(arch_version, f"GFX{arch_version[0]}.{arch_version[1]}")
@@ -222,14 +293,40 @@ class CapabilityRequirement:
     max_arch_version: ArchVersion | None = None
     required_features: frozenset[str] = frozenset()
     vendors: frozenset[str] | None = None  # None = any vendor
+    # Per-vendor minimum arch for kernels that serve several vendors, whose
+    # arch numbering differs (e.g. NVIDIA sm100 vs AMD gfx950). Use instead
+    # of min_arch_version, with one floor for every vendor in ``vendors``.
+    vendor_min_arch_versions: Mapping[str, ArchVersion] = field(
+        default_factory=dict, hash=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.vendor_min_arch_versions:
+            return
+        if self.min_arch_version is not None:
+            raise ValueError(
+                "set min_arch_version or vendor_min_arch_versions, not both"
+            )
+        if self.vendors is None or set(self.vendor_min_arch_versions) != self.vendors:
+            raise ValueError(
+                "vendor_min_arch_versions must give a floor for every vendor in "
+                "vendors, and only for those"
+            )
+
+    def min_arch_version_for(self, vendor: str) -> ArchVersion | None:
+        """The minimum arch version required on ``vendor``, if any."""
+        if self.vendor_min_arch_versions:
+            return self.vendor_min_arch_versions.get(vendor)
+        return self.min_arch_version
 
     def satisfied_by(self, platform: PlatformInfo) -> bool:
         """Check if platform satisfies these requirements."""
         if self.vendors and platform.vendor not in self.vendors:
             return False
 
-        if self.min_arch_version:
-            if not platform.arch_version >= self.min_arch_version:
+        min_arch_version = self.min_arch_version_for(platform.vendor)
+        if min_arch_version:
+            if not platform.arch_version >= min_arch_version:
                 return False
 
         if self.max_arch_version:
@@ -282,19 +379,70 @@ def current_platform() -> PlatformInfo:
     return Platform.get()
 
 
+@cache
+def max_active_ctas(kernel) -> int:
+    """Return the resident CTAs per SM/CU for a compiled non-cluster kernel.
+
+    The driver accounts for the loaded kernel's registers, shared memory and
+    threads. Results are cached by the device-specific compiled specialization.
+
+    Args:
+        kernel: A compiled Triton or Gluon kernel with one CTA per cluster.
+
+    Returns:
+        The maximum number of simultaneously resident CTAs on one SM/CU.
+    """
+    kernel._init_handles()
+    if kernel.metadata.num_ctas != 1:
+        raise ValueError("CTA occupancy requires a non-cluster kernel")
+    backend = kernel.metadata.target.backend
+    if backend == "cuda":
+        library = ctypes.CDLL("libcuda.so.1")
+        query = library.cuOccupancyMaxActiveBlocksPerMultiprocessor
+    elif backend == "hip":
+        from tokenspeed_kernel._triton import get_hip_runtime_path
+
+        # Kernel handles belong to the runtime that loaded the Triton module.
+        library = ctypes.CDLL(get_hip_runtime_path())
+        query = library.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
+    else:
+        raise ValueError(f"Unsupported occupancy backend: {backend}")
+    query.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_size_t,
+    ]
+    query.restype = ctypes.c_int
+    resident = ctypes.c_int()
+    status = query(
+        ctypes.byref(resident),
+        kernel.function,
+        kernel.metadata.num_warps * kernel.metadata.target.warp_size,
+        kernel.metadata.shared,
+    )
+    if status != 0 or resident.value < 1:
+        raise RuntimeError(
+            f"{backend} occupancy query failed: {status}, {resident.value}"
+        )
+    return resident.value
+
+
+_pdl_enabled: bool | None = None
+
+
+def pdl_enabled(overwrite: bool | None = None) -> bool:
+    global _pdl_enabled
+    if overwrite is not None:
+        _pdl_enabled = bool(overwrite) and current_platform().is_hopper_plus
+    elif _pdl_enabled is None:
+        _pdl_enabled = current_platform().is_hopper_plus
+    return _pdl_enabled
+
+
 # ---------------------------------------------------------------------------
 # Detection implementation
 # ---------------------------------------------------------------------------
-
-
-def _torch_version() -> tuple[int, ...]:
-    """Return PyTorch version as a comparable tuple, e.g. (2, 7, 0)."""
-    try:
-        import torch
-
-        return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:3])
-    except Exception:
-        return (0, 0, 0)
 
 
 def _detect_platform() -> PlatformInfo:
@@ -311,7 +459,31 @@ def _detect_platform() -> PlatformInfo:
             return _detect_rocm_platform()
         return _detect_cuda_platform()
 
-    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+    if _npu_is_available():
+        return _detect_npu_platform()
+
+    raise RuntimeError(
+        "tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, or Ascend NPU device."
+    )
+
+
+def _detect_npu_platform() -> PlatformInfo:
+    """Detect an Ascend platform exposed through torch-npu."""
+    props = torch.npu.get_device_properties(torch.npu.current_device())
+    return PlatformInfo(
+        vendor="ascend",
+        arch_version=ArchVersion(9, 1),
+        device_name=props.name,
+        device_count=torch.npu.device_count(),
+        total_memory=props.total_memory,
+        memory_bandwidth=0.0,
+        sm_count=getattr(props, "cube_core_num", 0),
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
+        sm_features=frozenset({"tensor_core:f16", "tensor_core:bf16"}),
+        runtime_features=frozenset({"runtime:acl_graph"}),
+        interconnect=InterconnectInfo(topology="single_gpu"),
+    )
 
 
 def _detect_cuda_platform() -> PlatformInfo:
@@ -399,6 +571,7 @@ def _detect_rocm_platform() -> PlatformInfo:
     # Map supported AMD architectures.
     arch_map = {
         "gfx950": ArchVersion(9, 5),  # MI350
+        "gfx1201": ArchVersion(12, 0),  # RDNA4
         "gfx1250": ArchVersion(12, 5),
     }
     try:
@@ -432,6 +605,8 @@ def _detect_rocm_platform() -> PlatformInfo:
 
 def _get_rocm_sm_features(arch: str) -> frozenset[str]:
     """Determine ROCm SM features from architecture."""
+    # gfx1201 uses portable kernels. Do not advertise CDNA matrix/async-copy
+    # capabilities until the corresponding implementations support RDNA4.
     features: set[str] = set()
 
     if arch in ("gfx950", "gfx1250"):
@@ -576,7 +751,7 @@ def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
                 )
             )
     except Exception as e:
-        logger.warning("NVML failed to query NUMA affinity: %s", e)
+        logger.warning(f"NVML failed to query NUMA affinity: {e!s}")
         return ()
     finally:
         if nvml_initialized:
@@ -625,7 +800,7 @@ def _detect_cuda_nvlink_topology() -> str | None:
                 except pynvml.NVMLError:
                     full_nvlink = False
     except Exception as e:
-        logger.warning("NVML failed to query NVLink topology: %s", e)
+        logger.warning(f"NVML failed to query NVLink topology: {e!s}")
         return None
     finally:
         if nvml_initialized:

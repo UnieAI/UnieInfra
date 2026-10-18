@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -42,6 +44,19 @@ def _pool() -> WorkspacePool:
     # CPU keeps these runnable without a device; a tiny initial block keeps
     # the growth-path tests meaningful.
     return WorkspacePool("cpu", initial_nbytes=1024)
+
+
+def test_ci_runner_starts_in_fresh_process():
+    # CI initializes env before communication; pytest's already-loaded modules
+    # can hide a cycle through the workspace allocator.
+    runner = Path(__file__).with_name("run_ci_suite.py")
+    result = subprocess.run(
+        [sys.executable, str(runner), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_allocate_returns_non_overlapping_views():
@@ -137,3 +152,7 @@ def test_initial_size_comes_from_env():
         pool = WorkspacePool("cpu")
     (view,) = pool.allocate(((1 << 20,), torch.uint8))  # fits, no growth
     assert view.numel() == 1 << 20
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

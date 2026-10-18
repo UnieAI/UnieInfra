@@ -1391,7 +1391,7 @@ NOT the target for a 2-GPU engine (2x decode hardware / HBM aggregate). The
 correct 2-GPU sglang TP2 reference on host GPU 6,7
 (`sglang-dsv4-vision:pr37257-fix`, `--tp 2`, `--speculative-algorithm DSPARK`):
 
-| metric | sglang TP2 (ref) | DSPARK engine (8192) | after `TOKENSPEED_ENABLE_FI_GDN_SM120=0` | 
+| metric | sglang TP2 (ref) | DSPARK engine (8192) | after `TOKENSPEED_ENABLE_FI_GDN_SM120=0` |
 |---|---|---|---|
 | tok/s | **96.8** | 17.5 | 35.7 |
 | TTFT p90 | 3.1 s | 28.8 s | 9.9 s |

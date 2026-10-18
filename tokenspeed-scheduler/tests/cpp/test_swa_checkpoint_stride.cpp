@@ -146,8 +146,7 @@ TEST(SwaCheckpointStrideTest, AdmissionEstimateMatchesWhatAcquireTakes) {
             }
             const std::int32_t before = BackedBlocks(table);
             ASSERT_TRUE(manager.Acquire(pool, table, tokens));
-            EXPECT_EQ(BackedBlocks(table) - before, estimate)
-                << "prepended=" << prepended << " tokens=" << tokens;
+            EXPECT_EQ(BackedBlocks(table) - before, estimate) << "prepended=" << prepended << " tokens=" << tokens;
             EXPECT_TRUE(table.Blocks().back()) << "the tail this chunk writes into cannot be a hole";
         }
     }

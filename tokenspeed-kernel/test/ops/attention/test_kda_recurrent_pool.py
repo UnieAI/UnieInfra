@@ -10,10 +10,6 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton.linear.kda import (
-    kda_recurrent_decode,
-    kda_recurrent_decode_pool,
-)
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -22,6 +18,11 @@ if find_spec("fla") is None:
         "flash-linear-attention (fla) required for the KDA reference kernel",
         allow_module_level=True,
     )
+
+from tokenspeed_kernel.ops.attention.kda._triton.fla import (
+    kda_recurrent_decode,
+    kda_recurrent_decode_pool,
+)
 
 # K3 decode shapes (TP8 rank): 12 heads, K=V=128; lower_bound from config.
 HV, K, V = 12, 128, 128
@@ -44,7 +45,8 @@ def _make_inputs(bs, seed=0):
 
 def _reference(q, k, v, g, beta, A_log, dt_bias, cu, pool, read_idx, write_idx):
     """The pre-pool path: python-side gather/scatter around the fla kernel."""
-    state = pool[read_idx.long()]
+    # The pool is V-major; the fla reference reads and writes K-major states.
+    state = pool[read_idx.long()].transpose(-1, -2)
     out, new_state = kda_recurrent_decode(
         q,
         k,
@@ -60,7 +62,9 @@ def _reference(q, k, v, g, beta, A_log, dt_bias, cu, pool, read_idx, write_idx):
     )
     keep = (write_idx >= 0).view(-1, 1, 1, 1)
     out_idx = write_idx.long().clamp_min(0)
-    pool[out_idx] = torch.where(keep, new_state.to(pool.dtype), pool[out_idx])
+    pool[out_idx] = torch.where(
+        keep, new_state.transpose(-1, -2).to(pool.dtype), pool[out_idx]
+    )
     return out
 
 

@@ -1,13 +1,14 @@
 api_version: ci.tokenspeed.io/v1
+# Keep the pure target as a manual control; the matching EAGLE3 configuration
+# is the per-commit Kimi-K3 performance gate.
 name: perf-kimi-k3-mxfp4-tp8ep8-random-4k-1k-mi35x
 type: perf
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
-    - amd-mi35x-8gpu-test
+    - amd-mi350-8gpu-bench
 env:
   CI: "true"
 install:
@@ -33,8 +34,7 @@ server:
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0
-    --no-enable-prefix-caching
-    --enable-cache-report
+    --disable-prefix-caching
     --host 127.0.0.1
     --port 21000
     --policy round_robin
@@ -49,13 +49,17 @@ perf:
     # Keep the load generator aligned with the version used to establish the
     # perf_reference below; EvalScope 1.10 changed its metric semantics.
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.9.1'
+  # EvalScope loads remote tokenizer paths through ModelScope even when the
+  # dataset source is Hugging Face, so materialize the HF tokenizer locally.
   command: >-
     REPO_ROOT=$PWD &&
     MODEL=kimi-k3 &&
     URL=http://127.0.0.1:21000/v1/completions &&
     OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-mi35x-perf &&
+    TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
     trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
     rm -rf "$OUTPUTS_DIR" &&
+    /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
     set +e &&
     echo "==================================================" &&
     echo ">>> input=4k output=1k conc=1" &&
@@ -65,7 +69,8 @@ perf:
     --url "$URL"
     --api openai
     --dataset random
-    --tokenizer-path moonshotai/Kimi-K3
+    --data-source huggingface
+    --tokenizer-path "$TOKENIZER_PATH"
     --min-prompt-length 4096
     --max-prompt-length 4096
     --prefix-length 0
@@ -90,6 +95,7 @@ report:
   github_step_summary: true
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
-# Rounded down from an 8x MI350X concurrency-1 measurement: 43.05 / 5.26.
+# Rounded down from the median of the three most recent passing runs on the 8x
+# MI35x runner (67.48/8.09, 65.66/7.88, 65.15/7.79): 65.66 / 7.88.
 perf_reference:
-  1: [42, 5.2]
+  1: [65, 7.8]

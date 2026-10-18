@@ -18,144 +18,481 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""The runner-facing attention backend contract.
+
+An ``AttentionBackend`` is what ``ForwardStepRunner`` / ``ModelExecutor`` /
+``PrefillGraph`` talk to: it receives the scheduler bridge's per-group
+``block_tables`` (raw scheduler blocks, batch-ordered) on every metadata
+call and answers the model's ``forward``. Three kinds of node implement it:
+
+* ``CacheGroupRouter`` — the paged-KV composite that maps blocks to kernel
+  pages once and fans out to ``PagedAttentionBackend`` leaves (``paged.py``);
+* composites that wrap a router next to a state consumer (hybrid GDN/KDA,
+  Inkling's conv columns, MSA's sparse layers);
+* block consumers that read raw tables of their own state groups (Mamba /
+  KDA state paging, DeepSeek-V4's bespoke multi-group backend).
+
+``block_tables`` is always a complete mapping — the runner synthesizes
+placeholder tables for capture, idle and warmup — so no implementation
+carries a "no tables" arm. Padding is the consumer's job: requests in
+``[actual_bs, bs)`` are dummies it must route to the null page itself.
+"""
+
 from __future__ import annotations
 
-import inspect
-from abc import ABC, abstractmethod
+from abc import ABC
+from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
+from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
+    CudaGraphSupport,
+    TreeSupport,
+    resolve_cuda_graph_support,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
 
-def init_backend_cuda_graph_state(
-    backend: "AttentionBackend",
-    max_bs: int,
-    **extras,
-) -> None:
-    """Call ``backend.init_cuda_graph_state`` with only the kwargs its
-    signature accepts (VAR_KEYWORD accepts all of them).
+@dataclass
+class SparseTopKShare:
+    """The sparse indexer's selection shared across one forward's layers.
 
-    Signature-probe instead of try/except TypeError: paged_cache_group_specs
-    is load-bearing for the state shed, so a TypeError raised from inside the
-    backend's body must propagate rather than silently retry without specs.
+    Sparse attention (GLM DSA, Qwen4-Exp QSA) selects the KV positions each
+    query row attends to with an indexer; a model may declare layers that
+    carry no indexer and reuse the previous indexer layer's selection
+    (``indexer_types == "shared"``), and an MTP head may reuse the target's
+    selection for its draft steps. The indexer layer that computes a
+    selection publishes it here; the consumers read it. It is the sparse
+    kernels' per-forward metadata, so it lives on the backend like the rest
+    — as scratch outside the graph-guarded metadata slots — and the node
+    clears it when it builds the next forward's metadata; between draft
+    steps the drafter carries it across explicitly.
 
-    Shared by the cuda-graph wrapper and by composite backends (hybrid) that
-    forward to user-selectable sub-backends with possibly narrow signatures.
+    ``prefill`` covers the extend rows, ``decode`` the decode rows (or the
+    verify window); each family stores its own record type. ``qsa_metadata``
+    holds QSA's layer-invariant row geometry so it is built once per forward.
     """
-    params = inspect.signature(backend.init_cuda_graph_state).parameters
-    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        extras = {k: v for k, v in extras.items() if k in params}
-    backend.init_cuda_graph_state(max_bs, **extras)
+
+    prefill: Any | None = None
+    decode: Any | None = None
+    qsa_metadata: Any | None = None
+
+    def clear(self) -> None:
+        self.prefill = None
+        self.decode = None
+        self.qsa_metadata = None
 
 
-class AttentionBackend(ABC):
-    """The base class of attention backends"""
+class CachePoolBinding:
+    """A node's bound cache pool."""
 
-    uses_paged_cache_groups: bool = False
-    # paged cache per-group block tables (absolute index, null hole = 0). A
-    # separate flag from uses_paged_cache_groups because the two mechanisms have
-    # different hole/index semantics; a group-aware backend sets
-    # this True. Default False keeps every existing backend on today's path.
-    uses_cache_groups: bool = False
-    # True when authoritative per-group tables also replace the shared
-    # full-history draft table for this backend. Keep this separate from
-    # uses_cache_groups: generic speculative backends still consume that table.
-    cache_group_tables_replace_draft_page_table: bool = False
-    # Capture helpers use a real writable page for every active group when
-    # the backend rejects the reserved null page for live sequence metadata.
-    cache_active_pages_must_be_real: bool = False
-    uses_padded_decode_token_mask: bool = False
-    # Whether this backend can serve a ``ForwardMode.MIXED`` batch (prefill
-    # chunks and decode rows in one forward). Backends that set this False must
-    # reject MIXED in ``init_forward_metadata``; the engine refuses to start
-    # with ``--enable-mixed-batch`` on such a backend rather than crashing the
-    # scheduler on the first mixed iteration. May be narrowed per instance (MHA
-    # opts out under speculative decoding) -- the startup guard reads it off the
-    # constructed backend, not off the class.
-    supports_mixed_batch: bool = True
-    supports_mla_projected_value_decode: bool = False
-    # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
-    draft_seq_lens_attr: str = "cuda_graph_seq_lens"
+    #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
+    #: none by default; a node that keeps some names them.
+    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
 
-    def __init__(self, config: BaseAttnConfig) -> None:
-        self.device = config.device
-        self.num_qo_heads = config.num_attention_heads // config.attn_tp_size
-        self.num_kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
-        self.dtype = config.dtype
-        self.head_dim = config.head_dim
-        self.is_draft = config.is_draft
-        self.spec_num_tokens = config.speculative_num_draft_tokens
+    def _init_pool_binding(self) -> None:
         self.cache_pool: CachePool | None = None
-        # True when this backend's CUDA-graph block-table (kv_indices) buffer is
-        # aliased to a peer backend's (e.g. a drafter sharing the target's), so
-        # the replay path skips rebuilding it — the peer already populates it.
-        self._block_table_aliased = False
+
+    def child_backends(self) -> tuple[CachePoolBinding, ...]:
+        """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
+        return ()
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        """Raise if this node or any child cannot rebind to ``cache_pool``."""
+        for backend in self.child_backends():
+            backend.validate_cache_pool(cache_pool)
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
+        """Bind: every node agrees, then the children publish, then this node."""
+        self.validate_cache_pool(cache_pool)
+        self._bind(cache_pool)
+
+    def _bind(self, cache_pool: CachePool) -> None:
+        for backend in self.child_backends():
+            backend._bind(cache_pool)
+        self._publish_cache_pool(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        """A node's own binding work: read the old pool before super(), use the new one after."""
         self.cache_pool = cache_pool
 
-    @contextmanager
-    def override_num_extends(self, num_extends: int):
-        """Temporarily override the decode-metadata slice discriminator for the
-        wrapped block. Used by MLA backends to flip between drafter step 0
-        (slice = [num_extends:]) and step 1+ (slice = [0:]).
+    def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
+        """Return logical-slot ownership, or None for local/replicated storage."""
+        return None
 
-        Default no-op for backends that fill separate prefill/decode metadata
-        at init time.
-        """
-        yield
-
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
+        """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
+        was written at (``PagedAttention.fp8_kv_scales``)."""
         return False
 
-    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Per-group write-location hook for out-of-backend KV writers
-        (fused RoPE prewrite); identity for backends without paged cache
-        groups (see uses_cache_groups). ``forward_mode`` picks the
-        metadata slot for backends that prewrite on extend as well."""
-        return out_cache_loc
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """This node's own per-slot rows a retraction snapshot images.
+
+        Backend-private state keyed by ``req_pool_index`` -- a recurrent
+        ring, a partial index pool not yet in a page -- is the exception
+        (``AGENTS.md``); a backend that keeps some lists it here, in a fixed
+        order, so a restore carries it with the pages. Paged state is in
+        cache groups and never listed. A node lists its own rows only; the
+        tree is flattened by :meth:`slot_state_exporters`. A leaf's default
+        is empty.
+        """
+        del slot
+        return []
+
+    def slot_state_exporters(self) -> tuple[CachePoolBinding, ...]:
+        """This node and every node below it, each imaging its own rows.
+
+        The model executor lists these in the blob, so a composite's rows and
+        its children's are separate segments laid out once by the Host cache
+        executor rather than re-measured at every export.
+        """
+        exporters = [self]
+        for child in self.child_backends():
+            exporters.extend(child.slot_state_exporters())
+        return tuple(exporters)
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # Backend rows are rewritten by every forward and prepared at a PD
+        # landing, never keyed by request: always valid, nothing to mark.
+        del request_id
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        del request_id
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
+    def prepare_cache_batch(
+        self, request_slots: torch.Tensor, *, num_extends: int, stream: torch.Stream
+    ) -> None:
+        """Begin KV offloading access for this target batch's request slots.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Clear last-step read/write mappings, mask null/padded requests, and
+        order residency work on stream. This does not allocate history.
+        num_extends identifies prefill rows, which offloaded arenas reject.
+        """
+        for child in self.child_backends():
+            child.prepare_cache_batch(
+                request_slots, num_extends=num_extends, stream=stream
+            )
+
+    def writeback_accepted_kv(self, accept_lengths: torch.Tensor) -> None:
+        """Persist accepted KV from offloading compute buffers to Host history.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Join writeback to the execution stream before publishing completion.
+        accept_lengths counts accepted target-input rows, not output tokens.
+        """
+        for child in self.child_backends():
+            child.writeback_accepted_kv(accept_lengths)
+
+    def invalidate_cache_residency(
+        self, request_slots: torch.Tensor, *, stream: torch.Stream
+    ) -> None:
+        """Fence KV offloading work and invalidate reused request-slot tags.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Reset hot-cache tags, seed state, and LRU on stream. This does not
+        erase authoritative history or release scheduler-owned cache blocks.
+        """
+        for child in self.child_backends():
+            child.invalidate_cache_residency(request_slots, stream=stream)
+
+    def prefetch_sparse_kv(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Overlap sparse KV offloading loads for this producer's consumers.
+
+        layer identifies the selection producer. Its recipe declares which
+        offloaded consumer fields share selection. Load those fields on the
+        prefetch stream when overlap is enabled; otherwise do nothing.
+        Each consumer must still call prepare_sparse_kv_access to join its
+        ready event and publish compute slots before projection/attention.
+        """
+
+
+class AttentionBackend(CachePoolBinding, ABC):
+    """The runner-facing contract; see the module docstring.
+
+    A subclass that skips ``__init__`` calls ``_init_pool_binding()`` itself.
+    """
+
+    # Cache-group kinds this node consumes from the pool contract (startup
+    # validation: every published kind must have a consumer); composites
+    # union their children's. Paged backends read rows of either history kind.
+    cache_consumer_attn_kinds: frozenset[str] = frozenset(
+        {"full_history", "sliding_window"}
+    )
+    # Only backends whose model skips incomplete-prefill outputs opt in.
+    skips_incomplete_prefill_outputs: bool = False
+    # MLA sharded history reads/writes and global attention-partial merging,
+    # independent of whether the model also has linear-attention layers.
+    supports_mla_dcp: bool = False
+    supports_mla_projected_value_decode: bool = False
+    # Bound by register_step_counter (PD layerwise transfer); None otherwise.
+    step_counter: StepCounter | None = None
+    # Static CUDA-graph capability of this class; the executor AND-composes
+    # it over the target+draft trees (resolve_cuda_graph_support).
+    cuda_graph_support: CudaGraphSupport = CudaGraphSupport()
+    # This backend forwards each layer's ``sliding_window_size`` to its kernels.
+    # Left False, a declared window silently widens to full-history attention.
+    supports_layer_sliding_window: bool = False
+
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+        self.device = config.device
+        self.dtype = config.dtype
+        self.is_draft = bool(config.is_draft)
+        self.spec_num_tokens = max(int(config.speculative_num_draft_tokens or 1), 1)
+        self.num_qo_heads = spec.num_attention_heads // spec.attn_tp_size
+        self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
+        self.head_dim = spec.head_dim
+        self._init_pool_binding()
+
+    # ------------------------------------------------------------------
+    # Structure
+    # ------------------------------------------------------------------
+
+    def _init_pool_binding(self) -> None:
+        """The binding lifecycle fields; wrappers that skip __init__ call this."""
+        super()._init_pool_binding()
+        self._sparse_topk = SparseTopKShare()
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        """Record the pool and clear shared sparse-forward metadata."""
+        super()._publish_cache_pool(cache_pool)
+        self._sparse_topk.clear()
+
+    def configure_runtime(self, **kwargs) -> None:
+        """Post-load configuration hook (information unavailable at
+        construction, e.g. sliding window sizes). Default: no-op."""
+
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        """Allocate static buffers the breakable prefill graphs bake.
+        Default: no-op — attention stays eager at the break points."""
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        """Allocate graph-stable target verify buffers and return their bytes.
+
+        ``max_bs`` is the serving batch capacity; ``draft_token_num`` is the
+        verify width. Composites delegate to their verify consumers. Backends
+        without verify buffers return zero.
+        """
+        return 0
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """Allocate the query-context-parallel history gather workspace and
+        return its bytes (the recipe reserved them from the cache budget;
+        the registry checks the two agree). Only a tree with the GPU DSA
+        sharded extend arm has one."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm; query context "
+            "parallelism needs GPU DSA attention"
+        )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        """The allocated history gather workspace of this tree, or ``None``
+        before :meth:`preallocate_history_gather_workspace` ran (or on a tree
+        without the sharded extend arm)."""
+        return None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """Share another tree's history gather workspace: the draft tree
+        gathers into the target's buffers, which are idle while the draft
+        runs. A leaf without the sharded extend arm ignores it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm to share a history "
+            "gather workspace with"
+        )
 
     @property
-    def sinks_dtype(self) -> torch.dtype:
-        return torch.bfloat16
+    def prefill_metadata_is_capture_ready(self) -> bool:
+        """Whether the current execution metadata supports a captured forward."""
+        return False
 
-    @abstractmethod
-    def init_forward_metadata(self, *args, **kwargs):
-        """Init the metadata for a forward pass.
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        """Whether a captured prefill graph can include attention for this shape.
 
-        When use_cuda_graph=True the backend should use its pre-allocated
-        cuda-graph buffers instead of the normal eager buffers.
+        The question ``prepare_prefill_metadata`` answers on its way to doing
+        the work, asked on its own so a caller can decide before anything is
+        written. Must read no forward context and change nothing.
         """
-        raise NotImplementedError()
+        return False
 
-    def init_cuda_graph_state(self, max_bs: int):
-        """Init the global shared states for cuda graph. Backends own their
-        cache-seqlens buffer and copy the live lengths in at replay time."""
-        raise NotImplementedError()
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        """Prepare execution metadata before eager forward or graph replay.
 
-    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
-        """Publish the drafter's in-graph seq_lens edits into our own buffer.
-
-        Copies into ``draft_seq_lens_attr``; backends with distinct draft
-        metadata or an inner backend override this.
+        ``capture`` only retains startup buffers at their captured addresses;
+        it must not select different computation. Returns the same answer as
+        :meth:`admits_prefill_graph`; the prefill capture raises if an override
+        refuses a shape that query admitted. Other backends keep
+        their existing metadata and attention breaks. Call on the consumer
+        stream, after the scheduler-derived metadata is built and before any
+        layer consumes it.
         """
-        buf = getattr(self, self.draft_seq_lens_attr, None)
-        if buf is None:
-            return
-        bs = seq_lens.shape[0]
-        buf[:bs].copy_(seq_lens[:bs])
+        return self.admits_prefill_graph(token_capacity, bs, forward_mode)
+
+    # ------------------------------------------------------------------
+    # Metadata (docs/design/unified_path.md)
+    # ------------------------------------------------------------------
+
+    def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
+        """Allocate the persistent decode buffers, sized by ``max_bs`` (the
+        max decode bs, never the capture ladder). Runs unconditionally at
+        wrapper construction, ``enforce_eager`` included.
+
+        Args:
+            max_bs: Persistent-buffer row capacity.
+            **kwargs: Runner extras every node accepts
+                (``cache_group_specs``, ``cache_group_page_counts``,
+                ``max_tokens_per_req``, ``overlap_schedule_depth``); a
+                narrower signature TypeErrors at boot.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement init_cuda_graph_state"
+        )
+
+    def init_forward_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        block_tables: Mapping[str, torch.Tensor],
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        **kwargs,
+    ) -> None:
+        """Build metadata for an extend / mixed (or idle warmup) forward.
+
+        Decode metadata goes through :meth:`refresh_decode_metadata`; a pure
+        DECODE call here is a contract violation.
+
+        Args:
+            bs: Requests in the batch (extend requests first, then decode
+                requests).
+            num_extends: Leading extend requests.
+            req_pool_indices: ``[>= bs]`` request-pool slots.
+            seq_lens: ``[>= bs]`` total cache lengths after this step.
+            forward_mode: EXTEND, MIXED or IDLE.
+            block_tables: ``group_id -> [>= bs, cols]`` int32 raw scheduler
+                tables for every published group (placeholders on warmup).
+            extend_*: ``[>= num_extends]`` per-request new-token / prefix
+                lengths and their pinned host mirrors (empty on idle warmup).
+            extend_replay_lens_cpu: ``[>= num_extends]`` host-only leading
+                input rows per request that re-feed cached prompt positions
+                (bounded replay). Positions ``[prefix, prefix + replay)``
+                regenerate replayable cache groups only; a node that cannot
+                honour that calls :func:`reject_bounded_replay`.
+            extend_prompt_lens_cpu: ``[>= num_extends]`` host-only whole
+                prompt lengths, so a node can tell the chunk that ends a
+                prompt from an intermediate one.
+            extend_with_prefix: Whether any extend row continues a cached or
+                chunked prefix (some ``extend_prefix_lens`` entry is non-zero).
+            query_shard: The rows of the extend span this rank computes under
+                query context parallelism, or ``None`` when every rank computes
+                every row. The lengths above describe the whole span on every
+                rank; a node that cannot attend a query shard calls
+                :func:`reject_query_shard`.
+            **kwargs: Model-side extras (positions, capture mode, ...) a
+                node may ignore.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement init_forward_metadata"
+        )
+
+    def refresh_decode_metadata(
+        self,
+        bs: int,
+        actual_bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+        block_tables: Mapping[str, torch.Tensor],
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
+        **kwargs,
+    ) -> None:
+        """The single decode metadata path — eager decode and graph replay.
+
+        Refreshes the persistent decode buffers in place; there is no
+        fresh-allocation decode arm anywhere (capture runs the idle arm of
+        this refresh, replay refreshes before ``graph.replay()``, eager
+        refreshes before the same forward the graph recorded).
+
+        Args:
+            bs: Requests to prepare (the padded capture batch under replay);
+                eager passes ``bs == actual_bs``.
+            actual_bs: Live requests; ``[actual_bs, bs)`` are padding the node
+                routes to the null page. ``0`` is the idle replay / capture
+                seeding.
+            req_pool_indices: ``[>= bs]`` request-pool slots.
+            seq_lens: ``[>= bs]`` live cache lengths (padding requests hold 1).
+            forward_mode: A decode mode.
+            block_tables: ``group_id -> [>= actual_bs, cols]`` raw scheduler
+                tables for every published group (placeholders when idle).
+            num_extends: Leading extend requests of a MIXED round whose decode
+                half this refresh describes; 0 for pure decode.
+            for_graph_replay: A graph is in play (live replay or capture
+                seeding). Branch on it only for graph-mechanics asymmetries.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement refresh_decode_metadata"
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -163,83 +500,235 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        cache_group_ids: tuple[str, ...] = (),
+        *,
+        block_tables: Mapping[str, torch.Tensor],
         **kwargs,
-    ):
-        """Init the metadata for a forward pass for capturing a cuda graph.
-
-        ``cache_group_ids`` names the cache groups whose page tables arrive at
-        replay; a group-aware backend (``uses_cache_groups``)
-        allocates its persistent per-group buffers from these ids — no table
-        data exists at capture time. Empty for single-table backends.
-        """
-        raise NotImplementedError()
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
-        block_tables: dict[str, torch.Tensor] | None = None,
-        **kwargs,
-    ):
-        """Update pre-allocated CUDA-graph metadata buffers in-place before replay.
-
-        Called instead of init_forward_metadata when use_cuda_graph=True, so
-        that the captured kernels (which hold pointers into the pre-allocated
-        buffers) see the current batch's data without any new allocations.
-        ``block_tables`` carries per-group page tables
-        (group_id -> [>=bs, cols]) for group-aware backends; a backend that
-        captured group buffers must receive non-empty tables whenever bs > 0.
-        Default: fall back to init_forward_metadata (correct but may not work
-        for all backends that use separate cuda-graph buffer pools).
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement init_forward_metadata_replay_cuda_graph "
-            "for CUDA graph support"
+    ) -> None:
+        """Default capture: the idle refresh (``actual_bs=0``,
+        ``for_graph_replay=True``) over the same persistent buffers replay
+        refreshes, against the runner's placeholder tables and the seeded
+        ``seq_lens``. Idempotent. Override only for a kernel-imposed
+        capture asymmetry (unified_path.md, "Capture is inherited")."""
+        if not forward_mode.is_decode_or_idle():
+            raise NotImplementedError(
+                f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"
+            )
+        self.refresh_decode_metadata(
+            bs,
+            0,
+            req_pool_indices,
+            seq_lens,
+            forward_mode=forward_mode,
+            block_tables=block_tables,
+            num_extends=0,
+            for_graph_replay=True,
+            **kwargs,
         )
 
-    def configure_runtime(self, **kwargs) -> None:
-        """Configure runtime state after model loading (e.g. sliding_window_size).
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        """Publish a drafter's in-graph seq_lens edits (Eagle chains); nodes
+        without per-request decode lengths ignore it."""
 
-        Called once during ModelExecutor initialization with information that is
-        not available at backend construction time.  Default: no-op.
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Vanilla MTP re-anchors the draft requests to the committed frontier."""
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """DFLASH: broadcast block-end lengths to each request's materialized
+        decode entries."""
+
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        """Temporarily override the decode-row slice discriminator (MLA
+        family). Default no-op."""
+        yield
+
+    @property
+    def sparse_topk(self) -> SparseTopKShare:
+        """This node's layer-shared sparse selection for the current forward
+        (:class:`SparseTopKShare`). Every runner-facing node clears it when it
+        builds a forward's metadata; composites fronting a paged child route
+        to the child's, so the model, the indexer and the drafter meet the
+        same object whichever level of the tree they hold."""
+        return self._sparse_topk
+
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        """Whether a narrowed draft step in a round of ``forward_mode`` can
+        attend its live rows as a DECODE dispatch (Eagle3's first step)."""
+        return False
+
+    # ------------------------------------------------------------------
+    # Write locations
+    # ------------------------------------------------------------------
+
+    def draft_write_locations_uniform(
+        self, out: torch.Tensor, cache_start: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Resolve ``num_tokens`` KV write slots per request into a
+        caller-owned scratch buffer (in-graph safe: fixed table address).
+
+        For slots a FORWARD will consume, use
+        :meth:`publish_draft_step_locations` instead — this variant serves
+        side writes that must not clobber the published step window (e.g.
+        DFLASH copying target-row KV into the draft cache).
         """
-        pass
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no draft write locations"
+        )
 
-    def register_step_counter(self, step_counter: StepCounter):
+    def publish_draft_step_locations(
+        self, cache_start: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Publish a draft step's write window (``num_tokens`` slots per
+        request starting at ``cache_start``) so the next forward's
+        ``write_locations`` serve it. The drafters declare the window; the
+        math and the address-stable storage live in the backend. In-graph
+        safe."""
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no draft write locations"
+        )
+
+    def tree_support(self) -> TreeSupport:
+        """This node's own draft-tree capability; ``resolve_tree_support`` asks
+        every node before any bind. Nodes without a tree path keep this."""
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} has no draft-tree verify path",
+            draft_blocker=f"{name} has no draft-tree lane path",
+        )
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        """Arm draft-tree verify (--speculative-eagle-topk > 1) on every node,
+        after ``resolve_tree_support``; leaves that verify trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_verify(inputs)
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        """Arm draft-tree lanes on every node of the drafter's backend, after
+        ``resolve_tree_support``; leaves that draft trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_draft(inputs)
+
+    def compact_verify_window(self, path: torch.Tensor) -> None:
+        """After a draft-tree verify, move each request's accepted path to the
+        front of its verify window in the cache this node owns; nodes that own
+        none forward to their children.
+
+        Args:
+            path: ``[bs, N]`` int32 accepted window row at each depth, root
+                first, ``-1`` past the path.
+        """
+        for backend in self.child_backends():
+            backend.compact_verify_window(path)
+
+    def write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Return this layer's authoritative history write slots.
+
+        Index-K uses these before selection, independently of KV offloading.
+        Offloaded latent KV writers use the compute slots returned by
+        prepare_sparse_kv_access instead. This query does not copy KV.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no paged write locations"
+        )
+
+    def forward_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Slots for the K/V rows a forward in ``forward_mode`` carries: the
+        attention prologue's write target."""
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no paged write locations"
+        )
+
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """:meth:`forward_write_locations` widened to the ``rows`` a graph-padded
+        forward carries, the extra rows landing in the dummy slot 0, so the
+        prologue can be captured; a backend without a padded span serves exact
+        counts only."""
+        locations = self.forward_write_locations(layer, forward_mode)
+        if locations.numel() != rows:
+            raise ValueError(f"{locations.numel()} write slots for {rows} rows")
+        return locations
+
+    def prepare_sparse_kv_access(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        """Prepare sparse KV offloading and return this layer's compute writes.
+
+        selection contains history row IDs, including masks and duplicates;
+        positions contains token positions. Decode loads history or joins
+        prefetch, then publishes hot reads/writes. Extend reserves projection
+        staging; sparse-prefill iteration later flushes and gathers history.
+        Use the returned slots for KV projection before attention. Layers
+        without offloading return ordinary history writes without copying KV.
+        Wrappers route by layer and preserve the returned tensor.
+        """
+        return self.write_locations(layer, forward_mode)
+
+    # ------------------------------------------------------------------
+    # PD / speculative side state
+    # ------------------------------------------------------------------
+
+    def prepare_remote_cache_slots(self, slot_indices: list[int]) -> None:
+        """Clear model-specific restore state before remote cache admission."""
+        del slot_indices
+
+    def mark_remote_cache_ready(self, slot_index: int) -> None:
+        """Arm model-specific hydration after a remote cache transfer succeeds."""
+        del slot_index
+
+    def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
+
+    def commit_speculative_state_after_verify(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
+    ) -> None:
+        """Commit live acceptance after drafted decode/mixed execution or replay.
+
+        ``num_extends == 0`` identifies pure decode; otherwise extend requests
+        lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted
+        draft-tree path (root first, ``-1`` past it), ``None`` for a chain.
+        Stateless backends inherit this no-op.
+        """
 
     @contextmanager
     def record_pd_cache_step(
         self,
         forward_mode: ForwardMode,
-        save_kv_cache: bool,
+        writes_in_call: bool,
         record_kv_cache: bool | None,
     ):
-        """Anchor the PD layerwise cache-step record to the wrapped KV write.
-
-        Records the ``StepCounter`` step before the attention call when the KV
-        was pre-written (``save_kv_cache=False``) and after it otherwise, so a
-        layerwise cache transfer always observes a fully written layer. See
-        ``forward`` for the ``record_kv_cache`` override contract. No-op when no
-        step counter is registered. Backends that own the record (e.g. the
-        hybrid wrapper, which counts once per model layer across full-attn +
-        mamba children) reuse this to avoid duplicating the gate logic.
-        """
+        """Anchor the PD layerwise cache-step record to the layer's last cache
+        write: after the wrapped call when it writes a cache field
+        (``writes_in_call``), before it otherwise. No-op without a step
+        counter."""
         if record_kv_cache is None:
             record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
         else:
             record_cache = record_kv_cache
-        record_cache = record_cache and getattr(self, "step_counter", None) is not None
-
-        if record_cache and not save_kv_cache:
+        record_cache = record_cache and self.step_counter is not None
+        if record_cache and not writes_in_call:
             self.step_counter.record_cache()
         yield
-        if record_cache and save_kv_cache:
+        if record_cache and writes_in_call:
             self.step_counter.record_cache()
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     @break_point
     def forward(
@@ -248,7 +737,6 @@ class AttentionBackend(ABC):
         k: torch.Tensor,
         v: torch.Tensor,
         layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
         token_to_kv_pool: CachePool,
         forward_mode: ForwardMode,
         bs: int,
@@ -256,15 +744,14 @@ class AttentionBackend(ABC):
         record_kv_cache: bool | None = None,
         **kwargs,
     ):
-        """Run forward on an attention layer with explicit scheduler metadata.
-
-        ``record_kv_cache`` overrides the PD layerwise cache-step recording:
-        ``None`` keeps the default (record on the EXTEND-side path), an explicit
-        bool forces it so a DECODE-dispatched draft catch-up can still record.
-        """
+        """Run one attention layer; KV write locations come from
+        :meth:`write_locations` (there is no caller-supplied location
+        vector). ``record_kv_cache`` overrides the PD layerwise recording
+        (None: record on the extend-side path)."""
+        out_cache_loc = self.write_locations(layer, forward_mode)
         with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
             if forward_mode.is_decode():
-                ret = self.forward_decode(
+                return self.forward_decode(
                     q,
                     k,
                     v,
@@ -275,20 +762,18 @@ class AttentionBackend(ABC):
                     save_kv_cache=save_kv_cache,
                     **kwargs,
                 )
-            else:
-                ret = self.forward_extend(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    out_cache_loc,
-                    token_to_kv_pool,
-                    bs,
-                    save_kv_cache=save_kv_cache,
-                    forward_mode=forward_mode,
-                    **kwargs,
-                )
-        return ret
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                forward_mode=forward_mode,
+                **kwargs,
+            )
 
     def forward_decode(
         self,
@@ -302,7 +787,6 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run a forward for decode."""
         raise NotImplementedError()
 
     def forward_extend(
@@ -317,5 +801,42 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run a forward for extend."""
         raise NotImplementedError()
+
+
+def reject_query_shard(query_shard: QueryShardPlan | None, node: str) -> None:
+    """Fail loud when a forward shards its query rows over a node that attends
+    every row.
+
+    Under query context parallelism the model feeds a node its shard of the
+    extend rows while the metadata describes the whole span; only a backend
+    whose extend arm gathers each request's history for its local rows may
+    accept the shard.
+
+    Args:
+        query_shard: The forward's shard plan, or ``None`` when not sharded.
+        node: Backend name for the diagnostic.
+    """
+    if query_shard is not None and query_shard.size > 1:
+        raise RuntimeError(
+            f"{node} cannot attend a query shard; query context parallelism "
+            "needs the gathered-history DSA extend arm"
+        )
+
+
+def reject_bounded_replay(extend_replay_lens_cpu: torch.Tensor, node: str) -> None:
+    """Fail loud when a forward re-feeds cached positions a node cannot mask.
+
+    Replayed rows must not rewrite the groups whose rows the prefix hit
+    already holds; only a backend that plans its writes around
+    ``extend_replay_lens_cpu`` may accept them.
+
+    Args:
+        extend_replay_lens_cpu: ``[num_extends]`` host replay lengths.
+        node: Backend name for the diagnostic.
+    """
+    if extend_replay_lens_cpu.numel() and bool((extend_replay_lens_cpu != 0).any()):
+        raise RuntimeError(
+            f"{node} cannot mask bounded-replay rows; its cache groups must not "
+            "be replayable"
+        )

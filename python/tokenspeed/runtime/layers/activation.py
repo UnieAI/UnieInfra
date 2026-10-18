@@ -27,34 +27,38 @@
 from dataclasses import dataclass
 
 import torch
-import triton
-import triton.language as tl
+from tokenspeed_kernel.ops.activation import silu_and_mul
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
+from tokenspeed.runtime.utils.triton import tl, triton
 
 _is_amd = current_platform().is_amd
-
-if _is_amd:
-    from tokenspeed_kernel.ops.activation.triton import silu_and_mul
-
-    # No Triton GeGLU on the AMD path; GeluTanhAndMul falls back to native.
-    gelu_tanh_and_mul = None
-else:
-    from tokenspeed_kernel.ops.activation.flashinfer import (
-        gelu_tanh_and_mul,
-        silu_and_mul,
-    )
 
 logger = get_colorful_logger(__name__)
 
 
 class SiluAndMul(torch.nn.Module):
+    def __init__(self, swiglu_limit: float | None = None) -> None:
+        super().__init__()
+        self.swiglu_limit = (
+            float(swiglu_limit)
+            if swiglu_limit is not None and swiglu_limit > 0
+            else None
+        )
 
     def forward(self, x: torch.Tensor, fp8_out: bool = False) -> torch.Tensor:
+        if x.shape[-1] % 2 != 0:
+            raise ValueError(
+                f"SwiGLU expects an even [gate, up] width, got {x.shape[-1]}"
+            )
+        if not x.is_cuda:
+            if fp8_out:
+                raise NotImplementedError("CPU fp8_out silu_and_mul is not implemented")
+            return self.forward_native(x)
+
         if not _is_amd:
 
             def get_tma_aligned_scale(x):
@@ -69,6 +73,10 @@ class SiluAndMul(torch.nn.Module):
             d = x.shape[-1] // 2
             output_shape = x.shape[:-1] + (d,)
             if fp8_out:
+                if self.swiglu_limit is not None:
+                    raise NotImplementedError(
+                        "clamped fp8_out silu_and_mul is not implemented"
+                    )
                 out = torch.empty(
                     output_shape, dtype=torch.float8_e4m3fn, device=x.device
                 )
@@ -77,45 +85,33 @@ class SiluAndMul(torch.nn.Module):
                     silu_and_mul_fuse_block_quant,
                 )
 
-                out, scale = silu_and_mul_fuse_block_quant(
-                    x, scale, out, enable_pdl=pdl_enabled()
-                )
+                out, scale = silu_and_mul_fuse_block_quant(x, scale, out)
                 return out, scale
-            else:
-                out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-                silu_and_mul(x, out, enable_pdl=pdl_enabled())
-                return out
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            return silu_and_mul(
+                x,
+                out,
+                limit=self.swiglu_limit,
+            )
 
         if fp8_out:
             raise NotImplementedError("AMD fp8_out silu_and_mul is not implemented")
         d = x.shape[-1] // 2
         out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
-        return silu_and_mul(x, out, enable_pdl=pdl_enabled())
+        return silu_and_mul(
+            x,
+            out,
+            limit=self.swiglu_limit,
+        )
 
-
-class GeluTanhAndMul(torch.nn.Module):
-    """GeGLU gated activation over a fused ``[..., gate | up]`` input.
-
-    Computes ``gelu(gate, approximate="tanh") * up``, the activation Gemma 3
-    and Gemma 4 use (``hidden_activation="gelu_pytorch_tanh"``).
-
-    On NVIDIA CUDA tensors this is one fused kernel launch; elsewhere (AMD,
-    CPU, meta) it falls back to the native chunk/gelu/multiply, which allocates
-    an extra intermediate but is numerically the reference.
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[-1] % 2 != 0:
-            raise ValueError(
-                f"GeGLU expects an even [gate, up] width, got {x.shape[-1]}"
-            )
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
-        if x.is_cuda and not _is_amd:
-            out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
-            gelu_tanh_and_mul(x, out, enable_pdl=pdl_enabled())
-            return out
-        gate, up = x[..., :d], x[..., d:]
-        return torch.nn.functional.gelu(gate, approximate="tanh") * up
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        if self.swiglu_limit is not None:
+            gate = gate.clamp_max(self.swiglu_limit)
+            up = up.clamp(-self.swiglu_limit, self.swiglu_limit)
+        return (torch.nn.functional.silu(gate) * up).to(x.dtype)
 
 
 class SituAndMul(torch.nn.Module):
@@ -151,13 +147,12 @@ class SituAndMul(torch.nn.Module):
                 f"SiTU expects an even [gate, up] width, got {x.shape[-1]}"
             )
         if x.is_cuda:
-            from tokenspeed_kernel import situ_and_mul
+            from tokenspeed_kernel.ops.activation import situ_and_mul
 
             return situ_and_mul(
                 x,
                 beta=self.beta,
                 linear_beta=self.linear_beta,
-                enable_pdl=pdl_enabled(),
             )
         return self.forward_native(x)
 

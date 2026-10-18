@@ -25,8 +25,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+)
+
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheMemoryPlan,
+    )
 
 
 def _positive(name: str, value: int) -> int:
@@ -57,17 +63,7 @@ def select_layer_fields(
     selected = set()
     consumers = [[] for _ in range(num_layers)]
     for field in fields:
-        parts = field.field_id.split(".", 2)
-        if len(parts) != 3 or parts[0] != "layer":
-            raise ValueError(
-                f"cache field {field.field_id!r} is not owned by a model layer"
-            )
-        try:
-            layer_id = int(parts[1])
-        except ValueError as exc:
-            raise ValueError(
-                f"cache field {field.field_id!r} has an invalid layer id"
-            ) from exc
+        layer_id = cache_field_layer_id(field.field_id)
         if first_layer <= layer_id < last_layer:
             selected.add(field.field_id)
             consumers[layer_id - first_layer].append(field.field_id)
@@ -256,7 +252,7 @@ def combine_cache_transfer_layouts(
 
     Args:
         target: Target model's local transfer view.
-        draft: Optional draft model's local transfer view.
+        draft: Optional draft model view into the target's arena.
         group_ids: Optional scheduler order for the merged groups.
 
     Returns:
@@ -303,32 +299,61 @@ def combine_cache_transfer_layouts(
             raise ValueError("scheduler and transfer cache groups do not match")
         ordered_group_ids = group_ids
 
-    draft_buffer_base = len(target.buffers)
+    shared_arena = (
+        len(target.buffers) == 1
+        and len(draft.buffers) == 1
+        and target.buffers[0] is draft.buffers[0]
+    )
+    if not shared_arena:
+        raise ValueError("target and draft cache views must share one arena")
+    target_fields = {
+        field.field_id for group in target.groups for field in group.fields
+    }
+    draft_fields = {field.field_id for group in draft.groups for field in group.fields}
+    aliased_fields = target_fields & draft_fields
+    if aliased_fields:
+        # A strict draft subset is one physical layout with two compute views.
+        if not draft_fields < target_fields:
+            raise ValueError(
+                "shared target/draft arena views have ambiguous overlapping "
+                f"fields {sorted(aliased_fields)}"
+            )
 
-    def namespaced_field(
-        field: CacheField, namespace: str, buffer_base: int
-    ) -> CacheField:
-        return CacheField(
-            field_id=f"{namespace}:{field.field_id}",
-            device_buffer_index=buffer_base + field.device_buffer_index,
-            device_block_zero_offset_bytes=field.device_block_zero_offset_bytes,
-            block_stride_bytes=field.block_stride_bytes,
-            payload_bytes=field.payload_bytes,
+        target_locations = {
+            field.field_id: (group.group_id, field)
+            for group in target.groups
+            for field in group.fields
+        }
+        conflicts = sorted(
+            field.field_id
+            for group in draft.groups
+            for field in group.fields
+            if target_locations[field.field_id] != (group.group_id, field)
         )
-
+        if conflicts:
+            raise ValueError(
+                "shared target/draft arena fields use conflicting layouts "
+                f"{conflicts}"
+            )
+    if any(
+        field.device_buffer_index != 0
+        for layout in (target, draft)
+        for group in layout.groups
+        for field in group.fields
+    ):
+        raise ValueError("shared arena fields must use device buffer zero")
     groups = []
     for group_id in ordered_group_ids:
         target_group = target_groups.get(group_id)
         draft_group = draft_groups.get(group_id)
         fields = ()
         if target_group is not None:
-            fields = tuple(
-                namespaced_field(field, "target", 0) for field in target_group.fields
-            )
+            fields += target_group.fields
         if draft_group is not None:
             fields += tuple(
-                namespaced_field(field, "draft", draft_buffer_base)
+                field
                 for field in draft_group.fields
+                if field.field_id not in aliased_fields
             )
         geometry = target_group if target_group is not None else draft_group
         groups.append(
@@ -338,17 +363,13 @@ def combine_cache_transfer_layouts(
                 fields=fields,
             )
         )
-
-    consumers = tuple(
-        tuple(f"target:{field_id}" for field_id in consumer)
-        for consumer in target.consumers
-    ) + tuple(
-        tuple(f"draft:{field_id}" for field_id in consumer)
+    draft_consumers = tuple(
+        tuple(field_id for field_id in consumer if field_id not in aliased_fields)
         for consumer in draft.consumers
     )
     return CacheTransferLayout(
         num_lcm_blocks=target.num_lcm_blocks,
         groups=tuple(groups),
-        buffers=target.buffers + draft.buffers,
-        consumers=consumers,
+        buffers=target.buffers,
+        consumers=target.consumers + draft_consumers,
     )

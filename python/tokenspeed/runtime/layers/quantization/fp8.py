@@ -26,7 +26,10 @@ from typing import Any
 
 import torch
 
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import (
+    LinearMethodBase,
+    QuantizationConfig,
+)
 from tokenspeed.runtime.utils import log_info_on_rank0
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -39,6 +42,17 @@ class Fp8Config(QuantizationConfig):
 
     weight_scale_dtype = torch.float32
 
+    # Excluded from online quantization: linear-attention (GDN/mamba)
+    # projections, plus wo_a, whose grouped projection plan requires serialized
+    # weights and scales during its one-time backend preprocessing.
+    ONLINE_IGNORED_LAYERS = [
+        "re:.*linear_attn.*",
+        "re:.*conv1d.*",
+        "re:.*in_proj.*",
+        "re:.*out_proj.*",
+        "re:.*wo_a.*",
+    ]
+
     def __init__(
         self,
         is_checkpoint_fp8_serialized: bool = False,
@@ -47,6 +61,8 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: list[int] = None,
         scale_fmt: str | None = None,
     ) -> None:
+        if not is_checkpoint_fp8_serialized:
+            ignored_layers = (ignored_layers or []) + self.ONLINE_IGNORED_LAYERS
         super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -54,11 +70,9 @@ class Fp8Config(QuantizationConfig):
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
+        if weight_block_size is None and not is_checkpoint_fp8_serialized:
+            weight_block_size = [128, 128]
         if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
-                )
             if len(weight_block_size) != 2:
                 raise ValueError(
                     f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
@@ -69,6 +83,18 @@ class Fp8Config(QuantizationConfig):
                 )
         self.weight_block_size = weight_block_size
         self.scale_fmt = scale_fmt.lower() if scale_fmt is not None else None
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> LinearMethodBase:
+        """Select a linear method before its weights are created.
+
+        LinearBase applies ignored-layer rules before calling this hook.
+        Subclasses can override it to own weight creation, checkpoint loading
+        and execution together. Rely only on initialized LinearBase fields on
+        ``layer`` here; partition sizes arrive in ``create_weights``.
+        """
+        from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+
+        return Fp8LinearMethod(self)
 
     @classmethod
     def get_name(cls) -> str:
@@ -91,7 +117,9 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
         return cls(

@@ -44,8 +44,8 @@ Layer layout: ``local_layer_ids`` use SWA (``sliding_window_size``) with
 ``rel_extent == sliding_window_size``; the rest are full attention with the
 config ``rel_extent``. KV heads default to the hetero layout (#647
 byte-uniform slots): full-attention layers keep their checkpoint-native
-head count (unconditional; the INKLING_HETERO_KV gate is retired) — uniform serving with
-full-layer KV replicated at load (see the config docstring).
+head count — uniform serving with full-layer KV replicated at load (see the
+config docstring).
 
 Multimodal towers (gated on ``*_config.decoder_dmodel`` being set; text-only
 checkpoints leave both off):
@@ -65,7 +65,7 @@ the text-token embedding for that path so tower outputs are never re-normed
 (reference parity).
 
 Prefix caching is supported under the paged-conv defaults; only the rolling
-conv-state fallback requires ``--no-enable-prefix-caching`` (asserted at
+conv-state fallback requires ``--disable-prefix-caching`` (asserted at
 init). Weight loading supports dummy, real BF16, Quark MXFP4, and ModelOpt
 NVFP4 checkpoints (routed experts quantized, quant-exclusion lists translated
 to this module tree). MTP speculative decoding is served by the NextN draft
@@ -81,9 +81,11 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.rmha.triton import (
+    log_scaling_tau as compute_log_scaling_tau,
+)
 from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -95,12 +97,11 @@ from tokenspeed.runtime.configs.inkling_config import (
     InklingModelConfig,
     InklingVisionConfig,
     inkling_conv_stream_layout,
-    inkling_kv_heads_for_layer,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -113,7 +114,10 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -134,17 +138,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.common import set_weight_attrs
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
 _is_hopper_plus = current_platform().is_hopper_plus
-
-# Escape hatch: disable the rel-logits aux-stream fork (serial pre-attention).
-_ATTN_RELFORK = os.environ.get("INKLING_ATTN_RELFORK", "1") == "1"
-# Hetero KV (#647 byte-uniform slots): full layers keep their native half KV
-# head count. Unconditional since 2026-07-15 (INKLING_HETERO_KV gate retired).
-_HETERO_KV = True
 
 
 # Checkpoint attention projections -> qkvr fused shard ids.
@@ -285,18 +282,6 @@ def _load_block_param(
     return False
 
 
-def compute_log_scaling_tau(
-    positions: torch.Tensor, n_floor: int, alpha: float
-) -> torch.Tensor:
-    """Long-context query scaling factor (config-gated; see InklingAttention)."""
-    effective_n = (positions + 1).to(torch.float32)
-    return 1.0 + alpha * torch.log(torch.clamp(effective_n / float(n_floor), min=1.0))
-
-
-def _apply_log_scaling_tau(x: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-    return x * tau.to(dtype=x.dtype)
-
-
 class InklingShortConvolution(nn.Module):
     """Residual per-channel causal FIR (sconv) over one stream.
 
@@ -376,14 +361,22 @@ def _sconv_apply(
 
     ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
     channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
-    is just a wider ``dim`` with concatenated weights. The paged bridges are
-    mandatory and fused: extend chunks tap the checkpoint at their aligned
+    is just a wider ``dim`` with concatenated weights. The checkpoint bridges
+    are mandatory and fused: extend chunks tap the input checkpoint at their
     start (the prefill kernel never reads the ring), decode rounds tap the
-    ring (the decode kernel never reads the paged cache), and both publish
-    every covered boundary in-kernel.
+    ring (the decode kernel never reads the checkpoint blocks), and the
+    chunk-end window is published to the live slot in-kernel whenever the
+    chunk ends at the committed frontier -- a target verify publishes its
+    accepted window after acceptance instead.
     """
     backend = ctx.attn_backend
-    md = backend.conv_metadata
+    # Same routing as the dense metadata: prefill-family forwards read the
+    # extend-init slot, decode-family forwards the capture/refresh slot.
+    md = (
+        backend.conv_prefill_metadata
+        if ctx.forward_mode.is_extend_or_mixed()
+        else backend.conv_decode_metadata
+    )
 
     # Channel slice of the layer's [slots, R, conv_dim] ring.
     state = backend.conv_pool.layer_state_wd(layer_id)[
@@ -407,6 +400,13 @@ def _sconv_apply(
         group_id=checkpoint_group,
         buffers=checkpoint_buffers,
     )
+    if md.remote_restore_mask is not None:
+        backend.restore_shortconv_endpoint(
+            state,
+            checkpoint_buffers,
+            md,
+            checkpoint_group,
+        )
     return inkling_ring_sconv(
         x,
         weight,
@@ -416,12 +416,13 @@ def _sconv_apply(
         md.cache_indices,
         md.has_initial_state,
         md.seq_lens,
-        md.col_page_table[checkpoint_group],
+        md.col_block_table[checkpoint_group],
         checkpoint_buffers[0],
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
         num_extends=md.num_extends,
-        page_size=backend.conv_columns["block_tokens"],
-        enable_pdl=pdl_enabled(),
+        publish_live=(
+            md.num_extends > 0 or backend.conv_spec_num_tokens == 1 or backend.is_draft
+        ),
     )
 
 
@@ -436,7 +437,7 @@ class InklingRelLogitsProj(nn.Module):
 
     def forward(self, r_out: torch.Tensor) -> torch.Tensor:
         # r_out: [T, num_heads, d_rel] -> rel_logits [T, num_heads, rel_extent]
-        return torch.einsum("thd,de->the", r_out, self.proj)
+        return torch.matmul(r_out, self.proj)
 
 
 class InklingAttention(nn.Module):
@@ -467,7 +468,11 @@ class InklingAttention(nn.Module):
         self.scaling = 1.0 / self.head_dim
 
         total_heads = config.num_attention_heads
-        total_kv_heads = inkling_kv_heads_for_layer(config, layer_id, _HETERO_KV)
+        total_kv_heads = (
+            config.swa_num_key_value_heads
+            if is_local
+            else config.ckpt_num_key_value_heads
+        )
         assert total_heads % attn_tp_size == 0
         self.num_tp_heads = total_heads // attn_tp_size
         if total_kv_heads >= attn_tp_size:
@@ -545,9 +550,13 @@ class InklingAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_tp_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=(config.sliding_window_size - 1) if is_local else -1,
-            # Group ids == config.paged_cache_layer_types labels (sliding sub-groups included).
-            group_id=config.paged_cache_layer_types[layer_id],
+            sliding_window_size=(
+                hf_sliding_window_to_window_left(config.sliding_window_size)
+                if is_local
+                else -1
+            ),
+            rotary_emb=None,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
         self.q_size = self.head_dim * self.num_tp_heads
@@ -577,32 +586,26 @@ class InklingAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         log_scaling_tau: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         qkvr, _ = self.qkvr(hidden_states)
         q, kv, r = qkvr.split([self.q_size, 2 * self.kv_size, self.r_size], dim=-1)
 
-        # Warm the R-slice projection serially on the capture topology, then
-        # overlap it during capture. INKLING_ATTN_RELFORK=0 stays serial.
         with self.stream_fork.scope(
-            enable=_ATTN_RELFORK and get_is_cuda_graph_phase(),
+            enable=get_is_cuda_graph_phase(),
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
                 rel_logits = self.rel_logits_proj(
                     r.view(num_tokens, self.num_tp_heads, self.d_rel)
                 )
-                if log_scaling_tau is not None and not self.is_local:
-                    rel_logits = _apply_log_scaling_tau(
-                        rel_logits, log_scaling_tau.view(-1, 1, 1)
-                    )
 
-            # K/V are adjacent in the qkvr output AND the conv pool, so both sconv streams fuse into one call.
+            # K/V are adjacent in the qkvr output AND the conv pool, so both
+            # sconv streams fuse into one call reading the strided slice.
             if self.use_sconv:
                 kv = _sconv_apply(
-                    kv.contiguous(),
+                    kv,
                     self._merged_kv_sconv_weight(),
                     ctx,
                     self.layer_id,
@@ -612,27 +615,19 @@ class InklingAttention(nn.Module):
                 )
             k = kv[:, : self.kv_size]
             v = kv[:, self.kv_size :]
+            # Norm and KV store hide under the rel_logits branch; only attention waits for the join.
+            prepared = self.attn.prologue(q, k, v, None, ctx)
 
-            # Fused q/k RMSNorm returns contiguous q/k; v stays a strided view (KV scatter/FA4 allow it).
-            q, k = qk_rmsnorm(
-                q,
-                k,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.q_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
-            )
-
-            if log_scaling_tau is not None and not self.is_local:
-                q = _apply_log_scaling_tau(q, log_scaling_tau.view(-1, 1))
-
-        attn_output = self.attn(
-            q,
-            k,
-            v,
+        attn_output = self.attn.attend(
+            prepared.q,
+            prepared.k,
+            prepared.v,
             ctx,
-            out_cache_loc,
-            rel_logits=rel_logits.contiguous(),
+            rel_logits=rel_logits,
+            log_scaling_tau=None if self.is_local else log_scaling_tau,
+            # Inkling's readiness boundary is after both hidden-state sconv
+            # writes below, not immediately after attention KV publication.
+            record_kv_cache=False,
         )
         output, _ = self.wo_ud(attn_output)
         return output
@@ -699,7 +694,7 @@ class InklingGate(nn.Module):
     thus compete for probability mass without entering top-k (a "sink").
 
     Selection and weighting run in one fused Triton kernel
-    (``tokenspeed_kernel.ops.moe.triton.inkling_topk``, reached through
+    (``tokenspeed_kernel.ops.moe._triton.inkling_topk``, reached through
     ``TopK`` / ``select_experts``), which implements the reference's
     deterministic lowest-index tie-breaking and computes the sink
     normalization in linear space (identical to the reference's
@@ -754,9 +749,7 @@ class InklingGate(nn.Module):
         and the shared sink gammas (last ``S`` columns) from one joint
         normalization; callers slice as needed."""
         if self.use_dsv3_router_gemm and x.size(0) > 0:
-            logits = dsv3_router_gemm(
-                x, self.weight, out_dtype=torch.float32, enable_pdl=pdl_enabled()
-            )
+            logits = dsv3_router_gemm(x, self.weight, out_dtype=torch.float32)
         else:
             logits = F.linear(x, self.weight, None)
 
@@ -920,7 +913,12 @@ class InklingSparseMoeBlock(nn.Module):
             )
             assert not self.experts.support_routing
         self.comm_manager = CommManager(
-            mapping=mapping, layer_id=layer_id, is_moe=True, prev_is_moe=True
+            mapping=mapping,
+            layer_id=layer_id,
+            is_moe=True,
+            prev_is_moe=True,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         # sconv shifts along the token dim, so this block must return full token rows (no reduce-scatter).
         assert self.comm_manager.use_all_reduce(is_moe=True), (
@@ -964,7 +962,7 @@ class InklingSparseMoeBlock(nn.Module):
                 weights,
                 shared_out,
                 top_k=top_k,
-                enable_pdl=pdl_enabled(),
+                hidden_dim=x.shape[-1],
             )
         else:
             weights, topk_ids, router_logits = self.gate(x)
@@ -1066,7 +1064,6 @@ class InklingDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         log_scaling_tau: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if ctx.forward_mode.is_idle():
@@ -1081,7 +1078,6 @@ class InklingDecoderLayer(nn.Module):
         attn_out = self.attn(
             hidden_states,
             ctx,
-            out_cache_loc,
             log_scaling_tau=log_scaling_tau,
         )
         if self.attn_sconv is not None:
@@ -1094,6 +1090,11 @@ class InklingDecoderLayer(nn.Module):
             mlp_out = self.mlp(mlp_input)
         if self.mlp_sconv is not None:
             mlp_out = self.mlp_sconv(mlp_out, ctx)
+        if ctx.attn_backend.enable_layerwise_cache_ready:
+            mlp_out = ctx.attn_backend.record_layer_cache_ready(
+                mlp_out,
+                ctx.forward_mode,
+            )
         return mlp_out, residual
 
 
@@ -1325,6 +1326,10 @@ class InklingVisionTower(nn.Module):
         assert config.vision_encoder_type == "hmlp", config.vision_encoder_type
         self.vision_encoder = InklingHMLPPatchEncoder(config)
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.vision_encoder.parameters()).dtype
+
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(vision_features)
 
@@ -1422,7 +1427,6 @@ class InklingTextModel(nn.Module):
             if config.use_embed_norm
             else None
         )
-
         alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         def get_layer(idx: int, prefix: str) -> InklingDecoderLayer:
@@ -1469,7 +1473,6 @@ class InklingTextModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is None:
@@ -1494,7 +1497,6 @@ class InklingTextModel(nn.Module):
                 hidden_states,
                 residual,
                 ctx,
-                out_cache_loc,
                 log_scaling_tau=log_scaling_tau,
             )
         if residual is None:
@@ -1502,6 +1504,14 @@ class InklingTextModel(nn.Module):
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states, None
+
+
+class _InklingLogitsProcessor(LogitsProcessor):
+    """Keeps full-vocabulary logits: the model masks its padded vocabulary
+    columns after this processor runs, so a fused argmax could pick one."""
+
+    def fuse_argmax(self) -> None:
+        return None
 
 
 class InklingForConditionalGeneration(nn.Module):
@@ -1588,12 +1598,13 @@ class InklingForConditionalGeneration(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         # All-gather vocab-sharded logits before sampling; do_argmax would bypass the pad masking below.
-        self.logits_processor = LogitsProcessor(
+        self.logits_processor = _InklingLogitsProcessor(
             text_config,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_input_embeddings(self):
@@ -1681,13 +1692,12 @@ class InklingForConditionalGeneration(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ):
         multimodal_context = kwargs.pop("multimodal_context", None)
         input_embeds = self._embed_multimodal(ctx, input_ids, multimodal_context)
         hidden_states, aux_hidden_states = self.model(
-            input_ids, positions, ctx, out_cache_loc, input_embeds=input_embeds
+            input_ids, positions, ctx, input_embeds=input_embeds
         )
         return self._compute_logits(
             input_ids, hidden_states, ctx, aux_hidden_states=aux_hidden_states
@@ -1739,8 +1749,7 @@ class InklingForConditionalGeneration(nn.Module):
         ckpt_heads = (
             cfg.swa_num_key_value_heads if is_local else cfg.ckpt_num_key_value_heads
         )
-        served = inkling_kv_heads_for_layer(cfg, layer_id, _HETERO_KV)
-        target_heads = max(served, self.mapping.attn.tp_size)
+        target_heads = max(ckpt_heads, self.mapping.attn.tp_size)
         if target_heads == ckpt_heads:
             return loaded_weight
         assert (
@@ -2081,9 +2090,8 @@ class InklingForConditionalGeneration(nn.Module):
 
         if dropped:
             logger.warning(
-                "Inkling load_weights dropped %d checkpoint tensors (first: %s)",
-                len(dropped),
-                dropped[:8],
+                f"Inkling load_weights dropped {len(dropped):d} checkpoint tensors "
+                f"(first: {dropped[:8]!s})",
             )
         if not loaded:
             raise RuntimeError("Inkling load_weights consumed no checkpoint tensors")

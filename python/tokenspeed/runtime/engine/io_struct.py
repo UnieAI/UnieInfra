@@ -178,16 +178,18 @@ class GenerateReqInput:
     bootstrap_port: list[int] | int | None = None
     bootstrap_room: list[int] | int | None = None
 
+    # Hard-pin to this attention-DP rank, bypassing load balancing. Ignored on
+    # disaggregation engines, where the bootstrap_room residue is authoritative.
+    data_parallel_rank: list[int] | int | None = None
+
     def normalize_batch_and_arguments(self):
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
-        ):
+        provided_sources = sum(
+            source is not None
+            for source in (self.text, self.input_ids, self.input_embeds)
+        )
+        if provided_sources != 1:
             raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
+                "Exactly one of text, input_ids, or input_embeds should be provided."
             )
 
         # Derive the batch size
@@ -280,6 +282,14 @@ class GenerateReqInput:
                 self.token_ids_logprob = None
             if isinstance(self.input_extra_infos, dict):
                 self.input_extra_infos = [self.input_extra_infos]
+            if isinstance(self.data_parallel_rank, list):
+                _require(
+                    len(self.data_parallel_rank) == 1,
+                    "data_parallel_rank list should have length 1 for "
+                    "single request.",
+                )
+                # Unwrap: TokenizedGenerateReqInput types this int | None.
+                self.data_parallel_rank = self.data_parallel_rank[0]
         else:
             if self.parallel_sample_num == 1:
                 num = self.batch_size
@@ -393,6 +403,20 @@ class GenerateReqInput:
                     "bootstrap_room cannot be a list when n > 1.",
                 )
 
+            if self.data_parallel_rank is None:
+                self.data_parallel_rank = [None] * num
+            elif not isinstance(self.data_parallel_rank, list):
+                self.data_parallel_rank = [self.data_parallel_rank] * num
+            else:
+                _require(
+                    self.parallel_sample_num == 1,
+                    "data_parallel_rank cannot be a list when n > 1.",
+                )
+                _require(
+                    len(self.data_parallel_rank) == num,
+                    "data_parallel_rank list length must match the batch size.",
+                )
+
         # Other checks
         if self.session_params is not None:
             _require(
@@ -451,6 +475,11 @@ class GenerateReqInput:
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
+            data_parallel_rank=(
+                self.data_parallel_rank[i]
+                if self.data_parallel_rank is not None
+                else None
+            ),
         )
         sub.rid = self.rid[i]
         return sub
@@ -465,11 +494,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_params: SamplingParams
     # Whether to return the sampled token's logprob for this request.
     return_logprob: bool = False
-    # Internal carry-over fields kept for pipeline/PD compatibility. The
-    # output-logprob API only drives ``return_logprob``; InputProcessor sets
-    # these to neutral values (logprob_start_len=-1, top_logprobs_num=0,
-    # token_ids_logprob=None) since prompt logprobs, output top-k, and token-id
-    # logprobs are not supported.
+    # SGLang dialect: prompt (input) logprobs are returned for positions
+    # ``[logprob_start_len, len(input_ids))``; -1 selects the last prompt
+    # token only (no prompt logits needed). The ingress resolves -1 and
+    # rejects starts past the prompt. Top-k logprobs (``top_logprobs_num``)
+    # are taken only for a request whose tokens are all sampled in its
+    # prefill (see InputProcessor); token-id logprobs are not supported:
+    # InputProcessor keeps token_ids_logprob=None.
     logprob_start_len: int = -1
     top_logprobs_num: int = 0
     token_ids_logprob: list[int] | None = None
@@ -512,6 +543,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # makes RequestHandler admit the request pre-finished with FINISH_ABORT so
     # the client receives a terminal abort instead of a silent drop.
     validation_error: str | None = None
+
+    # Hard-pin to an attention-DP rank. Keep last: array_like declaration
+    # order is the wire contract.
+    data_parallel_rank: int | None = None
 
 
 @dataclass
@@ -647,12 +682,21 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     spec_verify_ct: list[int]
 
     # Logprobs
-    input_token_logprobs_val: list[float]
-    input_token_logprobs_idx: list[int]
-    # Per-request lists, parallel to rids: the newly-decoded tokens' sampled
-    # logprobs/token ids this step, [] when logprobs are off (see stream_output).
+    # Per-request lists, parallel to rids. Prompt (input) logprobs are shipped
+    # once, on the first frame after the prompt's final chunk committed, as
+    # ``[None, lp(ids[start+1]), ...]`` over ``ids[start:]``; every other
+    # frame carries [] (see stream_output; the frontend keeps the lists).
+    input_token_logprobs_val: list[list[float | None]]
+    input_token_logprobs_idx: list[list[int]]
+    # The newly-decoded tokens' sampled logprobs/token ids this step, [] when
+    # logprobs are off (see stream_output).
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
+    # The top-k alternatives (``top_logprobs_num``). Per-request lists in a
+    # frame where some request asked for top-k, and [] for the whole frame
+    # otherwise -- the shape the token-id columns below always have. Read
+    # them through LogprobsProcessor._row, which returns [] for a request
+    # the frame has no entry for.
     input_top_logprobs_val: list[list]
     input_top_logprobs_idx: list[list]
     output_top_logprobs_val: list[list]
@@ -704,7 +748,11 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Sampled-token logprobs, parallel to rids: one inner list per request,
     # holding the value/token-id of each newly-decoded token this step. Empty []
     # for a request that did not ask for logprobs, so the columns stay
-    # non-ragged (always length == len(rids)).
+    # non-ragged (always length == len(rids)). Prompt (input) logprobs have no
+    # column here: the msgpack ingress refuses a ``logprob_start_len`` that
+    # would produce them (``MsgpackRecvSocket._validation_error``). Carrying
+    # them means appending ``input_token_logprobs_val/idx`` at the wire tail
+    # together with the frontend's decoder.
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
     # Producing DP rank's engine index (the identity it dialed the frontend
@@ -712,10 +760,23 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # DP the batch itself names its rank. Appended field: defaults to 0 so
     # older peers on either side stay compatible.
     engine_index: int = 0
+    # Latest scheduler load observed before the output is forwarded. Appended
+    # wire tail: older 9- and 10-element prefixes decode all four values as 0.
+    num_running: int = 0
+    num_waiting: int = 0
+    kv_active_pages: int = 0
+    kv_total_pages: int = 0
 
     @classmethod
     def from_full(
-        cls, out: BatchTokenIDOut, engine_index: int = 0
+        cls,
+        out: BatchTokenIDOut,
+        engine_index: int = 0,
+        *,
+        num_running: int = 0,
+        num_waiting: int = 0,
+        kv_active_pages: int = 0,
+        kv_total_pages: int = 0,
     ) -> "BatchTokenIDOutSlim":
         # Token source: ``out.output_ids`` — the not-yet-sent slice of each
         # request's generated ids. NOT ``out.decode_ids``: that is the
@@ -731,6 +792,10 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
             )
         return cls(
             engine_index=engine_index,
+            num_running=num_running,
+            num_waiting=num_waiting,
+            kv_active_pages=kv_active_pages,
+            kv_total_pages=kv_total_pages,
             rids=list(out.rids),
             output_ids=[list(ids) for ids in out.output_ids],
             finished_reasons=[_finish_type(fr) for fr in out.finished_reasons],
@@ -764,11 +829,13 @@ class BatchStrOut(BaseBatchReq, kw_only=True):
     cached_tokens: list[int]
     spec_verify_ct: list[int]
 
-    # Logprobs
-    input_token_logprobs_val: list[float]
-    input_token_logprobs_idx: list[int]
-    output_token_logprobs_val: list[float]
-    output_token_logprobs_idx: list[int]
+    # Logprobs: the same per-request columns as BatchTokenIDOut, forwarded
+    # unchanged by a detokenizing producer (typed msgspec decode rejects a
+    # mismatch).
+    input_token_logprobs_val: list[list[float | None]]
+    input_token_logprobs_idx: list[list[int]]
+    output_token_logprobs_val: list[list[float]]
+    output_token_logprobs_idx: list[list[int]]
     input_top_logprobs_val: list[list]
     input_top_logprobs_idx: list[list]
     output_top_logprobs_val: list[list]
@@ -840,6 +907,15 @@ class IsSchedulerPausedReqOutput(BaseReq, kw_only=True):
     is_paused: bool
 
 
+# Weight-update sources the scheduler's request dispatcher implements (see the
+# isinstance chain in the control-request handler). The in-engine RL control app
+# refuses the others up front instead of forwarding a request the scheduler
+# cannot handle, and advertises this set to gateways as `rl.update_from`.
+SUPPORTED_WEIGHT_UPDATE_SOURCES: frozenset[str] = frozenset(
+    {"distributed", "mooncake", "disk"}
+)
+
+
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
@@ -847,6 +923,8 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     load_format: str | None = None
     # Optional: update the weight version after a successful load.
     weight_version: str | None = None
+    # Drop cached KV before loading: it was computed under the old weights.
+    flush_cache: bool = True
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
@@ -856,27 +934,16 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int | None = 0
 
 
-# Packed-tensor framing defaults. The trainer (producer) and the worker
-# (consumer) must agree on these, so they are part of the wire contract.
-DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
-DEFAULT_PACKED_NUM_BUFFERS = 2
-
-
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     # Weight-update metadata shared with the trainer's NCCL sender.
     names: list[str]
     dtype_names: list[str]
     shapes: list[list[int]]
-    # Packed (batched small-tensor) broadcast. When True, multiple tensors are
-    # batched into shared buffers before broadcasting to cut NCCL overhead.
-    packed: bool = False
-    packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
-    packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
     group_name: str = "weight_update_group"
     flush_cache: bool = True
-    # Optional: update the weight version after a successful push. When provided,
-    # subsequent generation responses will carry this version in meta_info.
-    weight_version: str | None = None
+    # Required. Pass ``None`` to keep the current namespace. Flushed L3
+    # updates must supply a shared checkpoint identity.
+    weight_version: str | None
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
@@ -925,6 +992,60 @@ class DestroyWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
 
 
 class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class UpdateWeightsFromMooncakeReqInput(BaseReq, kw_only=True):
+    """Load one committed checkpoint version through the Model Updater SDK.
+
+    The trainer publishes weights to a Mooncake weight store and names the
+    version to serve; every scheduler reads its own shard. Requires the
+    server to be started with ``--model-update-config``.
+    """
+
+    # The committed weight-store version to load.
+    version: int
+    # Required: whether Device/Host KV is flushed before the load.
+    flush_cache: bool
+    # Required. The L3 namespace to publish after a successful load, or
+    # ``None`` for the default ``mooncake_load_weight_version`` resolves.
+    weight_version: str | None
+
+
+def mooncake_load_weight_version(
+    *, version: int, flush_cache: bool, weight_version: str | None
+) -> str | None:
+    """The L3 namespace a Mooncake load publishes on success.
+
+    The one place this rule lives, used by the HTTP route, the Python engine
+    API and the scheduler. An explicit ``weight_version`` wins. A flushed
+    load without one takes the committed version's own identity,
+    ``str(version)``: the checkpoint it reads is already named. An unflushed
+    load without one keeps the current namespace (``None``).
+    """
+    if weight_version is not None:
+        return str(weight_version)
+    if flush_cache:
+        return str(version)
+    return None
+
+
+class UpdateWeightsFromMooncakeReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class RebalanceExpertsReqInput(BaseReq, kw_only=True):
+    """Start one online expert rebalance now (``--enable-eplb``).
+
+    Takes the load snapshot the periodic trigger would take at its next
+    interval; the commit and the per-chunk weight moves follow on the same
+    schedule. Refused while a rebalance is already in progress.
+    """
+
+
+class RebalanceExpertsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
@@ -988,20 +1109,6 @@ class SetInternalStateReqOutput(BaseReq, kw_only=True):
     server_args: dict[str, Any]
 
 
-class ExpertDistributionReqType(Enum):
-    START_RECORD = 1
-    STOP_RECORD = 2
-    DUMP_RECORD = 3
-
-
-class ExpertDistributionReq(BaseReq, kw_only=True):
-    action: ExpertDistributionReqType
-
-
-class ExpertDistributionReqOutput(BaseReq, kw_only=True):
-    pass
-
-
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
@@ -1059,10 +1166,6 @@ class RpcReqOutput(BaseReq, kw_only=True):
     message: str
 
 
-class GetLoadReqInput(BaseReq, kw_only=True):
-    pass
-
-
 class GetLoadReqOutput(BaseReq, kw_only=True):
     dp_rank: int = 0
     num_reqs: int = 0
@@ -1070,8 +1173,24 @@ class GetLoadReqOutput(BaseReq, kw_only=True):
     num_pages: int = 0
 
 
-class WatchLoadUpdateReq(BaseReq, kw_only=True):
-    loads: list[GetLoadReqOutput] = []
+class LoadSnapshot(
+    msgspec.Struct, frozen=True, tag=True, tag_field="_tag", array_like=True
+):
+    """Immutable scheduler load replica sent over engine IPC.
+
+    Fields are positional on the wire. Append any future fields only at the
+    end so older decoders can retain their prefix compatibility.
+    """
+
+    epoch: str
+    sequence: int
+    dp_rank: int
+    num_running_reqs: int
+    num_waiting_reqs: int
+    num_active_pages: int
+    num_used_pages: int
+    max_total_pages: int
+    valid_for_ms: int
 
 
 class BlockReqType(Enum):
@@ -1258,10 +1377,22 @@ def ipc_message_union():
     """
     types = tuple(
         dict.fromkeys(
-            _walk_subclasses(BaseReq) + _walk_subclasses(BaseBatchReq) + [PickleWrapper]
+            _walk_subclasses(BaseReq)
+            + _walk_subclasses(BaseBatchReq)
+            + [LoadSnapshot, PickleWrapper]
         )
     )
     return Union[types]  # noqa: UP007 — dynamic union over a runtime tuple
+
+
+class NullSender:
+    """No-op stand-in for the engine's reply sender on ranks that don't own
+    request I/O (non-rank-0 workers), so control-reply call sites are safe to
+    run on every rank."""
+
+    @staticmethod
+    def send_pyobj(x):
+        return None
 
 
 class IpcSender:

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import replace
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
@@ -34,7 +33,6 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -70,9 +68,9 @@ def _resolve_mtp_quant_config(
 class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
     """NextN draft variant: skip dead catch-up rows on the first draft step.
 
-    On the first draft step the backend runs in DECODE mode with ``q`` sliced
-    to ``bs`` while ``self.attn`` still writes the full ``N`` rope-d KV rows
-    from the just-drafted tokens. Multi-step decode delegates to base.
+    On the first draft step the prologue writes the full ``N`` KV rows from the
+    just-drafted tokens, then attention runs in DECODE mode with ``q`` sliced to
+    ``bs``. Multi-step decode delegates to base.
 
     MIXED catch-up requires a backend that populates a decode-slot metadata
     under EXTEND/MIXED at draft init (e.g. trtllm-mha); MHA-family backends
@@ -81,59 +79,26 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None:
-            return super()._attn(q, k, v, gate, ctx, out_cache_loc)
-
-        self._apply_correction(ctx)
-        q = q.index_select(0, ctx.gather_ids)
+        if ctx.draft_narrowing is None:
+            return super()._attn(positions, q, k, v, gate, ctx)
+        attn_output = self.attn.attend_live_rows(q, k, v, positions, ctx)
         if gate is not None:
-            gate = gate.index_select(0, ctx.gather_ids)
-        # Dispatch as DECODE over the sliced live rows via self.attn (see the
-        # class docstring), which keeps the standard k/v reshape and KV write.
-        # A ctx copy overrides only the forward mode; record_kv_cache (keyed off
-        # the real mode) forces the backend's PD layerwise cache-step record that
-        # DECODE would otherwise skip on an EXTEND/MIXED catch-up.
-        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            decode_ctx,
-            out_cache_loc,
-            record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-        )
-        if gate is not None:
-            sigmoid_mul(attn_output, gate)
+            sigmoid_mul(attn_output, gate.index_select(0, ctx.gather_ids))
         return attn_output
-
-    def _apply_correction(self, ctx: ForwardContext) -> None:
-        """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        seq_lens_buf = ctx.draft_seq_lens_buf
-        if seq_lens_buf is None or ctx.accept_lengths is None:
-            return
-        num_extends = ctx.num_extends
-        if num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
-        ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        # Publish: the backend owns its buffer, so in-graph edits need a copy.
-        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
     def _maybe_narrow_residual(
         self,
         residual: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None or ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is None or ctx.forward_mode.is_idle():
             return residual
         return residual.index_select(0, ctx.gather_ids)
 
@@ -141,10 +106,9 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
 class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
     """Causal LM with the draft-variant attention layer injected.
 
-    Restricted to single-layer drafts: ``_apply_correction`` mutates
-    ``ctx.draft_seq_lens_buf`` in place and is not idempotent across layers.
-    A multi-layer draft would double-trim cache_seqlens. Lift the correction
-    out of the per-layer hook (e.g. into the drafter) before relaxing this.
+    Restricted to single-layer drafts: the narrowing happens once, at this
+    layer's attention, so a second layer would receive the already-narrowed
+    ``[bs, H]`` rows.
     """
 
     ATTENTION_LAYER_CLS: type = Qwen3_5DraftAttentionDecoderLayer
@@ -159,8 +123,8 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
         if config.num_hidden_layers != 1:
             raise ValueError(
                 "Qwen3_5DraftForCausalLM requires num_hidden_layers == 1 "
-                f"(got {config.num_hidden_layers}); _apply_correction is not "
-                "idempotent across layers."
+                f"(got {config.num_hidden_layers}); the draft row narrowing "
+                "happens once, at the single layer's attention."
             )
         super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
 
@@ -208,6 +172,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     config.hidden_size,
                     config.vocab_size,
                     bias=False,
+                    quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
             else:
@@ -227,6 +192,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
+            do_argmax=True,
+            dp_lm_head_tp=False,
         )
 
     def get_hot_token_id(self):
@@ -245,13 +212,21 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head = lm_head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     @torch.no_grad()
     def forward(
         self,
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         **kwargs,
@@ -284,7 +259,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_ids,
                 positions,
                 ctx,
-                out_cache_loc,
                 input_embeds=hidden_states,
             )
 
@@ -413,7 +387,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     continue
 
                 if name not in params_dict:
-                    logger.warning("MTP weight not in params_dict: %s", name)
+                    logger.warning(f"MTP weight not in params_dict: {name!s}")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

@@ -23,31 +23,34 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.communication import (
-    allreduce_lane_latent_norm_supported,
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection as kernel_kimi3_latent_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection_add3 as kernel_kimi3_latent_projection_add3,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_expert_shared,
     native_latent_moe_available,
 )
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
+from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.comm_ops import (
-    COMM_ONESHOT_MAX_BYTES,
     acquire_all_reduce_outputs,
+    all_gather,
+    all_gather_single,
     all_reduce,
-    all_reduce_latent_norm,
-    prepare_all_reduce_fusion,
-    prepare_all_reduce_lane,
 )
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_cuda_graph_phase
+from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 TensorReducer = Callable[[torch.Tensor], torch.Tensor]
@@ -58,6 +61,8 @@ InputProjector = Callable[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ]
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
+# Widest batch the down mailbox claims; above it the column gather takes over.
+DOWN_MAILBOX_MAX_TOKENS = 1280
 
 
 def _marlin_moe_available() -> bool:
@@ -71,71 +76,6 @@ def _marlin_moe_available() -> bool:
         and platform.arch_version >= ArchVersion(9, 0)
         and is_marlin_moe_available()
     )
-
-
-def kimi3_join_reduce_moe(
-    routed_partial: torch.Tensor,
-    shared_partial: torch.Tensor,
-    *,
-    lane: torch.Tensor | None,
-    routed_hidden: int,
-    routed_norm: nn.Module | None,
-    group: tuple[int, ...],
-    enable_lane_norm: bool,
-    max_token_num: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Join the routed/shared partials and reduce them, owning the strategy.
-
-    Three regimes, all element-wise identical:
-
-    * Lane hit (decode batch=1): the partials were produced straight into the
-      persistent fused lane, one one-shot reduce with an eligible norm
-      epilogue and zero copies.
-    * Small partials: cat into one contiguous operand and take a single
-      one-shot reduce; the copy is a couple of microseconds there.
-    * Partials past the one-shot window (prefill-sized chunks): the cat would
-      copy a few hundred MB per layer just to feed one NCCL call, while a
-      grouped NCCL launch reduces both tensors in place with the same
-      single-launch latency -- so skip the join entirely.
-    """
-
-    if lane is not None and routed_partial.data_ptr() == lane.data_ptr():
-        fused = lane
-    elif (
-        routed_partial.numel() * routed_partial.element_size() > COMM_ONESHOT_MAX_BYTES
-    ):
-        routed_out, shared_out = all_reduce(
-            (routed_partial, shared_partial),
-            group=group,
-        )
-        if routed_norm is not None:
-            routed_out = routed_norm(routed_out)
-        return routed_out, shared_out
-    else:
-        fused = torch.cat((routed_partial, shared_partial), dim=-1)
-
-    lane_norm_applied = routed_norm is not None and (
-        allreduce_lane_latent_norm_supported(
-            fused,
-            enabled=enable_lane_norm,
-        )
-    )
-    if lane_norm_applied:
-        fused = all_reduce_latent_norm(
-            fused,
-            routed_norm.weight,
-            routed_hidden,
-            group,
-            eps=routed_norm.variance_epsilon,
-            max_token_num=max_token_num,
-        )
-    else:
-        fused = all_reduce(fused, group)
-    routed_out = fused[:, :routed_hidden]
-    shared_out = fused[:, routed_hidden:]
-    if routed_norm is not None and not lane_norm_applied:
-        routed_out = routed_norm(routed_out)
-    return routed_out, shared_out
 
 
 def latent_moe_expert_shared_all_reduce(
@@ -192,16 +132,10 @@ class Kimi3MoEExecutionPlan:
 
     use_native: bool
     use_trtllm: bool
+    use_mega_moe: bool
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     use_marlin: bool = False
-    fused_moe_ar: bool = False
-    lane_latent_norm_ar: bool = False
-    comm_fusion_max_num_tokens: int = 0
-
-    @property
-    def use_precomputed_topk(self) -> bool:
-        return self.use_native or self.use_trtllm or self.use_marlin
 
     @classmethod
     def build(
@@ -209,35 +143,37 @@ class Kimi3MoEExecutionPlan:
         mapping,
         moe_backend,
         alt_stream: torch.cuda.Stream | None,
-        *,
-        enforce_eager: bool,
     ) -> "Kimi3MoEExecutionPlan":
-        """Select orchestration without exposing platform policy to the model."""
+        """Select orchestration from the backend, streams, and parallel layout."""
 
-        use_native = native_latent_moe_available()
+        use_mega_moe = moe_backend in (MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT)
+        use_native = not use_mega_moe and native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
         # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
         # W4A16 GEMM with a fused Triton SiTU epilogue. AUTO picks it whenever
         # neither the AMD-native nor the (Blackwell) TRT-LLM path is available;
         # it can also be forced with ``--moe-backend marlin``.
-        use_marlin = not use_native and (
-            moe_backend.is_marlin()
-            or (moe_backend.is_auto() and _marlin_moe_available())
+        use_marlin = (
+            not use_mega_moe
+            and not use_native
+            and (
+                moe_backend.is_marlin()
+                or (moe_backend.is_auto() and _marlin_moe_available())
+            )
         )
         use_trtllm = (
-            not use_native
+            not use_mega_moe
+            and not use_native
             and not use_marlin
             and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
         )
         return cls(
             use_native=use_native,
             use_trtllm=use_trtllm,
+            use_mega_moe=use_mega_moe,
             use_marlin=use_marlin,
             overlap_shared_experts=(
-                use_native
-                and enforce_eager
-                and alt_stream is not None
-                and mapping.moe.tp_ep_size == 1
+                use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
             ),
             joint_moe_reduce=(
                 use_native
@@ -247,43 +183,50 @@ class Kimi3MoEExecutionPlan:
             ),
         )
 
-    def prepare_latent_fusion(
-        self,
-        mapping,
-        *,
-        lane_width: int,
-        has_latent_norm: bool,
-        max_token_num: int,
-    ) -> "Kimi3MoEExecutionPlan":
-        """Prepare optional communication fusions before graph capture."""
-
-        fused_moe_ar = (
-            self.use_trtllm
-            and mapping.moe.has_tp_ep
-            and prepare_all_reduce_lane(mapping.moe.tp_ep_group, lane_width)
-        )
-        lane_latent_norm_ar = (
-            fused_moe_ar
-            and has_latent_norm
-            and prepare_all_reduce_fusion(
-                mapping.moe.tp_ep_group,
-                lane_width,
-                max_token_num,
-            )
-        )
-        return replace(
-            self,
-            fused_moe_ar=fused_moe_ar,
-            lane_latent_norm_ar=lane_latent_norm_ar,
-            comm_fusion_max_num_tokens=max_token_num,
-        )
-
 
 class Kimi3LatentProjection(ReplicatedLinear):
-    """Replicated latent projection with kernel-owned specialization.
+    """Latent projection with kernel-owned specialization.
 
     Tuned shapes use registered accelerator kernels. Other shapes retain the
     ordinary dense projection without requiring model-side shape selection.
+
+    With ``shard_group`` the output dimension is partitioned across the group
+    (column parallel): each rank stores ``output_size / tp`` rows of the weight
+    and the ordinary projection ends with one all-gather. K3 stage 2 uses the
+    weight shard directly for up-projection and multicast gather, or injects
+    this rank's output columns into the shared-expert all-reduce.
+
+    With ``multicast_down`` the projection instead takes a column shard that
+    publishes each rank's block into every peer's mailbox, which keeps each
+    output element computed on one rank and so leaves the numerics untouched.
+    It covers the widths the op claims -- the decode graph's captures.
+
+    With ``column_group`` the projection splits the same output columns over
+    the group and one all-gather concatenates the blocks. It is taken only
+    where a mailbox exists, which is to say only where the fabric can map
+    symmetric memory, and it narrows storage the same way ``shard_group``
+    does. That coupling is deliberate, and measured rather than inferred: the
+    replica wins at every width where the fabric cannot carry the gather. The
+    numbers are on ``_gather_shards``, which is where the two routes are
+    described together; they are not repeated here because an earlier eager
+    set that was repriced away lived in this paragraph, two decimal places
+    from a value in the other arm.
+
+    Where the fabric is there, the split pays from the mailbox ceiling
+    upward: measured on GB300 TP8 under graph replay with cold weights, the
+    shard wins from 1280 by about 5 percent out to 36 at 8192, and the
+    fused NVLink gather writes the final layout for 135us where the buffer
+    path needs 239us. It wins eager as well -- 64.3/53.8 at 2048, 101.8/78.7
+    at 4096, 208.9/138.6 at 8192 -- so the width does not depend on whether
+    the chunk was captured, and a deployment whose chunks exceed the capture
+    ceiling needs nothing done here.
+
+    ``get_is_cuda_graph_phase`` cannot decide those two regimes apart, which
+    is worth knowing because it reads as though it could. Its only setters
+    are the decode wrapper's capture and its comm prewarm, and the executor
+    runs prefill capture as a later statement, after that capture has
+    already restored the flag -- so it is False throughout prefill capture.
+    Nothing here keys on it, and nothing should.
     """
 
     def __init__(
@@ -294,24 +237,204 @@ class Kimi3LatentProjection(ReplicatedLinear):
         params_dtype: torch.dtype | None = None,
         prefix: str = "",
         solution: str = "auto",
+        shard_group: Group | None = None,
+        column_group: Group | None = None,
+        shard_rank: int = 0,
+        shard_size: int = 1,
+        multicast_down: KimiK3LatentDownOp | None = None,
     ) -> None:
+        if shard_group is not None and column_group is not None:
+            raise ValueError("a column shard already gathers over its own group")
+        group = shard_group if shard_group is not None else column_group
+        if group is not None and output_size % shard_size:
+            raise ValueError(
+                f"output_size {output_size} is not divisible by the shard size "
+                f"{shard_size}"
+            )
+        if group is not None and len(group) != shard_size:
+            raise ValueError(
+                f"group of {len(group)} ranks does not match the shard "
+                f"size {shard_size}"
+            )
+        if multicast_down is not None:
+            if shard_group is not None:
+                raise ValueError("a column shard cannot also multicast")
+            if multicast_down.rank != shard_rank:
+                raise ValueError(
+                    f"multicast rank {multicast_down.rank} does not match the "
+                    f"projection's {shard_rank}"
+                )
+            if multicast_down.shard_dim * shard_size != output_size:
+                raise ValueError(
+                    f"multicast block {multicast_down.shard_dim} x {shard_size} "
+                    f"does not cover the {output_size} outputs"
+                )
+        if not 0 <= shard_rank < shard_size:
+            raise ValueError(
+                f"shard_rank {shard_rank} is outside the shard size {shard_size}"
+            )
+        self.multicast_down = multicast_down
+        self.shard_group = shard_group
+        self.column_group = column_group
+        self.shard_rank = shard_rank
+        self.shard_size = shard_size if group is not None else 1
+        self.output_size_full = output_size
+        # Narrow only where the replica is unreachable: where a mailbox exists.
+        self.narrowed = shard_group is not None or (
+            column_group is not None and multicast_down is not None
+        )
         super().__init__(
             input_size=input_size,
-            output_size=output_size,
+            output_size=(output_size // shard_size if self.narrowed else output_size),
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
             prefix=prefix,
         )
         self.solution = solution
+        self.register_buffer("_nvfp4_output_scale", None, persistent=False)
 
-    def forward(self, hidden_states: torch.Tensor):
-        output = tokenspeed_kernel.kimi3_latent_projection(
+    def weight_loader(self, param, loaded_weight, shard_id=None, begin_size=None):
+        """Take this rank's column block; replicated instances load full width."""
+        if self.narrowed and (shard_id is not None or begin_size is not None):
+            # Chunked loads use full-weight row offsets, which sharded params cannot honor.
+            raise ValueError(
+                "column-parallel Kimi3LatentProjection only supports whole-tensor loads"
+            )
+        if self.narrowed:
+            rows = self.output_size_full // self.shard_size
+            loaded_weight = loaded_weight.narrow(0, self.shard_rank * rows, rows)
+        return super().weight_loader(
+            param, loaded_weight, shard_id=shard_id, begin_size=begin_size
+        )
+
+    def _gather_shards(self, local: torch.Tensor) -> torch.Tensor:
+        """Concatenate every rank's column block into the full output width.
+
+        Two routes, chosen by which group this instance was given; they are
+        mutually exclusive at every construction site and a caller never picks.
+
+        ``shard_group`` gathers into a ``[tp, tokens, shard]`` buffer and
+        permutes it by hand, deliberately not asking the backend for the
+        last-dim layout: that would move this projection onto a symmetric
+        memory path it has never been measured on, and would rendezvous a
+        second workspace sized to the full hidden width.
+
+        ``column_group`` asks the backend for that layout instead, and only
+        where storage narrowed: a full-width projection already holds every
+        column and has nothing to concatenate. That request reaches
+        ``all_gather_inner`` -- the fused NVLink gather writes the final layout
+        in one pass, 135us at 8152 tokens where a buffer-and-permute needs 239.
+
+        It reaches that kernel only on NVIDIA, with a 2-D bf16 tensor gathered
+        on the last dim; anything else, and any group the fabric cannot map,
+        falls back to the NCCL backend's allocate-gather-transpose, and that
+        fallback loses to the replica at every width. Measured under graph
+        replay on 8 ranks over two hosts, with the route witnessed rather than
+        assumed -- nccl 33 calls and rsag 0 with the probe declined, the
+        reverse with it live:
+
+            m       no fabric (nccl)      with fabric (rsag)
+            1280    37.2 rep / 76.8 col   37.7 rep / 35.6 col
+            4096   111.4     / 121.5     111.5     /  72.6
+            8192   226.0     / 254.0     224.5     / 142.8
+
+        Which is why a projection that cannot narrow does not take this route
+        at all. An earlier eager measurement here put the no-fabric gap at
+        4.5x rather than 2.1x; it timed host submission inside the interval,
+        and the two arms submit different amounts of Python.
+
+        Returns:
+            The full-width projection. **It may alias the backend's workspace**,
+            which the next gather reuses -- measured same-address across
+            consecutive calls. Read it on the issuing stream before gathering
+            again. The contract is stated for both routes even though only the
+            column one can alias, because a caller that had to know which route
+            it got would be the branch this method exists to remove.
+        """
+        if self.shard_group is not None:
+            num_tokens, shard = local.shape
+            stacked = torch.empty(
+                (self.shard_size, num_tokens, shard),
+                dtype=local.dtype,
+                device=local.device,
+            )
+            all_gather_single(stacked, local.contiguous(), self.shard_group)
+            return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
+        if not self.narrowed or self.column_group is None:
+            return local
+        return all_gather(local.contiguous(), self.column_group, dim=-1)
+
+    def project_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's ``output_size/tp`` columns, ungathered.
+
+        For callers that fold the gather into a collective they already run:
+        the column blocks are disjoint, so placing each rank's block into a
+        buffer that is about to be summed makes the sum concatenate them.
+
+        ``self.weight`` is already this rank's rows rather than a slice of the
+        full width: both sharding routes narrow storage, and the dispatch only
+        reaches here once ``narrowed`` holds.
+        """
+        if self.shard_group is None and self.column_group is None:
+            raise ValueError("project_shard requires a column-parallel projection")
+        return kernel_kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
         )
-        return output, None
+
+    @property
+    def shard_slice(self) -> tuple[int, int]:
+        """``(start, width)`` of this rank's column block in the full width."""
+        if self.shard_group is None and self.column_group is None:
+            raise ValueError("shard_slice requires a column-parallel projection")
+        width = self.output_size_full // self.shard_size
+        return self.shard_rank * width, width
+
+    def _project_replicated(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project through whatever this rank stores, gathering nothing."""
+        return kernel_kimi3_latent_projection(
+            hidden_states,
+            self.weight,
+            solution=self.solution,
+        )
+
+    def _multicast_block(self) -> torch.Tensor:
+        """This rank's rows for the mailbox, whatever the storage layout."""
+        if self.narrowed:
+            return self.weight
+        rows = self.multicast_down.shard_dim
+        return self.weight[self.shard_rank * rows : (self.shard_rank + 1) * rows]
+
+    def prepare_nvfp4_output(self, output_scale: torch.Tensor) -> None:
+        """Prepare fused NVFP4 output using the expert's loaded encoding scale.
+
+        Unsupported mailboxes retain BF16 output for the expert to quantize.
+        Preparation must finish before CUDA graph capture.
+        """
+        if self.multicast_down is None or not self.multicast_down.nvfp4_available():
+            return
+        self.multicast_down.prepare_nvfp4()
+        self._nvfp4_output_scale = output_scale.detach()
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], None]:
+        """Return (BF16 latent or packed NVFP4 values/scales, None)."""
+        num_tokens = hidden_states.shape[0]
+        if self.multicast_down is not None and self.multicast_down.handles(num_tokens):
+            return (
+                self.multicast_down(
+                    hidden_states,
+                    self._multicast_block(),
+                    output_scale=self._nvfp4_output_scale,
+                ),
+                None,
+            )
+        if self.narrowed and self.column_group is not None:
+            return self._gather_shards(self.project_shard(hidden_states)), None
+        return self._gather_shards(self._project_replicated(hidden_states)), None
 
     def forward_add3(
         self,
@@ -325,15 +448,49 @@ class Kimi3LatentProjection(ReplicatedLinear):
         """Project routed latents and accumulate two full-width addends.
 
         ``result = addend_a + hidden_states @ self.weight.T + addend_c``
+
+        Args:
+            hidden_states: Routed latent ``[m, input_size]``; with
+                ``norm_weight`` the projection fuses its RMSNorm.
+            addend_a: Full-width addend ``[m, output_size]`` (the residual
+                prefix); ``shard_group`` instances consume only this rank's
+                column block.
+            addend_c: Second full-width addend (the reduced shared output),
+                consumed the same way.
+            norm_weight: Optional fused-RMSNorm weight over ``input_size``.
+            eps: Epsilon for the fused norm; required with ``norm_weight``.
+
+        Returns:
+            The accumulated projection at full width; instances that narrowed
+            their storage project their block and gather it.
+
+        The branch keys on ``narrowed`` rather than on ``shard_group``, which
+        used to be the same question. It stopped being so when the column path
+        gained its own way to narrow: the proxy quietly lost its meaning, and
+        the full-width branch would have projected a block while calling it the
+        whole width. Anyone adding a third narrowing path should re-run that
+        enumeration over every ``shard_group is None`` left in this class.
         """
-        return tokenspeed_kernel.kimi3_latent_projection_add3(
+        if not self.narrowed:
+            return kernel_kimi3_latent_projection_add3(
+                hidden_states,
+                self.weight,
+                addend_a,
+                addend_c,
+                norm_weight=norm_weight,
+                eps=eps,
+            )
+        rows = self.output_size_full // self.shard_size
+        start = self.shard_rank * rows
+        local = kernel_kimi3_latent_projection_add3(
             hidden_states,
             self.weight,
-            addend_a,
-            addend_c,
+            addend_a.narrow(-1, start, rows),
+            addend_c.narrow(-1, start, rows),
             norm_weight=norm_weight,
             eps=eps,
         )
+        return self._gather_shards(local)
 
 
 def _module_tensor_output(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -651,6 +808,5 @@ __all__ = [
     "Kimi3LatentProjection",
     "Kimi3MoEExecutionPlan",
     "LatentMoELayer",
-    "kimi3_join_reduce_moe",
     "latent_moe_expert_shared_all_reduce",
 ]

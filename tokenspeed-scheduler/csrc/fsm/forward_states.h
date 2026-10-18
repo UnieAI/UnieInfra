@@ -21,17 +21,20 @@
 #pragma once
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "cache/core/cache_types.h"
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/request_spec.h"
+#include "utils.h"
 
 namespace tokenspeed::fsm {
 
@@ -40,10 +43,13 @@ enum class PrefillSource { kLocal, kRemote };
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
-    std::vector<std::string> page_hashes;
+    std::vector<std::string> prefix_hashes;
     std::uint64_t access_epoch{0};
-    // Pending closed-prefix boundary; zero once published or when absent.
-    std::int32_t promotion_boundary_tokens{0};
+    // The junction a chunk is cut at: the KV coverage the admission probe
+    // found beyond the state checkpoint it resumed from. The chunk ending
+    // there publishes its natural checkpoint where the KV is already cached,
+    // so the next prompt resumes at the junction. Zero once passed or absent.
+    std::int32_t junction_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -62,133 +68,158 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
     return shifted;
 }
 
+// Waiting for admission. A request whose L3 prefetch landed comes back here
+// holding the Host entries it fetched (prefetched_host_entries), pinned so
+// they are still there when its admission claims them as an ordinary Host hit;
+// the pins drop with the state at admission, after the admission acquired its
+// own references.
 struct Submitted {
-    Submitted(TokenContainer* token_container, std::int32_t page_size)
-        : token_container_{token_container}, page_size_{page_size} {}
-
-    TokenContainer* TokenContainerPtr() const { return token_container_; }
-    std::int32_t PageSize() const { return page_size_; }
-
-private:
-    TokenContainer* token_container_{};
-    std::int32_t page_size_{};
-};
-
-struct ForwardState {
-    ForwardState(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-                 std::vector<BlockTable> block_tables, CacheProgress cache_progress)
+    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity)
+        : token_container_{token_container}, prefix_granularity_{prefix_granularity} {}
+    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity,
+              std::vector<CacheBlockRef> prefetched_host_entries)
         : token_container_{token_container},
-          page_size_{page_size},
-          req_pool_index_{std::move(req_pool_index)},
-          block_tables_{std::move(block_tables)},
-          cache_progress_{std::move(cache_progress)} {}
-
-    ForwardState(const ForwardState&) = delete;
-    ForwardState& operator=(const ForwardState&) = delete;
-    ForwardState(ForwardState&&) noexcept = default;
-    ForwardState& operator=(ForwardState&&) noexcept = default;
+          prefix_granularity_{prefix_granularity},
+          prefetched_host_entries_{std::move(prefetched_host_entries)} {}
 
     TokenContainer* TokenContainerPtr() const { return token_container_; }
-    std::int32_t PageSize() const { return page_size_; }
+    std::int32_t PrefixGranularity() const { return prefix_granularity_; }
+    // A further prefetch (the remainder beyond what landed) carries these on,
+    // so the first fetch's entries stay pinned until the admission that
+    // claims them all.
+    std::vector<CacheBlockRef> TakePrefetchedHostEntries() { return std::exchange(prefetched_host_entries_, {}); }
 
-    std::unique_ptr<ReqPoolIndex> TakeRequestPoolIndex() && { return std::move(req_pool_index_); }
-    std::int32_t RequestPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
-
-    std::vector<BlockTable>& BlockTables() { return block_tables_; }
-    const std::vector<BlockTable>& BlockTables() const { return block_tables_; }
-    std::vector<BlockTable> TakeBlockTables() && { return std::move(block_tables_); }
-
-    CacheProgress TakeCacheProgress() && { return std::move(cache_progress_); }
-    const CacheProgress& CacheProgressRef() const { return cache_progress_; }
-
-    std::vector<std::int32_t> ActiveLcmBlockIds() const {
-        std::vector<std::int32_t> ids;
-        for (const BlockTable& table : block_tables_) {
-            for (const CacheBlockRef& block_ref : table.Blocks()) {
-                if (block_ref) {
-                    ids.push_back(block_ref->Location().lcm_block_id);
-                }
-            }
-        }
-        return ids;
-    }
-
-protected:
+private:
     TokenContainer* token_container_{};
-    std::int32_t page_size_{};
-
-private:
-    std::unique_ptr<ReqPoolIndex> req_pool_index_;
-    std::vector<BlockTable> block_tables_;
-    CacheProgress cache_progress_;
+    std::int32_t prefix_granularity_{};
+    std::vector<CacheBlockRef> prefetched_host_entries_;
 };
 
-struct Prefilling : public ForwardState {
-    Prefilling(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-               TokenContainer::Window window, std::int32_t reserve_num_tokens_in_next_schedule_event,
-               std::vector<BlockTable> block_tables, CacheProgress cache_progress,
-               PrefillSource source = PrefillSource::kLocal)
-        : ForwardState(token_container, page_size, std::move(req_pool_index), std::move(block_tables),
-                       std::move(cache_progress)),
-          window{window},
-          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
-          source_{source} {}
+// Before admission, with an L3 prefetch in flight: the request pins the Host
+// blocks the fetch fills -- and the entries an earlier prefetch of its own
+// already landed (host_blocks holds both) -- with nothing on the Device and
+// no request-pool row; it is skipped by admission (later Submitted requests
+// may be admitted past it, it holds no head of line) and is never a victim.
+// The op's ACK (PrefetchDone) returns it to Submitted holding every entry
+// that landed; an abort drops its pins, and the op's own pins keep the
+// blocks still being filled until the ACK.
+struct Prefetching {
+    Prefetching(TokenContainer* token_container, std::int32_t prefix_granularity,
+                std::vector<CacheBlockRef> host_blocks, std::uint32_t prefetch_op)
+        : token_container{token_container},
+          prefix_granularity{prefix_granularity},
+          host_blocks{std::move(host_blocks)},
+          prefetch_op{prefetch_op} {}
 
-    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
-    std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
-    PrefillInfo CurrentPrefillInfo() const {
-        return PrefillInfo{
-            .input_ids = PrefillInputIds(),
-            .shifted_input_ids = ShiftedInputIds(),
-            .already_scheduled_len = window.begin,
-            .extend_len = window.size,
-        };
+    TokenContainer* token_container{};
+    std::int32_t prefix_granularity{};
+    std::vector<CacheBlockRef> host_blocks;
+    std::uint32_t prefetch_op{};
+};
+
+// Everything a page-holding state owns on the request's behalf: the KV
+// pages, the request-pool slot, the prefix-cache progress and the count of
+// forwards still out against those pages. Move-only, and moved as ONE
+// bundle: a transition hands it whole to exactly one successor state, or
+// returns the pages to the coordinator and lets the empty bundle die. There
+// is no third path, and no field that a transition could forget to carry.
+struct ForwardResources {
+    TokenContainer* token_container{};
+    std::int32_t prefix_granularity{};
+    ReqPoolIndex req_pool_index;
+    std::vector<BlockTable> block_tables;
+    CacheProgress cache_progress;
+    // Forwards scheduled for this request whose results have not come back.
+    // More than one is normal under the overlap schedule, which plans the
+    // next step before committing the previous one.
+    //
+    // It lives here, not on the states that happen to consume a result: a
+    // forward is out against the PAGES, and every page-holding state has
+    // this bundle. A prefill chunk produces no ExtendResult, but its result
+    // still writes KV into this request's tables -- retract it mid-flight
+    // and the write lands on pages someone else now owns.
+    std::int32_t results_in_flight{0};
+
+    std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
+    void TrackScheduledForward() { ++results_in_flight; }
+    void ResultLanded() {
+        FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");
+        --results_in_flight;
     }
-
-    std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    PrefillSource Source() const { return source_; }
-
-    TokenContainer::Window window{};
-
-private:
-    std::int32_t reserve_num_tokens_in_next_schedule_event_{};
-    PrefillSource source_{PrefillSource::kLocal};
+    void ExtendTokens(const std::vector<std::int32_t>& tokens) { token_container->Extend(tokens); }
 };
 
-struct PrefillDone : public ForwardState {
-    PrefillDone(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-                TokenContainer::Window window, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                std::vector<BlockTable> block_tables, CacheProgress cache_progress)
-        : ForwardState(token_container, page_size, std::move(req_pool_index), std::move(block_tables),
-                       std::move(cache_progress)),
+template <typename State>
+concept HoldsForwardResources = requires(State& state) {
+    { state.resources } -> std::same_as<ForwardResources&>;
+};
+
+// A prefill window's model inputs; shared by every state that still
+// describes its prompt chunk. The model input starts `window.replay` tokens
+// before the window (bounded replay); progress still ends at begin + size.
+inline PrefillInfo MakePrefillInfo(const ForwardResources& resources, TokenContainer::Window window) {
+    _assert(window.replay >= 0 && window.replay <= window.begin, "replay must re-feed computed prompt tokens");
+    const TokenContainer::Window input{.begin = window.begin - window.replay, .size = window.size + window.replay};
+    return PrefillInfo{
+        .input_ids = resources.token_container->TokenSlice(input),
+        .shifted_input_ids = ComputeShiftedInputIds(resources.token_container, input),
+        .already_scheduled_len = input.begin,
+        .extend_len = input.size,
+        .replay_len = window.replay,
+    };
+}
+
+struct Prefilling {
+    Prefilling(ForwardResources resources, TokenContainer::Window window,
+               std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
-    std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
-    PrefillInfo CurrentPrefillInfo() const {
-        return PrefillInfo{
-            .input_ids = PrefillInputIds(),
-            .shifted_input_ids = ShiftedInputIds(),
-            .already_scheduled_len = window.begin,
-            .extend_len = window.size,
-        };
-    }
-    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { token_container_->Extend(result_tokens); }
 
+    ForwardResources resources;
     TokenContainer::Window window{};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-struct Decoding : public ForwardState {
-    Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-             std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
-             CacheProgress cache_progress)
-        : ForwardState(token_container, page_size, std::move(req_pool_index), std::move(block_tables),
-                       std::move(cache_progress)),
+// Set by RestoreDoneEvent on the state a restore resumes into: the device
+// holds no in-flight capture for this request's next input (its forward
+// history belongs to the slot it left), so the first decode after a restore
+// carries the token explicitly, as a D-role bootstrap decode does. The
+// ScheduleDecodeEvent that consumes it builds a fresh state without it.
+struct RestoreMarker {
+    bool ResumedByRestore() const { return resumed_by_restore_; }
+    void MarkResumedByRestore() { resumed_by_restore_ = true; }
+
+private:
+    bool resumed_by_restore_{false};
+};
+
+struct PrefillDone : RestoreMarker {
+    PrefillDone(ForwardResources resources, TokenContainer::Window window,
+                std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
+          window{window},
+          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
+
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
+    TokenContainer::Window window{};
+
+private:
+    std::int32_t reserve_num_tokens_in_next_schedule_event_{};
+};
+
+struct Decoding : RestoreMarker {
+    Decoding(ForwardResources resources, std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
@@ -198,18 +229,109 @@ struct Decoding : public ForwardState {
     void SetReserveNumTokensInNextScheduleEvent(std::int32_t value) {
         reserve_num_tokens_in_next_schedule_event_ = value;
     }
-    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { token_container_->Extend(result_tokens); }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 
+// Where a retracted request resumes once its image is back on Device: the
+// state it left, with what that state carried beyond its ForwardResources.
+struct ResumePrefilling {
+    TokenContainer::Window window{};
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+struct ResumePrefillDone {
+    TokenContainer::Window window{};
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+struct ResumeDecoding {
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+using ResumeShape = std::variant<ResumePrefilling, ResumePrefillDone, ResumeDecoding>;
+
+// Suspended with its image: the request holds no Device pages and no request
+// pool slot, but its KV lives on -- the published pages as pinned Host L2
+// entries, everything else in the snapshot pool -- together with its cache
+// progress and the exact point it stopped at, so the restore continues it
+// where it was (a decoding victim decodes, a mid-prefill victim runs its next
+// chunk). Nothing is recomputed and nothing is rebased.
 struct Retracted {
     TokenContainer* token_container{};
-    std::int32_t page_size{};
+    std::int32_t prefix_granularity{};
+    CacheProgress cache_progress;
+    RetractionImage image;
+    // The slot-state blob's slot in the runtime's arena. Shared with the
+    // store that exports into it and, later, the restore that imports from
+    // it: whichever of the state and the in-flight op lives longer keeps the
+    // slot, so an abort while either copy runs cannot hand the slot to a
+    // new victim before the ACK.
+    std::shared_ptr<SnapshotSlotIndex> blob_slot;
+    ResumeShape shape;
+    // Monotonic stamp from the retraction that produced this state. The plan
+    // builder derives the readmission order off the states themselves -- no
+    // separate queue to keep in step with the FSM.
+    std::int64_t retraction_epoch{0};
+    // A victim with generated output a client is reading resumes ahead of
+    // one that had produced nothing, whatever their retraction epochs say.
+    bool resumes_generation{false};
+    // The store ops the image waits for: the L2 leg's write-back(s) -- its
+    // own and any earlier in-flight store carrying one of its keys -- and
+    // the tail leg's snapshot store. A restore is issued only once every one
+    // has been acknowledged.
+    std::vector<std::uint32_t> pending_store_ops;
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
-    std::int32_t PageSize() const { return page_size; }
+    std::int32_t PrefixGranularity() const { return prefix_granularity; }
+    std::int64_t RetractionEpoch() const { return retraction_epoch; }
+    bool ResumesGeneration() const { return resumes_generation; }
+    bool ImageLanded() const { return pending_store_ops.empty(); }
+    bool WaitsForStore(std::uint32_t op_id) const {
+        return std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) != pending_store_ops.end();
+    }
+    // The store landed; its publications say which Host block is canonical
+    // for each key, and the image's L2 slots follow (an L3 prefetch of the
+    // same key may have published first, leaving the ticket's block unindexed).
+    void NoteStoreLanded(std::uint32_t op_id, std::span<const HostPublication> published) {
+        std::erase(pending_store_ops, op_id);
+        image.FollowPublished(published);
+    }
+};
+
+// The image is being copied back into freshly allocated Device pages: the
+// request holds pages again (so they count as active and are never granted
+// away), but nothing is schedulable until the restore's ACK. The image stays
+// alive here because the copy reads it. The request-pool row the copy imports
+// the slot-state blob into is NOT in `resources` yet: the restore op owns it
+// until its ACK (an abort meanwhile must not re-grant a row still being
+// written), and RestoreDoneEvent installs it; `resources.req_pool_index` is
+// empty here.
+struct Restoring {
+    ForwardResources resources;
+    RetractionImage image;
+    std::shared_ptr<SnapshotSlotIndex> blob_slot;
+    ResumeShape shape;
+    std::uint32_t restore_op{0};
+};
+
+// The request is done but its pages are not: every finish passes through
+// here, whether or not a forward is still out against the pages. The
+// scheduler settles it at the next plan once no result is in flight --
+// publishes the frontier (the state the last landed forward wrote and the KV
+// below the one unconsumed token) and releases the pages. Under the overlap
+// schedule the finish lands while the next decode is dispatched; that decode's
+// result still arrives and extends the tokens by what it reports (nothing
+// when the device stopped the request, which keeps the frontier before the
+// token the finish was decided on). Nothing is scheduled for it, and it is no
+// retraction victim.
+struct Finishing {
+    explicit Finishing(ForwardResources resources) : resources{std::move(resources)} {}
+
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
 };
 
 struct Finished {};

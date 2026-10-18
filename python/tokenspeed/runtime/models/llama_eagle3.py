@@ -37,8 +37,8 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.configs.base import resolve_cache_layer_types
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.paged_attention import hf_sliding_window_to_window_left
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -69,15 +70,31 @@ logger = get_colorful_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _draft_window_left(config: LlamaConfig) -> int:
+    """``window_left`` of the draft layer from the labels its cache plan reads: -1 unless sliding."""
+    layer_types = resolve_cache_layer_types(
+        config,
+        num_layers=config.num_hidden_layers,
+        is_draft=True,
+        draft_block_decode=False,
+    ) or ("full_attention",)
+    if layer_types[0] == "full_attention":
+        return -1
+    if layer_types[0] == "sliding_attention":
+        return hf_sliding_window_to_window_left(config.sliding_window)
+    raise ValueError(f"unsupported draft layer type {layer_types[0]!r}")
+
+
 class LlamaAttention(BaseLlamaAttention):
     """Eagle3 draft head attention.
 
     Inherits the projection setup (with ``qkv_input_size=2*hidden_size`` for
     the [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj
     scaffolding) from base. Overrides ``_attn`` so the draft's first step
-    skips dead catch-up rows: on backends that support fused KV pre-write, q
-    is sliced to one live row per request and dispatched as DECODE; otherwise
-    the fallback runs the full N-row attn and post-slices the output.
+    skips dead catch-up rows: on backends that support a narrowed draft
+    decode, the prologue writes every row and q is sliced to one live row per
+    request and dispatched as DECODE; otherwise the fallback runs the full
+    N-row attn and post-slices the output.
     Inactive draft steps delegate to base.
     """
 
@@ -88,58 +105,14 @@ class LlamaAttention(BaseLlamaAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
-        # Active draft first step (drafter set up gather_ids + accept_lengths).
-        # Covers both decode catch-up and prefill catch-up; multi-step decode
-        # delegates to base.
-        if ctx.accept_lengths is None:
-            return super()._attn(positions, q, k, v, ctx, out_cache_loc)
+        # Only the active draft first step narrows; later steps delegate to base.
+        if ctx.draft_narrowing is None:
+            return super()._attn(positions, q, k, v, ctx)
 
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            fused_kv_arg = self._build_fused_kv_arg(v, ctx, out_cache_loc)
-            if fused_kv_arg is not None:
-                # Trim only on the sliced single-token decode path; the
-                # post-slice fallback below still runs full N-row attn and
-                # needs the original seq_lens.
-                self._apply_correction(ctx)
-                q_rope = self._fused_rope_kv_write(
-                    positions, q, k, fused_kv_arg
-                ).index_select(0, ctx.gather_ids)
-                # record_kv_cache (keyed off the real mode) forces the backend's
-                # PD layerwise cache-step record that the DECODE dispatch would
-                # otherwise skip on an EXTEND/MIXED catch-up.
-                return ctx.attn_backend.forward(
-                    q_rope,
-                    None,
-                    None,
-                    self.attn,
-                    out_cache_loc,
-                    ctx.token_to_kv_pool,
-                    ForwardMode.DECODE,
-                    ctx.bs,
-                    save_kv_cache=False,
-                    record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-                )
-        q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
-            0, ctx.gather_ids
-        )
-
-    def _apply_correction(self, ctx: ForwardContext) -> None:
-        """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        seq_lens_buf = ctx.draft_seq_lens_buf
-        if seq_lens_buf is None or ctx.accept_lengths is None:
-            return
-        num_extends = ctx.num_extends
-        if num_extends >= ctx.bs:
-            return
-        correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
-        ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        # Publish: the backend owns its buffer, so in-graph edits need a copy.
-        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
+        if not ctx.attn_backend.supports_narrowed_draft_decode(ctx.forward_mode):
+            return self.attn(q, k, v, positions, ctx).index_select(0, ctx.gather_ids)
+        return self.attn.attend_live_rows(q, k, v, positions, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +224,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             quant_config=self._eagle3_quant_config,
             prefix=add_prefix("self_attn", prefix),
             qkv_input_size=2 * config.hidden_size,
+            sliding_window_size=_draft_window_left(config),
         )
 
     def resolve_mlp(self, prefix: str) -> nn.Module:
@@ -277,7 +251,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Align residual with attn output narrowed to [bs, H]."""
-        if ctx.accept_lengths is not None and not ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is not None and not ctx.forward_mode.is_idle():
             return residual.index_select(0, ctx.gather_ids)
         return residual
 
@@ -287,7 +261,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         final_norm: RMSNorm = None,
         fuse_embed_reduce: bool = False,
@@ -330,7 +303,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         residual = self._maybe_narrow_residual(residual, ctx)
 
@@ -365,7 +337,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         final_norm: RMSNorm = None,
         fuse_embed_reduce: bool = False,
@@ -377,7 +348,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 embeds,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 final_norm,
                 fuse_embed_reduce=fuse_embed_reduce,
@@ -411,7 +381,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
         residual = self._maybe_narrow_residual(residual, ctx)
         hidden_states, residual = self.comm_manager.post_attn_comm(
@@ -513,7 +482,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor = None,
         hidden_states: torch.Tensor = None,
     ) -> torch.Tensor:
@@ -565,7 +533,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
             embeds,
             hidden_states,
             ctx,
-            out_cache_loc,
             residual,
             self.norm,
             fuse_embed_reduce=fuse_embed_reduce,
@@ -616,17 +583,25 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
 
         self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
+            if mapping.attn.has_dp and mapping.lm_head.has_tp:
+                raise ValueError(
+                    "--lm-head-tp-size > 1 vocab-shards the LM head, but this "
+                    "draft ties it to its replicated embedding (tie_word_embeddings)"
+                )
             self.lm_head = self.model.embed_tokens
         else:
             if getattr(config, "draft_vocab_size", None) is None:
                 self.load_lm_head_from_target = True
+            # The draft's head follows the target's LM-head layout
+            # (mapping.lm_head): the shared target head arrives in that
+            # layout, and a draft-vocab head shards the same way.
             self.lm_head = ParallelLMHead(
                 getattr(config, "draft_vocab_size", None) or config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                tp_rank=mapping.attn.tp_rank,
-                tp_size=mapping.attn.tp_size,
-                tp_group=mapping.attn.tp_group,
+                tp_rank=mapping.lm_head.tp_rank,
+                tp_size=mapping.lm_head.tp_size,
+                tp_group=mapping.lm_head.tp_group,
                 prefix=add_prefix("lm_head", prefix),
             )
 
@@ -634,9 +609,10 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
@@ -646,11 +622,10 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
-            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
+            return super().forward(ctx, input_ids, positions, **kwargs)
 
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict
@@ -689,7 +664,9 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
                 name = "midlayer." + name[len("layers.0.") :]
 
             if "d2t" in name:
-                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
+                self.hot_token_id = loaded_weight + torch.arange(
+                    loaded_weight.shape[0], device=loaded_weight.device
+                )
                 continue
 
             if "t2d" in name:

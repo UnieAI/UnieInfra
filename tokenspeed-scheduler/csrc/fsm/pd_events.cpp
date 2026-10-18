@@ -30,28 +30,15 @@ namespace tokenspeed {
 namespace fsm {
 
 Submitted BootstrappedEvent::operator()(Bootstrapping&& state) {
-    return Submitted{state.token_container, state.page_size};
+    return Submitted{state.token_container, state.prefix_granularity};
 }
 
 Finished SucceededEvent::operator()(Decoding&& /*state*/) {
     return Finished{};
 }
 
-PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
-    const TokenContainer::Window window = state.window;
-    TokenContainer* token_container = state.TokenContainerPtr();
-    const std::int32_t page_size = state.PageSize();
-    const std::int32_t reserve_num_tokens_in_next_schedule_event = state.ReserveNumTokensInNextScheduleEvent();
-    auto req_pool_index = std::move(state).TakeRequestPoolIndex();
-    auto block_tables = std::move(state).TakeBlockTables();
-    auto cache_progress = std::move(state).TakeCacheProgress();
-    auto prefill_done = PrefillDone{token_container,
-                                    page_size,
-                                    std::move(req_pool_index),
-                                    window,
-                                    reserve_num_tokens_in_next_schedule_event,
-                                    std::move(block_tables),
-                                    std::move(cache_progress)};
+PrefillDone RemotePrefillDoneEvent::operator()(RemotePrefilling&& state) {
+    PrefillDone prefill_done{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
     prefill_done.ExtendResultTokens({bootstrap_token});
     return prefill_done;
 }

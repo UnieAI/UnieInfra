@@ -45,6 +45,14 @@ class QuantizeMethodBase(ABC):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def static_fp8_input_scale(self, layer: nn.Module) -> torch.Tensor | None:
+        """The per-tensor FP8 scale ``apply`` quantizes its input with, which a producer may apply instead."""
+        return None
+
+    def nvfp4_global_scale(self, layer: nn.Module) -> torch.Tensor | None:
+        """The global scale ``apply`` hands ``fp4_quantize`` for its input, which a producer may apply instead."""
+        return None
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Process the weight after loading.
 
@@ -80,6 +88,18 @@ class QuantizationConfig(ABC):
         configs ignore the argument.
         """
         return self.get_name()
+
+    def quantizes_any(self, prefix: str) -> bool:
+        """Whether the checkpoint quantizes some module under ``prefix``.
+
+        A single-algorithm config covers every module it does not exclude;
+        mixed-precision configs answer from their per-module entries.
+        """
+        return True
+
+    def get_moe_quant_config(self, prefix: str) -> "QuantizationConfig":
+        """Return the concrete quantization config for a routed MoE layer."""
+        return self
 
     def apply_checkpoint_name_replacements(
         self, replacements: tuple[tuple[str, str], ...]
@@ -195,6 +215,39 @@ class LinearMethodBase(QuantizeMethodBase):
         """Apply the weights in layer to the input tensor.
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
+
+    def apply_with_activation(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        activation: nn.Module,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply an activation followed by the linear operation.
+
+        Quantized methods may override this semantic boundary when their
+        prepared kernel supports fused activation and input quantization.
+        """
+        return self.apply(layer, activation(x), bias)
+
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        """Apply into caller-owned storage; methods may override to avoid staging.
+
+        Return the supplied tensor itself, not another view of its storage.
+        This keeps ownership explicit and avoids redundant self-copies.
+        """
+        if block_scale is None:
+            output = self.apply(layer, x, bias)
+        else:
+            output = self.apply(layer, x, bias, block_scale, output_dtype)
+        if (
+            out.shape != output.shape
+            or out.dtype != output.dtype
+            or out.device != output.device
+        ):
+            raise ValueError("Linear destination must match the computed output")
+        out.copy_(output)
+        return out
 
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:

@@ -19,15 +19,15 @@
 # SOFTWARE.
 
 [build-system]
-requires = ["setuptools==69.5.1", "wheel"]
+requires = ["setuptools==83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenspeed"
-version = "0.1.0"
+version = "0.1.1"
 description = "TokenSpeed is a speed-of-light LLM inference engine."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -39,7 +39,7 @@ dependencies = [
     "dill",
     "einops",
     "fastapi",
-    # 1.82+ ships protobuf-7.35 gencode; nvidia-cutlass-dsl caps protobuf<7.
+    # Keep the gRPC helpers aligned with SMG's generated protobuf code.
     "grpcio-health-checking==1.81.1",
     "grpcio-reflection==1.81.1",
     "hf_transfer",
@@ -61,6 +61,7 @@ dependencies = [
     "pybind11",
     "pydantic",
     "py-spy",
+    "pytest>=9",
     "pytest-asyncio",
     "python-multipart",
     "pyzmq",
@@ -69,12 +70,12 @@ dependencies = [
     "tiktoken",
     "torch",
     "torchvision",
-    "tokenspeed-kernel>=0.1.3.dev0",
-    "tokenspeed-mooncake>=0.3.12.post20260803",
-    "tokenspeed-scheduler>=0.1.6",
-    "tokenspeed-smg==1.9.0.post20260813",
-    "tokenspeed-smg-grpc-proto==0.4.14.post20260813",
-    "tokenspeed-smg-grpc-servicer==0.8.0.post20260813",
+    "tokenspeed-kernel>=0.1.4.dev0",
+    "tokenspeed-mooncake>=0.3.13.post20260929",
+    "tokenspeed-scheduler>=0.1.39",
+    "tokenspeed-smg==1.13.0.post20261016",
+    "tokenspeed-smg-grpc-proto==0.4.27.post20261016",
+    "tokenspeed-smg-grpc-servicer==0.14.0.post20261016",
     # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
     # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
     # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
@@ -84,7 +85,7 @@ dependencies = [
     "uv",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.2.3",
+    "xgrammar==0.2.8",
     "viztracer",
 ]
 
@@ -95,8 +96,16 @@ ts = "tokenspeed.cli:main"
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"
 
+[project.optional-dependencies]
+# Capped: 0.1.9 clones internally, so a release that stops would alias silently.
+instanttensor = ["instanttensor>=0.1.9,<0.2"]
+
 [tool.setuptools]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
 include = ["tokenspeed*"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"triton" = { msg = "Use tokenspeed_triton instead." }
+"torch.compile" = { msg = "Write the fused kernel directly in Triton instead." }

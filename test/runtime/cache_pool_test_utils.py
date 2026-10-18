@@ -1,33 +1,168 @@
 from __future__ import annotations
 
+import inspect
+from collections.abc import Iterator
+
 import torch
 
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    mha_cache_fields,
-    mla_cache_fields,
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    cache_dtype_name,
+    mxfp8_kv_scale_fields,
+    pack,
+    scatter_stored_dtype_name,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import solve_cache_layout
+
+
+def specs_for_layers(
+    *,
+    layer_types,
+    group_ids,
+    prefix_granularity,
+    sliding_window_tokens=None,
+    pd_disaggregation_enabled=False,
+):
+    """The group specs a layer vocabulary produces.
+
+    A group must declare fields, so this supplies a one-byte placeholder per
+    layer: the subject here is the scheduler semantics (kind, window, block
+    span), not the bytes.
+    """
+    return tuple(
+        group_spec
+        for group_spec, _ in spec.group(
+            layer_types=layer_types,
+            group_ids=group_ids,
+            sliding_window_tokens=sliding_window_tokens,
+            prefix_granularity=prefix_granularity,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
+            fields_for_layer=lambda layer_id, group_id, occurrence: (
+                CacheFieldSpec(
+                    f"layer.{layer_id}.probe", f"unit.{occurrence}", (1,), "uint8"
+                ),
+            ),
+        )
+    )
+
+
+def one_group(group_id: str, *fields, **spec_kwargs):
+    """One ``(spec, fields)`` pair for a plan under test.
+
+    A whole-group declaration, the way a recipe declares a group that is not
+    per-layer: the id is spelled once, in its spec, and its fields hang off
+    it. Row geometry defaults so a byte-layout test need not restate
+    scheduler semantics. ``group`` (the pipeline stage) is the other way in.
+    """
+    spec_kwargs.setdefault("attn_kind", "full_history")
+    if spec_kwargs["attn_kind"] != "state":
+        spec_kwargs.setdefault("rows_per_page", spec_kwargs.pop("page_size", 1))
+        spec_kwargs.setdefault("entry_stride_tokens", 1)
+    return spec.CacheGroupSpec(
+        group_id=group_id, **spec_kwargs, replayable=False
+    ), tuple(fields)
+
+
+def plan_group_specs(plan) -> tuple[spec.CacheGroupSpec, ...]:
+    """Row-geometry specs for every group the plan names.
+
+    The arena publishes a contract unconditionally, so a test that only
+    exercises field geometry still needs specs. Derive them from the plan
+    rather than restating numbers: a group's CacheBlock spans
+    ``prefix_granularity / cache_blocks_per_lcm_block`` tokens, declared here
+    as one row per token. Tests whose subject *is* the geometry or the
+    kind/transfer policy pass their own specs instead.
+    """
+    return tuple(
+        spec.CacheGroupSpec(
+            group_id=group.group_id,
+            attn_kind="full_history",
+            rows_per_page=plan.prefix_granularity // group.cache_blocks_per_lcm_block,
+            entry_stride_tokens=1,
+            replayable=False,
+        )
+        for group in plan.groups
+    )
+
+
+class MinimalCacheView(CachePool):
+    """The smallest constructible cache view.
+
+    ``CachePool`` is abstract in exactly the four accessors a view owes its
+    kernels, so this stub doubles as the list of what a real pool must add.
+    Use it to exercise view-layer behaviour the base class owns (arena
+    ownership, dtype, layer window, the scheduler bridge) without dragging in
+    a family's kernel buffers.
+    """
+
+    layer_num = 0
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        raise AssertionError("not exercised")
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        raise AssertionError("not exercised")
+
+    def get_kv_buffer(self, layer_id: int):
+        raise AssertionError("not exercised")
+
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v) -> None:
+        raise AssertionError("not exercised")
+
+
+def make_arena(plan, device: str = "cuda", **kwargs) -> CacheArena:
+    """Allocate the arena the pool(s) under test are compute views onto."""
+    if "cache_group_specs" not in kwargs:
+        kwargs["cache_group_specs"] = plan_group_specs(plan)
+    return CacheArena(plan, device, **kwargs)
+
+
+def make_pool(pool_cls, plan, *, device="cpu", arena=None, **kwargs):
+    """Build one pool as a compute view over ``plan``'s arena.
+
+    Tests name a plan and the view's compute parameters; the arena is
+    created here (or shared, when several views of one arena are under
+    test) so no test has to restate the allocation contract.
+    """
+    arena_kwargs = {
+        key: kwargs.pop(key)
+        for key in ("cache_group_specs", "token_capacity")
+        if key in kwargs
+    }
+    if arena is None:
+        arena = make_arena(plan, device, **arena_kwargs)
+    elif arena_kwargs:
+        raise TypeError("arena parameters cannot be passed alongside a shared arena")
+    return arena, pool_cls(arena=arena, **kwargs)
 
 
 def plan_fields(
     fields,
     *,
-    logical_block_tokens,
+    prefix_granularity,
     budget_bytes=None,
     num_lcm_blocks=None,
     **kwargs,
 ):
-    """Solve a layout and bind capacity the way the recipes do."""
-    layout = solve_cache_layout(
-        fields,
-        logical_block_tokens=logical_block_tokens,
+    """Solve a layout and bind capacity the way the recipes do.
+
+    ``fields`` is the ``{group_id: fields}`` map a recipe field builder
+    returns; declarations are formed here, the same join the recipes do.
+    """
+    layout = pack(
+        tuple(
+            one_group(group_id, *declared, rows_per_page=prefix_granularity)
+            for group_id, declared in fields.items()
+        ),
+        prefix_granularity=prefix_granularity,
         **kwargs,
     )
     if budget_bytes is not None:
         # Parent 0 backs logical null page 0 and is never schedulable.
         num_lcm_blocks = budget_bytes // layout.lcm_block_bytes - 1
-    return layout.with_num_lcm_blocks(num_lcm_blocks)
+    return layout.bind(num_lcm_blocks)
 
 
 def make_layer_group_ids(
@@ -50,7 +185,7 @@ def make_layer_group_ids(
 def make_mha_memory_plan(
     *,
     size: int,
-    page_size: int,
+    prefix_granularity: int,
     layer_num: int,
     kv_heads: int,
     head_dim: int,
@@ -59,53 +194,189 @@ def make_mha_memory_plan(
     sliding_window_tokens: int | tuple[int | None, ...] | None = None,
     mxfp8: bool = False,
 ):
-    if size % page_size:
-        raise ValueError("test pool size must be divisible by page_size")
+    """An MHA plan the way the recipe builds one: group, pack, bind."""
+    if size % prefix_granularity:
+        raise ValueError("test pool size must be divisible by prefix_granularity")
+    # Resolve the labels the way a recipe does: one per layer, full-history
+    # when the caller declares none.
+    if not layer_types:
+        layer_types = ("full_attention",) * layer_num
     group_ids = make_layer_group_ids(
         layer_num=layer_num,
         layer_types=layer_types,
         sliding_window_tokens=sliding_window_tokens,
     )
-    fields = mha_cache_fields(
-        layer_group_ids=group_ids,
-        logical_block_tokens=page_size,
-        kv_heads=kv_heads,
-        head_dim=head_dim,
-        kv_element_size=(1 if mxfp8 else torch.empty((), dtype=dtype).element_size()),
-        kv_scale_block_size=(32 if mxfp8 else 0),
-        kv_scale_element_size=(1 if mxfp8 else 0),
+    kv_dtype = (
+        cache_dtype_name(torch.float8_e4m3fn)
+        if mxfp8
+        else scatter_stored_dtype_name(dtype)
     )
-    layout = solve_cache_layout(
-        fields,
-        logical_block_tokens=page_size,
-        cache_blocks_per_lcm_block={group_id: 1 for group_id in group_ids},
+    shape = (prefix_granularity, kv_heads, head_dim)
+
+    def fields_for_layer(layer_id, group_id, occurrence):
+        fields = (
+            CacheFieldSpec(
+                f"layer.{layer_id}.k", f"unit.{occurrence}.k", shape, kv_dtype
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.v", f"unit.{occurrence}.v", shape, kv_dtype
+            ),
+        )
+        if not mxfp8:
+            return fields
+        # The production builder, so a test plan cannot declare a scale shape
+        # the recipes would never emit.
+        return fields + mxfp8_kv_scale_fields(
+            layer_id=layer_id,
+            occurrence=occurrence,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            prefix_granularity=prefix_granularity,
+        )
+
+    groups = spec.group(
+        layer_types=layer_types,
+        group_ids=group_ids,
+        sliding_window_tokens=sliding_window_tokens,
+        prefix_granularity=prefix_granularity,
+        fields_for_layer=fields_for_layer,
+    )
+    layout = pack(
+        groups,
+        prefix_granularity=prefix_granularity,
+        cache_blocks_per_lcm_block={gid: 1 for gid in set(group_ids)},
         alignment=1,
         max_padding_fraction=1.0,
     )
-    return layout.with_num_lcm_blocks(size // page_size)
+    return layout.bind(size // prefix_granularity)
 
 
 def make_mla_memory_plan(
     *,
     size: int,
-    page_size: int,
+    prefix_granularity: int,
     layer_num: int,
     latent_width: int,
     dtype: torch.dtype,
 ):
-    if size % page_size:
-        raise ValueError("test pool size must be divisible by page_size")
-    fields = mla_cache_fields(
-        layer_group_ids=("full_attention",) * layer_num,
-        logical_block_tokens=page_size,
-        latent_width=latent_width,
-        element_size=torch.empty((), dtype=dtype).element_size(),
+    """An MLA plan: one full-attention group, one latent field per layer."""
+    if size % prefix_granularity:
+        raise ValueError("test pool size must be divisible by prefix_granularity")
+    latent_dtype = scatter_stored_dtype_name(dtype)
+    groups = spec.group(
+        layer_types=("full_attention",) * layer_num,
+        group_ids=("full_attention",) * layer_num,
+        sliding_window_tokens=None,
+        prefix_granularity=prefix_granularity,
+        fields_for_layer=lambda layer_id, group_id, occurrence: (
+            CacheFieldSpec(
+                f"layer.{layer_id}.latent_kv",
+                f"slot.{occurrence}",
+                (prefix_granularity, 1, latent_width),
+                latent_dtype,
+            ),
+        ),
     )
-    layout = solve_cache_layout(
-        fields,
-        logical_block_tokens=page_size,
+    layout = pack(
+        groups,
+        prefix_granularity=prefix_granularity,
         cache_blocks_per_lcm_block={"full_attention": 1},
         alignment=1,
         max_padding_fraction=1.0,
     )
-    return layout.with_num_lcm_blocks(size // page_size)
+    return layout.bind(size // prefix_granularity)
+
+
+def binding_state(node: object) -> dict[str, object]:
+    """Every attribute of ``node``, reduced to what a fresh-vs-rebound comparison sees."""
+    return {name: _reduced(value, set()) for name, value in vars(node).items()}
+
+
+def _reduced(value: object, seen: set[int]) -> object:
+    if isinstance(value, torch.Tensor):
+        return (
+            "tensor",
+            tuple(value.shape),
+            value.stride(),
+            value.dtype,
+            str(value.device),
+        )
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                (str(key), _reduced(item, seen))
+                for key, item in sorted(value.items(), key=lambda kv: str(kv[0]))
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return (type(value).__name__, tuple(_reduced(item, seen) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return (type(value).__name__, sorted(map(str, value)))
+    if isinstance(value, (bool, int, float, str, type(None))):
+        return value
+    if isinstance(value, (torch.dtype, torch.device)):
+        return str(value)
+    if (
+        hasattr(value, "__dict__")
+        and not isinstance(value, type)
+        and not callable(value)
+    ):
+        if id(value) in seen:
+            return type(value).__name__
+        seen.add(id(value))
+        return (
+            type(value).__name__,
+            tuple(
+                (name, _reduced(item, seen))
+                for name, item in sorted(vars(value).items())
+            ),
+        )
+    return type(value).__name__
+
+
+def storages_of(*tensors: torch.Tensor) -> set[int]:
+    """The untyped storages behind ``tensors``, so views at any offset are
+    recognised; an empty tensor has no storage to alias."""
+    return {tensor.untyped_storage().data_ptr() for tensor in tensors if tensor.numel()}
+
+
+def reachable_tensors(node: object) -> list[torch.Tensor]:
+    """Every tensor reachable from ``node``'s attributes, for an alias set taken before a rebind."""
+    return [
+        tensor for value in vars(node).values() for tensor in _tensors(value, set())
+    ]
+
+
+def assert_no_alias(node: object, storages: set[int]) -> None:
+    """Fail if any tensor reachable from ``node``'s attributes lives in ``storages``."""
+    for name, value in vars(node).items():
+        for tensor in _tensors(value, set()):
+            assert (
+                not tensor.numel()
+                or tensor.untyped_storage().data_ptr() not in storages
+            ), f"{name} still aliases the old pool"
+
+
+def _tensors(value: object, seen: set[int]) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _tensors(item, seen)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _tensors(item, seen)
+    elif inspect.isfunction(value) and value.__closure__:
+        for cell in value.__closure__:
+            yield from _tensors(cell.cell_contents, seen)
+    elif isinstance(value, torch.nn.Module) or (
+        hasattr(value, "__dict__")
+        and not isinstance(value, type)
+        and not callable(value)
+    ):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        for item in vars(value).values():
+            yield from _tensors(item, seen)

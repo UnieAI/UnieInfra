@@ -21,8 +21,12 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine import event_loop as event_loop_module  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
+from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
+from tokenspeed.runtime.metrics.service import MetricsService  # noqa: E402
+from tokenspeed.runtime.utils.server_args import PortArgs  # noqa: E402
 
 
 class _PauseHarness:
@@ -41,16 +45,21 @@ class _SchedulerHarness:
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(pages_to_zero=())
+        return SimpleNamespace(
+            pages_to_zero=(), pages_to_copy_arrays=dict, cache=(), aborts=()
+        )
 
 
-class _ModelExecutorHarness:
+class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def zero_cache_pages(self, page_ids) -> None:
-        assert tuple(page_ids) == ()
-        self._trace.append("zero_pages")
+    def execute(self, execution_plan, planned):
+        # The harness plans no device work and no batch; trace anything that
+        # does appear rather than fail on a missing attr.
+        if execution_plan.pages_to_zero or execution_plan.cache or planned:
+            self._trace.append("execute")
+        return None
 
 
 class _EventLoopHarness:
@@ -63,10 +72,43 @@ class _EventLoopHarness:
             self.shutdown_event.set()
         self._pause = _PauseHarness(self.trace)
         self.scheduler = _SchedulerHarness(self.trace)
-        self.model_executor = _ModelExecutorHarness(self.trace)
+        self._device = _DeviceHarness(self.trace)
+        self._l3_hooks = L3CacheHooks(
+            self.scheduler,
+            None,
+            attn_tp_size=1,
+            attn_tp_cpu_group=None,
+            pp_size=1,
+            pp_cpu_group=None,
+        )
+        self.output_processor = SimpleNamespace(
+            rid_to_state={}, finish_scheduler_aborted_requests=lambda aborts: None
+        )
         self.has_dp = False
         self.kv_transfer = None
-        self._pd_cache_enabled = False
+        self.in_flight_depth = 0
+        self._epd_hooks = SimpleNamespace(
+            drain_ready_embeddings=lambda: self.trace.append("drain_epd")
+        )
+        self._cache_hooks = SimpleNamespace(
+            poll_ready_events=lambda: (self.trace.append("poll_cache"), [])[1],
+            count_plan_ops=lambda _plan: self.trace.append("count_cache"),
+        )
+        self._pd_hooks = SimpleNamespace(
+            poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
+        )
+        self._eplb_hooks = SimpleNamespace(
+            note_round=lambda *, forwarded: self.trace.append("eplb_round"),
+            close=lambda: self.trace.append("close_eplb"),
+        )
+        self._gc_hooks = SimpleNamespace(
+            note_round=lambda *, forwarded: self.trace.append("gc_round")
+        )
+        self.load_reporter = SimpleNamespace(
+            observe=lambda _stats, _running: self.trace.append("observe_load"),
+            sample_and_observe=lambda _running: self.trace.append("sample_load"),
+            close=lambda: self.trace.append("close_load"),
+        )
 
     def _shutdown_complete(self) -> bool:
         return EventLoop._shutdown_complete(self)
@@ -77,17 +119,8 @@ class _EventLoopHarness:
         # iteration: finish this scheduler step, then stop at the next head.
         self.shutdown_event.set()
 
-    def _drain_ready_epd_embeddings(self) -> None:
-        self.trace.append("drain_epd")
-
-    def _commit_cache_results(self) -> None:
-        self.trace.append("commit_cache")
-
     def _publish_scheduler_kv_events(self) -> None:
         self.trace.append("publish_kv")
-
-    def _submit_cache_ops(self, _execution_plan) -> None:
-        self.trace.append("submit_cache")
 
     def _get_forward_op(self, _execution_plan):
         self.trace.append("get_forward")
@@ -96,6 +129,9 @@ class _EventLoopHarness:
     def _get_scheduler_stats(self):
         self.trace.append("stats")
         return object()
+
+    def _num_running(self) -> int:
+        return 0
 
     def _record_scheduler_iteration_metrics(
         self, _stats, _num_iter_tokens: int
@@ -119,28 +155,32 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
     assert loop.trace == [
         "process_requests",
         "drain_epd",
-        "commit_cache",
+        "poll_cache",
         "next_plan",
-        "publish_kv",
-        "zero_pages",
-        "submit_cache",
+        # No "zero_pages": the round's plan plans no page, so the loop
+        # submits no zeroing work to the forward thread.
+        "count_cache",
         "get_forward",
         "stats",
-        "pause_finish",
+        "observe_load",
         "metrics",
+        # Every non-paused round reports its forward (none here) to the
+        # expert-rebalance hooks after the device call, then to the
+        # garbage-collection hooks.
+        "eplb_round",
+        "gc_round",
+        "poll_pd",
+        "publish_kv",
+        "pause_finish",
     ]
 
 
-@pytest.mark.parametrize("pd_cache_enabled", [False, True])
-def test_abort_uses_the_same_output_marker_for_every_layout(
-    pd_cache_enabled: bool,
-) -> None:
+def test_abort_uses_the_output_marker() -> None:
     calls = []
     output = SimpleNamespace(
         mark_abort=lambda request_id, **kwargs: calls.append((request_id, kwargs))
     )
     loop = SimpleNamespace(
-        _pd_cache_enabled=pd_cache_enabled,
         output_processor=output,
     )
 
@@ -154,13 +194,19 @@ def test_abort_uses_the_same_output_marker_for_every_layout(
     assert calls == [("request-0", {"notify_client": True})]
 
 
-def test_run_event_loop_sigterm_sets_event_and_finally_closes(
+@pytest.mark.parametrize("exit_kind", ["sigterm", "return", "system_exit"])
+def test_run_event_loop_reports_exit_and_finally_closes(
     monkeypatch: pytest.MonkeyPatch,
+    exit_kind: str,
 ) -> None:
     trace: list[str] = []
     signal_calls: list[tuple[int, object]] = []
     installed_handler: dict[str, object] = {}
     parent_signals: list[int] = []
+    exit_logs = []
+
+    def record_exit(message, *args, **kwargs):
+        exit_logs.append((message % args, kwargs["exc_info"]))
 
     previous_handler = object()
 
@@ -198,6 +244,7 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
             self.max_model_len = 4096
             self.max_req_input_len = 512
             self.multimodal_encoder_dtype = None
+            self.supports_prompt_logprobs = True
             self.model_config = SimpleNamespace(context_len=4096)
             self.has_dp = False
             self.use_overlap_schedule = False
@@ -205,10 +252,14 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
         def event_loop(self) -> None:
             trace.append("loop_enter")
             assert not self.shutdown_event.is_set()
-            handler = installed_handler["value"]
-            assert callable(handler)
-            handler(signal.SIGTERM, None)
-            assert self.shutdown_event.is_set()
+            if exit_kind == "system_exit":
+                raise SystemExit(0)
+            if exit_kind == "sigterm":
+                handler = installed_handler["value"]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                assert self.shutdown_event.is_set()
+                assert not exit_logs
             trace.append("loop_return")
 
         def close(self) -> None:
@@ -221,20 +272,30 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
         def send(self, message: object) -> None:
             self.messages.append(message)
 
-    mapping = SimpleNamespace(
-        rank=0,
-        nprocs_per_node=1,
-        attn=SimpleNamespace(tp_rank=0, dp_rank=0),
-    )
+    mapping = Mapping(rank=0)
     server_args = SimpleNamespace(
         mapping=mapping,
+        device="cpu",
         base_gpu_id=0,
         disaggregation_mode="decode",
+        enable_metrics=False,
         max_num_seqs=8,
         chunked_prefill_size=128,
     )
+    port_args = PortArgs(
+        tokenizer_ipc_name="unused",
+        scheduler_input_ipc_name="unused",
+        nccl_port=0,
+        dist_init_addr="localhost:0",
+        rpc_ipc_name="unused",
+        metrics_ipc_name="unused",
+        tokenizer_worker_ipc_name=None,
+    )
     pipe_writer = _PipeWriter()
 
+    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "default")
+    # Each case models a fresh worker process with its own metrics lifecycle.
+    monkeypatch.setattr(event_loop_module, "metrics_service", MetricsService())
     monkeypatch.setattr(event_loop_module, "EventLoop", _FakeEventLoop)
     monkeypatch.setattr(event_loop_module.psutil, "Process", _Process)
     monkeypatch.setattr(
@@ -242,6 +303,10 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
     )
     monkeypatch.setattr(event_loop_module.faulthandler, "enable", lambda: None)
     monkeypatch.setattr(event_loop_module, "register_usr_signal", lambda: None)
+    # Freezing would take this test process's objects out of collection.
+    monkeypatch.setattr(
+        event_loop_module, "freeze_startup_heap", lambda: trace.append("freeze_gc")
+    )
     monkeypatch.setattr(
         event_loop_module, "configure_logger", lambda *_args, **_kwargs: None
     )
@@ -249,10 +314,31 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
         event_loop_module.signal, "getsignal", lambda _sig: previous_handler
     )
     monkeypatch.setattr(event_loop_module.signal, "signal", fake_signal)
+    monkeypatch.setattr(event_loop_module.logger, "warning", record_exit)
 
-    event_loop_module.run_event_loop(server_args, object(), pipe_writer)
-
-    assert trace == ["construct", "loop_enter", "loop_return", "close"]
+    if exit_kind == "system_exit":
+        with pytest.raises(SystemExit) as raised:
+            event_loop_module.run_event_loop(server_args, port_args, pipe_writer)
+        assert raised.value.code == 0
+        assert trace == ["construct", "freeze_gc", "loop_enter", "close"]
+        assert exit_logs[0][1][0] is SystemExit
+    else:
+        event_loop_module.run_event_loop(server_args, port_args, pipe_writer)
+        assert trace == [
+            "construct",
+            "freeze_gc",
+            "loop_enter",
+            "loop_return",
+            "close",
+        ]
+        assert exit_logs[0][1] is None
+    assert len(exit_logs) == 1
+    assert "rank=0 pid=" in exit_logs[0][0]
+    assert (
+        "shutdown_requested=True signal=15"
+        if exit_kind == "sigterm"
+        else "shutdown_requested=False signal=None"
+    ) in exit_logs[0][0]
     assert parent_signals == []
     assert len(pipe_writer.messages) == 1
     assert pipe_writer.messages[0]["status"] == "ready"

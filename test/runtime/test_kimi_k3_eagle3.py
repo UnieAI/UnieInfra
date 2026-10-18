@@ -35,7 +35,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
         def __init__(self, hidden_states):
             self.hidden_states = hidden_states
 
-        def __call__(self, positions, prefix_sum, ctx, out_cache_loc, block_residual):
+        def __call__(self, positions, prefix_sum, ctx, block_residual):
             return (
                 _post_layer_attnres_reference(prefix_sum, self.hidden_states),
                 block_residual,
@@ -44,6 +44,12 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
     model = SimpleNamespace(
         embed_tokens=lambda input_ids: input_ids.to(torch.bfloat16).unsqueeze(-1),
         config=SimpleNamespace(num_hidden_layers=4, attn_res_block_size=2),
+        # Single-stage pipeline window: the forward walks
+        # [pp_start_layer, pp_end_layer) and only the last stage applies
+        # the output AttnRes fold.
+        pp_start_layer=0,
+        pp_end_layer=4,
+        mapping=SimpleNamespace(is_last_pp_rank=True),
         layers=[
             FakeLayer(torch.tensor([[1.0], [2.0]], dtype=torch.bfloat16)),
             FakeLayer(torch.tensor([[3.0], [4.0]], dtype=torch.bfloat16)),
@@ -54,6 +60,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
         output_attn_res_norm=None,
         norm=None,
         layers_to_capture=[],
+        dflash_aux_stream="prefix",
         eagle3_layers_to_capture=(2, 3),
     )
 
@@ -64,8 +71,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
             model,
             torch.tensor([0, 1]),
             positions=None,
-            ctx=None,
-            out_cache_loc=None,
+            ctx=SimpleNamespace(dspark_context_producer=None),
         )
 
     # IDs are one-based completed-layer IDs.  IDs 2 and 3 select the

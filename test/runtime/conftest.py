@@ -1,4 +1,4 @@
-"""Shared helpers for Kimi-K3 paged cache runtime tests."""
+"""Shared helpers for Kimi-K3 cache-group runtime tests."""
 
 from __future__ import annotations
 
@@ -27,36 +27,129 @@ MLA_QK_ROPE_DIM = 64
 MLA_LATENT_DIM = MLA_KV_LORA_RANK + MLA_QK_ROPE_DIM
 
 
-def _poison(shape, device="cuda", dtype=torch.int32):
-    return torch.full(shape, 987_654, device=device, dtype=dtype)
+def kimi_recipe(
+    *,
+    text_config=None,
+    tp_size: int = 8,
+    draft_layers: int = 0,
+    pd_enabled: bool = False,
+    max_bs: int = 1,
+    max_scheduled_tokens: int = 128,
+    context_len: int = 4096,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+    speculative_algorithm: str | None = None,
+    speculative_num_draft_tokens: int = 1,
+    kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
+):
+    """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+        LinearAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        KimiK3Recipe,
+    )
+
+    text_config = text_config if text_config is not None else KimiLinearConfig()
+    # The real components, not namespace fakes: the recipe reads the linear
+    # component's state-shape properties and the MLA spec's latent dims.
+    kda = text_config.linear_attn_config
+    linear_attn = LinearAttnConfig(
+        num_k_heads=int(kda["num_heads"]),
+        num_v_heads=int(kda["num_heads"]),
+        head_k_dim=int(kda["head_dim"]),
+        head_v_dim=int(kda["head_dim"]),
+        conv_kernel_size=int(kda["short_conv_kernel_size"]),
+        layer_ids=tuple(text_config.linear_layer_ids),
+        tp_size=tp_size,
+    )
+    mla = MLAConfig(
+        backend_name="mla",
+        num_attention_heads=text_config.num_attention_heads,
+        num_kv_heads=text_config.num_key_value_heads,
+        head_dim=text_config.qk_nope_head_dim + text_config.qk_rope_head_dim,
+        attn_tp_size=tp_size,
+        kv_lora_rank=text_config.kv_lora_rank,
+        qk_nope_head_dim=text_config.qk_nope_head_dim,
+        qk_rope_head_dim=text_config.qk_rope_head_dim,
+        v_head_dim=text_config.v_head_dim,
+        scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
+        kv_cache_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
+    )
+    attn_config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_quant_method=None,
+        prefix_granularity=128,
+        max_bs=max_bs,
+        # K3's per-group demand reads the scheduler's concurrency through
+        # CacheRecipe.scheduler_limits, context length included.
+        context_len=context_len,
+        pd_disaggregation_enabled=pd_enabled,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        components=(mla, linear_attn),
+    )
+    # The real K3 draft is BF16 MLA over the FP8 target arena.
+    draft_attn_config = (
+        dataclasses.replace(attn_config, kv_cache_dtype=torch.bfloat16)
+        if draft_layers
+        else None
+    )
+    return KimiK3Recipe(
+        server_args=SimpleNamespace(
+            kv_offload_config=None,
+            max_total_tokens=None,
+            chunked_prefill_size=max_scheduled_tokens,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
+            speculative_algorithm=speculative_algorithm,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        ),
+        model_config=SimpleNamespace(hf_text_config=text_config),
+        attn_config=attn_config,
+        draft_model_config=(
+            SimpleNamespace(num_attention_layers=draft_layers) if draft_layers else None
+        ),
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=1 << 34,
+        probe_batch_rows=None,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+
+
+def kimi_tp8_layout(**recipe_kwargs):
+    """The capacity-independent K3 layout: group, then pack."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    recipe = kimi_recipe(**recipe_kwargs)
+    groups = recipe.groups()
+    layout = pack(
+        groups,
+        prefix_granularity=recipe.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
+    )
+    # Same order as CacheRecipe.setup: group, pack, check, then bind.
+    recipe.check_layout(layout)
+    return recipe, groups, layout
 
 
 def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
-    from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-        solve_kimi_k3_cache_layout,
-    )
-
-    layout = solve_kimi_k3_cache_layout(
-        KimiLinearConfig(),
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-    )
-    return layout.with_num_lcm_blocks(num_lcm_blocks)
+    return kimi_tp8_layout()[2].bind(num_lcm_blocks)
 
 
 def _kimi_group_specs(group_ids, layer_types, plan):
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        build_paged_cache_group_specs,
-    )
-
-    return build_paged_cache_group_specs(
-        layer_types=layer_types,
-        group_ids=group_ids,
-        sliding_window_tokens=None,
-        page_size=plan.logical_block_tokens,
-    )
+    del group_ids, layer_types, plan
+    return tuple(spec for spec, _ in kimi_recipe().groups())
 
 
 def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True):
@@ -64,73 +157,50 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-        kimi_k3_layer_group_ids,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        FULL_ATTENTION,
-        LINEAR_ATTENTION,
-    )
 
     del with_mla_dims
     text_config = KimiLinearConfig()
     plan = kimi_tp8_plan(num_lcm_blocks=usable_pages)
-    group_ids = kimi_k3_layer_group_ids(text_config)
-    layer_types = tuple(
-        FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
-        for group_id in group_ids
-    )
-    return HybridKDATokenToKVPool(
-        size=usable_pages * 12 * plan.logical_block_tokens,
+    recipe = kimi_recipe()
+    group_ids = recipe.target_group_ids
+    layer_types = recipe.layer_types
+    from test.runtime.cache_pool_test_utils import make_pool
+
+    _, pool = make_pool(
+        HybridKDATokenToKVPool,
+        plan,
+        device=device,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,
         quant_method=None,
         kv_lora_rank=MLA_KV_LORA_RANK,
         qk_rope_head_dim=MLA_QK_ROPE_DIM,
         layer_num=text_config.num_hidden_layers,
-        device=device,
-        enable_memory_saver=False,
-        page_size=plan.logical_block_tokens,
         rank=0,
         layer_types=layer_types,
-        layer_group_ids=group_ids,
-        paged_cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
-        state_field_dtypes={
-            field_id: dtype
-            for layer_id, layer_type in enumerate(layer_types)
-            if layer_type == LINEAR_ATTENTION
-            for field_id, dtype in (
-                (f"layer.{layer_id}.conv_state", torch.bfloat16),
-                (f"layer.{layer_id}.recurrent_state", torch.float32),
-            )
-        },
-        memory_plan=plan,
+        cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
     )
-
-
-@pytest.fixture(scope="module")
-def kimi_pool():
-    return make_kimi_pool("cpu", usable_pages=1)
+    return pool
 
 
 def layer_for_group(pool, group_id: str) -> int:
     return next(
         layer_id
-        for layer_id, candidate in pool._group_ids_by_layer.items()
+        for layer_id, candidate in sorted(pool.state_group_by_layer.items())
         if candidate == group_id
     )
 
 
 def mla_layer_id(pool) -> int:
-    return layer_for_group(pool, "full_attention")
+    return next(
+        layer_id
+        for layer_id in range(pool.layer_num)
+        if layer_id not in pool.state_group_by_layer
+    )
 
 
 def kda_layer_id(pool) -> int:
-    return next(
-        layer_id
-        for layer_id, group_id in pool._group_ids_by_layer.items()
-        if group_id != "full_attention"
-    )
+    return min(pool.state_group_by_layer)
 
 
 def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
@@ -152,9 +222,18 @@ def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
     return metadata, forward_op
 
 
+def block_tables_for(contract, tables, device, *, filler_page: int = 1):
+    """The bridge-shaped per-group dict for a contract: packed storage,
+    contract order, missing groups filled with one filler page per row."""
+    metadata, forward_op = cache_metadata_for(
+        contract, tables, device, filler_page=filler_page
+    )
+    return dict(metadata.tables(active_forward_op=forward_op))
+
+
 def full_attention_metadata_for(pool, full_table_np, device):
     return cache_metadata_for(
-        pool.runtime_contract,
+        pool.arena.runtime_contract,
         {"full_attention": np.asarray(full_table_np, dtype=np.int32)},
         device,
     )

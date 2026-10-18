@@ -28,13 +28,10 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
+from tokenspeed_kernel.ops.attention.prologue import qk_norm_rope
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
-    fused_qknorm_rope_kv_insert,
-)
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 
@@ -46,10 +43,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
+from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -68,7 +62,7 @@ from tokenspeed.runtime.layers.moe import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import PagedAttention, head_norm
 from tokenspeed.runtime.layers.parameter import (
     BaseWeightParameter,
     BlockQuantScaleParameter,
@@ -94,8 +88,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -209,10 +201,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         }
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=(
-                config.num_local_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
-            ),
+            num_experts=config.num_local_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
@@ -262,7 +251,6 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                     hidden_states,
                     self.gate.weight,
                     out_dtype=torch.float32,
-                    enable_pdl=pdl_enabled(),
                 )
             else:
                 router_logits, _ = self.gate(hidden_states.to(torch.float32))
@@ -298,7 +286,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=pdl_enabled(),
+                hidden_dim=hidden_states.shape[-1],
             )
         else:
             output = (
@@ -543,14 +531,14 @@ class MiniMaxM3Indexer(nn.Module):
         index_q: torch.Tensor,
         index_k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        index_q, index_k = qk_rmsnorm(
+        # The MSA backend caches the index keys itself.
+        index_q, index_k = qk_norm_rope(
             index_q,
             index_k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
+            head_dim=self.head_dim,
+            norm=head_norm(self.q_norm, self.k_norm),
+            rotary=self.rotary_emb.as_rotary(positions),
         )
-        index_q, index_k = self.rotary_emb(positions, index_q, index_k)
         return (
             index_q.view(-1, self.num_index_heads, self.head_dim),
             index_k.view(-1, self.head_dim),
@@ -580,13 +568,6 @@ class MiniMaxM3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.is_sparse = config.layer_types[layer_id] == "minimax_m3_sparse"
-        self.use_fused_qknorm_rope = (
-            self.is_sparse
-            and current_platform().is_nvidia
-            and self.head_dim == 128
-            and config.index_head_dim == 128
-        )
-
         if self.is_sparse:
             # Sparse layers fuse the indexer's index_q/index_k into the QKV GEMM:
             # a single projection emits [q | k | v | index_q | index_k].
@@ -651,7 +632,8 @@ class MiniMaxM3Attention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=FULL_ATTENTION,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
     def forward(
@@ -659,34 +641,15 @@ class MiniMaxM3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-
         qkv, _ = self.qkv_proj(hidden_states)
-
-        if self.use_fused_qknorm_rope:
-            q, k, v, attn_kwargs = self.fused_qknorm_rope(qkv, positions)
+        if not self.is_sparse:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v, positions, ctx)
         else:
-            q, k, v, attn_kwargs = self.qknorm_rope(qkv, positions)
-
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            ctx=ctx,
-            out_cache_loc=out_cache_loc,
-            **attn_kwargs,
-        )
-        output, _ = self.o_proj(attn_output)
-        return output
-
-    def qknorm_rope(
-        self, qkv: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        if self.is_sparse:
-            # Fused projection emits [q | k | v | index_q | index_k].
+            # Sparse layers project [q | k | v | index_q | index_k] in one GEMM.
             q, k, v, index_q, index_k = qkv.split(
                 [
                     self.q_size,
@@ -697,66 +660,12 @@ class MiniMaxM3Attention(nn.Module):
                 ],
                 dim=-1,
             )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
-            enable_pdl=pdl_enabled(),
-        )
-        q, k = self.rotary_emb(positions, q, k, enable_pdl=pdl_enabled())
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        attn_kwargs = {}
-        if self.is_sparse:
             index_q, index_k = self.indexer(positions, index_q, index_k)
-            attn_kwargs = {"index_q": index_q, "index_k": index_k}
-        return q, k, v, attn_kwargs
-
-    def fused_qknorm_rope(
-        self, qkv: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        q_out = qkv.new_empty(qkv.size(0), self.q_size)
-        index_q_out = qkv.new_empty(qkv.size(0), self.index_q_size)
-        fused_qknorm_rope_kv_insert(
-            qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.rotary_emb.cos_sin_cache,
-            positions,
-            self.num_heads,
-            self.num_kv_heads,
-            self.rotary_emb.rotary_dim,
-            self.q_norm.variance_epsilon,
-            index_q_norm_weight=self.indexer.q_norm.weight,
-            index_k_norm_weight=self.indexer.k_norm.weight,
-            num_index_heads=self.indexer.num_index_heads,
-            q_out=q_out,
-            index_q_out=index_q_out,
-            enable_pdl=pdl_enabled(),
-        )
-        _, k, v, _, index_k = qkv.split(
-            [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
-                self.index_q_size,
-                self.index_k_size,
-            ],
-            dim=-1,
-        )
-        q = q_out.view(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-        index_q = index_q_out.view(
-            -1, self.indexer.num_index_heads, self.index_head_dim
-        )
-        index_k = index_k.reshape(-1, self.index_head_dim)
-        return q, k, v, {"index_q": index_q, "index_k": index_k}
+            attn_output = self.attn(
+                q, k, v, positions, ctx, index_q=index_q, index_k=index_k
+            )
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -812,8 +721,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=previous_is_moe_layer,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -821,7 +732,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -842,7 +752,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
@@ -1746,7 +1655,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -1760,7 +1668,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
                 **kwargs,
             )
         if self.multimodal_embedder is None:
@@ -1781,7 +1688,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )

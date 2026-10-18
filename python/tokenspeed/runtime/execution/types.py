@@ -22,8 +22,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -33,16 +34,229 @@ if TYPE_CHECKING:
     )
 
 
-@dataclass
-class PoolerForwardResult:
-    """What a pooling forward returns in place of (tokens, lengths, logprobs).
+@dataclass(frozen=True)
+class DpForwardMetadata:
+    """CPU-only DP metadata, gathered by the event loop before each forward.
 
-    Kept as its own type rather than reusing the token tuple: an embedding
-    tensor smuggled through ``output_tokens`` would be silently clamped to the
-    vocab range and packed as int32 by the generative D2H path.
+    Every DP rank must enter the model's collectives with the same shapes,
+    so the loop all-gathers these before any GPU work and hands the result
+    to the executor as one unit.
     """
 
-    embeddings: torch.Tensor
+    global_num_tokens: list[int]
+    global_batch_size: list[int]
+    global_forward_mode: list[int]
+    all_decode_or_idle: bool
+    all_extend: bool
+    need_idle_forward: bool
+
+
+@dataclass(frozen=True)
+class NGramInputs:
+    """Immutable, bounded raw-token windows captured on the control plane.
+
+    Each row holds the token at ``positions[row]`` followed by its predecessors,
+    newest first. Decode snapshots include one extra ID because the current
+    input may already be committed or may still live in ``future_input_map``.
+    No request objects or device tensors cross this boundary.
+    """
+
+    tokens: tuple[tuple[int, ...], ...]
+    positions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class RequestHistorySeeds:
+    """Immutable committed prefixes that rebuild request-token history rows.
+
+    Row ``i`` restores the first ``prefix_lengths[i]`` tokens of request-pool
+    slot ``slots[i]`` from ``tokens[i]``: an extend that resumes a prefix it
+    did not compute on this slot (a prefix-cache hit, a later chunk, a PD
+    landing) must see that prefix before its own inputs are appended. No
+    request objects or device tensors cross this boundary.
+    """
+
+    slots: tuple[int, ...]
+    prefix_lengths: tuple[int, ...]
+    tokens: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not len(self.slots) == len(self.prefix_lengths) == len(self.tokens):
+            raise ValueError("request history seed fields must have equal lengths")
+        for prefix_length, tokens in zip(self.prefix_lengths, self.tokens):
+            if len(tokens) != prefix_length:
+                raise ValueError(
+                    f"request history seed has {len(tokens)} tokens for a "
+                    f"{prefix_length}-token prefix"
+                )
+
+
+@dataclass(frozen=True)
+class InputLogprobPlan:
+    """Which prompt rows of one forward need their next-token logprob.
+
+    Built on the control plane as one ``(row_start, count, position_start)``
+    triple per extend slot and captured into the submitted closure as plain
+    tuples, so the plan stays O(slots) whatever the prompt length. The
+    forward thread expands the triples into the device row index (an
+    ``arange`` per slot) and reads each row's target -- the next prompt
+    token -- from the scheduler's shifted input ids, which every prefill
+    already lands on the device; the logits processor then gathers exactly
+    those rows out of the full ``[num_tokens, hidden]`` activations (position
+    chunked, so the ``[rows, vocab]`` logits never materialize at once). The
+    commit path slices the flat result back per slot by ``counts`` and places
+    it at ``position_starts``.
+
+    Attributes:
+        row_starts: Per extend slot, the flat input-row index of its first
+            gathered row (meaningful only where the count is non-zero).
+        counts: Per extend slot, how many consecutive rows are gathered;
+            0 for a slot that needs none.
+        position_starts: Per extend slot, the prompt position of its first
+            gathered row (meaningful only where the count is non-zero).
+        top_k: How many most likely next tokens every gathered row also
+            returns: the largest ``top_logprobs_num`` among the planned slots
+            (each slot keeps its own), 0 for none.
+    """
+
+    row_starts: tuple[int, ...]
+    counts: tuple[int, ...]
+    position_starts: tuple[int, ...]
+    top_k: int = 0
+
+    def __post_init__(self) -> None:
+        if not len(self.row_starts) == len(self.counts) == len(self.position_starts):
+            raise ValueError("input logprob plan fields must have equal lengths")
+        if any(count < 0 for count in self.counts):
+            raise ValueError("input logprob plan counts must be non-negative")
+        if self.top_k < 0:
+            raise ValueError("input logprob plan top_k must be non-negative")
+        if self.num_rows == 0:
+            raise ValueError("an input logprob plan must name at least one row")
+
+    @property
+    def num_rows(self) -> int:
+        """Rows gathered by the whole batch (the flat result's length)."""
+        return sum(self.counts)
+
+
+# Most stop tokens a request may end on (its own plus the model's EOS ids):
+# the width of the per-slot stop table the device cuts verify rounds with.
+MAX_STOP_TOKEN_IDS = 16
+
+
+@dataclass(frozen=True)
+class StopCriteria:
+    """Where a request's generation ends, as the device cuts verify rounds.
+
+    Attributes:
+        stop_token_ids: The tokens that end the request, at most
+            ``MAX_STOP_TOKEN_IDS``; empty under ``ignore_eos``.
+        token_limit: Total token count (prompt plus ``max_new_tokens``) at
+            which the request ends.
+    """
+
+    stop_token_ids: tuple[int, ...]
+    token_limit: int
+
+    def __post_init__(self) -> None:
+        if len(self.stop_token_ids) > MAX_STOP_TOKEN_IDS:
+            raise ValueError(
+                f"{len(self.stop_token_ids)} stop token ids exceed the device "
+                f"table width {MAX_STOP_TOKEN_IDS}"
+            )
+        if self.token_limit <= 0:
+            raise ValueError(f"token_limit must be positive, got {self.token_limit}")
+
+
+@dataclass(frozen=True)
+class PlannedForward:
+    """One round's planned work, as the device side needs to see it.
+
+    Everything the data plane learns about a round arrives through here and
+    is captured into the submitted closure, so every field must be something
+    the control plane will not touch again once the round is dispatched (the
+    capture contract in ``forward_thread.py``). A new field either satisfies
+    that, or it is a new registered exception — not a comment.
+
+    Attributes:
+        forward_op: The scheduler's op for this round. A per-round value copy
+            out of C++ (``rv_policy::copy`` on ``ExecutionPlan.forward``), so
+            no later scheduler activity can reach it.
+        sampling_params_list: Per-slot sampling params, gathered by the loop.
+            Read-only for the request's lifetime.
+        dp_metadata: CPU-gathered DP metadata, None outside DP. A frozen
+            dataclass of plain lists.
+        grammar_inputs: Per-batch grammar state, None when no request in the
+            batch is constrained. A registered exception: these are the
+            control plane's live matchers, see the contract's rule 5.
+        ngram_inputs: Immutable raw-token snapshots, None without Engram.
+        request_history_seeds: Immutable committed prefixes for the batch's
+            resuming extends, None for a model that reads no request-token
+            history or a batch without such extends.
+        multimodal_context: Per-batch multimodal state, None for text-only.
+            Its ``mm_inputs`` are shallow copies taken at gather time; the
+            items inside are the other registered exception.
+        input_logprob_plan: The prompt rows whose logprobs this forward
+            gathers, None when no extend row needs any. A frozen dataclass
+            of plain tuples.
+        sampled_top_k: How many most likely tokens each prefill row's
+            sampled token is reported with: the largest ``top_logprobs_num``
+            among the extend slots, 0 for none. A plain int.
+        stop_criteria: Per-slot stop tokens and token limits, gathered by the
+            loop. Frozen values fixed for the request's lifetime.
+    """
+
+    forward_op: Any
+    sampling_params_list: list
+    dp_metadata: "DpForwardMetadata | None"
+    grammar_inputs: Any
+    multimodal_context: Any
+    ngram_inputs: NGramInputs | None
+    request_history_seeds: RequestHistorySeeds | None
+    input_logprob_plan: InputLogprobPlan | None
+    sampled_top_k: int
+    stop_criteria: tuple[StopCriteria, ...]
+
+
+@dataclass
+class ForwardLogprobs:
+    """The logprobs an eager extend forward returns beside its sampled
+    tokens': the planned prompt rows' (``ForwardContext.input_logprob_rows``),
+    and the top-k alternatives of those rows and of the prefill rows' sampled
+    tokens (``ForwardContext.sampled_top_k``). A forward that asked for none of
+    them -- every captured graph among them -- returns None in its place.
+    """
+
+    input_token_logprobs: torch.Tensor | None = None
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
+
+    @classmethod
+    def of(cls, logits_output: Any) -> ForwardLogprobs | None:
+        """The forward's logprobs from its ``LogitsProcessorOutput``."""
+        logprobs = cls(
+            input_token_logprobs=logits_output.input_token_logprobs,
+            input_top_logprobs_val=logits_output.input_top_logprobs_val,
+            input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
+            output_top_logprobs_val=logits_output.sampled_top_logprobs_val,
+            output_top_logprobs_idx=logits_output.sampled_top_logprobs_idx,
+        )
+        return None if logprobs.is_empty() else logprobs
+
+    def is_empty(self) -> bool:
+        return all(value is None for value in vars(self).values())
+
+    def to_host(self) -> ForwardLogprobs:
+        """Non-blocking D2H copies, landed by the result's copy event."""
+        return ForwardLogprobs(
+            **{
+                name: None if value is None else value.to("cpu", non_blocking=True)
+                for name, value in vars(self).items()
+            }
+        )
 
 
 @dataclass
@@ -54,41 +268,81 @@ class ModelExecutionResult:
 
     Attributes:
         output_tokens: Sampled token IDs
-        output_logits: Output logits (if requested)
         output_lengths: Number of tokens generated per request (for spec decoding)
     """
 
     output_tokens: torch.Tensor
     copy_event: torch.cuda.Event | None = None
-    output_logits: torch.Tensor | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
     # Per-position logprob of the sampled token, same layout as output_tokens.
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
-    # Optional next-round input rows captured for PD prefill data-plane handoff.
+    # P role, final chunk only: the sampled rows the commit path folds into
+    # the ExtendResult as the bootstrap payload the peer's decode needs.
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None
-    # Embedding serving only: one pooled vector per request, [bs, hidden].
-    # Mutually exclusive with output_tokens -- a pooling forward samples
-    # nothing, so output_tokens is empty when this is set.
-    output_embeddings: torch.Tensor | None = None
-    # TEMP profiling: (start, end) CUDA events bracketing forward_step on the
-    # execution stream. elapsed_time() is only valid AFTER copy_event has been
-    # synchronised; the commit path reads it then (no extra device sync).
-    gpu_events: tuple | None = None
+    # Prompt (input) logprobs of the rows ``input_logprob_plan`` named, flat
+    # fp32 in plan order; None when the forward gathered none (no plan, or a
+    # pipeline stage without logits). The plan rides along so the commit path
+    # slices the flat tensor per request without re-deriving the rows.
+    input_token_logprobs: torch.Tensor | None = None
+    input_logprob_plan: InputLogprobPlan | None = None
+    # The top-k alternatives ([rows, k] fp32 values and int64 ids) of the
+    # planned prompt rows (plan order) and of the prefill rows' sampled tokens
+    # (prefill output order); None when the forward asked for none.
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
+    _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:
+        """Block until this result's D2H copy has landed.
+
+        Called exactly once, by ``PendingExecution.result()`` — the single
+        gate between the forward thread and the control plane. Consumers
+        receive an already-synced result and must not call this again; a
+        second call means a redundant sync path was reintroduced, so it
+        raises instead of silently costing a no-op event join.
+        """
+        if self._synced:
+            raise RuntimeError(
+                "ModelExecutionResult is synced exactly once, by "
+                "PendingExecution.result(); consumers get a synced result."
+            )
         if self.copy_event is None:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
+        self._synced = True
 
-    def gpu_elapsed_ms(self) -> float | None:
-        if self.gpu_events is None:
-            return None
-        return self.gpu_events[0].elapsed_time(self.gpu_events[1])
+
+@dataclass
+class PendingExecution:
+    """A forward submitted to the forward thread, awaiting its result.
+
+    The control plane's ``in_flight`` queue holds these instead of raw
+    ``ModelExecutionResult``s. ``result()`` joins the forward-thread future
+    (all launches + D2H issued) and then syncs the copy event (D2H landed).
+    Only commit blocks here — the dispatch path never waits, which is what
+    keeps a backpressured stage's launches from stalling the control plane.
+
+    Also the only place a ``ModelExecutionResult`` crosses back, which is
+    what makes the sync exactly-once: the future is private and the result
+    is memoized.
+    """
+
+    _future: Future
+    _result: ModelExecutionResult | None = field(default=None, init=False, repr=False)
+
+    def result(self) -> ModelExecutionResult:
+        if self._result is None:
+            results = self._future.result()
+            results.sync()
+            self._result = results
+        return self._result

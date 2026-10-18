@@ -38,9 +38,6 @@ from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -56,11 +53,9 @@ from tokenspeed.runtime.models.base import (
     BaseTransformerModel,
 )
 from tokenspeed.runtime.models.utils import (
-    create_fused_set_kv_buffer_arg,
     validate_attention_partition,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class LlamaMLP(nn.Module):
@@ -128,6 +123,8 @@ class LlamaAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         qkv_input_size: int | None = None,
+        *,
+        sliding_window_size: int,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -195,7 +192,9 @@ class LlamaAttention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=FULL_ATTENTION,
+            sliding_window_size=sliding_window_size,
+            rotary_emb=self.rotary_emb,
+            qk_norm=None,
         )
 
     def forward(
@@ -203,7 +202,6 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         # Skip the QKV projection, RoPE, attention, and o_proj kernels when
         # the batch row is empty (e.g. idle ranks under DP attention). Matches
@@ -214,7 +212,7 @@ class LlamaAttention(nn.Module):
             )
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self._attn(positions, q, k, v, ctx, out_cache_loc)
+        attn_output = self._attn(positions, q, k, v, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -225,76 +223,9 @@ class LlamaAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
-        """RoPE + attention (pre-o_proj), with optional fused KV pre-write.
-
-        When the backend supports KV pre-write *and* ``create_fused_set_kv_buffer_arg``
-        accepts the layer's scales, fused rope writes KV directly into the cache
-        so the attention call can run with ``save_kv_cache=False`` (saves one
-        kernel launch). Otherwise we fall back to plain RoPE + ``self.attn(q, k, v)``
-        so the backend writes KV the normal way — without this fallback, layers
-        with non-trivial k/v scales silently lose their KV writes. Subclasses
-        (e.g. Eagle3 draft head) override this hook to insert spec-decode
-        behaviour around the same scaffolding.
-        """
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            fused_kv_arg = self._build_fused_kv_arg(v, ctx, out_cache_loc)
-            if fused_kv_arg is not None:
-                q_rope = self._fused_rope_kv_write(positions, q, k, fused_kv_arg)
-                return self.attn(
-                    q_rope,
-                    None,
-                    None,
-                    save_kv_cache=False,
-                    ctx=ctx,
-                    out_cache_loc=out_cache_loc,
-                )
-        q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc)
-
-    def _build_fused_kv_arg(
-        self,
-        v: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-    ):
-        """Try to build the fused RoPE+KV-write descriptor; returns ``None`` if
-        the helper rejects the layer (e.g. non-trivial k/v scales)."""
-        n = v.shape[0]
-        return create_fused_set_kv_buffer_arg(
-            value=v.view(n, self.num_kv_heads, self.head_dim),
-            layer=self.attn,
-            # Cache path: prewrite at this layer's group locations. Identity on
-            # the legacy single-table path; without it a grouped pool would get
-            # the scheduler's locations and the write would miss the pages this
-            # layer reads.
-            out_cache_loc=ctx.attn_backend.select_out_cache_loc(
-                self.attn, out_cache_loc, ctx.forward_mode
-            ),
-            token_to_kv_pool=ctx.token_to_kv_pool,
-        )
-
-    def _fused_rope_kv_write(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        fused_kv_arg,
-    ) -> torch.Tensor:
-        """Fused RoPE that writes KV into cache (via ``fused_kv_arg``) and
-        returns the rope'd Q."""
-        n = q.shape[0]
-        q_rope = torch.empty((n, self.q_size), dtype=q.dtype, device=q.device)
-        self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=fused_kv_arg,
-            output_q_rope=q_rope,
-            enable_pdl=pdl_enabled(),
-        )
-        return q_rope
+        """Attention before ``o_proj``; the Eagle3 draft head overrides it."""
+        return self.attn(q, k, v, positions, ctx)
 
 
 class LlamaDecoderLayer(BaseDecoderLayer):
@@ -309,6 +240,7 @@ class LlamaDecoderLayer(BaseDecoderLayer):
             layer_id=self.layer_id,
             quant_config=self.quant_config,
             prefix=add_prefix("self_attn", prefix),
+            sliding_window_size=-1,
         )
 
     def resolve_mlp(self, prefix: str) -> nn.Module:

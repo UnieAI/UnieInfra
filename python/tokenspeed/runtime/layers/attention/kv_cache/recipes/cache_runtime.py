@@ -26,12 +26,12 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 
 
 def cache_debug_enabled() -> bool:
-    """Whether expensive, GPU-synchronizing Paged cache validation is enabled."""
+    """Whether expensive, GPU-synchronizing cache validation is enabled."""
     return os.environ.get("TOKENSPEED_CACHE_DEBUG") == "1"
 
 
@@ -53,23 +53,43 @@ def require_positive_int(name: str, value: object) -> int:
     return value
 
 
+def virtual_block_count(page_count: int, shard_count: int) -> int:
+    """Scheduler block count of a group holding ``page_count`` local pages.
+
+    Local page 0 and virtual block 0 are both the null block. Every other
+    virtual block is dealt cyclically to ``shard_count`` owners, so one
+    owner's local pages back one ``shard_count``-th of the virtual blocks; a
+    replicated group (``shard_count`` 1) has as many virtual blocks as pages.
+    Both the arena contract and the PD wire contract size scheduler IDs with
+    this one formula.
+    """
+    return 1 + (page_count - 1) * shard_count
+
+
 @dataclass(frozen=True)
-class PagedCacheRuntimeContract:
-    block_size: int
+class CacheRuntimeContract:
+    prefix_granularity: int
     num_lcm_blocks: int
     token_capacity: int
-    group_specs: tuple[PagedCacheGroupSpec, ...]
+    group_specs: tuple[CacheGroupSpec, ...]
+    # Both projected from the memory plan, which owns physical geometry: how
+    # many CacheBlocks each group has, and how many share one LCM parent.
     group_page_counts: Mapping[str, int]
+    group_packing: Mapping[str, int]
 
     def __post_init__(self) -> None:
-        block_size = require_positive_int("block_size", self.block_size)
+        prefix_granularity = require_positive_int(
+            "prefix_granularity", self.prefix_granularity
+        )
         num_lcm_blocks = require_positive_int("num_lcm_blocks", self.num_lcm_blocks)
         token_capacity = require_positive_int("token_capacity", self.token_capacity)
         if not isinstance(self.group_specs, tuple) or not self.group_specs:
             raise ValueError("group_specs must be a non-empty tuple")
-        if any(not isinstance(spec, PagedCacheGroupSpec) for spec in self.group_specs):
-            raise ValueError("group_specs must contain PagedCacheGroupSpec values")
+        if any(not isinstance(spec, CacheGroupSpec) for spec in self.group_specs):
+            raise ValueError("group_specs must contain CacheGroupSpec values")
         group_ids = tuple(spec.group_id for spec in self.group_specs)
+        if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
+            raise ValueError("group_specs must use nonempty string IDs")
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("group_specs contain duplicate group IDs")
         counts = dict(self.group_page_counts)
@@ -87,14 +107,24 @@ class PagedCacheRuntimeContract:
             )
             for group_id in group_ids
         }
-        expected_counts = {
-            spec.group_id: num_lcm_blocks
-            * require_positive_int(
-                f"cache_blocks_per_lcm_block for {spec.group_id!r}",
-                spec.cache_blocks_per_lcm_block,
+        packing = dict(self.group_packing)
+        if set(packing) != expected_group_ids:
+            raise ValueError(
+                "group_packing keys must match group_specs: "
+                f"missing={sorted(expected_group_ids - set(packing))} "
+                f"extra={sorted(set(packing) - expected_group_ids)}"
             )
-            + 1
-            for spec in self.group_specs
+        packing = {
+            group_id: require_positive_int(
+                f"cache_blocks_per_lcm_block for {group_id!r}", packing[group_id]
+            )
+            for group_id in group_ids
+        }
+        # Both sides come from the plan, so this checks the plan's own
+        # arithmetic: every group's blocks are its packing per parent times
+        # the parent count, plus the reserved null block.
+        expected_counts = {
+            group_id: num_lcm_blocks * packing[group_id] + 1 for group_id in group_ids
         }
         if counts != expected_counts:
             raise ValueError(
@@ -102,9 +132,38 @@ class PagedCacheRuntimeContract:
                 "cache_blocks_per_lcm_block + 1: "
                 f"expected={expected_counts}, got={counts}"
             )
-        max_child_pages = max(counts.values()) - 1
-        if token_capacity > max_child_pages * block_size:
+        virtual_counts = self.virtual_block_counts
+        if max(virtual_counts.values()) - 1 > (1 << 31) - 1:
+            raise ValueError("virtual cache block ID exceeds int32 range")
+        for spec in self.group_specs:
+            if spec.rows_per_page is not None:
+                max_slots = counts[spec.group_id] * spec.rows_per_page
+                if max_slots - 1 > (1 << 31) - 1:
+                    raise ValueError(
+                        f"local cache slots for {spec.group_id!r} exceed int32 range"
+                    )
+        max_child_pages = max(virtual_counts.values()) - 1
+        if token_capacity > max_child_pages * prefix_granularity:
             raise ValueError(
                 "token_capacity exceeds the largest group's child-page capacity"
             )
         object.__setattr__(self, "group_page_counts", MappingProxyType(counts))
+        object.__setattr__(self, "group_packing", MappingProxyType(packing))
+
+    @property
+    def virtual_block_counts(self) -> Mapping[str, int]:
+        """Scheduler block counts, including the null block."""
+        return {
+            spec.group_id: virtual_block_count(
+                self.group_page_counts[spec.group_id], spec.shard_count
+            )
+            for spec in self.group_specs
+        }
+
+    @property
+    def virtual_packing(self) -> Mapping[str, int]:
+        """Scheduler children per parent; physical binding uses group_packing."""
+        return {
+            spec.group_id: self.group_packing[spec.group_id] * spec.shard_count
+            for spec in self.group_specs
+        }

@@ -36,6 +36,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
+from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 from tokenspeed.runtime.layers.quantization import QuantizationConfig as Q
 from tokenspeed.runtime.models.base.execution import (
     CompiledDecoderLayer as _CompiledRuntime,
@@ -45,6 +46,31 @@ from tokenspeed.runtime.models.base.execution import (
 )
 from tokenspeed.runtime.models.base.module_spec import ModuleKind, ModuleSpec
 from tokenspeed.runtime.models.base.placement import ParallelGroup, Partial, Replicate
+
+
+def capture_layer_input(
+    comm_manager: CommManager,
+    residual: torch.Tensor,
+    ctx: ForwardContext,
+    aux_hidden_states: list[torch.Tensor] | None,
+) -> None:
+    """Append a capture layer's input to ``aux_hidden_states`` as full rows.
+
+    Args:
+        comm_manager: The layer's communication policy; gathers RSAG rows.
+        residual: The residual right after the layer's opening (all-reduce +)
+            add, i.e. the reduced layer input even when the previous layer's
+            MLP all-reduce was fused into that add.
+        ctx: The forward context.
+        aux_hidden_states: The taps collected so far; ``None`` when this layer
+            is not captured.
+    """
+    if aux_hidden_states is None:
+        return
+    # Under RSAG the residual is reduce-scattered across the attn TP group;
+    # aux consumers (e.g. the EAGLE3 drafter) expect full rows. Clone because
+    # later norms update the residual in place.
+    aux_hidden_states.append(comm_manager.gather_residual(residual, ctx).clone())
 
 
 def _default_compute_output_placement(
@@ -99,8 +125,10 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=self.is_moe_layer,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     @property
@@ -125,7 +153,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -134,13 +161,7 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             hidden_states, residual
         )
 
-        if aux_hidden_states is not None:
-            # Under RSAG the residual entering this layer is reduce-scattered
-            # across the attn TP group; aux consumers (e.g. the EAGLE3
-            # drafter) expect full rows, so gather before capturing.
-            aux_hidden_states.append(
-                self.comm_manager.gather_residual(residual, ctx).clone()
-            )
+        capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
 
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
 
@@ -148,7 +169,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
         )
 
         hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
@@ -189,7 +209,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -204,7 +223,6 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 aux_hidden_states,
             )
@@ -353,16 +371,28 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         aux_hidden_states: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self._compiled.forward(
-            positions, hidden_states, ctx, out_cache_loc, residual, aux_hidden_states
+            positions, hidden_states, ctx, residual, aux_hidden_states
         )
 
 
 class CompiledMoEDecoderLayer(CompiledDecoderLayer):
+
+    def mlp_spec(self) -> ModuleSpec:
+        if get_all2all_backend().is_gluon_petit():
+            # MegaMoE consumes and returns the rank-local attention-DP token
+            # shard. Its fused kernel owns expert dispatch and combine, so the
+            # layer compiler must not wrap it in the all-gather/reduce-scatter
+            # pair used by local-expert MoE kernels.
+            return ModuleSpec.from_kind(
+                input_placement=Replicate(ParallelGroup.ATTN_TP),
+                output_placement=None,
+                kind=ModuleKind.MOE,
+            )
+        return super().mlp_spec()
 
     @property
     def is_moe_layer(self) -> bool:

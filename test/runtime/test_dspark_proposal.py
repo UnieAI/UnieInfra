@@ -10,13 +10,12 @@ recurrent KDA state still gets committed after a DSpark verify.
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
+import pytest
 import torch
 
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-    _should_update_mamba_state_after_mtp_verify,
-)
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 
 VOCAB = 32
@@ -32,6 +31,42 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
     drafter.markov_head = head
     return drafter
+
+
+# --------------------------------------------------------------------------
+# DeepSeek V4 prefill window seeding
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("declares", [False, True])
+@pytest.mark.parametrize("prefill_disabled", [False, True])
+@pytest.mark.parametrize("decode_disabled", [False, True])
+def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
+    monkeypatch, prefill_disabled, decode_disabled, declares
+):
+    from tokenspeed.runtime.execution import model_executor
+    from tokenspeed.runtime.execution.memory_delta import (
+        NULL_MEMORY_DELTA_OBSERVER,
+    )
+
+    monkeypatch.setattr(model_executor, "workspace_pool", Mock())
+    # A real instance, so the gate resolves the production property.
+    executor = model_executor.ModelExecutor.__new__(model_executor.ModelExecutor)
+    executor.device = "cuda"
+    executor.forward_step = Mock(disable=decode_disabled)
+    executor.prefill_graph = Mock(disable=prefill_disabled)
+    # Explicit: a bare Mock answers truthily, so the gate below would hold anyway.
+    executor.drafter = Mock(captures_prefill_graph=declares)
+    model_executor.ModelExecutor.capture_graphs(
+        executor, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER
+    )
+    if prefill_disabled or not declares:
+        executor.drafter.capture_prefill_graph.assert_not_called()
+    else:
+        # The drafter's own graph is a measured ladder of its own.
+        executor.drafter.capture_prefill_graph.assert_called_once()
+        (stream, _observer), _ = executor.drafter.capture_prefill_graph.call_args
+        assert stream is executor.forward_step.stream
 
 
 # --------------------------------------------------------------------------
@@ -222,54 +257,78 @@ def test_proposals_are_valid_token_ids() -> None:
     assert int(out.min()) >= 0
 
 
-# --------------------------------------------------------------------------
-# Recurrent (KDA) state commit after verify
-# --------------------------------------------------------------------------
+class _ShardIndices:
+    def __init__(self, num_org: int) -> None:
+        self.num_org_elements = num_org
 
 
-class _BackendWithCommit:
-    def update_mamba_state_after_mtp_verify(self, accept_lengths, model):
-        return None
+class _ShardedHead:
+    """Enough of a vocab-parallel head for the block projection to run."""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        self.weight = weight
+        self.shard_indices = _ShardIndices(weight.shape[0])
 
 
-class _BackendWithoutCommit:
-    pass
+def test_the_walk_feeds_each_round_its_own_positions_hoisted_slice() -> None:
+    """The whole proposal walk must hand round k the hoisted projection of
+    position k-1, allowing float32 GEMM rounding across batch shapes."""
+    torch.manual_seed(11)
+    drafter = _drafter()
+    weight = torch.randn(VOCAB, HIDDEN)
+    drafter.lm_head = _ShardedHead(weight)
+    received: list[torch.Tensor] = []
+
+    def fake_argmax(hidden, out=None, bias_fn=None, base_logits=None):
+        assert base_logits is not None, "the walk must use the hoisted slice"
+        assert base_logits.is_contiguous()
+        received.append(base_logits.clone())
+        logits = base_logits.float()
+        if bias_fn is not None:
+            logits = logits + bias_fn(0, logits.shape[-1]).float()
+        argmax = torch.argmax(logits, dim=-1)
+        if out is not None:
+            out.copy_(argmax.view_as(out))
+            return out
+        return argmax
+
+    drafter._greedy_argmax_vocab_parallel = fake_argmax
+    hidden = torch.randn(3, drafter.spec_num_tokens, HIDDEN)
+    ids = torch.zeros(3, drafter.spec_num_tokens, dtype=torch.long)
+    block = torch.randint(0, VOCAB, (3, drafter.spec_num_tokens))
+    drafter._sample_block(hidden, block, ids)
+
+    assert len(received) == drafter.spec_num_tokens - 1
+    for k, got in enumerate(received, start=1):
+        want = hidden[:, k - 1, :].to(weight.dtype) @ weight.T
+        torch.testing.assert_close(got, want)
 
 
-def test_kda_commit_fires_for_a_dspark_drafter() -> None:
-    """K3's recurrent state must be committed after a DSpark verify too.
+def test_the_block_projection_matches_projecting_each_position() -> None:
+    """The walk is semi-autoregressive, so the projection is hoisted out of it
+    while the bias and the argmax stay behind. A layout slip here would feed
+    each position another position's logits and go unnoticed: every proposal
+    would still be a valid token id."""
+    rows, positions = 3, 8
+    drafter = _drafter(spec_num_tokens=positions)
+    torch.manual_seed(1)
+    weight = torch.randn(VOCAB, HIDDEN)
+    drafter.lm_head = _ShardedHead(weight)
+    draft_hidden = torch.randn(rows, positions, HIDDEN)
 
-    The hook keys on the backend, not the algorithm, so DSpark inherits it --
-    this test is what keeps that true if the predicate ever grows an
-    algorithm check.
-    """
-    assert _should_update_mamba_state_after_mtp_verify(
-        drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithCommit(),
-        forward_mode=ForwardMode.DECODE,
-    )
+    block = drafter._block_base_logits(draft_hidden)
 
-
-def test_kda_commit_is_skipped_without_a_drafter() -> None:
-    assert not _should_update_mamba_state_after_mtp_verify(
-        drafter=None,
-        attn_backend=_BackendWithCommit(),
-        forward_mode=ForwardMode.DECODE,
-    )
-
-
-def test_kda_commit_is_skipped_on_a_stateless_backend() -> None:
-    assert not _should_update_mamba_state_after_mtp_verify(
-        drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithoutCommit(),
-        forward_mode=ForwardMode.DECODE,
-    )
+    assert block is not None
+    assert block.shape == (positions, rows, VOCAB)
+    for k in range(positions):
+        expected = torch.matmul(draft_hidden[:, k, :], weight.T)
+        assert torch.allclose(block[k], expected, atol=1e-5), f"position {k}"
 
 
-def test_kda_commit_is_skipped_outside_decode() -> None:
-    """Prefill writes state inline; there is no verify to commit."""
-    assert not _should_update_mamba_state_after_mtp_verify(
-        drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithCommit(),
-        forward_mode=ForwardMode.EXTEND,
-    )
+def test_the_block_projection_stands_down_without_a_sharded_head() -> None:
+    """Drafters whose head carries no shard metadata keep the per-step path."""
+    drafter = _drafter(spec_num_tokens=4)
+    assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+
+    drafter.lm_head = _ShardedHead(torch.randn(0, HIDDEN))
+    assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None

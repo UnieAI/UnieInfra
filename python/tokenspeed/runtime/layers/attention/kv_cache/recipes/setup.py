@@ -22,44 +22,51 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Literal
 
-import torch
-
-from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-    prepare_deepseek_v4_cache,
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
+    DeepseekV41Recipe,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.dots3_note import (
+    Dots3NoteRecipe,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
+    Glm53FlashRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
-    prepare_inkling_cache,
+    InklingRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-    prepare_kimi_k3_cache,
+    KimiK3Recipe,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.mamba2 import (
+    Mamba2Recipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    prepare_ordinary_cache,
+    OrdinaryRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
+    Qwen4ExpRecipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
-    prepare_qwen35_cache,
+    QwenGDNRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+    CacheStoragePlan,
 )
 
-CacheModelFamily = Literal[
-    "mha",
-    "mla",
-    "dsa",
-    "msa",
-    "qwen_gdn",
-    "inkling",
-    "kimi_k3",
-    "deepseek_v4",
-]
+# A cache family names one registered recipe and pool factory. The in-tree
+# families are mha, mla, dsa, msa, qwen_gdn, qwen4_exp, mamba2, inkling,
+# kimi_k3, glm53_flash and deepseek_v41; plugins register their own.
+CacheModelFamily = str
 
 
 @dataclass(frozen=True)
@@ -69,30 +76,13 @@ class CachePoolSpec:
     family: CacheModelFamily
     memory_plan: CacheMemoryPlan
     layer_types: tuple[str, ...]
-    layer_group_ids: tuple[str, ...]
-    # Scheduler group specs, computed once by the recipe. The pool aligns
-    # their physical fields (packing) with the memory plan and publishes the
-    # runtime contract from the pair.
-    paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...]
-    state_field_dtypes: Mapping[str, torch.dtype]
+    # Scheduler group specs, declared next to the fields the plan was packed
+    # from (CacheRecipe.groups), so the plan and the specs name one group set.
+    cache_group_specs: tuple[CacheGroupSpec, ...]
     token_capacity: int
     layer_kv_head_counts: tuple[int, ...] | None = None
-    # Per-layer KV head_dim. Only set for models whose layers disagree about it
-    # (gemma-4: 4 x 512 on the ten global layers against 16 x 256 on the
-    # sliding half); None keeps the pool on its one-geometry path.
-    layer_kv_head_dims: tuple[int, ...] | None = None
     pool_options: object | None = None
-
-    @property
-    def pool_size(self) -> int:
-        max_packing = max(
-            group.cache_blocks_per_lcm_block for group in self.memory_plan.groups
-        )
-        return (
-            self.memory_plan.num_lcm_blocks
-            * max_packing
-            * self.memory_plan.logical_block_tokens
-        )
+    storage_plan: CacheStoragePlan | None = None
 
     def layer_view(
         self,
@@ -100,15 +90,15 @@ class CachePoolSpec:
         first_layer: int,
         num_layers: int,
         family: CacheModelFamily | None = None,
-        publish_runtime_contract: bool = True,
     ) -> CachePoolSpec:
         """Describe one concrete compute view over this spec's shared arena.
 
-        The memory plan and scheduler geometry stay merged. Only per-layer
-        compute metadata is sliced; a secondary view inherits the target's
-        published contract instead of publishing the same groups again.
+        The memory plan and scheduler geometry stay merged, group specs
+        included: publication is not a view's concern. Only per-layer compute
+        metadata is sliced. The arena publishes the contract once, from the
+        merged spec, so no view can republish or diverge from it.
         """
-        total_layers = len(self.layer_group_ids)
+        total_layers = len(self.layer_types)
         if first_layer < 0 or num_layers < 0:
             raise ValueError("cache layer view bounds must be non-negative")
         last_layer = first_layer + num_layers
@@ -117,42 +107,27 @@ class CachePoolSpec:
                 f"cache layer view [{first_layer}, {last_layer}) exceeds "
                 f"the merged {total_layers}-layer spec"
             )
-        if self.layer_types and len(self.layer_types) != total_layers:
-            raise ValueError("cache layer types must be empty or cover every layer")
         if self.layer_kv_head_counts is not None and (
             len(self.layer_kv_head_counts) != total_layers
         ):
             raise ValueError("cache KV head counts must cover every layer")
-        if self.layer_kv_head_dims is not None and (
-            len(self.layer_kv_head_dims) != total_layers
-        ):
-            raise ValueError("cache KV head dims must cover every layer")
-        if self.layer_kv_head_dims is not None and self.layer_kv_head_counts is None:
-            # One-directional on purpose. Counts alone is a real and supported
-            # state (inkling: narrower layers, one head_dim). Dims alone is not:
-            # a layer would be sized at the ALLOCATION head count against its
-            # own head_dim, which is wider than its field, so the row view
-            # would run past the buffer.
-            raise ValueError("cache KV head dims require the matching head counts")
+        # A family whose pool options are themselves per-layer (V4's kernel
+        # cache layout) narrows them to the same window; anything else is a
+        # whole-pool fact and travels unchanged.
+        narrow_options = getattr(self.pool_options, "layer_view", None)
         return replace(
             self,
             family=family or self.family,
-            layer_types=(
-                self.layer_types[first_layer:last_layer] if self.layer_types else ()
-            ),
-            layer_group_ids=self.layer_group_ids[first_layer:last_layer],
+            layer_types=self.layer_types[first_layer:last_layer],
             layer_kv_head_counts=(
                 self.layer_kv_head_counts[first_layer:last_layer]
                 if self.layer_kv_head_counts is not None
                 else None
             ),
-            layer_kv_head_dims=(
-                self.layer_kv_head_dims[first_layer:last_layer]
-                if self.layer_kv_head_dims is not None
-                else None
-            ),
-            paged_cache_group_specs=(
-                self.paged_cache_group_specs if publish_runtime_contract else ()
+            pool_options=(
+                narrow_options(first_layer=first_layer, num_layers=num_layers)
+                if narrow_options is not None
+                else self.pool_options
             ),
         )
 
@@ -174,21 +149,32 @@ class CacheSetup:
     num_draft_layers: int
     cache_budget_bytes: int
     fixed_workspace_bytes: int
+    # The linear backend verifies from paged state and owns the planned
+    # ``fixed_workspace_bytes`` of verify staging.
+    uses_paged_state_verify: bool
 
     @property
     def num_target_layers(self) -> int:
-        return len(self.spec.layer_group_ids) - self.num_draft_layers
+        return len(self.spec.layer_types) - self.num_draft_layers
 
 
-_PREPARE_CACHE = {
-    "mha": partial(prepare_ordinary_cache, family="mha"),
-    "mla": partial(prepare_ordinary_cache, family="mla"),
-    "dsa": partial(prepare_ordinary_cache, family="dsa"),
-    "msa": partial(prepare_ordinary_cache, family="msa"),
-    "qwen_gdn": prepare_qwen35_cache,
-    "inkling": prepare_inkling_cache,
-    "kimi_k3": prepare_kimi_k3_cache,
-    "deepseek_v4": prepare_deepseek_v4_cache,
+# family -> how to build its recipe. Every family runs the one pipeline in
+# CacheRecipe.setup(); the class only fills in that family's seams, and the
+# four ordinary families differ by nothing but the family label. Plugins add
+# families via ``tokenspeed.runtime.plugins.registry.register_cache_recipe``.
+_RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
+    "mha": partial(OrdinaryRecipe, family="mha"),
+    "mla": partial(OrdinaryRecipe, family="mla"),
+    "dsa": partial(OrdinaryRecipe, family="dsa"),
+    "msa": partial(OrdinaryRecipe, family="msa"),
+    "qwen_gdn": QwenGDNRecipe,
+    "qwen4_exp": Qwen4ExpRecipe,
+    "mamba2": Mamba2Recipe,
+    "inkling": InklingRecipe,
+    "kimi_k3": KimiK3Recipe,
+    "glm53_flash": Glm53FlashRecipe,
+    "deepseek_v41": DeepseekV41Recipe,
+    "dots3_note": Dots3NoteRecipe,
 }
 
 
@@ -197,24 +183,32 @@ def prepare_cache_setup(
     family: CacheModelFamily,
     server_args,
     model_config,
-    attn_config: BaseAttnConfig,
+    attn_config: AttnConfig,
     draft_model_config,
-    draft_attn_config: BaseAttnConfig | None,
+    draft_attn_config: AttnConfig | None,
     cache_budget_bytes: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
+    probe_batch_rows: int | None,
 ) -> CacheSetup:
     """Apply one model recipe and size target/draft arenas from one budget."""
-    prepare = _PREPARE_CACHE.get(family)
-    if prepare is None:
-        raise ValueError(f"unsupported cache model family: {family}")
-    return prepare(
+    return cache_recipe(
+        family,
         server_args=server_args,
         model_config=model_config,
         attn_config=attn_config,
         draft_model_config=draft_model_config,
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=cache_budget_bytes,
+        probe_batch_rows=probe_batch_rows,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
-    )
+    ).setup()
+
+
+def cache_recipe(family: CacheModelFamily, **kwargs) -> CacheRecipe:
+    """The family's recipe, built but not yet set up."""
+    recipe = _RECIPES.get(family)
+    if recipe is None:
+        raise ValueError(f"unsupported cache model family: {family}")
+    return recipe(**kwargs)

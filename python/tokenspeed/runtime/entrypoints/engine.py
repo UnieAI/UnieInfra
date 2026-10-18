@@ -31,6 +31,7 @@ This file implements python APIs for the inference engine.
 # ruff: noqa: E402
 import asyncio
 import atexit
+import contextlib
 import copy
 import dataclasses
 import multiprocessing as mp
@@ -40,11 +41,10 @@ import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
 
-import zmq
-import zmq.asyncio
-
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
+from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.service import metrics_service
 
 
 def _ignore_threading_atexit(*args, **kwargs) -> None:
@@ -57,23 +57,28 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 import torch
 import uvloop
 
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
-    EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
-    RpcReqInput,
-    RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
 from tokenspeed.runtime.utils import (
@@ -81,13 +86,18 @@ from tokenspeed.runtime.utils import (
     configure_logger,
     get_colorful_logger,
     launch_dummy_health_check_server,
+    launch_metrics_server,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import interface_for_host
-from tokenspeed.runtime.utils.process import kill_process_tree
+from tokenspeed.runtime.utils.process import (
+    kill_process_tree,
+    receive_ready_messages,
+    start_process_with_ready_pipe,
+)
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from tokenspeed.version import __version__
@@ -125,19 +135,23 @@ class Engine(EngineBase):
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
 
+        self.server_args = server_args
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
         # Allocate ports for inter-process communications
         self.port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
         # Launch subprocesses
-        tokenizer_manager, _, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-            port_args=self.port_args,
-        )
-        self.server_args = server_args
+        try:
+            tokenizer_manager, _, scheduler_info = _launch_subprocesses(
+                server_args=server_args,
+                port_args=self.port_args,
+            )
+        except BaseException:
+            self.shutdown()
+            raise
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
@@ -173,16 +187,6 @@ class Engine(EngineBase):
         ``tokenspeed.runtime.engine.io_struct.GenerateReqInput``.
         Please refer to ``GenerateReqInput`` for the documentation.
         """
-        if self.server_args.mapping.has_attn_dp:
-            if data_parallel_rank is None:
-                logger.debug("data_parallel_rank not provided, using default dispatch")
-            elif data_parallel_rank < 0:
-                raise ValueError("data_parallel_rank must be non-negative")
-            elif data_parallel_rank >= self.server_args.mapping.attn.dp_size:
-                raise ValueError(
-                    f"data_parallel_rank must be less than dp_size: {self.server_args.mapping.attn.dp_size}"
-                )
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -199,26 +203,12 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            data_parallel_rank=data_parallel_rank,
         )
         if stream:
             return self.llm.generate_stream(obj)
         else:
             return self.llm.generate(obj)
-
-    def encode(
-        self,
-        prompt: list[str] | str | None = None,
-        input_ids: list[list[int]] | list[int] | None = None,
-    ) -> dict | list[dict]:
-        """Embed one prompt or a batch; returns ``{"embedding": [...], ...}``.
-
-        The pooling counterpart of :meth:`generate`, and the only entry point
-        for an embedding server -- ``generate`` is refused on one, and
-        ``encode`` is refused on a generative one, because a server is one or
-        the other (no engine in the xref survey serves both at once).
-        """
-        obj = EmbeddingReqInput(text=prompt, input_ids=input_ids)
-        return self.llm.generate(obj)
 
     async def async_generate(
         self,
@@ -244,6 +234,7 @@ class Engine(EngineBase):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         user_rid: list[str] | str | None = None,
+        data_parallel_rank: list[int] | int | None = None,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function match
@@ -271,6 +262,7 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             user_rid=user_rid,
+            data_parallel_rank=data_parallel_rank,
         )
         generator = self.tokenizer_manager.generate_request(obj)
 
@@ -306,6 +298,7 @@ class Engine(EngineBase):
             logger.exception("Failed to close the disaggregation bootstrap server")
         finally:
             kill_process_tree(os.getpid(), include_parent=False)
+            metrics_service.close(timeout=2.0)
 
     def __enter__(self):
         return self
@@ -335,19 +328,12 @@ class Engine(EngineBase):
     def stop_profile(self):
         self.llm.run(self.tokenizer_manager.stop_profile())
 
-    def start_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.start_expert_distribution_record())
-
-    def stop_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.stop_expert_distribution_record())
-
-    def dump_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.dump_expert_distribution_record())
-
     def get_server_info(self):
         internal_states = self.llm.run(self.tokenizer_manager.get_internal_state())
+        server_args = dataclasses.asdict(self.tokenizer_manager.server_args)
+        server_args.pop("rl_control_api_key", None)
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
+            **server_args,
             **self.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
@@ -388,16 +374,86 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        *,
+        weight_version: str | None,
     ):
-        """Update weights from distributed source."""
+        """Update weights from distributed source.
+
+        ``weight_version`` is required. Pass ``None`` to keep the current
+        namespace on an intermediate update. Flushed L3 updates must pass
+        a caller-supplied identity so independent checkpoints cannot share
+        a minted successor.
+        """
+        if (
+            flush_cache
+            and weight_version is None
+            and self.server_args.kvstore_storage_backend is not None
+        ):
+            return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            weight_version,
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            weight_version=weight_version,
         )
-        return self.llm.run(self.tokenizer_manager.update_weights_from_distributed(obj))
+        result = self.llm.run(
+            self.tokenizer_manager.update_weights_from_distributed(obj)
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
+
+    def update_weights_from_mooncake(
+        self,
+        version: int,
+        *,
+        flush_cache: bool,
+        weight_version: str | None,
+    ):
+        """Load one committed Model Updater SDK version on every worker.
+
+        ``flush_cache`` selects whether the KV caches are dropped and a new
+        weight namespace published, so it is explicit here; only the HTTP
+        route defaults it, for the reference engine's trainer clients.
+        ``weight_version`` is required. Pass ``None`` to publish
+        ``str(version)`` on a flushed load, or to keep the current namespace
+        on an intermediate (unflushed) one (``mooncake_load_weight_version``).
+        """
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            mooncake_load_weight_version(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            ),
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
+        obj = UpdateWeightsFromMooncakeReqInput(
+            version=version,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+        result = self.llm.run(self.tokenizer_manager.update_weights_from_mooncake(obj))
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
+
+    def rebalance_experts(self) -> tuple[bool, str]:
+        """Start one online expert rebalance now (``--enable-eplb``)."""
+        return self.llm.run(
+            self.tokenizer_manager.rebalance_experts(RebalanceExpertsReqInput())
+        )
 
     def update_weights_from_tensor(
         self,
@@ -452,25 +508,6 @@ class Engine(EngineBase):
         """Return whether any GPU memory is currently released (data-plane sleep)."""
         return self.llm.run(self.tokenizer_manager.is_sleeping())
 
-    """
-    Execute an RPC call on all scheduler processes.
-    """
-
-    def collective_rpc(self, method: str, **kwargs):
-        obj = RpcReqInput(method=method, parameters=kwargs)
-        self.send_to_rpc.send_pyobj(obj)
-        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
-        if not isinstance(recv_req, RpcReqOutput):
-            raise TypeError(f"Expected RpcReqOutput, got {type(recv_req).__name__}.")
-        if not recv_req.success:
-            raise RuntimeError(recv_req.message)
-
-    def save_remote_model(self, **kwargs):
-        self.collective_rpc("save_remote_model", **kwargs)
-
-    def save_sharded_model(self, **kwargs):
-        self.collective_rpc("save_sharded_model", **kwargs)
-
 
 def _set_socket_interface(server_args: ServerArgs):
     """Point gloo and NCCL at the interface that reaches the head node.
@@ -496,79 +533,71 @@ def _set_socket_interface(server_args: ServerArgs):
     logger.info(f"socket interface reaching {head}: {interface}")
 
 
-def _check_peer_access(server_args: ServerArgs):
-    """Refuse a multi-GPU launch whose devices cannot reach each other.
-
-    The collectives and the CUDA-graph capture both assume peer access. Without
-    it the launch dies deep inside capture with ``CUDART error: peer access is
-    not supported between these two devices`` -- after weights have loaded,
-    with no indication of which devices are at fault or which pairing would
-    work. On a PCIe box only devices behind the same switch are peers, so the
-    valid pairings are a property of the machine that the operator has to pick,
-    not something the engine can work around.
-
-    This follows the same habit as vLLM refusing ``max_num_seqs`` above the
-    recurrent-cache block count: fail at startup, and name the value to use.
-    """
-    world_size = getattr(getattr(server_args, "mapping", None), "world_size", None)
-    if not world_size or world_size < 2:
-        return
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return
-        count = torch.cuda.device_count()
-        if count < 2:
-            return
-        blocked = [
-            (i, j)
-            for i in range(count)
-            for j in range(i + 1, count)
-            if not torch.cuda.can_device_access_peer(i, j)
-        ]
-    except Exception as exc:  # pragma: no cover - diagnostic only
-        logger.debug("peer-access check skipped: %s", exc)
-        return
-    if not blocked:
-        return
-    peers = [
-        (i, j)
-        for i in range(count)
-        for j in range(i + 1, count)
-        if (i, j) not in blocked
-    ]
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "all")
-    raise ValueError(
-        f"CUDA_VISIBLE_DEVICES={visible} exposes {count} devices, but these "
-        f"pairs cannot peer-access each other: {blocked}. Multi-GPU serving "
-        f"needs peers throughout. Peer-capable pairs among the visible "
-        f"devices: {peers or 'none'} (indices are post-CUDA_VISIBLE_DEVICES; "
-        f"check `nvidia-smi topo -m` for the physical ones -- PIX pairs peer, "
-        f"NODE pairs do not)."
-    )
+def _force_env(owner: str, key: str, value: str) -> None:
+    """Set ``key`` to ``value``: ``owner``'s promise beats the ambient
+    environment, so a conflicting value is replaced, loudly, instead of
+    silently voiding it."""
+    prior = os.environ.get(key)
+    if prior is not None and prior != value:
+        logger.warning(f"{owner} replaces {key}={prior} with {value}")
+    os.environ[key] = value
 
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
-    if not server_args.enable_symm_mem:
-        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    if server_args.disable_symm_mem:
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    if server_args.disable_nccl_nvls:
+        os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    if getattr(server_args, "_beam_checkpoint", False) is None:
+        # A hub id the local cache does not hold yet (a first launch): fetch
+        # its config.json now, before any process starts.
+        server_args.resolve_model_defaults(download=True)
+        if server_args._beam_checkpoint:
+            # Beam's all-reduce fusion default across nodes reads the
+            # checkpoint as well (ServerArgs.resolve_communication): resolve
+            # it again from the downloaded file, as from a directory, so that
+            # every node of a launch decides it from the same config.json
+            # whatever its cache held when its arguments resolved.
+            server_args.resolve_communication()
+            server_args.resolve_numerics()
+        if server_args._beam_checkpoint is None and not server_args.disable_tf32:
+            logger.warning(
+                f"Cannot read the config.json of {server_args.model} before "
+                "launch, so TF32 stays at its default. For a Beam checkpoint, "
+                "pass its local directory as --model or pass --disable-tf32 so "
+                "that its FP32 router runs without TF32."
+            )
     if not server_args.disable_tf32:
         # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    if getattr(server_args, "_beam_checkpoint", False):
+        # Beam serves without TF32 (ServerArgs.resolve_model_defaults): both
+        # switches off for the processes started below, whatever the caller
+        # exported.
+        for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"):
+            _force_env("Beam (no TF32)", key, "0")
+    if server_args.numerics in BITWISE_ENVELOPES:
+        # Bitwise envelopes: no TF32 anywhere, and pin NCCL to one
+        # algorithm/protocol so the reduction association order cannot switch
+        # with message size. The envelope's promise beats ambient
+        # environment (_force_env).
+        for key, value in (
+            ("NVIDIA_TF32_OVERRIDE", "0"),
+            ("NCCL_ALGO", "Ring"),
+            ("NCCL_PROTO", "Simple"),
+        ):
+            _force_env(f"--numerics {server_args.numerics}", key, value)
 
     _set_socket_interface(server_args)
 
-    _check_peer_access(server_args)
-
     # Set prometheus env vars
-    if server_args.enable_metrics:
+    if metrics_enabled(server_args, "prometheus"):
         set_prometheus_multiproc_dir()
 
     # Set ulimit
@@ -590,6 +619,14 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _scheduler_ranks(server_args: ServerArgs) -> range:
+    """Global ranks of the scheduler processes this node launches."""
+    if server_args.emulate_rank_zero:
+        return range(1)
+    rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
+    return range(rank_start, rank_start + server_args.mapping.nprocs_per_node)
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -599,16 +636,19 @@ def _launch_subprocesses(
     # Configure global environment
     configure_logger(server_args)
     _set_envs_and_config(server_args)
+    metrics_service.prepare(server_args)
 
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info("server_args=%r", server_args)
+        logger.info(f"server_args={server_args!r}")
 
     # If using model from www.modelscope.cn, first download the model.
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
         server_args.model, server_args.tokenizer
     )
+
+    metrics_service.start(server_args, port_args)
 
     scheduler_procs = []
     if not server_args.mapping.attn.has_dp:
@@ -618,45 +658,34 @@ def _launch_subprocesses(
         )
 
         scheduler_pipe_readers = []
-        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
-        rank_end = rank_start + server_args.mapping.nprocs_per_node
-        for rank in range(rank_start, rank_end):
+        for rank in _scheduler_ranks(server_args):
             # Create per-rank server_args with rank-initialized mapping
             rank_server_args = copy.copy(server_args)
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
             rank_server_args.mapping.rank = rank
 
-            reader, writer = mp.Pipe(duplex=False)
-
-            proc = mp.Process(
-                target=run_event_loop,
-                args=(
-                    rank_server_args,
-                    port_args,
-                    writer,
-                ),
+            proc, reader = start_process_with_ready_pipe(
+                run_event_loop,
+                (rank_server_args, port_args),
+                memory_saver_adapter.configure_subprocess(),
             )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
         # Launch the data parallel controller
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers = [reader]
-        proc = mp.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
+        proc, reader = start_process_with_ready_pipe(
+            run_data_parallel_controller_process,
+            (server_args, port_args),
+            contextlib.nullcontext(),
         )
-        proc.start()
+        scheduler_pipe_readers = [reader]
         scheduler_procs.append(proc)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
+        for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
                     "Initialization failed. Please see the error messages above."
@@ -667,17 +696,22 @@ def _launch_subprocesses(
             return None, None, None
 
         launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
+            server_args.host,
+            server_args.port,
+            metrics_enabled(server_args, "prometheus"),
         )
 
         for proc in scheduler_procs:
             proc.join()
             logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
-                proc.pid,
-                proc.exitcode,
+                f"Scheduler or DataParallelController {proc.pid!s} terminated with "
+                f"{proc.exitcode!s}",
             )
         return None, None, None
+
+    # Follower nodes (node_rank >= 1) serve /metrics from the dummy
+    # health-check server above; the main node gets the dedicated endpoint.
+    launch_metrics_server(server_args)
 
     # Launch the main-process async frontend. The detokenizer runs
     # inline inside AsyncLLM — no separate subprocess.
@@ -685,17 +719,7 @@ def _launch_subprocesses(
 
     # Wait for the model to finish loading
     scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                "Rank %s scheduler is dead. Please check if there are relevant logs.", i
-            )
-            scheduler_procs[i].join()
-            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
-            raise
-
+    for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
         if data["status"] != "ready":
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
@@ -709,6 +733,9 @@ def _launch_subprocesses(
         "max_single_request_tokens"
     ]
     tokenizer_manager.context_len = scheduler_info["max_model_len"]
+    tokenizer_manager.supports_prompt_logprobs = scheduler_info[
+        "supports_prompt_logprobs"
+    ]
     return tokenizer_manager, None, scheduler_info
 
 
@@ -718,7 +745,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     Headless: no in-process tokenizer_manager and no AsyncLLM detokenizer (SMG
     owns both). This process only spawns and
     supervises the scheduler workers, which connect out to the SMG-bound
-    handshake/input/output sockets (see engine.event_loop._init_msgpack_transport),
+    handshake/input/output sockets (see zmq_msgpack.connect_msgpack_engine_for_loop),
     then blocks until they exit.
 
     Forces ``--zmq-msgpack`` + ``--skip-tokenizer-init`` since SMG passes
@@ -730,21 +757,11 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     server_args.zmq_msgpack = True
     server_args.skip_tokenizer_init = True
     # DP > 1: each rank dials the frontend with its own engine identity
-    # (zmq_engine_index + dp_rank) in event_loop._init_msgpack_transport, the
+    # (zmq_engine_index + dp_rank) in zmq_msgpack.connect_msgpack_engine_for_loop, the
     # choke point shared with the non-headless --zmq-msgpack launch path.
 
     configure_logger(server_args)
     _set_envs_and_config(server_args)
-
-    # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
-    # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.
-    port_args = PortArgs.init_new(server_args)
-    logger.info("headless server_args=%r", server_args)
-
-    server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
-        server_args.model, server_args.tokenizer
-    )
-
     scheduler_procs: list[mp.Process] = []
     scheduler_pipe_readers = []
 
@@ -756,69 +773,66 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     def _terminate_schedulers(signum=None, _frame=None):
         """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
         if signum is not None:
-            logger.info("received signal %s; terminating scheduler(s)", signum)
+            logger.info(f"received signal {signum!s}; terminating scheduler(s)")
         if signum == signal.SIGUSR1:
             child_failed.set()
         for proc in scheduler_procs:
             if proc.is_alive():
                 proc.terminate()
 
-    # Install before spawning so a signal in the launch window is not lost;
-    # an unhandled SIGUSR1 would kill this supervisor without cleanup.
-    signal.signal(signal.SIGTERM, _terminate_schedulers)
-    signal.signal(signal.SIGINT, _terminate_schedulers)
-    signal.signal(signal.SIGUSR1, _terminate_schedulers)
-
-    if not server_args.mapping.attn.has_dp:
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
-        rank_end = rank_start + server_args.mapping.nprocs_per_node
-        for rank in range(rank_start, rank_end):
-            rank_server_args = copy.copy(server_args)
-            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-            rank_server_args.mapping.rank = rank
-
-            reader, writer = mp.Pipe(duplex=False)
-            proc = mp.Process(
-                target=run_event_loop,
-                args=(rank_server_args, port_args, writer),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
-    else:
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers.append(reader)
-        proc = mp.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
-        )
-        proc.start()
-        scheduler_procs.append(proc)
-
     try:
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(
-                    "Rank %s scheduler is dead. Please check if there are "
-                    "relevant logs.",
-                    i,
+        metrics_service.prepare(server_args)
+        # Headless runs no dummy health-check server on any node, so every node
+        # serves its own /metrics here.
+        launch_metrics_server(server_args)
+
+        # PortArgs is still derived (nccl_port drives torch.distributed); the
+        # pickle scheduler_input/tokenizer IPC names are unused in msgpack mode.
+        port_args = PortArgs.init_new(server_args)
+        logger.info(f"headless server_args={server_args!r}")
+        server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
+            server_args.model, server_args.tokenizer
+        )
+
+        # Install before spawning so a signal in the launch window is not lost;
+        # an unhandled SIGUSR1 would kill this supervisor without cleanup.
+        signal.signal(signal.SIGTERM, _terminate_schedulers)
+        signal.signal(signal.SIGINT, _terminate_schedulers)
+        signal.signal(signal.SIGUSR1, _terminate_schedulers)
+
+        metrics_service.start(server_args, port_args)
+        if not server_args.mapping.attn.has_dp:
+            memory_saver_adapter = TorchMemorySaverAdapter.create(
+                enable=server_args.enable_memory_saver
+            )
+            for rank in _scheduler_ranks(server_args):
+                rank_server_args = copy.copy(server_args)
+                rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+                rank_server_args.mapping.rank = rank
+
+                proc, reader = start_process_with_ready_pipe(
+                    run_event_loop,
+                    (rank_server_args, port_args),
+                    memory_saver_adapter.configure_subprocess(),
                 )
-                scheduler_procs[i].join()
-                logger.error("Exit code: %s", scheduler_procs[i].exitcode)
-                raise
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
+        else:
+            proc, reader = start_process_with_ready_pipe(
+                run_data_parallel_controller_process,
+                (server_args, port_args),
+                contextlib.nullcontext(),
+            )
+            scheduler_pipe_readers.append(reader)
+            scheduler_procs.append(proc)
+        for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."
                 )
         logger.info(
-            "headless scheduler(s) ready; SMG handshake endpoint=%s",
-            server_args.zmq_handshake_endpoint(),
+            "headless scheduler(s) ready; SMG handshake endpoint="
+            f"{server_args.zmq_handshake_endpoint()!s}",
         )
 
         # Supervise until every scheduler exits. If any rank dies (e.g. OOM
@@ -834,14 +848,13 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 alive.remove(proc)
                 if proc.exitcode == 0:
                     logger.info(
-                        "scheduler %s exited with code %s", proc.pid, proc.exitcode
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}",
                     )
                 else:
                     logger.error(
-                        "scheduler %s exited with code %s; terminating the "
+                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}; "
+                        "terminating the "
                         "remaining scheduler(s)",
-                        proc.pid,
-                        proc.exitcode,
                     )
                     failed = True
                     _terminate_schedulers()
@@ -853,7 +866,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         _terminate_schedulers()
         for proc in scheduler_procs:
             proc.join(timeout=5)
-        kill_process_tree(os.getpid(), include_parent=False)
+        if scheduler_procs:
+            kill_process_tree(os.getpid(), include_parent=False)
+        metrics_service.close(timeout=2.0)
 
 
 def run_scheduler_headless_from_cli(argv: list[str] | None = None) -> None:

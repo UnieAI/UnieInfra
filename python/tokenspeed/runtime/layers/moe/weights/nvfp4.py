@@ -25,9 +25,11 @@ from torch import nn
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.loaders import (
+    load_per_expert_input_scale,
+    load_per_tensor_input_scale,
+    load_per_tensor_weight_scale,
     make_group_scale_loader,
     make_weight_loader,
-    per_tensor_scale_loader,
 )
 from tokenspeed.runtime.utils import set_weight_attrs
 
@@ -39,17 +41,18 @@ def create_nvfp4_weight_pair(
     group_size: int,
 ) -> None:
     ispp = spec.intermediate_size // spec.tp_size
+    w13_rows = 2 * ispp if spec.gated else ispp
     w13_weight = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
-            2 * ispp,
+            w13_rows,
             spec.hidden_size // 2,
             dtype=torch.uint8,
         ),
         requires_grad=False,
     )
     w2_weight = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
             spec.hidden_size,
             ispp // 2,
@@ -61,16 +64,16 @@ def create_nvfp4_weight_pair(
     layer.register_parameter("w2_weight", w2_weight)
 
     w13_weight_scale = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
-            2 * ispp,
+            w13_rows,
             spec.hidden_size // group_size,
             dtype=torch.float8_e4m3fn,
         ),
         requires_grad=False,
     )
     w2_weight_scale = torch.nn.Parameter(
-        torch.empty(
+        torch.zeros(
             spec.num_local_experts,
             spec.hidden_size,
             ispp // group_size,
@@ -82,7 +85,10 @@ def create_nvfp4_weight_pair(
     layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
     w13_weight_scale_2 = torch.nn.Parameter(
-        torch.empty(spec.num_local_experts, 2, dtype=torch.float32),
+        torch.empty(
+            (spec.num_local_experts, 2) if spec.gated else (spec.num_local_experts,),
+            dtype=torch.float32,
+        ),
         requires_grad=False,
     )
     w2_weight_scale_2 = torch.nn.Parameter(
@@ -90,12 +96,12 @@ def create_nvfp4_weight_pair(
         requires_grad=False,
     )
     w13_input_scale = torch.nn.Parameter(
-        torch.empty(spec.num_local_experts, 2, dtype=torch.float32),
-        requires_grad=False,
+        torch.zeros(1, dtype=torch.float32), requires_grad=False
     )
+    # The second GEMM reads each expert's own intermediate rows, so its activation
+    # scale stays per expert; collapsing it would quantize most experts far too coarsely.
     w2_input_scale = torch.nn.Parameter(
-        torch.empty(spec.num_local_experts, dtype=torch.float32),
-        requires_grad=False,
+        torch.zeros(spec.num_local_experts, dtype=torch.float32), requires_grad=False
     )
     layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
     layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -104,15 +110,16 @@ def create_nvfp4_weight_pair(
 
     weight_loader = make_weight_loader(spec)
     scale_loader = make_group_scale_loader(spec)
-    per_tensor_loader = per_tensor_scale_loader()
     set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
     set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
     set_weight_attrs(w13_weight_scale, {"weight_loader": scale_loader})
     set_weight_attrs(w2_weight_scale, {"weight_loader": scale_loader})
-    set_weight_attrs(w13_weight_scale_2, {"weight_loader": per_tensor_loader})
-    set_weight_attrs(w2_weight_scale_2, {"weight_loader": per_tensor_loader})
-    set_weight_attrs(w13_input_scale, {"weight_loader": per_tensor_loader})
-    set_weight_attrs(w2_input_scale, {"weight_loader": per_tensor_loader})
+    set_weight_attrs(
+        w13_weight_scale_2, {"weight_loader": load_per_tensor_weight_scale}
+    )
+    set_weight_attrs(w2_weight_scale_2, {"weight_loader": load_per_tensor_weight_scale})
+    set_weight_attrs(w13_input_scale, {"weight_loader": load_per_tensor_input_scale})
+    set_weight_attrs(w2_input_scale, {"weight_loader": load_per_expert_input_scale})
 
 
 __all__ = ["create_nvfp4_weight_pair"]

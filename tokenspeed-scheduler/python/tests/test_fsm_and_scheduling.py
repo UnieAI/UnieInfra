@@ -32,12 +32,13 @@ Covers:
 
 import pytest
 from tokenspeed_scheduler import (
+    PD,
+    AttnKind,
+    CacheGroupConfig,
+    CacheTransferPolicy,
     ExecutionEvent,
     ExecutionPlan,
     ForwardEvent,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -51,22 +52,21 @@ from tokenspeed_scheduler import (
 def make_config(
     max_scheduled_tokens: int = 512,
     max_batch_size: int = 8,
-    page_size: int = 16,
+    prefix_granularity: int = 16,
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.block_size = page_size
+    cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    cfg.num_snapshot_pages = 1  # never retracts
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id="full_attention",
-            rows_per_page=page_size,
-            entry_stride_tokens=1,
+            block_granularity=prefix_granularity,
             total_pages=num_device_pages,
-            retention=PagedCacheRetention.FullHistory,
-            family=PagedCacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     return cfg
@@ -172,19 +172,29 @@ class TestFSMTransitions:
         assert decode_plan.forward[0].num_extends() == 0
 
     def test_finish_event_erases_request(self):
-        """advance(finish=True) triggers FinishEvent: Decoding → Finished, erased on next plan."""
+        """FinishEvent parks the request in Finishing; once every forward has
+        landed it settles (publishes, releases) and the next plan erases it."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
         submit(s, "r0", list(range(4)))
 
         s.next_execution_plan()  # → PrefillDone
+        advance_forward(s, "r0", [100])  # the prefill's result lands
         s.next_execution_plan()  # → Decoding  (reserve consumed, new Decoding state has reserve=-1)
+        advance_forward(s, "r0", [101])
         send_reserve_num_tokens(s, "r0", 0)  # reset reserve before next decode plan
         decode_plan = s.next_execution_plan()  # Decoding → Decoding
         assert s.decoding_size() == 1
         assert decode_plan.forward[0].num_extends() == 0
 
-        advance_forward(s, "r0", finish=True)
-        s.next_execution_plan()  # r0 erased (FinishEvent was already applied via advance)
+        advance_forward(
+            s, "r0", finish=True
+        )  # decided on 101; the decode above is in flight
+        s.next_execution_plan()  # nothing settles: a forward of r0 is still out
+        assert s.decoding_size() == 0
+        assert s.request_token_size("r0") == 6
+
+        advance_forward(s, "r0", [102])  # the in-flight decode lands: r0 settles
+        s.next_execution_plan()  # and is erased
 
         assert s.decoding_size() == 0
         assert s.request_token_size("r0") == -1
@@ -284,6 +294,57 @@ class TestPrefillFirst:
         assert plan2.forward[0].num_extends() > 0
         assert plan2.forward[0].request_ids == ["r0"]
 
+    def test_prefill_role_emits_remote_decodes_beside_new_admission(self):
+        """A P-side completed prompt leaves on plan.remote_decode, beside
+        whatever forward work the round schedules -- everything dispatchable
+        dispatches in one round."""
+        cfg = make_config(max_scheduled_tokens=8)
+        cfg.role = SchedulerConfig.Role.P
+        cfg.decode_input_tokens = 0
+        cfg.cache_groups[0].transfer_policy = CacheTransferPolicy.FullSuffix
+        s = Scheduler(cfg)
+        s.submit_requests(
+            [
+                make_spec("r0", list(range(4))),
+                make_spec("r1", list(range(4, 8))),
+            ]
+        )
+        s.advance(
+            ExecutionEvent()
+            .add_event(PD.BootstrappedEvent("r0"))
+            .add_event(PD.BootstrappedEvent("r1"))
+        )
+
+        first_prefill = s.next_execution_plan()
+        assert first_prefill.forward[0].request_ids == ["r0", "r1"]
+        assert first_prefill.forward[0].num_extends() == 2
+
+        s.submit_requests([make_spec("r2", list(range(8, 12)))])
+        s.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("r2")))
+
+        # r0/r1's results have not landed, so their remote decodes are held
+        # (the transfer needs the bootstrap token that arrives with the
+        # result) while r2's prefill proceeds.
+        held = s.next_execution_plan()
+        assert held.remote_decode is None
+        assert held.forward[0].request_ids == ["r2"]
+
+        results = ExecutionEvent()
+        for rid, token in (("r0", 42), ("r1", 43)):
+            ev = ForwardEvent.ExtendResult()
+            ev.request_id = rid
+            ev.tokens = [token]
+            results.add_event(ev)
+        s.advance(results)
+
+        # Results in hand: both remote decodes go out on the plan's own
+        # stream, carrying the bootstrap token each transfer needs.
+        transfer_start = s.next_execution_plan()
+        assert transfer_start.remote_decode is not None
+        assert transfer_start.remote_decode.request_ids == ["r0", "r1"]
+        assert transfer_start.remote_decode.decode_input_ids == [42, 43]
+        assert s.waiting_size() == 0
+
     def test_decode_batch_only_when_no_prefill_work(self):
         """Decode batch is only scheduled when there are no prefilling/submitted requests."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
@@ -376,9 +437,12 @@ class TestDecodeBatch:
         """
         submit(scheduler, request_id, tokens)
         scheduler.next_execution_plan()  # → PrefillDone
+        advance_forward(scheduler, request_id, [100])  # every planned forward lands
         for peer in decoding_peers:
             send_reserve_num_tokens(scheduler, peer, 0)
         scheduler.next_execution_plan()  # → Decoding
+        for rid in (request_id, *decoding_peers):
+            advance_forward(scheduler, rid, [101])
 
     def test_multiple_decoding_requests_scheduled_together(self):
         """All decoding requests are included in the same decode batch."""
@@ -404,7 +468,8 @@ class TestDecodeBatch:
         self._get_to_decoding(s, "r1", list(range(4)), decoding_peers=["r0"])
 
         advance_forward(s, "r0", finish=True)
-        # r1 is still Decoding and needs reserve; r0 received FinishEvent so it won't be scheduled.
+        # r1 is still Decoding and needs reserve; r0 settled with its finish
+        # (nothing in flight), so this plan erases it and never schedules it.
         send_reserve_num_tokens(s, "r1", 0)
         plan = s.next_execution_plan()
 
@@ -416,7 +481,10 @@ class TestDecodeBatch:
     def test_decode_step_appends_token(self):
         """Each decode advance appends one output token."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
-        self._get_to_decoding(s, "r0", list(range(4)))
+        self._get_to_decoding(
+            s, "r0", list(range(4))
+        )  # prompt, the prefill's token, one decode's
+        assert s.request_token_size("r0") == 6
 
         for step in range(3):
             send_reserve_num_tokens(
@@ -425,7 +493,7 @@ class TestDecodeBatch:
             plan = s.next_execution_plan()
             assert plan.forward[0].num_extends() == 0
             advance_forward(s, "r0", tokens=[100 + step])
-            assert s.request_token_size("r0") == 4 + step + 1
+            assert s.request_token_size("r0") == 6 + step + 1
 
 
 # ---------------------------------------------------------------------------
@@ -554,10 +622,10 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_causes_extra_page_allocation_on_decode(self):
         """When reserve_num_tokens_in_next_schedule_event exceeds tail capacity, extra pages are allocated."""
-        # page_size=16: after prefilling 8 tokens, tail page has 8 free slots.
+        # prefix_granularity=16: after prefilling 8 tokens, tail page has 8 free slots.
         # First decode: PrefillDone→Decoding uses PrefillDone's built-in reserve (decode_input_tokens=1),
         # no extra page. Then set reserve=16 for next decode step, which needs 1 extra page.
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone (1 page, 8 slots used, 8 free)
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed, new reserve=-1)
@@ -573,7 +641,7 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_update_overrides_previous_value(self):
         """The last UpdateReserveNumTokens wins; earlier values are discarded."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone (tail has 8 free slots)
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed, new reserve=-1)
@@ -586,9 +654,9 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_larger_than_one_page_allocates_multiple_pages(self):
         """A reserve requiring more than one extra page allocates all of them."""
-        # page_size=8: after prefilling 4 tokens, first decode step uses PrefillDone reserve.
+        # prefix_granularity=8: after prefilling 4 tokens, first decode step uses PrefillDone reserve.
         # Then set reserve=20, which should require multiple extra pages on next decode step.
-        s = Scheduler(make_config(page_size=8, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=8, num_device_pages=1024))
         submit(s, "r0", list(range(4)))
         s.next_execution_plan()  # → PrefillDone
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed)
@@ -602,7 +670,7 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_auto_resets_after_allocation(self):
         """After decode allocates for reserve, subsequent steps need no extra pages if reserve is small."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed)
@@ -618,7 +686,7 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_updated_during_decoding(self):
         """UpdateReserveNumTokens applied while already Decoding takes effect next decode step."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed, tail has 8 free slots)
@@ -634,7 +702,7 @@ class TestUpdateReserveNumTokens:
         PrefillDone carries its own built-in reserve (decode_input_tokens=1 by default).
         To test extra pages, transition to Decoding first, then set a large reserve.
         """
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         prefill_plan = s.next_execution_plan()  # → PrefillDone
         assert prefill_plan.forward[0].num_extends() > 0
@@ -654,7 +722,7 @@ class TestUpdateReserveNumTokens:
     def test_reserve_independent_per_request(self):
         """Reserve settings on one request do not affect another in the same batch."""
         s = Scheduler(
-            make_config(page_size=16, num_device_pages=1024, max_batch_size=8)
+            make_config(prefix_granularity=16, num_device_pages=1024, max_batch_size=8)
         )
         # Submit both together so they are both Submitted at the first plan → both become PrefillDone.
         submit(s, "r0", list(range(8)))
@@ -685,7 +753,7 @@ class TestDecodeInputIds:
 
     def test_normal_decode_has_minus_one(self):
         """Normal decode (not recovered from Retract) yields decode_input_ids == [-1]."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # Submitted → PrefillDone
         decode_plan = s.next_execution_plan()  # PrefillDone → Decoding
@@ -695,7 +763,9 @@ class TestDecodeInputIds:
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""
-        cfg = make_config(page_size=16, num_device_pages=1024, max_batch_size=8)
+        cfg = make_config(
+            prefix_granularity=16, num_device_pages=1024, max_batch_size=8
+        )
         cfg.enable_mixed_prefill_decode = True
         s = Scheduler(cfg)
         # Bring r0 to Decoding.

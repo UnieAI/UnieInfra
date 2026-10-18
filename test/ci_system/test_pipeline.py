@@ -1,7 +1,12 @@
+import json
 import re
+import runpy
 import subprocess
 import textwrap
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pipeline
 import pytest
@@ -14,6 +19,7 @@ from pipeline import (
     configure_slurm_server_command,
     ensure_ready_port_available,
     extract_evalscope_score,
+    extract_inspect_score,
     extract_perf_summary_rows,
     filter_stage_commands,
     format_perf_reference_markdown_table,
@@ -21,8 +27,10 @@ from pipeline import (
     get_excluded_runner_labels,
     get_jit_cache_env,
     get_runner_specific_env,
+    get_stage_command_env,
     get_stage_commands,
     is_amd_runner,
+    is_cpu_only_runner,
     is_gb200_runner,
     is_nvidia_arm_runner,
     parse_args,
@@ -63,6 +71,28 @@ def test_stale_process_patterns_match_existing_targets():
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        pipeline.URLError("not ready"),
+        ConnectionResetError("connection reset by peer"),
+        TimeoutError("probe timed out"),
+    ],
+)
+def test_poll_readiness_retries_transient_errors(monkeypatch, error):
+    probe = Mock(side_effect=[error, nullcontext(SimpleNamespace(status=200))])
+    monkeypatch.setattr(pipeline, "urlopen", probe)
+
+    poll_readiness(
+        {"url": "http://127.0.0.1:8000/readiness", "interval": 0, "timeout": 1},
+        False,
+        process=None,
+        log_path=None,
+    )
+
+    assert probe.call_count == 2
+
+
 def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):
     class ServerProcess:
         calls = 0
@@ -100,18 +130,110 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert is_amd_runner("amd-mi355-1gpu-bench")
     assert is_amd_runner("amd-mi350-1gpu-bench")
     assert is_amd_runner("amd-mi350-4gpu-bench")
+    assert is_amd_runner("amd-mi450-sim")
+    assert is_amd_runner("amd-mi45x-cpu-test")
     assert not is_amd_runner("b200-1gpu")
     assert not is_amd_runner("gb200-4gpu-perf")
 
 
+def test_cpu_only_runners_are_told_apart_from_gpu_pools():
+    # The emulator lane holds no device, so the GPU reclaim run before every
+    # other AMD task has nothing to reclaim there.
+    assert is_cpu_only_runner("amd-mi45x-cpu-test")
+    assert not is_cpu_only_runner("amd-mi35x-1gpu-test")
+    assert not is_cpu_only_runner("amd-mi355-1gpu-bench")
+
+
+def test_cpu_only_amd_runner_skips_the_gpu_reclaim(capsys, tmp_path):
+    pipeline.setup_runner(
+        "amd-mi45x-cpu-test",
+        {},
+        tmp_path,
+        dry_run=True,
+        reuse_state=False,
+        setup_mode="ci",
+    )
+
+    assert "cleanup_amd_gpu_state.sh" not in capsys.readouterr().out
+
+
+def test_amd_gpu_runner_reclaims_stale_vram(capsys, tmp_path):
+    pipeline.setup_runner(
+        "amd-mi35x-1gpu-test",
+        {},
+        tmp_path,
+        dry_run=True,
+        reuse_state=False,
+        setup_mode="ci",
+    )
+
+    assert "cleanup_amd_gpu_state.sh" in capsys.readouterr().out
+
+
+def test_ci_setup_only_refreshes_apt_when_ninja_is_missing(capsys, tmp_path):
+    setup_runner("amd-mi35x-4gpu-test", {}, tmp_path, dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "if ! command -v ninja >/dev/null 2>&1; then" in output
+    assert output.count("sudo apt-get -o Acquire::Retries=5 update -q") == 1
+    assert "&& sudo apt-get install -y ninja-build; fi" in output
+
+
+@pytest.mark.parametrize(
+    ("declared", "effective"),
+    [
+        ("b200-1gpu", "gb300-1gpu"),
+        ("gb200-4gpu-perf", "gb300-4gpu-perf"),
+        ("slurm-gb200-4node-4gpu", "slurm-gb300-4node-4gpu"),
+        ("gb300-4gpu", "gb300-4gpu"),
+    ],
+)
+def test_gb300_runner_alias_preserves_logical_topology(declared, effective):
+    assert pipeline.validate_gb300_runner_alias(declared, effective) == effective
+
+
+@pytest.mark.parametrize(
+    ("declared", "effective", "message"),
+    [
+        ("b200-4gpu", "gb300-1gpu", "GPU counts"),
+        ("gb200-4gpu-perf", "gb300-4gpu", "suffixes"),
+        ("slurm-gb200-4gpu", "gb300-4gpu", "slurm- prefix"),
+        ("h200-4gpu", "gb300-4gpu", "b200"),
+    ],
+)
+def test_gb300_runner_alias_rejects_semantic_changes(declared, effective, message):
+    with pytest.raises(ValueError, match=message):
+        pipeline.validate_gb300_runner_alias(declared, effective)
+
+
+def test_runner_override_is_slurm_only():
+    assert (
+        pipeline.apply_slurm_runner_override("b200-4gpu", "gb300-4gpu", "slurm")
+        == "gb300-4gpu"
+    )
+    with pytest.raises(ValueError, match="setup-mode"):
+        pipeline.apply_slurm_runner_override("b200-4gpu", "gb300-4gpu", "ci")
+
+
 def test_nvidia_runner_groups_split_arm_from_x86():
     assert is_nvidia_arm_runner("gb200-1gpu")
+    assert is_nvidia_arm_runner("gb300-4gpu")
     assert not is_nvidia_arm_runner("b200-1gpu")
     assert not is_nvidia_arm_runner("amd-mi35x-1gpu-test")
 
     assert runner_matches_group("gb200-1gpu", "nvidia")
     assert runner_matches_group("gb200-1gpu", "nvidia-arm")
     assert not runner_matches_group("gb200-1gpu", "nvidia-x86")
+    assert runner_matches_group("gb300-4gpu", "nvidia")
+    assert runner_matches_group("gb300-4gpu", "nvidia-arm")
+    assert not runner_matches_group("gb300-4gpu", "nvidia-x86")
+    assert runner_matches_group("slurm-b300-4gpu", "nvidia-arm")
+    assert runner_matches_group("slurm-gb200-4node-4gpu", "nvidia-arm")
+    assert runner_matches_group("slurm-gb300-4gpu", "nvidia-arm")
+    assert not runner_matches_group("slurm-b300-4gpu", "nvidia-x86")
+    assert not runner_matches_group("slurm-gb200-4node-4gpu", "nvidia-x86")
+    assert pipeline.get_default_runner_env("slurm-b300-4gpu")["SM"] == "sm103"
+    assert pipeline.uses_isolated_jit_cache("slurm-gb300-4gpu")
     assert runner_matches_group("b200-1gpu", "nvidia-x86")
     assert runner_matches_group("b300-4gpu", "nvidia-x86")
     assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-arm")
@@ -121,11 +243,14 @@ def test_nvidia_runner_groups_split_arm_from_x86():
 def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert is_gb200_runner("gb200-1gpu")
     assert is_gb200_runner("gb200-4gpu-perf")
+    assert is_gb200_runner("slurm-gb200-4node-4gpu")
     assert not is_gb200_runner("b300-4gpu")
+    assert not is_gb200_runner("gb300-4gpu")
 
     assert should_run_nvidia_gpu_cleanup("gb200-1gpu")
     assert should_run_nvidia_gpu_cleanup("gb200-4gpu-perf")
     assert should_run_nvidia_gpu_cleanup("b300-4gpu")
+    assert not should_run_nvidia_gpu_cleanup("gb300-4gpu")
     assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
@@ -157,6 +282,13 @@ def test_execute_cli_defaults_to_ci_setup_mode():
     assert args.setup_mode == "ci"
 
 
+def test_scan_cli_excludes_multi_node_tasks_by_default():
+    args = parse_args(["scan"])
+
+    assert args.runner_group == "all"
+    assert args.multi_node == "exclude"
+
+
 def test_execute_cli_accepts_slurm_setup_mode():
     args = parse_args(
         [
@@ -171,6 +303,192 @@ def test_execute_cli_accepts_slurm_setup_mode():
     )
 
     assert args.setup_mode == "slurm"
+
+
+def test_execute_cli_accepts_gb300_runner_override():
+    args = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "b200-4gpu",
+            "--runner-override",
+            "gb300-4gpu",
+            "--setup-mode",
+            "slurm",
+        ]
+    )
+
+    assert args.runner == "b200-4gpu"
+    assert args.runner_override == "gb300-4gpu"
+
+
+def test_execute_cli_accepts_slurm_server_modes():
+    serve = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "slurm-gb200-4node-4gpu",
+            "--setup-mode",
+            "slurm",
+            "--serve-only",
+        ]
+    )
+    client = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "slurm-gb200-4node-4gpu",
+            "--setup-mode",
+            "slurm",
+            "--external-server",
+        ]
+    )
+
+    assert serve.serve_only is True
+    assert serve.external_server is False
+    assert client.serve_only is False
+    assert client.external_server is True
+
+
+def test_multi_node_slurm_task_validation():
+    task = {
+        "api_version": "ci.tokenspeed.io/v1",
+        "name": "multi-node",
+        "type": "eval",
+        "workflow_stage": "model-test",
+        "triggers": ["slurm"],
+        "runner": {"labels": ["slurm-gb200-4node-4gpu"]},
+        "slurm": {"nodes": 4, "gpus_per_node": 4},
+        "server": {
+            "command": "ts serve --model example/model",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {"command": "run eval"},
+    }
+
+    validate_task(task, Path("task.yaml"))
+
+    task["triggers"] = ["per-commit"]
+    validate_task(task, Path("task.yaml"))
+
+    task["triggers"] = ["nightly"]
+    validate_task(task, Path("task.yaml"))
+
+    task["triggers"] = ["manual"]
+    with pytest.raises(ValueError, match="exactly one"):
+        validate_task(task, Path("task.yaml"))
+
+    task["triggers"] = ["per-commit", "slurm"]
+    with pytest.raises(ValueError, match="exactly one"):
+        validate_task(task, Path("task.yaml"))
+
+
+def test_slurm_server_modes_split_server_from_client(monkeypatch, tmp_path):
+    task = {
+        "name": "multi-node",
+        "type": "eval",
+        "runner": {"labels": ["slurm-gb200-4node-4gpu"]},
+        "install": ["install project"],
+        "server": {
+            "command": "ts serve --model example/model",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {
+            "install": ["install eval"],
+            "command": "run eval",
+        },
+    }
+
+    class FakeProcessGroupManager:
+        def __init__(self):
+            self.commands = []
+
+        def run(self, command, *, cwd, env, dry_run):
+            self.commands.append(command)
+            return {"returncode": 0, "output": ""}
+
+        def start(self, *args, **kwargs):
+            raise AssertionError("server modes must not start a managed server")
+
+        def terminate_all(self, *, dry_run):
+            pass
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "summarize_task_targets", lambda *_: {})
+    monkeypatch.setattr(pipeline, "get_jit_cache_env", lambda *_: {})
+
+    serve_manager = FakeProcessGroupManager()
+    monkeypatch.setattr(
+        pipeline,
+        "setup_runner",
+        lambda *args, **kwargs: (args[1], serve_manager),
+    )
+    assert (
+        pipeline.execute_task(
+            config="task.yaml",
+            runner="slurm-gb200-4node-4gpu",
+            work_dir=str(tmp_path),
+            dry_run=False,
+            print_plan=False,
+            result_json=None,
+            setup_mode="slurm",
+            serve_only=True,
+        )
+        == 0
+    )
+    assert serve_manager.commands == [
+        "install project",
+        "ts serve --model example/model --engine-startup-timeout 7200",
+    ]
+
+    ready_calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "poll_readiness",
+        lambda ready, dry_run, **kwargs: ready_calls.append((ready, dry_run)),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "ensure_ready_port_available",
+        lambda *_: (_ for _ in ()).throw(
+            AssertionError("external server mode must not check for a free port")
+        ),
+    )
+    client_manager = FakeProcessGroupManager()
+    monkeypatch.setattr(
+        pipeline,
+        "setup_runner",
+        lambda *args, **kwargs: (args[1], client_manager),
+    )
+    assert (
+        pipeline.execute_task(
+            config="task.yaml",
+            runner="slurm-gb200-4node-4gpu",
+            work_dir=str(tmp_path),
+            dry_run=False,
+            print_plan=False,
+            result_json=None,
+            setup_mode="slurm",
+            external_server=True,
+        )
+        == 0
+    )
+    assert client_manager.commands == ["install project", "install eval", "run eval"]
+    assert ready_calls == [
+        (
+            {
+                "url": "http://127.0.0.1:8000/readiness",
+                "timeout": 7200,
+            },
+            False,
+        )
+    ]
 
 
 def test_slurm_setup_is_scoped_to_job_id(monkeypatch, tmp_path):
@@ -193,6 +511,25 @@ def test_slurm_setup_is_scoped_to_job_id(monkeypatch, tmp_path):
     assert local_env["CI_RUNNER_ID"] == "slurm-12345"
     assert local_env["CI_VENV_PATH"] == "/shared/venv"
     assert "CI_RUNNER_ID" not in original_env
+
+
+def test_slurm_setup_isolates_overlapping_steps(monkeypatch, tmp_path):
+    class FakeProcessGroupManager:
+        def __init__(self, runner_id):
+            self.runner_id = runner_id
+
+    monkeypatch.setattr(pipeline, "ProcessGroupManager", FakeProcessGroupManager)
+
+    local_env, manager = setup_runner(
+        "slurm-gb200-4node-4gpu",
+        {"SLURM_JOB_ID": "12345", "SLURM_STEP_ID": "7", "SLURM_PROCID": "3"},
+        tmp_path,
+        dry_run=False,
+        setup_mode="slurm",
+    )
+
+    assert manager.runner_id == "slurm-12345-step-7-proc-3"
+    assert local_env["CI_RUNNER_ID"] == manager.runner_id
 
 
 def test_slurm_setup_requires_job_id(tmp_path):
@@ -262,6 +599,27 @@ def test_skipping_top_level_install_keeps_eval_install():
     assert [name for name, _ in stages] == ["server", "eval.install", "eval"]
 
 
+@pytest.mark.parametrize("stage_name", ["eval.install", "perf.install"])
+def test_eval_and_perf_install_use_dedicated_persistent_uv_cache(stage_name):
+    env = {
+        "UV_CACHE_DIR": "/work/.uv-cache",
+        "EVALSCOPE_UV_CACHE_DIR": "/cache/uv/evalscope",
+    }
+
+    install_env = get_stage_command_env(stage_name, env)
+
+    assert install_env is not env
+    assert install_env["UV_CACHE_DIR"] == "/cache/uv/evalscope"
+    assert get_stage_command_env("eval", env) is env
+    assert env["UV_CACHE_DIR"] == "/work/.uv-cache"
+
+
+def test_eval_install_keeps_job_uv_cache_without_persistent_cache():
+    env = {"UV_CACHE_DIR": "/work/.uv-cache"}
+
+    assert get_stage_command_env("eval.install", env) is env
+
+
 def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
     task = {
         "name": "slurm-unit-test",
@@ -308,6 +666,120 @@ def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
     assert return_code == 0
     assert manager.terminated is True
     assert result_json.exists()
+
+
+def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
+    monkeypatch, tmp_path
+):
+    task = {
+        "name": "aliased-unit-test",
+        "type": "ut",
+        "runner": {
+            "labels": ["b200-1gpu"],
+            "env": {"b200-1gpu": {"LOGICAL_RUNNER_ENV": "preserved"}},
+        },
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(runner=runner, env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+
+    assert (
+        pipeline.execute_task(
+            config="task.yaml",
+            runner="b200-1gpu",
+            runner_override="gb300-1gpu",
+            work_dir=str(tmp_path),
+            dry_run=False,
+            print_plan=False,
+            result_json=None,
+            setup_mode="slurm",
+        )
+        == 0
+    )
+    assert captured["runner"] == "gb300-1gpu"
+    assert captured["env"]["CI_RUNNER_LABEL"] == "gb300-1gpu"
+    assert captured["env"]["SM"] == "sm103"
+    assert captured["env"]["LOGICAL_RUNNER_ENV"] == "preserved"
+
+
+@pytest.mark.parametrize(
+    ("task_type", "inherited", "task_env", "expected"),
+    [
+        ("eval", None, {}, "error"),
+        ("perf", None, {}, "error"),
+        ("server_smoke", None, {}, "error"),
+        ("eval", None, {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("eval", "off", {}, "error"),
+        ("perf", "off", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("ut", None, {}, None),
+        ("ut", "warn", {}, "warn"),
+    ],
+)
+def test_b200v2_tasks_set_cache_and_jit_check_defaults(
+    monkeypatch, tmp_path, task_type, inherited, task_env, expected
+):
+    cache_env = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
+    monkeypatch.delenv(cache_env, raising=False)
+    monkeypatch.delenv("CI_CACHE_ROOT", raising=False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    cache_root = tmp_path / "persistent cache"
+    monkeypatch.setenv("FLASHINFER_CACHE_DIR", str(cache_root / "flashinfer"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "ephemeral-home" / ".cache"))
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", inherited)
+    task = {
+        "name": "jit-check",
+        "type": task_type,
+        "runner": {"labels": ["b200v2-1gpu"]},
+        "env": task_env,
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+    monkeypatch.setattr(pipeline, "get_stage_commands", lambda task: [])
+
+    pipeline.execute_task(
+        config="task.yaml",
+        runner="b200v2-1gpu",
+        runner_override=None,
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=None,
+        setup_mode="ci",
+    )
+    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+    assert captured["env"][cache_env] == str(
+        cache_root / "tokenspeed" / "flashinfer-autotune"
+    )
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
@@ -376,6 +848,39 @@ def test_extract_evalscope_score_from_box_table():
     assert extract_evalscope_score(report_table) == 0.9667
 
 
+def test_extract_evalscope_score_from_percentage_table():
+    """evalscope 1.11 renames the metric and reports Score as a percentage."""
+    report_table = """
+┌─────────────────┬───────────┬────────────┬──────────┬───────┬─────────┬─────────┐
+│ Model           │ Dataset   │ Metric     │ Subset   │   Num │   Score │ Cat.0   │
+├─────────────────┼───────────┼────────────┼──────────┼───────┼─────────┼─────────┤
+│ Kimi-K3         │ aime25    │ Accuracy ↑ │ default  │    30 │   93.3% │ default │
+└─────────────────┴───────────┴────────────┴──────────┴───────┴─────────┴─────────┘
+"""
+
+    assert extract_evalscope_score(report_table) == pytest.approx(0.933)
+
+
+def test_extract_evalscope_score_ignores_non_numeric_cells():
+    report_table = """
+| Model   | Dataset | Metric     | Subset  | Num | Score | Cat.0   |
+|---------|---------|------------|---------|-----|-------|---------|
+| Kimi-K3 | aime25  | Accuracy ↑ | default | 30  | n/a   | default |
+"""
+
+    assert extract_evalscope_score(report_table) is None
+
+
+def test_extract_inspect_score_from_accuracy_summary():
+    output = """
+ocrbench_scorer
+accuracy         0.890
+stderr           0.010
+"""
+
+    assert extract_inspect_score(output) == 0.89
+
+
 PERF_CSV_FIXTURE = """\
 some unrelated log line
 config,Conc.,Latency (tps/user),Throughput (tps/gpu),Approx Cache Hit,Decoded Tok/Iter
@@ -389,25 +894,73 @@ attn_tp4_moe_tp4,16,30.0,24000.0,82.5,3.1
 """
 
 
-def test_extract_perf_summary_rows_parses_csv_block():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_extract_perf_summary_rows_parses_csv_block(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     assert rows is not None
     assert len(rows) == 5
     assert rows[0]["Conc."] == "1"
     assert rows[-1]["Latency (tps/user)"] == "30.0"
-    assert rows[-1]["Throughput (tps/gpu)"] == "24000.0"
+    assert rows[-1][throughput_metric] == "24000.0"
 
 
 def test_extract_perf_summary_rows_returns_none_when_missing():
     assert extract_perf_summary_rows("nothing relevant here") is None
 
 
+@pytest.mark.parametrize(
+    "invalid_values",
+    [{}, {"Output Throughput (tok/s)": "nan"}, {"Failed Requests": 1}],
+)
+def test_qwen_output_throughput_is_reported_per_minute_per_gpu(
+    tmp_path, invalid_values
+):
+    run_dir = tmp_path / "attn_tp4_moe_ep4" / "parallel_1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "benchmark_summary.json").write_text(
+        json.dumps(
+            {
+                "Concurrency": 1,
+                "TPOT (ms)": 10.0,
+                "Total Throughput (tok/s)": 4000.0,
+                "Output Throughput (tok/s)": 120.0,
+                "KV Cache Hit Rate (%)": 0.0,
+                "Failed Requests": 0,
+                **invalid_values,
+            }
+        ),
+        encoding="utf-8",
+    )
+    collector = runpy.run_path(
+        str(
+            Path(__file__).resolve().parents[1]
+            / "agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/collect_outputs.py"
+        )
+    )
+
+    if invalid_values:
+        with pytest.raises(ValueError):
+            collector["collect"](tmp_path, expected_concurrencies=[1])
+        return
+
+    rows = collector["collect"](tmp_path, expected_concurrencies=[1])
+
+    assert rows[0]["Output Throughput (tok/min/gpu)"] == 1800.0
+
+
 def _command_results_with(rows):
     return [{"perf_summary_rows": rows}]
 
 
-def test_check_perf_reference_passes_when_actual_meets_floor():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_check_perf_reference_passes_when_actual_meets_floor(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     task = {
         "perf_threshold": 0.9,
         "perf_reference": {16: [33.0, 26000.0]},
@@ -416,18 +969,28 @@ def test_check_perf_reference_passes_when_actual_meets_floor():
     assert result is not None
     assert result["passed"] is True
     assert result["failures"] == []
+    assert result["checks"][0][throughput_metric]["actual"] == 24000.0
+    for formatter in (
+        format_perf_reference_table,
+        format_perf_reference_markdown_table,
+    ):
+        assert "24000.00" in "\n".join(formatter(result["checks"]))
 
 
-def test_check_perf_reference_fails_when_metric_below_floor():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_check_perf_reference_fails_when_metric_below_floor(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     task = {
         "perf_threshold": 0.9,
-        "perf_reference": {16: [40.0, 26000.0]},
+        "perf_reference": {16: [33.0, 30000.0]},
     }
     result = check_perf_reference(task, _command_results_with(rows), ["perf"])
     assert result is not None
     assert result["passed"] is False
-    assert any("Latency (tps/user)" in f for f in result["failures"])
+    assert any(throughput_metric in failure for failure in result["failures"])
 
 
 def test_check_perf_reference_reports_missing_row():
@@ -458,7 +1021,7 @@ def test_check_perf_reference_raises_when_no_rows_found():
 def test_check_perf_reference_raises_on_malformed_pair():
     rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
     task = {"perf_reference": {16: [40.0]}}
-    with pytest.raises(ValueError, match=r"\[tps_user, tps_gpu\]"):
+    with pytest.raises(ValueError, match=r"\[tps_user, throughput_per_gpu\]"):
         check_perf_reference(task, _command_results_with(rows), ["perf"])
 
 
@@ -591,6 +1154,28 @@ def test_check_eval_score_threshold_still_supports_scalar():
     assert check["min"] == 0.7
 
 
+def test_check_eval_score_threshold_supports_inspect_score():
+    task = {"score_threshold": 0.89}
+    results = [{"stage": "eval", "inspect_score": 0.891}]
+    check = check_eval_score_threshold(task, results, ["eval"], "b200-2gpu")
+
+    assert check is not None
+    assert check["passed"] is True
+    assert check["score"] == 0.891
+
+
+def test_check_eval_score_threshold_ignores_non_eval_inspect_score():
+    task = {"score_threshold": 0.89}
+    results = [
+        {"stage": "eval.install", "inspect_score": 0.99},
+        {"stage": "eval", "inspect_score": 0.891},
+    ]
+    check = check_eval_score_threshold(task, results, ["eval"], "b200-2gpu")
+
+    assert check is not None
+    assert check["score"] == 0.891
+
+
 def _write_task_yaml(tmp_path: Path, filename: str, body: str) -> Path:
     path = tmp_path / filename
     path.write_text(textwrap.dedent(body).lstrip())
@@ -616,6 +1201,76 @@ def _default_body(name: str, labels: list[str], extra: str = "") -> str:
     if extra:
         body += extra
     return body
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        (None, ["a", "a", "b"]),
+        ("", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n", ["a", "a"]),
+        ("test/ci/old.yaml\ntest/ci/a.yaml\n", ["a", "a"]),
+        ("test/ci/deleted.yaml\n", []),
+        ("test/ci/a.yaml\npython/model.py\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n.github/workflows/a.yaml\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\n test/ci/b.yaml\n", ["a", "a", "b"]),
+        ("test/ci/a.yaml\ntest/ci/b.yaml \n", ["a", "a", "b"]),
+        ("\n".join(f"test/ci/{i}.yaml" for i in range(300)), ["a", "a", "b"]),
+    ],
+)
+def test_scan_filters_task_yaml_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    for name, labels in [("a", ["b200-4gpu", "gb200-4gpu"]), ("b", ["b200-4gpu"])]:
+        _write_task_yaml(root, f"{name}.yaml", _default_body(name, labels))
+    argv = ["scan", "--repo-root", str(tmp_path)]
+    if changed is not None:
+        changed_file = tmp_path / "changed.txt"
+        changed_file.write_text(changed)
+        argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        ("tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n", ["bench"]),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "test/ci/ut.yaml\n",
+            ["bench", "ut"],
+        ),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/harness.py\n",
+            ["bench", "ut"],
+        ),
+    ],
+)
+def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    _write_task_yaml(root, "ut.yaml", _default_body("ut", ["amd-mi350-1gpu"]))
+    bench = _default_body("bench", ["amd-mi350-1gpu-bench"])
+    bench = bench.replace("type: ut", "type: perf").replace(
+        "workflow_stage: unit-test", "workflow_stage: kernel-benchmark"
+    )
+    _write_task_yaml(root, "bench.yaml", bench + "perf:\n  command: true\n")
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
 
 
 def test_validate_task_accepts_known_priorities(tmp_path):
@@ -691,6 +1346,101 @@ def test_validate_task_rejects_per_label_optional_with_non_boolean_value(tmp_pat
         validate_task(_yaml.safe_load(path.read_text()), path)
 
 
+def test_validate_task_accepts_retries_on_eval(tmp_path):
+    body = _default_body("eval-a", ["b200-4gpu"], extra="retries: 1\n")
+    body = body.replace(
+        "type: ut\nworkflow_stage: unit-test\n",
+        "type: eval\nworkflow_stage: model-test\n",
+    )
+    path = _write_task_yaml(tmp_path, "eval-retries.yaml", body)
+    import yaml as _yaml
+
+    validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_retries_on_ut(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra="retries: 1\n")
+    path = _write_task_yaml(tmp_path, "ut-retries.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"retries is only supported"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_negative_retries(tmp_path):
+    body = _default_body("eval-a", ["b200-4gpu"], extra="retries: -1\n")
+    body = body.replace(
+        "type: ut\nworkflow_stage: unit-test\n",
+        "type: eval\nworkflow_stage: model-test\n",
+    )
+    path = _write_task_yaml(tmp_path, "neg-retries.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"retries must be a non-negative integer"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
+    task = {
+        "name": "eval-retry",
+        "type": "eval",
+        "retries": 1,
+        "runner": {"labels": ["b200v2-1gpu"]},
+        "server": {
+            "command": "serve",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {"command": "run eval"},
+    }
+    result_json = tmp_path / "result.json"
+    eval_calls = {"n": 0}
+    server_starts = {"n": 0}
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "summarize_task_targets", lambda *_: {})
+    monkeypatch.setattr(
+        pipeline,
+        "setup_runner",
+        lambda runner, env, cwd, dry_run, reuse_state, setup_mode: (env, None),
+    )
+    monkeypatch.setattr(pipeline, "cleanup_runner", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "poll_readiness", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "kill_ready_port_listener", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "summarize_command_output", lambda *a, **k: {})
+    monkeypatch.setattr(pipeline, "summarize_eval_accept_rate", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "check_eval_score_threshold", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "stop_server", lambda *a, **k: None)
+
+    def fake_start_server(*args, **kwargs):
+        server_starts["n"] += 1
+        return object()
+
+    def fake_shell_run(command, **kwargs):
+        if command == "run eval":
+            eval_calls["n"] += 1
+            if eval_calls["n"] == 1:
+                raise RuntimeError("command failed with exit code 1: run eval")
+            return {"command": command, "returncode": 0, "output": "ok"}
+        return {"command": command, "returncode": 0, "output": ""}
+
+    monkeypatch.setattr(pipeline, "start_server", fake_start_server)
+    monkeypatch.setattr(pipeline, "shell_run", fake_shell_run)
+
+    return_code = pipeline.execute_task(
+        config="task.yaml",
+        runner="b200v2-1gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=str(result_json),
+    )
+
+    assert return_code == 0
+    assert eval_calls["n"] == 2
+    assert server_starts["n"] == 2
+    assert result_json.exists()
+
+
 def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     # Two tasks; both omit `priority`. Order must match the existing
     # behaviour: alphabetical by file path, then label order from the yaml.
@@ -712,6 +1462,133 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
     assert all(e["optional"] is False for e in matrix["include"])
+
+
+def test_build_matrix_post_submit_also_selects_per_commit_tasks(tmp_path):
+    _write_task_yaml(tmp_path, "a.yaml", _default_body("pr", ["b200-1gpu"]))
+    _write_task_yaml(
+        tmp_path,
+        "b.yaml",
+        _default_body("push", ["b200-1gpu"]).replace("per-commit", "post-submit"),
+    )
+
+    def names(trigger):
+        matrix = build_matrix(tmp_path, tmp_path, trigger=trigger)
+        return [entry["name"] for entry in matrix["include"]]
+
+    assert names("per-commit") == ["pr"]
+    assert names("post-submit") == ["pr", "push"]
+
+
+def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "kernel-benchmark.yaml",
+        """
+        api_version: ci.tokenspeed.io/v1
+        name: kernel-benchmark
+        type: perf
+        workflow_stage: kernel-benchmark
+        triggers: [per-commit]
+        runner:
+          labels: [amd-mi355-1gpu-bench]
+        perf:
+          command: run benchmark
+        """,
+    )
+    _write_task_yaml(
+        tmp_path,
+        "model.yaml",
+        """
+        api_version: ci.tokenspeed.io/v1
+        name: model
+        type: perf
+        workflow_stage: model-test
+        triggers: [per-commit]
+        runner:
+          labels: [amd-mi355-1gpu-bench]
+        perf:
+          command: run model
+        """,
+    )
+
+    matrix = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="amd",
+        workflow_stage="kernel-benchmark",
+    )
+
+    assert [entry["name"] for entry in matrix["include"]] == ["kernel-benchmark"]
+    assert matrix["include"][0]["workflow_stage"] == "kernel-benchmark"
+
+
+def test_build_matrix_can_select_or_exclude_multi_node_tasks(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "single.yaml",
+        _default_body("single", ["gb300-4gpu"]),
+    )
+    _write_task_yaml(
+        tmp_path,
+        "multi.yaml",
+        """
+        api_version: ci.tokenspeed.io/v1
+        name: multi
+        type: eval
+        workflow_stage: model-test
+        triggers: [per-commit]
+        runner:
+          labels: [slurm-b300-4gpu]
+        slurm:
+          nodes: 2
+          gpus_per_node: 4
+        server:
+          command: ts serve example/model
+          ready:
+            url: http://127.0.0.1:8000/readiness
+        eval:
+          command: run eval
+        """,
+    )
+
+    only = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+        multi_node="only",
+    )
+    excluded = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+        multi_node="exclude",
+    )
+    default = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+    )
+
+    assert [entry["name"] for entry in only["include"]] == ["multi"]
+    assert [entry["name"] for entry in excluded["include"]] == ["single"]
+    assert default == excluded
+    assert build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-x86",
+    ) == {"include": []}
+    assert build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="amd",
+    ) == {"include": []}
 
 
 def test_build_matrix_excludes_runner_label_substrings_case_insensitively(

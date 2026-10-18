@@ -23,7 +23,8 @@ import warnings
 from contextlib import contextmanager
 from typing import Any
 
-from tokenspeed.runtime.utils.pdl import pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
+
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
@@ -33,21 +34,34 @@ global_server_args_dict: dict = {
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
     "deepseek_v4_prefill_chunk_size": ServerArgs.deepseek_v4_prefill_chunk_size,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "engram_host_table": ServerArgs.engram_host_table,
+    "engram_host_table_dir": ServerArgs.engram_host_table_dir,
+    "engram_host_table_layout": ServerArgs.engram_host_table_layout,
     "kv_cache_dtype": ServerArgs.kv_cache_dtype,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "enable_p2p_check": ServerArgs.enable_p2p_check,
     "mapping": ServerArgs.mapping,
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
+    "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
+    "numerics": ServerArgs.numerics,
+    "yarn_ramp_mask_device": ServerArgs.yarn_ramp_mask_device,
+    "mla_lora_scale": ServerArgs.mla_lora_scale,
+    "layer_boundary_norm": ServerArgs.layer_boundary_norm,
+    "router_topk": ServerArgs.router_topk,
+    "logprob_order": ServerArgs.logprob_order,
+    "moe_combine_order": ServerArgs.moe_combine_order,
+    "dsa_slot_order": ServerArgs.dsa_slot_order,
+    "tp_batch_invariant": ServerArgs.tp_batch_invariant,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
     "disable_pdl": ServerArgs.disable_pdl,
+    "disable_autotune": ServerArgs.disable_autotune,
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "mla_chunk_multiplier": ServerArgs.mla_chunk_multiplier,
     "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
+    "init_expert_location": ServerArgs.init_expert_location,
     "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
     "enable_eplb": ServerArgs.enable_eplb,
     "mm_attention_backend": ServerArgs.mm_attention_backend,
@@ -57,6 +71,8 @@ global_server_args_dict: dict = {
     "max_model_len": ServerArgs.max_model_len,
     "max_num_seqs": ServerArgs.max_num_seqs,
     "moe_backend": ServerArgs.moe_backend,
+    "moe_mxfp4_fp8_activation": ServerArgs.moe_mxfp4_fp8_activation,
+    "dense_gemm_backend": ServerArgs.dense_gemm_backend,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
@@ -68,10 +84,7 @@ global_server_args_dict: dict = {
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
-
-    # Export the PDL kill-switch: tokenspeed_kernel cannot import runtime modules.
-    if server_args.disable_pdl:
-        os.environ["TOKENSPEED_DISABLE_PDL"] = "1"
+    pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
@@ -80,23 +93,36 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
             "deepseek_v4_prefill_chunk_size": server_args.deepseek_v4_prefill_chunk_size,
-            "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
+            "engram_host_table": server_args.engram_host_table,
+            "engram_host_table_dir": server_args.engram_host_table_dir,
+            "engram_host_table_layout": server_args.engram_host_table_layout,
             "kv_cache_dtype": server_args.kv_cache_dtype,
             "enable_nan_detection": server_args.enable_nan_detection,
-            "enable_p2p_check": server_args.enable_p2p_check,
             "mapping": server_args.mapping,
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
+            "batch_invariant_collectives": server_args.batch_invariant_collectives,
+            "numerics": server_args.numerics,
+            "yarn_ramp_mask_device": server_args.yarn_ramp_mask_device,
+            "mla_lora_scale": server_args.mla_lora_scale,
+            "layer_boundary_norm": server_args.layer_boundary_norm,
+            "router_topk": server_args.router_topk,
+            "logprob_order": server_args.logprob_order,
+            "moe_combine_order": server_args.moe_combine_order,
+            "dsa_slot_order": server_args.dsa_slot_order,
+            "tp_batch_invariant": server_args.tp_batch_invariant,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
             "speculative_algorithm": server_args.speculative_algorithm,
             "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
+            "disable_autotune": server_args.disable_autotune,
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
             "mla_chunk_multiplier": server_args.mla_chunk_multiplier,
             "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
+            "init_expert_location": server_args.init_expert_location,
             "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
             "enable_eplb": server_args.enable_eplb,
             "mm_attention_backend": server_args.mm_attention_backend,
@@ -106,6 +132,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_model_len": server_args.max_model_len,
             "max_num_seqs": server_args.max_num_seqs,
             "moe_backend": server_args.moe_backend,
+            "moe_mxfp4_fp8_activation": server_args.moe_mxfp4_fp8_activation,
+            "dense_gemm_backend": server_args.dense_gemm_backend,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,
@@ -115,7 +143,6 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "deepep_mode": server_args.deepep_mode,
         }
     )
-    pdl_enabled.cache_clear()
 
 
 class EnvField:
@@ -239,12 +266,32 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_PROFILE_WITH_STACK = EnvBool(True)
+    TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
+    # torch.cuda sync-debug mode armed once serving starts (after capture and
+    # tuning, which synchronize legitimately): "warn" reports every host
+    # synchronization on a serving path with its Python location, "error"
+    # raises. Any such synchronization on the data plane stalls the forward
+    # thread until the in-flight step drains and defeats overlap scheduling.
+    TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
+    # Triton compilations once serving starts: "warn" logs each one with what
+    # changed and names a compile-time kernel parameter that keeps taking new
+    # values (a per-batch constexpr, one JIT compile on the forward thread per
+    # batch shape), "error" raises on such a parameter, "off" disables the
+    # monitor. CI serves with "error".
+    TOKENSPEED_STARTUP_TIMING = EnvBool(False)
+    TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
+
+    # Shared-expert parallelism.
+    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvInt(1)
+    # Independent projection groups retain attention's local token ownership.
+    TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE = EnvInt(1)
+    TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvInt(1)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
@@ -278,10 +325,12 @@ class Envs:
 
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
-    TOKENSPEED_MINIMAX_AR_USE_TRITON = EnvBool(False)
 
-    # EPLB
-    TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    # Communication
+    # InfiniBand traffic class for NVSHMEM (DeepEP all-to-all). Read in every
+    # inference process entry so the value reaches NVSHMEM regardless of how
+    # the process was spawned; unset leaves NVSHMEM's own default in place.
+    NVSHMEM_IB_TRAFFIC_CLASS = EnvInt(None)
 
     # Runtime behavior
     TOKENSPEED_WORKSPACE_INITIAL_MB = EnvInt(256)
@@ -297,6 +346,13 @@ class Envs:
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
+    # "uniform" routes each token to a fixed random set of experts, so dummy
+    # weights spread MoE traffic like a trained router does.
+    TOKENSPEED_MOE_ROUTING_SIMULATION = EnvStr("")
+    # Tokens per request each speculative verify step keeps, on average, in
+    # place of what verification accepted. A raw string so malformed input
+    # fails at startup instead of silently turning the simulation off.
+    TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN = EnvStr("")
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
@@ -305,19 +361,16 @@ class Envs:
     # engine.io_struct.
     TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
 
-    # Diagnostic: per-iteration wall split of the scheduler event loop.
-    TOKENSPEED_SCHED_LOOP_TIMING = EnvBool(False)
-
-    # Diagnostic: time each forward_step with CUDA events and report the device
-    # elapsed time. Pairs with TOKENSPEED_SCHED_LOOP_TIMING, which prints it as
-    # the `gpu=` field, because the loop's `dispatch` bucket cannot by itself
-    # separate GPU backpressure from host cost.
-    TOKENSPEED_GPU_ELAPSED = EnvBool(False)
+    # Qwen4-Exp QSA
+    TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH = EnvStr("auto")
+    TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB = EnvInt(256)
 
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
     TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH = EnvInt(None)
+    # Eager V4.1 vision input tokens, before spatial merging.
+    TOKENSPEED_DEEPSEEK_V41_VISION_MAX_BATCH_TOKENS = EnvInt(16384)
     TOKENSPEED_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
     # fmt: on

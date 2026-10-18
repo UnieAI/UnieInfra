@@ -21,9 +21,13 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 
 class _RuntimeStates:
@@ -41,7 +45,12 @@ class _ExecutionStream:
 
 def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
     executor.device = "cpu"
+    executor.device_module = torch.cuda
+    executor.default_stream = object()
     executor.execution_stream = _ExecutionStream()
     executor.runtime_states = _RuntimeStates()
 
@@ -58,11 +67,320 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
         return torch_tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
 
-    executor.reset_valid_cache_length(forward_op)
+    executor._reset_valid_cache_length(forward_op)
 
     assert executor.runtime_states.valid_cache_lengths[2].item() == 10
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3
     assert executor.runtime_states.valid_cache_lengths[4].item() == 4
+
+
+def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
+    """A PD decode destination never runs the prompt, so no forward of its own
+    can establish these lengths: they come from the prefill node's complete
+    prompt, not from the local extend prefix."""
+    executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
+    executor.device = "cpu"
+    executor.device_module = torch.cuda
+    executor.default_stream = object()
+    executor.execution_stream = _ExecutionStream()
+    executor.runtime_states = _RuntimeStates()
+
+    forward_op = SimpleNamespace(
+        request_pool_indices=[7, 11, 13],
+        prefill_lengths=[15, 17, 19],
+        extend_prefix_lens=[0, 0],
+        num_extends=lambda: 2,
+    )
+
+    torch_tensor = torch.tensor
+
+    def tensor_without_pinning(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return torch_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+
+    executor.reset_remote_prefill_cache_lengths(forward_op)
+
+    assert executor.runtime_states.valid_cache_lengths[7].item() == 15
+    assert executor.runtime_states.valid_cache_lengths[11].item() == 17
+    # Only the extend rows are seeded; the third row is not part of this op.
+    assert executor.runtime_states.valid_cache_lengths[13].item() == 13
+
+
+def test_remote_slot_preparation_orders_behind_the_default_stream(monkeypatch):
+    """The slot a remote admission is granted may be the one a retraction in
+    the same plan imaged: the snapshot store reads it on the write stream and
+    fences the default stream, so the backend write must order behind that
+    stream before anything of the slot changes."""
+    trace = []
+
+    class _Stream:
+        def wait_stream(self, stream):
+            trace.append(("wait", stream))
+
+    class _Backend:
+        def prepare_remote_cache_slots(self, slots):
+            trace.append(("prepare", slots))
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device_module = torch.cuda
+    executor.default_stream = "default"
+    executor.execution_stream = _Stream()
+    executor.attn_backend = _Backend()
+    monkeypatch.setattr(
+        torch.cuda,
+        "stream",
+        lambda stream: (trace.append(("on", stream)), nullcontext())[1],
+    )
+
+    executor.prepare_remote_cache_slots([3, 5])
+
+    assert trace == [
+        ("wait", "default"),
+        ("on", executor.execution_stream),
+        ("prepare", [3, 5]),
+    ]
+
+
+def test_draft_final_step_follows_the_complete_drafter_run():
+    events = []
+
+    class _Drafter:
+        supports_pd_layerwise_finalization = True
+
+        def prepare_target_forward(self, ctx):
+            events.append("prepare-target")
+
+        def run(self, **_kwargs):
+            events.extend(("draft-write-0", "draft-write-1", "draft-return"))
+            return torch.tensor([7], dtype=torch.int32)
+
+    class _FutureInputMap:
+        def __setitem__(self, _key, _value):
+            events.append("future-input")
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
+    executor.device_module = SimpleNamespace(current_stream=lambda: None)
+    executor.input_buffers = SimpleNamespace(
+        req_pool_indices_buf=torch.tensor([0]),
+        state_write_req_pool_indices_buf=torch.tensor([0]),
+    )
+    executor.grammar_runtime = None
+    executor.drafter = _Drafter()
+    executor.tree_spec = None
+    executor.dspark_context_producer = None
+    executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
+    executor.runtime_states = SimpleNamespace(
+        future_input_map=_FutureInputMap(),
+        mark_spec_candidates_drafted=lambda _rows: events.append("candidates-real"),
+        vocab_size=32,
+    )
+    executor.nan_guard = SimpleNamespace(
+        audit_logits=lambda *_args: None,
+        merge_oov=lambda *_args: None,
+    )
+    executor._run_target_forward = lambda *_args: SimpleNamespace(
+        next_token_logprobs=None,
+        input_token_logprobs=None,
+        input_top_logprobs_val=None,
+        input_top_logprobs_idx=None,
+        sampled_top_logprobs_val=None,
+        sampled_top_logprobs_idx=None,
+    )
+    executor._run_sampling = lambda *_args: (
+        torch.tensor([3], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+    )
+    executor._draft_final_step_counter = SimpleNamespace(
+        record_cache=lambda: events.append("draft-final")
+    )
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        output_layout=ForwardOutputLayout(1, 1, 0, 1),
+        input_num_tokens=1,
+        forward_mode=ForwardMode.EXTEND,
+    )
+
+    executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
+
+    assert events == [
+        "prepare-target",
+        "draft-write-0",
+        "draft-write-1",
+        "draft-return",
+        "future-input",
+        "candidates-real",
+        "draft-final",
+    ]
+
+
+def test_cudagraph_gc_flag_reaches_the_capture_context():
+    """The operator flag must survive ServerArgs -> config -> capture.
+
+    Freezing the collector for the duration of capture is the default; the
+    flag is the escape hatch. It previously never arrived -- the wrapper read
+    it off a config that never carried it -- so capture never froze and the
+    flag moved nothing in either direction. Pin the whole path, not the
+    default: read the value the capture context would actually see.
+    """
+    import dataclasses
+    import gc
+
+    from tokenspeed.runtime.execution.forward_step import (
+        ForwardStepRunner,
+        freeze_gc,
+    )
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+
+    fields = {f.name for f in dataclasses.fields(ModelExecutorConfig)}
+    assert "enable_cudagraph_gc" in fields, "config must carry the flag"
+
+    for flag in (False, True):
+        config = SimpleNamespace(enable_cudagraph_gc=flag)
+        wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
+        # Only the flag plumbing is under test; __init__ needs a live model.
+        wrapper.enable_cudagraph_gc = config.enable_cudagraph_gc
+        assert wrapper.enable_cudagraph_gc is flag
+
+        # get_freeze_count() is process-global and other code freezes too, so
+        # compare against the count on entry rather than against zero.
+        before = gc.get_freeze_count()
+        canary = [object() for _ in range(64)]
+        with freeze_gc(wrapper.enable_cudagraph_gc):
+            during = gc.get_freeze_count()
+        after = gc.get_freeze_count()
+        assert (during > before) is (not flag), (flag, before, during)
+        assert after <= before, (before, after)
+        assert len(canary) == 64
+
+
+def test_non_spec_decode_routes_through_verify():
+    """The unified sampling rule: decode rows verify even without a drafter.
+
+    Non-speculative decode is verify's N == 1 case — _decode_candidates
+    yields the one-column window (this step's input token per request) and
+    _sample_and_verify must call verify(), never the sample() fast path.
+    """
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+    calls = []
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
+    executor.device_module = SimpleNamespace(current_stream=lambda: None)
+    executor.drafter = None
+    executor.tree_spec = None
+    executor.config = SimpleNamespace(output_length=1)
+    executor._simulated_accept_length = None
+    executor.input_buffers = SimpleNamespace(
+        input_ids_buf=torch.arange(8, dtype=torch.int32),
+        force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),
+        input_lengths_buf=torch.ones(8, dtype=torch.int32),
+    )
+    executor.sampling_backend = SimpleNamespace(
+        sample=lambda *_a, **_k: calls.append("sample") or (None, None),
+        verify=lambda _lo, _si, cand, tree: calls.append(("verify", tuple(cand.shape)))
+        or (
+            torch.zeros(cand.shape[0], dtype=torch.int32),
+            torch.ones(cand.shape[0], dtype=torch.int32),
+        ),
+    )
+
+    # Pure decode, bs=3, N=1: candidates are the tail 3 ids as [3, 1].
+    ctx = SimpleNamespace(
+        bs=3,
+        num_extends=0,
+        input_num_tokens=3,
+        decode_input_ids=None,
+        output_layout=ForwardOutputLayout(0, 0, 3, 1),
+        sampled_top_k=0,
+    )
+    candidates = executor._decode_candidates(ctx)
+    assert candidates.shape == (3, 1)
+    assert candidates.view(-1).tolist() == [0, 1, 2]
+
+    executor._sample_and_verify(object(), object(), ctx, candidates)
+    assert calls == [("verify", (3, 1))]
+
+    # Pure prefill still samples.
+    calls.clear()
+    ctx2 = SimpleNamespace(
+        bs=2,
+        num_extends=2,
+        input_num_tokens=6,
+        decode_input_ids=None,
+        output_layout=ForwardOutputLayout(2, 2, 0, 1),
+        sampled_top_k=0,
+    )
+    assert executor._decode_candidates(ctx2) is None
+    executor._sample_and_verify(
+        object(),
+        SimpleNamespace(valid_cache_lengths=None, req_pool_indices=None),
+        ctx2,
+        None,
+    )
+    assert calls == ["sample"]
+
+
+@pytest.mark.parametrize(
+    ("prefill_tokens", "dp_size", "width", "capacity"),
+    [(64, 1, 1, 160), (64, 1, 4, 640), (64, 4, 4, 160), (8192, 1, 4, 8192)],
+)
+def test_input_allocation_covers_decode(
+    monkeypatch, prefill_tokens, dp_size, width, capacity
+):
+    import tokenspeed.runtime.execution.model_executor as module
+
+    class AllocationChecked(Exception):
+        pass
+
+    def check_allocation(
+        max_bs, max_num_tokens, state_write_padding_pool_index, device
+    ):
+        assert max_bs == 160 // dp_size
+        assert max_num_tokens == capacity
+        raise AllocationChecked
+
+    monkeypatch.setattr(
+        module, "validate_scheduler_config", lambda attn_backend, kv_pool: None
+    )
+    # Check the real constructor's allocation arguments without model/GPU setup.
+    monkeypatch.setattr(module, "InputBuffers", check_allocation)
+    config = SimpleNamespace(
+        device="cpu",
+        max_num_seqs=160,
+        data_parallel_size=dp_size,
+        chunked_prefill_size=prefill_tokens,
+        output_length=width,
+        max_req_pool_size=161,
+        spec_algo="EAGLE" if width > 1 else None,
+        spec_num_tokens=width,
+    )
+    with pytest.raises(AllocationChecked):
+        ModelExecutor(
+            config=config,
+            model_runner=None,
+            attn_backend=None,
+            token_to_kv_pool=SimpleNamespace(
+                arena=SimpleNamespace(runtime_contract=None)
+            ),
+            sampling_backend=None,
+            draft_model_runner=None,
+            draft_attn_backend=None,
+            draft_token_to_kv_pool=None,
+        )

@@ -23,12 +23,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cached_property
+from typing import ClassVar
 
 import numpy as np
 import torch
 
+from tokenspeed.runtime.layers.attention.kv_cache.base import (
+    derive_state_groups_by_layer,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LAYER_TYPES,
 )
@@ -37,109 +41,69 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 class HybridKDATokenToKVPool(MLATokenToKVPool):
     """MLA compute interface whose latent KV and KDA state share one buffer."""
 
+    #: Sanitizing latent write: under the prefill graph a padded row's NaN
+    #: reaches a live row's softmax through the shared dummy slot, because the
+    #: paged MLA decode computes ``q·k`` before the causal mask.
+    latent_write_sanitizes: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
-        memory_plan: CacheMemoryPlan,
-        layer_group_ids: tuple[str, ...],
         layer_types: tuple[str, ...],
-        pd_disaggregation_enabled: bool = False,
-        state_field_dtypes: Mapping[str, torch.dtype] | None = None,
         **kwargs,
     ):
         self._layer_types = tuple(layer_types)
-        group_ids = tuple(layer_group_ids)
-        self._group_ids_by_layer = dict(enumerate(group_ids))
-        self._state_field_dtypes = dict(state_field_dtypes or {})
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.paged_cache_requires_page_zeroing = True
+        self.requires_page_zeroing = True
 
-        layer_num = kwargs["layer_num"]
-        if len(self._layer_types) != layer_num:
+        if len(self._layer_types) != kwargs["layer_num"]:
             raise ValueError("cache layer types must cover every model layer")
-        if len(group_ids) != layer_num:
-            raise ValueError("cache group ids must cover every model layer")
 
-        super().__init__(
-            memory_plan=memory_plan,
-            layer_group_ids=group_ids,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
-            **kwargs,
-        )
+        super().__init__(**kwargs)
 
-    def _create_buffers(self) -> None:
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._bind_buffers()
+    # A KDA layer has conv/recurrent planes planned and an MLA layer has a
+    # latent plane; the plan's field list decides per layer. Latent-page
+    # contiguity is a plan invariant (exact_page_stride).
+    # State planes keep their planned shape: the KDA decode ABI reads them
+    # as the plan lays them out.
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        **MLATokenToKVPool.layer_plane_bindings,
+        "conv_state": "_conv_state",
+        "recurrent_state": "_recurrent_state",
+    }
 
-    def _bind_buffers(self) -> None:
+    def _bind_layer_planes(self) -> None:
         if self.quant_method == "per_token_head":
             raise ValueError("KDA cache does not support per-token-head KV")
-        if self.plan.logical_block_tokens != self.page_size:
-            raise ValueError(
-                f"cache plan P={self.plan.logical_block_tokens} does not match "
-                f"pool page_size={self.page_size}"
-            )
-        max_packing = max(
-            group.cache_blocks_per_lcm_block for group in self.plan.groups
+        super()._bind_layer_planes()
+        # A state layer with no planned planes belongs to another pipeline
+        # stage (the PP-narrowed plan drops its fields); this view never
+        # executes it, so it gets no entry.
+        self._state_buffers_by_layer = {
+            layer_id: (self._conv_state[layer_id], self._recurrent_state[layer_id])
+            for layer_id, label in enumerate(self._layer_types)
+            if label in STATE_LAYER_TYPES and self._conv_state[layer_id] is not None
+        }
+
+    @cached_property
+    def state_group_by_layer(self) -> dict[int, str]:
+        """View-local state layer id -> its state cache group id."""
+        return derive_state_groups_by_layer(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
+            state_layer_ids=(
+                layer_id
+                for layer_id, label in enumerate(self._layer_types)
+                if label in STATE_LAYER_TYPES
+            ),
+            state_field_suffixes=("conv_state", "recurrent_state"),
         )
-        expected_size = self.plan.num_lcm_blocks * max_packing * self.page_size
-        if self.size != expected_size:
-            raise ValueError(
-                f"cache pool size {self.size} does not match child capacity "
-                f"{expected_size}"
-            )
-        self.kv_buffer = [None] * self.layer_num
-        for layer_id, label in enumerate(self._layer_types):
-            if label in STATE_LAYER_TYPES:
-                conv_id = f"layer.{layer_id}.conv_state"
-                recurrent_id = f"layer.{layer_id}.recurrent_state"
-                try:
-                    conv_dtype = self._state_field_dtypes[conv_id]
-                    recurrent_dtype = self._state_field_dtypes[recurrent_id]
-                except KeyError as exc:
-                    raise ValueError(
-                        f"cache state field {exc.args[0]!r} has no dtype"
-                    ) from exc
-                conv = self.field(
-                    conv_id,
-                    conv_dtype,
-                )
-                recurrent = self.field(
-                    recurrent_id,
-                    recurrent_dtype,
-                )
-                self._state_buffers_by_layer[layer_id] = (conv, recurrent)
-                continue
-            latent = self.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
-            page_elements = int(np.prod(latent.shape[1:]))
-            if latent.stride(0) != page_elements:
-                raise ValueError(
-                    f"layer {layer_id} latent pages have padding between pages"
-                )
-            self.kv_buffer[layer_id] = latent.view(-1, 1, self.kv_cache_dim)
-
-    @property
-    def num_lcm_blocks(self) -> int:
-        return self.plan.num_lcm_blocks
-
-    @property
-    def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        return list(self._state_buffers_by_layer.values())
-
-    def group_id_for_layer(self, layer_id: int) -> str:
-        try:
-            return self._group_ids_by_layer[layer_id]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no cache group") from exc
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
+        """Return one KDA state plane. Latent KV is read via ``kv_buffer``."""
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
-        if component_name == "latent_kv":
-            buffer = self.kv_buffer[layer_id]
-            if buffer is None:
-                raise ValueError(f"layer {layer_id} has no MLA latent cache")
-            return self.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
         try:
             conv, recurrent = self._state_buffers_by_layer[layer_id]
         except KeyError as exc:
@@ -156,21 +120,9 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         except KeyError as exc:
             raise ValueError(f"layer {layer_id} has no KDA state") from exc
 
-    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: Mapping[str, np.ndarray]) -> None:
         if new_page_ids:
-            self.zero_blocks(new_page_ids)
-
-    @torch.no_grad()
-    def clear_kv_buffers(self) -> None:
-        assert self.buffer is not None
-        self.buffer.zero_()
+            self.arena.zero_blocks(new_page_ids)
 
     def get_kv_size_bytes(self):
-        assert self.buffer is not None
-        return self.buffer.nbytes
-
-    def get_contiguous_buf_infos(self):
-        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")
+        return self.arena.buffer.nbytes

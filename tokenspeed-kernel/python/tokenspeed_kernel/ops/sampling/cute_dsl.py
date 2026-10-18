@@ -61,6 +61,8 @@ __all__ = [
     "argmax",
     "argmax_pair",
     "create_dist_argmax_state",
+    "supports_dist_argmax_shape",
+    "try_create_dist_argmax_state",
     "cute_dsl_argmax",
     "distributed_argmax",
     "is_available",
@@ -148,7 +150,7 @@ if _ARCH_SUPPORTED and _has_cluster_launch_support():
         import cutlass.cute as cute
         from cutlass._mlir.dialects import llvm
         from cutlass.cute.runtime import from_dlpack
-        from cutlass.cute.typing import Float32, Int32
+        from cutlass.cute.typing import Int32
         from cutlass.cutlass_dsl import T, dsl_user_op
         from tokenspeed_kernel.thirdparty.cute_dsl.argmax import (
             ArgmaxKernel,
@@ -171,6 +173,32 @@ if _ARCH_SUPPORTED and _has_cluster_launch_support():
 def is_available() -> bool:
     """Whether the CuTe DSL argmax kernel can run on this platform."""
     return _CUTE_AVAILABLE
+
+
+def supports_dist_argmax_shape(
+    vocab_per_rank: int, dtype: torch.dtype, world_size: int
+) -> bool:
+    """Whether a shard's width, dtype and group size fit the distributed argmax.
+
+    Deliberately excludes platform and multicast support, which can differ
+    between ranks: this verdict follows from the model config alone, so a
+    caller may reject on it before doing any collective work.
+
+    Args:
+        vocab_per_rank: Column count of one rank's logits shard.
+        dtype: Value dtype of those logits.
+        world_size: Ranks in the group the argmax reduces over.
+
+    Returns:
+        True when the shard is one :func:`distributed_argmax` will accept.
+    """
+    return (
+        dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and 1 <= world_size <= 32
+        and vocab_per_rank >= _MIN_VOCAB_SIZE
+        and vocab_per_rank % _VOCAB_SIZE_ALIGNMENT == 0
+        and world_size * vocab_per_rank < 0x7FFFFFFF
+    )
 
 
 def _supports_cute(N: int, dtype: torch.dtype) -> bool:
@@ -318,12 +346,11 @@ def _register_cute_argmax(fn):
             "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
         ),
         priority=Priority.SPECIALIZED,
-        tags={"latency", "determinism"},
     )(fn)
 
 
 @_register_cute_argmax
-def _argmax_cute(
+def cute_dsl_argmax(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
@@ -394,12 +421,10 @@ def _argmax_pair_cute(
     return out
 
 
-cute_dsl_argmax = _argmax_cute
-
 # Direct CuTe DSL module API. The common runtime-facing API lives in
 # tokenspeed_kernel.ops.sampling and selects among registered solutions.
 if _CUTE_AVAILABLE:
-    argmax = _argmax_cute
+    argmax = cute_dsl_argmax
     argmax_pair = _argmax_pair_cute
     _argmax_kernel_impl = _invoke_kernel
 else:
@@ -900,14 +925,16 @@ class DistArgmaxState:
     skip_ping_pong: bool = False
 
 
-def create_dist_argmax_state(
+def _build_dist_argmax_state(
     group: _dist.ProcessGroup,
     rank_in_group: int,
     max_M: int,
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device | None = None,
     skip_ping_pong: bool = False,
-) -> DistArgmaxState:
+    *,
+    strict: bool,
+) -> DistArgmaxState | None:
     assert dtype in (
         torch.bfloat16,
         torch.float16,
@@ -942,6 +969,8 @@ def create_dist_argmax_state(
         f"world_size={world_size}"
     )
     if not hdl.multicast_ptr:
+        if not strict:
+            return None
         raise RuntimeError(
             f"distributed_argmax requires CUDA multicast / NVLS, but the "
             f"symm-mem handle on device {device} reports multicast_ptr="
@@ -963,6 +992,70 @@ def create_dist_argmax_state(
         warps_done_gpu=warps_done_gpu,
         use_redux=use_redux,
         skip_ping_pong=skip_ping_pong,
+    )
+
+
+def create_dist_argmax_state(
+    group: _dist.ProcessGroup,
+    rank_in_group: int,
+    max_M: int,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | None = None,
+    skip_ping_pong: bool = False,
+) -> DistArgmaxState:
+    """Build the cross-rank argmax state, requiring NVLS multicast.
+
+    Args:
+        group: The process group the argmax reduces over.
+        rank_in_group: This process's rank within ``group``.
+        max_M: Largest row count any call will pass.
+        dtype: Value dtype of the logits; bf16, fp16 or fp32.
+        device: CUDA device for the symmetric-memory slots; defaults to the
+            current device.
+        skip_ping_pong: Pin the slot band instead of alternating. Only safe
+            when the caller synchronizes across ranks between calls.
+
+    Returns:
+        The state to pass to :func:`distributed_argmax`.
+
+    Raises:
+        RuntimeError: The group has no CUDA multicast / NVLS support.
+    """
+    return _build_dist_argmax_state(
+        group, rank_in_group, max_M, dtype, device, skip_ping_pong, strict=True
+    )
+
+
+def try_create_dist_argmax_state(
+    group: _dist.ProcessGroup,
+    rank_in_group: int,
+    max_M: int,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | None = None,
+    skip_ping_pong: bool = False,
+) -> DistArgmaxState | None:
+    """Build the cross-rank argmax state, or report that NVLS is missing.
+
+    Multicast support cannot be queried before the symmetric-memory
+    rendezvous, so callers that would rather fall back than fail ask here
+    instead of catching an exception. Every other precondition still asserts.
+
+    Args:
+        group: The process group the argmax reduces over.
+        rank_in_group: This process's rank within ``group``.
+        max_M: Largest row count any call will pass.
+        dtype: Value dtype of the logits; bf16, fp16 or fp32.
+        device: CUDA device for the symmetric-memory slots; defaults to the
+            current device.
+        skip_ping_pong: Pin the slot band instead of alternating. Only safe
+            when the caller synchronizes across ranks between calls.
+
+    Returns:
+        The state, or ``None`` when the group has no multicast support. The
+        verdict follows from the group's fabric, so every rank agrees on it.
+    """
+    return _build_dist_argmax_state(
+        group, rank_in_group, max_M, dtype, device, skip_ping_pong, strict=False
     )
 
 
@@ -1072,6 +1165,10 @@ def distributed_argmax(
     cross-rank exchange is collective and slot bands are reused across
     calls. Do not share one ``DistArgmaxState`` across concurrent streams.
     """
+    assert logits.is_contiguous(), (
+        "distributed_argmax wraps its input as compact rows; a strided view "
+        "would be read with the wrong row pitch"
+    )
     M, N = _dist_argmax_validate_inputs(state, logits, out_max, out_idx)
     device = logits.device
 

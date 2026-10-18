@@ -22,14 +22,19 @@
 
 #include <concepts>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "cache/core/cache_types.h"
 #include "core/token_container.h"
+#include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "fsm/states.h"
 #include "scheduler/request_spec.h"
@@ -39,14 +44,81 @@ namespace tokenspeed {
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t page_size, Role role);
+    Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
 
-    std::int32_t MaxNewTokens() const { return max_new_tokens_; }
+    // Decode headroom an admission must secure before the prefill starts:
+    // one safe-step window up front, plus one more per retraction suffered
+    // -- being retracted means the previous admission was still too
+    // optimistic. Capped by the generation budget the request can STILL
+    // use, which makes the escalation terminate. Remaining, not declared: a
+    // restore re-reserves on top of the tokens already generated, so a
+    // readmission that reserved the full declared budget would demand
+    // prompt + generated + max_new -- more than the request can ever write,
+    // and possibly more than the pool holds, leaving it Retracted forever.
+    //
+    // A request with no declared budget (max_new_tokens == 0) demands none,
+    // and keeps demanding none however often it is retracted. That looks
+    // like an omission but is the only safe reading: the declared budget is
+    // what bounds the escalation, and without one there is nothing to stop
+    // it from demanding more than the pool can ever hold -- at which point
+    // the request could not be readmitted at all. An undeclared budget
+    // stays optimistic and relies on the victim policy to make progress.
+    std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
+        return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
+    }
+    void NoteRetracted() { ++retraction_count_; }
+
+    // True when the last admission's headroom already covers every token
+    // this request could still generate. Retracting such a request is pure
+    // thrash -- its readmission must take back exactly what the retraction
+    // freed -- so the victim policy skips it. (An undeclared budget is
+    // never covered: nothing was reserved for it.)
+    //
+    // Judged against the budget that was open AT ADMISSION, never the
+    // current one. The windows were sized then, and decode spends them
+    // exactly as fast as it shrinks RemainingNewTokens(), so holding them
+    // against today's remainder would count spent headroom as still held:
+    // a request that outgrew a partial reserve would look covered the
+    // moment its remainder dipped under the window, and once every
+    // resident request looked covered nothing could be retracted to free
+    // the next page.
+    bool ReserveCoversGeneration(std::int32_t safe_steps) const {
+        return max_new_tokens_ > 0 && safe_steps * (1 + retraction_count_) >= RemainingNewTokensAtAdmission();
+    }
+
+    // Tokens generated so far / still permitted. Both compare against the
+    // SUBMITTED prompt, which no retraction or restore changes.
+    std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
+    std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
+    bool HasDeclaredBudget() const { return max_new_tokens_ > 0; }
+    // The submitted prompt plus the declared budget.
+    std::int64_t TokenLimit() const { return std::int64_t{submitted_prompt_size_} + max_new_tokens_; }
+    bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
+    // The budget that was still open when the current admission was granted:
+    // stamped by the admission events (a first chunk, a restore), frozen for
+    // the admission's whole life where RemainingNewTokens() shrinks with
+    // every decode.
+    std::int32_t RemainingNewTokensAtAdmission() const {
+        return std::max(0, max_new_tokens_ - generated_tokens_at_admission_);
+    }
+
+    // Longest prompt prefix the admission probe may claim from the prefix
+    // cache (RequestSpec::max_cached_prefix_tokens); INT32_MAX means
+    // unbounded. Only a first admission probes: a restore copies the
+    // request's own image back and matches nothing.
+    std::int32_t MaxCachedPrefixTokens() const { return max_cached_prefix_tokens_; }
 
     template <typename Event>
     void Apply(Event&& event) {
+        // An admission that secures headroom records the generation budget it
+        // saw, so the retraction exemption is judged against that budget and
+        // not today's remainder.
+        if constexpr (std::same_as<std::remove_cvref_t<Event>, fsm::SchedulePrefillFirstChunkEvent> ||
+                      std::same_as<std::remove_cvref_t<Event>, fsm::ScheduleRestoreEvent>) {
+            generated_tokens_at_admission_ = GeneratedTokens();
+        }
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State { return fsm::ToState(std::forward<Event>(event)(std::move(state))); },
             std::move(state_));
@@ -57,14 +129,79 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
-    std::vector<std::span<const std::int32_t>> FullPagedTokens(bool except_last) const {
-        return token_container_.FullPagedTokens(page_size_, except_last);
+    template <typename... States>
+    bool IsAnyOf() const {
+        return (std::holds_alternative<States>(state_) || ...);
     }
+
+    template <typename State>
+    const State* GetIf() const {
+        return std::get_if<State>(&state_);
+    }
+
+    // True in every state that carries ForwardResources; Bootstrapping,
+    // Submitted, Prefetching, Retracted and Finished hold no pages (Restoring
+    // does: its fresh pages are being filled).
+    bool HoldsPages() const {
+        return std::visit(Overloaded{
+                              [](const fsm::HoldsForwardResources auto&) { return true; },
+                              [](const auto&) { return false; },
+                          },
+                          state_);
+    }
+
+    // Forwards scheduled for this request whose results have not come back.
+    // Every state that holds pages answers this; the page-less ones
+    // (Submitted, Retracted, Finished) owe nothing by construction.
+    std::int32_t ResultsInFlight() const {
+        return std::visit(Overloaded{
+                              [](const fsm::HoldsForwardResources auto& s) { return s.resources.results_in_flight; },
+                              [](const auto&) { return 0; },
+                          },
+                          state_);
+    }
+
+    void TrackScheduledForward() {
+        std::visit(Overloaded{
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.TrackScheduledForward(); },
+                       [](auto&) {},
+                   },
+                   state_);
+    }
+
+    void NoteResultLanded() {
+        std::visit(Overloaded{
+                       [](fsm::HoldsForwardResources auto& s) { s.resources.ResultLanded(); },
+                       [](auto&) {},
+                   },
+                   state_);
+    }
+
+    std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
+        return token_container_.FullPrefixPages(prefix_granularity_, except_last);
+    }
+    std::span<const std::int32_t> TokenSlice(std::int32_t begin, std::int32_t size) const {
+        return token_container_.TokenSlice(TokenContainer::Window{.begin = begin, .size = size});
+    }
+    // The partial prefix page ending at num_computed_tokens, hashed under
+    // `prior` (the chain hash of the last full page below it, "" for page 0);
+    // nullopt when the frontier is page-aligned.
+    std::optional<TailPublication> TailPublicationAt(std::int32_t num_computed_tokens, const std::string& prior) const;
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
+    // P role: the drafter candidates that arrived with the final chunk's
+    // ExtendResult, held until the remote-decode operation carries them out.
+    void StoreSpecCandidates(std::vector<std::int32_t> ids) { spec_candidate_ids_ = std::move(ids); }
+    std::vector<std::int32_t> TakeSpecCandidates() { return std::exchange(spec_candidate_ids_, {}); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
     PrefillInfo CurrentPrefillInfo() const;
+    // Tokens whose KV and state the ordered forward stream has written, or
+    // is writing, ahead of any later plan: the end of a scheduled prefill
+    // window, or -- once decoding -- every token but the last, which is the
+    // sampled input the next forward computes. Exact for any verify width;
+    // the frontier for prefix publication and retention.
+    std::int32_t NumComputedTokens() const;
 
     std::int32_t UnscheduledPrefillSize() const {
         return std::visit(Overloaded{
@@ -77,29 +214,35 @@ public:
                           state_);
     }
 
-    std::int32_t RequestPoolIndex() const { return forwardState("RequestPoolIndex").RequestPoolIndex(); }
+    std::int32_t RequestPoolIndex() const { return forwardResources("RequestPoolIndex").RequestPoolIndex(); }
 
-    std::vector<std::int32_t> ActiveLcmBlockIds() const {
-        return forwardState("ActiveLcmBlockIds").ActiveLcmBlockIds();
-    }
+    const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
-    const std::vector<BlockTable>& BlockTablesRef() const { return forwardState("BlockTablesRef").BlockTables(); }
+    std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
 
-    std::vector<BlockTable>& BlockTablesRef() { return forwardState("BlockTablesRef").BlockTables(); }
+    fsm::CacheProgress CacheProgress() const { return forwardResources("CacheProgress").cache_progress; }
+    // Written by the scheduler when an admission succeeds, like the block
+    // tables the same admission fills: resources and progress land at
+    // admission time, and a state transition only moves them on.
+    fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
 
-    fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
-
-    fsm::PrefillSource PrefillSource() const {
-        if (const auto* state = std::get_if<fsm::Prefilling>(&state_)) {
-            return state->Source();
-        }
-        throw std::logic_error("Request::PrefillSource: expected Prefilling; got " + StateName());
+    // True from a restore's ACK until the first decode is scheduled: the
+    // device holds no in-flight capture for the request's next input, so that
+    // decode carries its token explicitly (fsm::RestoreMarker).
+    bool ResumedByRestore() const {
+        return std::visit(Overloaded{
+                              [](const fsm::PrefillDone& state) { return state.ResumedByRestore(); },
+                              [](const fsm::Decoding& state) { return state.ResumedByRestore(); },
+                              [](const auto&) { return false; },
+                          },
+                          state_);
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{
                 [](const fsm::PrefillDone& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::PrefillAwaitingResult& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [](const fsm::Decoding& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [this](const auto&) -> std::int32_t {
                     throw std::logic_error(
@@ -110,40 +253,39 @@ public:
             state_);
     }
 
-    // How many scheduler rounds this request's first-chunk prefill was deferred
-    // by `prefill_defer_window`. Used to bound the deferral so a lone prefill
-    // that never gains a sibling still makes forward progress (see the policy
-    // at SchedulerConfig::prefill_defer_window).
-    std::int32_t PrefillDeferRounds() const { return prefill_defer_rounds_; }
-    void MarkPrefillDeferred() { ++prefill_defer_rounds_; }
-
     std::string StateName() const {
         return std::visit(Overloaded{
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
                               [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
+                              [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                              [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
+                              [](const fsm::Restoring&) -> std::string { return "Restoring"; },
+                              [](const fsm::Finishing&) -> std::string { return "Finishing"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);
     }
 
 private:
-    fsm::ForwardState& forwardState(const char* operation);
-    const fsm::ForwardState& forwardState(const char* operation) const;
+    fsm::ForwardResources& forwardResources(const char* operation);
+    const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
     TokenContainer token_container_;
-    // The caller's generation budget. Admission needs it to charge what a
-    // request will eventually occupy rather than only its prompt: SGLang's
-    // reservation is prompt + max_new_tokens * an adaptive ratio, and without
-    // this field the scheduler cannot express the second term.
+    std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
-    std::int32_t page_size_{};
+    std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
+    std::int32_t retraction_count_{0};
+    // GeneratedTokens() when the current admission was granted.
+    std::int32_t generated_tokens_at_admission_{0};
+    std::vector<std::int32_t> spec_candidate_ids_;
+    std::int32_t prefix_granularity_{};
     fsm::State state_;
-    std::int32_t prefill_defer_rounds_{0};
 };
 
 }  // namespace tokenspeed

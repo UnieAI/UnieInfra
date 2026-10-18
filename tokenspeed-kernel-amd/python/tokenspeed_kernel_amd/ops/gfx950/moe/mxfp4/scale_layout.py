@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Single source of truth for the gfx950 A4W4 CDNA4 MXFP4 scale layout.
+"""Single source of truth for the gfx950 CDNA4 block-scale layout.
 
 Both scale producers and consumers must agree on the CDNA4 MXFP4 scale-swizzle
 parameters and byte permutation:
@@ -26,9 +26,9 @@ parameters and byte permutation:
 * B-scales (weights): swizzled at load time by the weight preprocessor
   (``mxfp4_gfx950_preprocess._swizzle_mxfp4`` via
   :func:`swizzle_cdna4_mxfp4_scale`).
-* A-scales (activations): emitted in token order by the MXFP4 activation
-  quantizer and re-gathered into sorted-route order by
-  ``mxfp4.scale.gather_package_cdna4_scale``.
+* A-scales (activations): MXFP4 quantization emits token-order scales that
+  ``mxfp4.scale.gather_package_cdna4_scale`` reorders; the EP8 MXFP8 quantizer
+  emits the same swizzle directly in sorted-route order.
 * Consumers: the package stage kernels (``prefill_stage1/2``,
   ``decode_stage1/2``) address the scales with the matching CDNA4 MFMA scale
   layout (``gl.amd.cdna4.get_mfma_scale_layout``).
@@ -81,7 +81,7 @@ MXFP4_BLOCK = 32
 CDNA4_SCALE_N_BLOCK = 32
 CDNA4_SCALE_K_BLOCK = 8
 
-# MFMA non-K dimension used by the a4w4 stage kernels
+# MFMA non-K dimension used by the block-scaled stage kernels
 # (``v_mfma_scale_f32_16x16x128_f8f6f4``). The scale swizzle below is fixed to
 # this shape.
 MFMA_NONK_DIM = 16
@@ -91,8 +91,56 @@ __all__ = [
     "CDNA4_SCALE_N_BLOCK",
     "CDNA4_SCALE_K_BLOCK",
     "MFMA_NONK_DIM",
+    "empty_swizzled_cdna4_mxfp4_scale",
+    "is_swizzled_cdna4_mxfp4_scale",
     "swizzle_cdna4_mxfp4_scale",
 ]
+
+
+def is_swizzled_cdna4_mxfp4_scale(scale: torch.Tensor) -> bool:
+    """Cheap check for an already-swizzled CDNA4 MXFP4 scale tensor.
+
+    ``stride(-2) == 1`` (the contiguous ``K_SCALE_pad * 32`` axis) is the
+    swizzle's signature; see :func:`swizzle_cdna4_mxfp4_scale`.
+    """
+    return scale.stride(-2) == 1 and scale.stride(-1) >= scale.shape[-2]
+
+
+def empty_swizzled_cdna4_mxfp4_scale(
+    rows: int,
+    k_scale: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate an uninitialized CDNA4-swizzled MXFP4 scale tensor.
+
+    Args:
+        rows: logical non-K (row) count; padded to ``CDNA4_SCALE_N_BLOCK``.
+        k_scale: logical per-32-element scale column count; padded to
+            ``CDNA4_SCALE_K_BLOCK``.
+        device: target device.
+
+    Returns:
+        An empty uint8 tensor shaped/strided as
+        :func:`swizzle_cdna4_mxfp4_scale` output, ready for producers that
+        write scales directly in swizzled order.
+    """
+    k_scale_pad = (
+        (k_scale + CDNA4_SCALE_K_BLOCK - 1) // CDNA4_SCALE_K_BLOCK
+    ) * CDNA4_SCALE_K_BLOCK
+    rows_pad = (
+        (rows + CDNA4_SCALE_N_BLOCK - 1) // CDNA4_SCALE_N_BLOCK
+    ) * CDNA4_SCALE_N_BLOCK
+    shape = (
+        k_scale_pad * CDNA4_SCALE_N_BLOCK,
+        rows_pad // CDNA4_SCALE_N_BLOCK,
+    )
+    return torch.empty_strided(
+        shape,
+        (1, shape[0]),
+        dtype=torch.uint8,
+        device=device,
+    )
 
 
 def swizzle_cdna4_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:

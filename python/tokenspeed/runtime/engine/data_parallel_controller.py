@@ -20,27 +20,27 @@
 
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import contextlib
 import copy
-import multiprocessing as mp
 import os
 import signal
 import threading
-from collections import deque
 from enum import Enum, auto
 
 import psutil
 import setproctitle
 import zmq
 
-from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     BlockReqInput,
+    GetLoadReqOutput,
     IpcReceiver,
     IpcSender,
+    LoadSnapshot,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    WatchLoadUpdateReq,
 )
+from tokenspeed.runtime.engine.load_snapshot import LoadSnapshotStore
 from tokenspeed.runtime.engine.request import Req
 from tokenspeed.runtime.utils import (
     configure_logger,
@@ -49,7 +49,11 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
-from tokenspeed.runtime.utils.process import register_usr_signal
+from tokenspeed.runtime.utils.process import (
+    receive_ready_messages,
+    register_usr_signal,
+    start_process_with_ready_pipe,
+)
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
@@ -77,44 +81,88 @@ class DPBudget:
         # - SHORTEST_QUEUE: by num_reqs (running + waiting)
         # - MINIMUM_CACHE_USAGE: by num_pages (page usage)
         self.method = method
-        self.budget_queue = deque()
+        self.reported_metrics: dict[int, int] = {}
+        self.reported_request_counts: dict[int, int] = {}
+        self.reservations: dict[int, int] = {}
+        self.rank_order: list[int] = []
 
-    def update_budget(self, load_update: WatchLoadUpdateReq):
-        """Update the budget queue.
+    def update_budget(
+        self,
+        loads: list[GetLoadReqOutput],
+        reset_rank: int | None = None,
+    ):
+        """Reconcile reported load while retaining speculative reservations.
 
         For SHORTEST_QUEUE, use num_reqs instead of num_waiting_reqs to balance decode running batch.
         For MINIMUM_CACHE_USAGE, use num_pages as cache usage metric.
         """
-        # method update_budget and method dispatch happen in the same thread, so clearing budget_queue is safe
-        self.budget_queue.clear()
-
-        loads = load_update.loads
         if not loads:
+            self.clear()
             return
 
         if self.method == LoadBalanceMethod.MINIMUM_CACHE_USAGE:
-            metrics = [load.num_pages for load in loads]
+            metrics = {load.dp_rank: load.num_pages for load in loads}
         else:
-            metrics = [load.num_reqs for load in loads]
+            metrics = {load.dp_rank: load.num_reqs for load in loads}
+        request_counts = {load.dp_rank: load.num_reqs for load in loads}
+        rank_order = [load.dp_rank for load in loads]
 
-        max_metric = max(metrics)
-        if all(x == max_metric for x in metrics):
+        if rank_order != self.rank_order:
+            self.rank_order = rank_order
+            self.reported_metrics = metrics
+            self.reported_request_counts = request_counts
+            self.reservations = {rank: 0 for rank in rank_order}
             return
 
-        while any(x != metrics[0] for x in metrics):
-            min_load = min(metrics)
-            min_indices = [i for i, x in enumerate(metrics) if x == min_load]
-            second_min_load = min(x for x in metrics if x > min_load)
-            self.budget_queue.extend(
-                [loads[i].dp_rank for i in min_indices] * (second_min_load - min_load)
-            )
-            for idx in min_indices:
-                metrics[idx] = second_min_load
+        # Reservations count controller-dispatched requests. Only growth in the
+        # scheduler's request count can acknowledge them; cache-page growth is
+        # an independent signal used solely by MINIMUM_CACHE_USAGE scoring.
+        for rank in rank_order:
+            if rank == reset_rank:
+                self.reservations[rank] = 0
+                continue
 
-    def dispatch(self):
-        if self.budget_queue:
-            return self.budget_queue.popleft()
-        return None
+            reflected_reservations = (
+                request_counts[rank] - self.reported_request_counts[rank]
+            )
+            if reflected_reservations > 0:
+                self.reservations[rank] = max(
+                    0,
+                    self.reservations[rank] - reflected_reservations,
+                )
+        self.reported_metrics = metrics
+        self.reported_request_counts = request_counts
+
+    def dispatch(self, pinned_rank: int | None = None):
+        """Pick the least-loaded rank and reserve it.
+
+        ``pinned_rank`` skips the choice and only records the reservation,
+        keeping hard-pinned dispatches visible to update_budget's accounting.
+        """
+        if pinned_rank is not None:
+            if pinned_rank in self.reservations:
+                self.reservations[pinned_rank] += 1
+            return pinned_rank
+        if not self.rank_order:
+            return None
+
+        effective_metrics = [
+            self.reported_metrics[rank] + self.reservations[rank]
+            for rank in self.rank_order
+        ]
+        minimum = min(effective_metrics)
+        if all(metric == minimum for metric in effective_metrics):
+            return None
+
+        target_rank = self.rank_order[effective_metrics.index(minimum)]
+        self.reservations[target_rank] += 1
+        return target_rank
+
+    def clear(self):
+        self.reported_metrics.clear()
+        self.reported_request_counts.clear()
+        self.reservations.clear()
+        self.rank_order.clear()
 
 
 class DataParallelController:
@@ -128,6 +176,7 @@ class DataParallelController:
         self.max_num_seqs = None
         self.chunked_prefill_size = None
         self.max_model_len = None
+        self.supports_prompt_logprobs = None
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
@@ -159,6 +208,10 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget(self.load_balance_method)
+        self.load_snapshot_store = LoadSnapshotStore(server_args.mapping.attn.dp_size)
+        self.load_snapshot_epochs: list[str | None] = [
+            None
+        ] * server_args.mapping.attn.dp_size
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -166,13 +219,9 @@ class DataParallelController:
 
         self.launch_dp_schedulers(server_args, port_args)
 
-        # Workers are already created in launch_dp_schedulers before starting scheduler threads
-
-        if server_args.mapping.has_attn_dp:
-            self.control_message_step = server_args.mapping.attn.tp_size
-        else:
-            self.control_message_step = 1
-
+        # Each worker represents one attention-DP shard. Its local TP rank 0
+        # receives messages from this controller and broadcasts them to the
+        # remaining ranks in that TP group.
         self.init_dispatcher()
 
     def send_to_all_workers(self, obj):
@@ -180,20 +229,44 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
-        # Send control messages to first worker of tp group
-        for worker in self.workers[:: self.control_message_step]:
+        """Broadcast a control request to every attention-DP worker.
+
+        ``self.workers`` is indexed by attention-DP rank, not tensor-parallel
+        rank. Each worker endpoint is consumed by TP rank 0 of that DP shard,
+        which broadcasts the request within its local TP group.
+        """
+        for worker in self.workers:
             worker.send_pyobj(obj)
 
-    def handle_load_update_req(self, obj):
-        self.dp_budget.update_budget(obj)
+    def handle_load_snapshot(self, snapshot: LoadSnapshot):
+        previous_epoch = (
+            self.load_snapshot_epochs[snapshot.dp_rank]
+            if 0 <= snapshot.dp_rank < len(self.load_snapshot_epochs)
+            else None
+        )
+        if not self.load_snapshot_store.accept(snapshot):
+            return
+        self.load_snapshot_epochs[snapshot.dp_rank] = snapshot.epoch
+
+        loads = self.load_snapshot_store.project_loads()
+        if loads:
+            epoch_changed = (
+                previous_epoch is not None and previous_epoch != snapshot.epoch
+            )
+            self.dp_budget.update_budget(
+                loads,
+                reset_rank=snapshot.dp_rank if epoch_changed else None,
+            )
+        else:
+            self.dp_budget.clear()
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (TokenizedGenerateReqInput, self.dispatching),
+                (TokenizedGenerateReqInput, self.dispatch_generate_request),
                 (TokenizedEmbeddingReqInput, self.dispatching),
                 (BlockReqInput, self.send_to_all_workers),
-                (WatchLoadUpdateReq, self.handle_load_update_req),
+                (LoadSnapshot, self.handle_load_snapshot),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -231,6 +304,7 @@ class DataParallelController:
                 dist_init_addr=port_args.dist_init_addr,
                 rpc_ipc_name=port_args.rpc_ipc_name,
                 metrics_ipc_name=port_args.metrics_ipc_name,
+                metrics_producer_configs=port_args.metrics_producer_configs,
                 tokenizer_worker_ipc_name=port_args.tokenizer_worker_ipc_name,
             )
             dp_port_args.append(tmp_port_args)
@@ -279,7 +353,10 @@ class DataParallelController:
         port_args: PortArgs,
         dp_rank: int,
     ):
+        from tokenspeed.runtime.engine.event_loop import run_event_loop
+
         scheduler_pipe_readers = []
+        group_procs = []
         mapping_template = server_args.mapping
         attn_tp_size = mapping_template.attn.tp_size
 
@@ -292,7 +369,6 @@ class DataParallelController:
         else:
             attn_tp_rank_range = range(0, attn_tp_size)
         for attn_tp_rank in attn_tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
             global_rank = dp_rank * attn_tp_size + attn_tp_rank
 
             # Create per-rank server_args with rank-initialized mapping
@@ -300,19 +376,16 @@ class DataParallelController:
             rank_server_args.mapping = copy.deepcopy(mapping_template)
             rank_server_args.mapping.rank = global_rank
 
-            proc = mp.Process(
-                target=run_event_loop,
-                args=(
-                    rank_server_args,
-                    port_args,
-                    writer,
-                ),
+            proc, reader = start_process_with_ready_pipe(
+                run_event_loop,
+                (rank_server_args, port_args),
+                contextlib.nullcontext(),
             )
-            proc.start()
             self.scheduler_procs.append(proc)
+            group_procs.append(proc)
             scheduler_pipe_readers.append(reader)
         # Wait for model to finish loading
-        scheduler_info = [reader.recv() for reader in scheduler_pipe_readers]
+        scheduler_info = receive_ready_messages(scheduler_pipe_readers, group_procs)
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -324,6 +397,32 @@ class DataParallelController:
             "multimodal_encoder_dtype"
         )
         self.cache_storage = scheduler_info[0]["cache_storage"]
+        self.supports_prompt_logprobs = scheduler_info[0]["supports_prompt_logprobs"]
+
+    def dispatch_generate_request(self, req):
+        """Route one tokenized request, honoring an attention-DP hard pin.
+
+        Validation lives upstream (InputProcessor.validate_request); the check
+        here is a defensive backstop — this fire-and-forget loop must fall
+        back to the normal policy on a bad pin, never raise.
+        """
+        rank = getattr(req, "data_parallel_rank", None)
+        if rank is not None and self.server_args.disaggregation_mode == "null":
+            # bool/float/list must degrade here, not raise mid-comparison.
+            if (
+                isinstance(rank, int)
+                and not isinstance(rank, bool)
+                and 0 <= rank < len(self.workers)
+            ):
+                self.workers[rank].send_pyobj(req)
+                self.dp_budget.dispatch(pinned_rank=rank)
+                return
+            logger.warning(
+                f"data_parallel_rank={rank!r} invalid (need an int in [0, "
+                f"{len(self.workers):d})); "
+                f"falling back to the {self.load_balance_method.name!s} policy",
+            )
+        self.dispatching(req)
 
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == "null":
@@ -336,11 +435,16 @@ class DataParallelController:
 
     def single_robin_scheduler(self, req):
         worker_id = int(os.environ.get("SINGLE_WORKER_ID", "-1"))
-        if not 0 <= worker_id < self.server_args.mapping.attn.dp_size - 1:
+        if not 0 <= worker_id < self.server_args.mapping.attn.dp_size:
             raise ValueError(f"Invalid SINGLE_WORKER_ID:{worker_id}")
         self.workers[worker_id].send_pyobj(req)
 
     def budget_scheduler(self, req):
+        if not self.load_snapshot_store.is_complete_fresh():
+            self.dp_budget.clear()
+            self.round_robin_scheduler(req)
+            return
+
         target_worker = self.dp_budget.dispatch()
         if target_worker is None:
             self.round_robin_scheduler(req)
@@ -380,6 +484,7 @@ def run_data_parallel_controller_process(
                 "max_model_len": controller.max_model_len,
                 "multimodal_encoder_dtype": controller.multimodal_encoder_dtype,
                 "cache_storage": controller.cache_storage,
+                "supports_prompt_logprobs": controller.supports_prompt_logprobs,
             }
         )
         if server_args.node_rank == 0:
@@ -387,11 +492,10 @@ def run_data_parallel_controller_process(
         for proc in controller.scheduler_procs:
             proc.join()
             logger.error(
-                "Scheduler or DataParallelController %s terminated with %s",
-                proc.pid,
-                proc.exitcode,
+                f"Scheduler or DataParallelController {proc.pid!s} terminated with "
+                f"{proc.exitcode!s}",
             )
     except Exception:
         traceback = get_exception_traceback()
-        logger.error("DataParallelController hit an exception: %s", traceback)
+        logger.error(f"DataParallelController hit an exception: {traceback!s}")
         parent_process.send_signal(signal.SIGUSR1)

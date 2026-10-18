@@ -1,0 +1,695 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Scheduler-owned speculative KDA state versus independent tokenwise decode.
+
+The scheduler supplies all tested cache locations. Only the numerical oracle
+uses a fixed private working block: it runs each accepted token independently,
+without verification, snapshots, publication or cache eviction.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+# The CI runner executes each registered test file as a standalone script.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+from test.runtime.conftest import KIMI_STATE_GROUPS, requires_cuda
+from test.runtime.test_kimi_k3_kda import (
+    _assert_close,
+    _backend,
+    _KDAHarness,
+    _stub_contract,
+    _StubContractPool,
+    requires_fla,
+)
+
+import pytest
+import torch
+from ci_system.ci_register import register_cuda_ci
+
+ts = pytest.importorskip("tokenspeed_scheduler")
+
+from tokenspeed.runtime.engine.generation_output_processor import (  # noqa: E402
+    OutputProcesser,
+    RequestState,
+)
+from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+    make_extend_result_event,
+    pool_to_cache_groups,
+)
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
+from tokenspeed.runtime.execution.types import ModelExecutionResult  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    STATE_INPUT_SLOT,
+    STATE_LIVE_SLOT,
+)
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
+
+register_cuda_ci(
+    est_time=180,
+    suite="runtime-1gpu",
+    nightly=False,
+    disabled=None,
+    disabled_on_runners=None,
+    disabled_on_runners_reason=None,
+)
+
+_P = 4
+_WIDTH = 3
+_USABLE = 32
+_H = 4
+_D = 128
+_FA = 128
+_LAYERS = (0, 1, 2)
+_COMPONENTS = ("conv_state", "recurrent_state")
+
+
+class _KDA:
+    def __init__(self, *, width: int, replay: bool):
+        self.contract = _stub_contract(prefix_granularity=_P, usable_pages=_USABLE)
+        self.pool = _StubContractPool(
+            self.contract,
+            "cuda",
+            conv_dim=3 * _H * _D,
+            width=4,
+            num_heads=_H,
+            head_dim=_D,
+        )
+        self.backend = _backend("cuda", contract_pool=self.pool, spec_tokens=width)
+        self.backend.init_cuda_graph_state(max_bs=8)
+        if width > 1:
+            if replay and not self.backend._replay_active:
+                pytest.skip("KDA replay commit kernel unavailable")
+            if not replay:
+                self.backend._replay_active = False
+                self.backend._verify_scratch = None
+            self.backend.preallocate_verify_workspace(8, width)
+        generator = torch.Generator(device="cpu").manual_seed(107)
+
+        def random_tensor(shape, dtype, scale):
+            return torch.randn(shape, generator=generator).to("cuda", dtype) * scale
+
+        self.params = {
+            layer: {
+                "conv_weights": random_tensor((3 * _H * _D, 4), torch.bfloat16, 0.1),
+                "f_b_weight": random_tensor((_H * _D, _FA), torch.bfloat16, 0.05),
+                "A_log": random_tensor((_H,), torch.float32, 0.1),
+                "dt_bias": random_tensor((_H * _D,), torch.float32, 0.1),
+            }
+            for layer in _LAYERS
+        }
+
+    def metadata(
+        self,
+        tables,
+        *,
+        begin: int,
+        end: int,
+        prefill: bool,
+        request_slot: int,
+        prompt_tokens: int,
+    ):
+        # Use the same contract-to-runtime table bridge as the numerical KDA
+        # harness, with the complete unmodified scheduler tables supplied here.
+        delivered = _KDAHarness._delivered(self, tables)
+        request_indices = torch.tensor([request_slot], dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor([end], dtype=torch.int32, device="cuda")
+        if prefill:
+            prefixes = torch.tensor([begin], dtype=torch.int32)
+            lengths = torch.tensor([end - begin], dtype=torch.int32)
+            self.backend.init_forward_metadata(
+                bs=1,
+                num_extends=1,
+                req_pool_indices=request_indices,
+                seq_lens=seq_lens,
+                forward_mode=ForwardMode.EXTEND,
+                block_tables=delivered,
+                extend_seq_lens=lengths.to("cuda"),
+                extend_seq_lens_cpu=lengths,
+                extend_prefix_lens=prefixes.to("cuda"),
+                extend_prefix_lens_cpu=prefixes,
+                extend_replay_lens_cpu=torch.zeros_like(prefixes),
+                extend_prompt_lens_cpu=torch.tensor([prompt_tokens], dtype=torch.int32),
+                extend_with_prefix=begin > 0,
+                query_shard=None,
+            )
+        else:
+            self.backend.refresh_decode_metadata(
+                1,
+                1,
+                request_indices,
+                seq_lens,
+                forward_mode=ForwardMode.DECODE,
+                block_tables=delivered,
+                for_graph_replay=False,
+            )
+
+    @property
+    def device(self):
+        return "cuda"
+
+    def forward(self, inputs, *, begin: int, end: int, prefill: bool):
+        outputs = {}
+        for layer in _LAYERS:
+            kwargs = dict(
+                layer=None,
+                token_to_kv_pool=self.pool,
+                bs=1,
+                mixed_qkv=inputs["mixed_qkv"][begin:end].clone(),
+                f_a_out=inputs["f_a_out"][begin:end],
+                beta_raw=inputs["beta_raw"][begin:end],
+                g_raw=None,
+                bias=None,
+                activation="silu",
+                key_dim=_H * _D,
+                value_dim=_H * _D,
+                attention_tp_size=1,
+                head_k_dim=_D,
+                head_v_dim=_D,
+                lower_bound=-5.0,
+                layer_id=layer,
+                seq_len=end - begin,
+                a=None,
+                b=None,
+                **self.params[layer],
+            )
+            if prefill:
+                output = self.backend.forward_extend(
+                    None,
+                    None,
+                    None,
+                    forward_mode=ForwardMode.EXTEND,
+                    save_kv_cache=True,
+                    **kwargs,
+                )
+            else:
+                output = self.backend.forward_decode(None, None, None, **kwargs)
+            outputs[layer] = output.reshape(end - begin, _H, _D).clone()
+        return outputs
+
+    def states(self, tables):
+        return {
+            (layer, component): self.pool.get_component(layer, component)[
+                tables[group][0][STATE_LIVE_SLOT]
+            ].clone()
+            for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
+            for component in _COMPONENTS
+        }
+
+
+def _batch(scheduler, request_id: str):
+    plan = scheduler.next_execution_plan()
+    batches = [batch for batch in plan.forward if batch.request_ids]
+    assert len(batches) == 1
+    batch = batches[0]
+    assert list(batch.request_ids) == [request_id]
+    tables = {
+        group: [list(row) for row in rows] for group, rows in batch.block_tables.items()
+    }
+    return batch, tables
+
+
+def _feedback(scheduler, *, request_id: str, tokens: list[int], decode: bool):
+    # Accepted-state commit and completion precede this feedback in every caller.
+    torch.cuda.synchronize()
+    result = make_extend_result_event(request_id, tokens, None)
+    event = ts.ExecutionEvent().add_event(result)
+    if decode:
+        reserve = ts.ForwardEvent.UpdateReserveNumTokens()
+        reserve.request_id = request_id
+        reserve.reserve_num_tokens_in_next_schedule_event = len(tokens)
+        event.add_event(reserve)
+    scheduler.advance(event)
+
+
+def _scheduler(pool, *, width: int, overlap_schedule_depth: int):
+    config = ts.SchedulerConfig()
+    config.prefix_granularity = _P
+    config.num_device_pages = _USABLE + 1
+    config.num_host_pages = 0
+    config.num_snapshot_pages = 1  # the null page alone: no pool
+    config.max_retracted_requests = 0
+    config.max_scheduled_tokens = 8
+    config.max_batch_size = 1
+    config.decode_input_tokens = width
+    config.overlap_schedule_depth = overlap_schedule_depth
+    config.enable_mixed_prefill_decode = False
+    config.disable_l2_cache = True
+    config.cache_groups = pool_to_cache_groups(pool)
+    return ts.Scheduler(config)
+
+
+def _inputs():
+    generator = torch.Generator(device="cpu").manual_seed(113)
+    return {
+        name: torch.randn((48, columns), generator=generator).to("cuda", torch.bfloat16)
+        for name, columns in (
+            ("mixed_qkv", 3 * _H * _D),
+            ("f_a_out", _FA),
+            ("beta_raw", _H),
+        )
+    }
+
+
+def _reference(inputs, num_positions: int):
+    """Per-position outputs and the state after every token count.
+
+    The oracle never allocates or publishes checkpoints: every token updates
+    the same live block through q_len=1 decode.
+    """
+    reference = _KDA(width=1, replay=False)
+    tables = {spec.group_id: [[0, 1]] for spec in reference.contract.group_specs}
+    outputs = {layer: [] for layer in _LAYERS}
+    states = {}
+    for position in range(num_positions):
+        reference.metadata(
+            tables,
+            begin=position,
+            end=position + 1,
+            prefill=False,
+            request_slot=0,
+            prompt_tokens=0,
+        )
+        step = reference.forward(
+            inputs, begin=position, end=position + 1, prefill=False
+        )
+        for layer in _LAYERS:
+            outputs[layer].append(step[layer])
+        states[position + 1] = reference.states(tables)
+    return {layer: torch.cat(rows, dim=0) for layer, rows in outputs.items()}, states
+
+
+def _assert_states(actual, expected, label: str):
+    for layer in _LAYERS:
+        torch.testing.assert_close(
+            actual[layer, "conv_state"], expected[layer, "conv_state"], atol=0, rtol=0
+        )
+        _assert_close(
+            actual[layer, "recurrent_state"],
+            expected[layer, "recurrent_state"],
+            f"{label}: layer {layer} recurrent state",
+        )
+
+
+@requires_cuda
+@requires_fla
+@pytest.mark.parametrize("replay", [False, True], ids=["scratch", "replay"])
+def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints(
+    replay,
+):
+    actual = _KDA(width=_WIDTH, replay=replay)
+    scheduler = _scheduler(actual.pool, width=_WIDTH, overlap_schedule_depth=0)
+    inputs = _inputs()
+    reference_outputs, reference_states = _reference(inputs, 41)
+
+    request = ts.RequestSpec()
+    request.request_id = "source"
+    request.tokens = list(range(4))
+    request.max_new_tokens = 40
+    scheduler.submit_requests([request])
+    batch, tables = _batch(scheduler, "source")
+    assert list(batch.input_lengths) == [4]
+    actual.metadata(
+        tables,
+        begin=0,
+        end=4,
+        prefill=True,
+        request_slot=batch.request_pool_indices[0],
+        prompt_tokens=batch.prefill_lengths[0],
+    )
+    outputs = actual.forward(inputs, begin=0, end=4, prefill=True)
+    for layer in _LAYERS:
+        _assert_close(outputs[layer], reference_outputs[layer][:4], "initial prefill")
+    _assert_states(actual.states(tables), reference_states[4], "initial prefill")
+    _feedback(scheduler, request_id="source", tokens=[4], decode=False)
+    prompt_end_tables = tables
+    prompt_end = actual.states(tables)
+
+    computed = 4
+    live_blocks = None
+    # Every verify round reads the committed state and commits the accepted
+    # prefix into the live block; the first round reads the prompt-end
+    # checkpoint from slot 0, every later one evolves the live block in place.
+    for index, accepted in enumerate([1, 2, 3, 2, 1, 3] + [3, 1] * 6):
+        batch, tables = _batch(scheduler, "source")
+        assert batch.num_extends() == 0
+        assert list(batch.input_lengths) == [_WIDTH]
+        for group in KIMI_STATE_GROUPS:
+            row = tables[group][0]
+            if index == 0:
+                assert (
+                    row[STATE_INPUT_SLOT]
+                    == prompt_end_tables[group][0][STATE_LIVE_SLOT]
+                )
+                assert row[STATE_LIVE_SLOT] not in prompt_end_tables[group][0]
+            else:
+                assert row[STATE_INPUT_SLOT] == 0
+                assert row[STATE_LIVE_SLOT] == live_blocks[group]
+        live_blocks = {
+            group: tables[group][0][STATE_LIVE_SLOT] for group in KIMI_STATE_GROUPS
+        }
+        actual.metadata(
+            tables,
+            begin=computed,
+            end=computed + _WIDTH,
+            prefill=False,
+            request_slot=batch.request_pool_indices[0],
+            prompt_tokens=0,
+        )
+        outputs = actual.forward(
+            inputs, begin=computed, end=computed + _WIDTH, prefill=False
+        )
+        actual.backend.commit_verified_state(
+            torch.tensor([accepted], dtype=torch.int32, device="cuda"),
+            accepted_path=None,
+        )
+        end = computed + accepted
+        for layer in _LAYERS:
+            _assert_close(
+                outputs[layer][:accepted],
+                reference_outputs[layer][computed:end],
+                f"accepted verify outputs at {end}",
+            )
+        _assert_states(
+            actual.states(tables),
+            reference_states[end],
+            f"accepted endpoint {end}",
+        )
+        empty_before_feedback = scheduler.empty_lcm_blocks()
+        assert empty_before_feedback > 0
+        _feedback(
+            scheduler,
+            request_id="source",
+            tokens=list(range(computed + 1, end + 1)),
+            decode=True,
+        )
+        assert scheduler.empty_lcm_blocks() == empty_before_feedback
+        computed = end
+    assert computed == 40
+    _assert_states(
+        actual.states(prompt_end_tables), prompt_end, "prompt-end checkpoint"
+    )
+    finish = ts.ForwardEvent.Finish()
+    finish.request_id = "source"
+    scheduler.advance(ts.ExecutionEvent().add_event(finish))
+    finish_tables = tables
+
+    # The published checkpoints are the prompt end (4 tokens) and the finish
+    # (40 computed tokens). A probe sharing 8 or 12 tokens resumes from the
+    # prompt-end state; one sharing all 40 resumes from the finish state.
+    for boundary, begin in ((8, 4), (12, 4), (40, 40)):
+        request = ts.RequestSpec()
+        request.request_id = f"resume_{boundary}"
+        request.tokens = list(range(boundary)) + [999]
+        request.max_new_tokens = 4
+        scheduler.submit_requests([request])
+        batch, tables = _batch(scheduler, request.request_id)
+        assert int(batch.extend_prefix_lens[0]) == begin
+        checkpoint_tables = prompt_end_tables if begin == 4 else finish_tables
+        for group in KIMI_STATE_GROUPS:
+            assert (
+                tables[group][0][STATE_INPUT_SLOT]
+                == checkpoint_tables[group][0][STATE_LIVE_SLOT]
+            )
+        end = begin + int(batch.input_lengths[0])
+        actual.metadata(
+            tables,
+            begin=begin,
+            end=end,
+            prefill=True,
+            request_slot=batch.request_pool_indices[0],
+            prompt_tokens=batch.prefill_lengths[0],
+        )
+        outputs = actual.forward(inputs, begin=begin, end=end, prefill=True)
+        for layer in _LAYERS:
+            _assert_close(
+                outputs[layer],
+                reference_outputs[layer][begin:end],
+                f"resume {boundary}",
+            )
+        _assert_states(
+            actual.states(tables), reference_states[end], f"resume {boundary}"
+        )
+        _feedback(
+            scheduler,
+            request_id=request.request_id,
+            tokens=[1000] if end == len(request.tokens) else [],
+            decode=False,
+        )
+        # Do not publish the probe's freshly recomputed checkpoints: later
+        # probes must inspect only the original source's cache contents.
+        abort = ts.ForwardEvent.Abort()
+        abort.request_id = request.request_id
+        scheduler.advance(ts.ExecutionEvent().add_event(abort))
+    _assert_states(
+        actual.states(prompt_end_tables), prompt_end, "prompt-end checkpoint"
+    )
+    for layer in _LAYERS:
+        for component in _COMPONENTS:
+            assert (
+                torch.count_nonzero(actual.pool.get_component(layer, component)[0]) == 0
+            )
+
+
+class _Sender:
+    """Stands in for the detokenizer socket."""
+
+    def __init__(self):
+        self.items = []
+
+    def send_pyobj(self, obj):
+        self.items.append(obj)
+
+
+class _Tokenizer:
+    eos_token_id = None
+    additional_stop_token_ids = None
+
+    def decode(self, ids):
+        return " ".join(str(i) for i in ids)
+
+
+class _Metrics:
+    enabled = False
+
+
+_STOP = 99
+
+
+def _land(scheduler, processor, batch, sampled: list[int], accepted: int):
+    """Report a landed forward the way the event loop does: the output
+    processor turns the sampled rows into scheduler events. Returns the tokens
+    the scheduler was told the forward produced."""
+    torch.cuda.synchronize()
+    result = ModelExecutionResult(
+        output_tokens=torch.tensor(sampled, dtype=torch.int32),
+        output_lengths=torch.tensor([accepted], dtype=torch.int32),
+    )
+    event = ts.ExecutionEvent()
+    reported = []
+    for change in processor.post_process_forward_op(
+        batch, result, is_prefill_instance=False
+    ):
+        if type(change).__name__ == "ExtendResult":
+            reported += list(change.tokens)
+        event.add_event(change)
+    scheduler.advance(event)
+    return reported
+
+
+def _masked_tables(runtime, tables, slot):
+    """The executor's padding of a stopped request's state rows."""
+    masked = runtime.masked_state_tables(
+        {
+            group: torch.tensor(rows, dtype=torch.int32, device="cuda")
+            for group, rows in tables.items()
+        },
+        torch.tensor([slot], dtype=torch.int64, device="cuda"),
+        KIMI_STATE_GROUPS,
+    )
+    return {group: table.tolist() for group, table in masked.items()}
+
+
+@requires_cuda
+@requires_fla
+@pytest.mark.parametrize(
+    "width,overlap",
+    [(_WIDTH, False), (_WIDTH, True), (1, True)],
+    ids=["spec", "spec_overlap", "overlap"],
+)
+def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
+    width, overlap
+):
+    """A finish publishes the live slot under the key of the scheduler's
+    frontier (every reported token but the last). The round that samples the
+    stop token as its first output accepts its whole window; the device keeps
+    it through the stop token, and the forward the overlap schedule dispatched
+    behind it runs the request as a padding row. The published state is the
+    state before the stop token, bit for bit the oracle's."""
+    actual = _KDA(width=width, replay=True)
+    scheduler = _scheduler(
+        actual.pool, width=width, overlap_schedule_depth=int(overlap)
+    )
+    inputs = _inputs()
+    _, reference_states = _reference(inputs, 24)
+    runtime = RuntimeStates(
+        req_pool_size=8, vocab_size=1024, output_length=width, device="cuda"
+    )
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE" if width > 1 else None,
+        spec_num_tokens=width if width > 1 else None,
+    )
+    prompt = list(range(4))
+    processor.rid_to_state["source"] = RequestState(
+        prompt_input_ids=prompt,
+        sampling_params=SamplingParams(
+            max_new_tokens=40, stop=[], stop_token_ids={_STOP}
+        ),
+        stream=False,
+        tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
+    )
+    criteria = processor.rid_to_state["source"].stop_criteria
+    request = ts.RequestSpec()
+    request.request_id = "source"
+    request.tokens = prompt
+    request.max_new_tokens = 40
+    scheduler.submit_requests([request])
+
+    batch, tables = _batch(scheduler, "source")
+    actual.metadata(
+        tables,
+        begin=0,
+        end=4,
+        prefill=True,
+        request_slot=batch.request_pool_indices[0],
+        prompt_tokens=batch.prefill_lengths[0],
+    )
+    actual.forward(inputs, begin=0, end=4, prefill=True)
+    reported = prompt + _land(scheduler, processor, batch, [104], accepted=1)
+    # The device-side length: the tokens the live slot has consumed. A round
+    # starting there samples the token at sequence index consumed + j as its
+    # j-th output.
+    consumed = 4
+
+    def run_round(batch, tables, accepted, *, samples_stop=False):
+        """One decode in the model executor's order; returns the sampled rows
+        and the tokens the round keeps."""
+        nonlocal consumed
+        slot = batch.request_pool_indices[0]
+        runtime.bind_stop_criteria(
+            batch.request_ids, batch.request_pool_indices, [criteria]
+        )
+        if overlap:
+            tables = _masked_tables(runtime, tables, slot)
+        actual.metadata(
+            tables,
+            begin=consumed,
+            end=consumed + width,
+            prefill=False,
+            request_slot=slot,
+            prompt_tokens=0,
+        )
+        actual.forward(inputs, begin=consumed, end=consumed + width, prefill=False)
+        sampled = [100 + consumed + j for j in range(1, width + 1)]
+        if samples_stop:
+            sampled[0] = _STOP
+        runtime.valid_cache_lengths[slot] = consumed
+        accept_lengths = torch.tensor([accepted], dtype=torch.int32, device="cuda")
+        runtime.apply_stop_conditions(
+            torch.tensor([slot], dtype=torch.int64, device="cuda"),
+            torch.tensor(sampled, dtype=torch.int32, device="cuda"),
+            accept_lengths,
+            torch.tensor([width], dtype=torch.int32, device="cuda"),
+            torch.empty(0, dtype=torch.int32, device="cuda"),
+            num_extends=0,
+            num_prefill_outputs=0,
+            decode_width=width,
+            padding_index=runtime.valid_cache_lengths.shape[0] - 1,
+        )
+        if width > 1:
+            actual.backend.commit_verified_state(accept_lengths, accepted_path=None)
+        kept = int(accept_lengths[0])
+        consumed += kept
+        return sampled, kept
+
+    for accepted in [2, 3] if width > 1 else [1, 1]:
+        batch, tables = _batch(scheduler, "source")
+        sampled, kept = run_round(batch, tables, accepted)
+        assert kept == accepted
+        reported += _land(scheduler, processor, batch, sampled, kept)
+
+    batch, tables = _batch(scheduler, "source")
+    sampled, kept = run_round(batch, tables, width, samples_stop=True)
+    assert kept == 1
+    if overlap:
+        # Planned while the finishing round is still in flight.
+        next_batch, next_tables = _batch(scheduler, "source")
+    reported += _land(scheduler, processor, batch, sampled, kept)
+    assert "source" not in processor.rid_to_state
+    if overlap:
+        next_sampled, next_kept = run_round(next_batch, next_tables, min(2, width))
+        assert next_kept == 0
+        reported += _land(scheduler, processor, next_batch, next_sampled, next_kept)
+    published = actual.states(tables)
+
+    # A prompt extending the reported tokens resumes at the frontier, the
+    # position of the stop token, from the live slot the finish published.
+    frontier = len(reported) - 1
+    assert reported[-1] == _STOP
+    probe = ts.RequestSpec()
+    probe.request_id = "probe"
+    probe.tokens = reported + [999]
+    probe.max_new_tokens = 4
+    scheduler.submit_requests([probe])
+    batch, probe_tables = _batch(scheduler, "probe")
+    assert int(batch.extend_prefix_lens[0]) == frontier
+    for group in KIMI_STATE_GROUPS:
+        assert (
+            probe_tables[group][0][STATE_INPUT_SLOT]
+            == tables[group][0][STATE_LIVE_SLOT]
+        )
+    # The conv state holds the last inputs bit for bit, so it names the token
+    # count the checkpoint actually reached.
+    reached = [
+        count
+        for count, expected in reference_states.items()
+        if all(
+            torch.equal(published[layer, "conv_state"], expected[layer, "conv_state"])
+            for layer in _LAYERS
+        )
+    ]
+    assert reached == [frontier], (
+        f"the checkpoint published under the key of {frontier} tokens holds "
+        f"the state after {reached} tokens"
+    )
+    _assert_states(published, reference_states[frontier], "finish checkpoint")
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

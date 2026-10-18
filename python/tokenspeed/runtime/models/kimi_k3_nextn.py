@@ -55,8 +55,11 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
     KimiLinearMoE,
+    create_kimi_linear_moe,
+    prepare_k3_all_reduce_buffers,
     sigmoid_mul,
 )
+from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -76,7 +79,6 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -92,12 +94,13 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
             )
             gate = None
             absorbed_query = None
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
             positions,
             q,
             latent_cache,
             ctx,
-            out_cache_loc,
+            expanded=expanded,
             absorbed_query=absorbed_query,
         )
         if gate is not None:
@@ -120,6 +123,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
         self,
         config: KimiLinearConfig,
         mapping: Mapping,
+        model_scope: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
@@ -144,19 +148,21 @@ class KimiK3DraftDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             reduce_attn_results=True,
             alt_stream=alt_stream,
+            qkv_parallel=None,
+            output_parallel=None,
         )
-        self.block_sparse_moe = KimiLinearMoE(
-            config,
-            mapping,
-            quant_config,
-            0,
-            add_prefix("block_sparse_moe", prefix),
+        self.block_sparse_moe = create_kimi_linear_moe(
+            config=config,
+            mapping=mapping,
+            layer_index=0,
+            model_scope=model_scope,
+            # One block, re-entered every draft step: nothing rotates.
+            moe_block_count=1,
+            quant_config=quant_config,
+            prefix=add_prefix("block_sparse_moe", prefix),
             alt_stream=alt_stream,
         )
-        # The fused-AR lane workspace is a singleton shaped around the base
-        # model's usage; the draft takes the plain reduce path.
-        self.block_sparse_moe._fused_moe_ar = False
-        self.block_sparse_moe._lane_latent_norm_ar = False
+        # The old underscored flag writes were dead; making that intent effective needs a spec-decode run.
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -180,8 +186,10 @@ class KimiK3DraftDecoderLayer(nn.Module):
             0,
             is_moe=True,
             prev_is_moe=False,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -189,7 +197,6 @@ class KimiK3DraftDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -200,11 +207,10 @@ class KimiK3DraftDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=self.input_layernorm(hidden_states),
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
             if (
-                ctx.accept_lengths is not None
+                ctx.draft_narrowing is not None
                 and attn_out.shape[0] != residual.shape[0]
             ):
                 residual = residual.index_select(0, ctx.gather_ids)
@@ -215,6 +221,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             ctx=ctx,
+            prefix_is_sharded=False,
         )
         return prefix.view(residual.shape)
 
@@ -247,11 +254,13 @@ class KimiK3ModelNextN(nn.Module):
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         self.alt_stream = torch.cuda.Stream()
+        decoder_scope = add_prefix("decoder", prefix)
         self.decoder = KimiK3DraftDecoderLayer(
-            config,
-            mapping,
-            quant_config,
-            prefix=add_prefix("decoder", prefix),
+            config=config,
+            mapping=mapping,
+            model_scope=decoder_scope,
+            quant_config=quant_config,
+            prefix=decoder_scope,
             alt_stream=self.alt_stream,
         )
 
@@ -266,7 +275,6 @@ class KimiK3ModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
@@ -283,12 +291,18 @@ class KimiK3ModelNextN(nn.Module):
                 dim=-1,
             )
         )
-        hidden_states = self.decoder(positions, hidden_states, ctx, out_cache_loc)
+        hidden_states = self.decoder(positions, hidden_states, ctx)
         return self.shared_head.norm(hidden_states), None
 
 
 class KimiK3NextNForCausalLM(nn.Module):
-    """Text-side NextN causal LM (draft worker)."""
+    """Text-side NextN causal LM (draft worker).
+
+    On a prefill chunk pipeline only the last stage builds and runs this draft
+    (``create_model_runner``). It keeps the checkpoint's ``embed_tokens`` shard
+    there, since the target embedding lives on the first stage, and shares
+    only the target's head; off the pipeline both are shared from the target.
+    """
 
     def __init__(
         self,
@@ -326,7 +340,26 @@ class KimiK3NextNForCausalLM(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        routed_hidden_size = (
+            self.config.routed_expert_hidden_size
+            if self.config.routed_expert_hidden_size is not None
+            else self.config.hidden_size
+        )
+        prepared = prepare_k3_all_reduce_buffers(
+            mapping=self.mapping,
+            hidden_size=self.config.hidden_size,
+            routed_hidden_size=routed_hidden_size,
+            max_num_tokens=max_num_tokens,
+            states=K3AttnComm.iris_states,
+        )
+        moe = self.model.decoder.block_sparse_moe
+        if isinstance(moe, KimiLinearMoE):
+            moe.iris_state = K3AttnComm.iris_states.get(self.mapping.moe.tp_ep_group)
+        return prepared
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
@@ -334,12 +367,25 @@ class KimiK3NextNForCausalLM(nn.Module):
     def get_hot_token_id(self):
         return None
 
-    def set_embed_and_head(self, embed, head):
-        # DeepSeek MTP convention: the draft shares the target's embedding
-        # and lm head (the checkpoint's per-layer copies are skipped).
-        del self.model.embed_tokens.weight
+    def get_embed_and_head(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """The embedding and head weights this draft drafts with."""
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(
+        self, embed: torch.Tensor | None, head: torch.Tensor
+    ) -> None:
+        """Alias the target's weights; ``embed=None`` keeps the checkpoint shard.
+
+        DeepSeek MTP convention: the draft shares the target's embedding and
+        lm head, dropping the checkpoint's per-layer copies. A pipeline's last
+        stage has no target embedding to share (it lives on the first stage),
+        so it passes ``embed=None`` and the draft keeps the shard it loaded
+        (``load_weights`` rejects a pipeline checkpoint without one).
+        """
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
         del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -349,14 +395,12 @@ class KimiK3NextNForCausalLM(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states, _ = self.model(
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             captured_hidden_states=captured_hidden_states,
         )
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -389,6 +433,7 @@ class KimiK3NextNForCausalLM(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
         )
+        embed_tokens_loaded = False
 
         for name, loaded_weight in weights:
             if not name.startswith(nextn_prefix):
@@ -462,7 +507,17 @@ class KimiK3NextNForCausalLM(nn.Module):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if name == "model.embed_tokens.weight":
+                    embed_tokens_loaded = True
 
+        if self.mapping.has_pp and not embed_tokens_loaded:
+            # Off the pipeline the target's embedding replaces this shard, so
+            # a checkpoint without one is harmless there; the pipeline's last
+            # stage drafts with it.
+            raise ValueError(
+                "Kimi-K3 NextN on a pipeline needs the checkpoint's "
+                f"model.layers.{config.num_hidden_layers}.embed_tokens.weight"
+            )
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
@@ -491,13 +546,19 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
         self.logits_processor = self.language_model.logits_processor
         self.lm_head = self.language_model.lm_head
 
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        return self.language_model.prepare_communication_runtime(max_num_tokens)
+
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()
 
     def get_hot_token_id(self):
         return None
 
-    def set_embed_and_head(self, embed, head):
+    def get_embed_and_head(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed: torch.Tensor | None, head: torch.Tensor):
         self.language_model.set_embed_and_head(embed, head)
 
     def forward(self, *args, **kwargs):

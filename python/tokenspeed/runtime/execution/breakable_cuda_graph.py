@@ -33,10 +33,10 @@ prefill graph: vLLM's ``BreakableCUDAGraphWrapper`` (the homogeneous segment-lis
 structure + the ``set_forward_context``/``get_forward_context`` ambient pattern we
 mirror in :func:`active_forward`/:func:`current_forward_ctx`) and SGLang's
 breakable prefill graph (the eager-copy output handoff at each break). Unlike a
-full prefill graph, attention -- the only batch/length-aware op and the source of
-the host-side ``max_seq_len_q`` scalar -- stays eager, so it never enters a graph.
-Keeping all KV-cache reads/writes in the eager breaks also makes them honor the
-per-layer transfer consumer index naturally.
+full prefill graph, attention and request-shaped state updates stay eager, so
+live lengths and cache addresses never enter a captured segment. Keeping all
+KV-cache reads/writes in eager breaks also makes them honor the per-layer
+transfer consumer index naturally.
 
 Address-stability contract (the load-bearing invariant):
 
@@ -53,23 +53,23 @@ from __future__ import annotations
 
 import functools
 import gc
-import logging
 from collections import deque
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
-
-logger = logging.getLogger(__name__)
+from tokenspeed_kernel.workspace import capture_session
 
 __all__ = [
     "BreakableCapture",
+    "HandoffSlot",
     "active_forward",
     "break_here",
     "break_point",
     "current_forward_ctx",
+    "current_valid_rows",
     "is_breakable_capture_active",
     "scrub_padding_tail",
     "slice_to_real_tokens",
@@ -77,8 +77,15 @@ __all__ = [
 ]
 
 
+# A break output's shape, dtype and device.
+HandoffKey = tuple[tuple[int, ...], torch.dtype, torch.device]
+# Trailing shape, dtype, device, and the output's ordinal among a capture's handoffs with them.
+HandoffSlot = tuple[tuple[int, ...], torch.dtype, torch.device, int]
+
 # Ambient per-forward ctx; plain module state (one launch thread per rank).
 _ambient_ctx: Any = None
+# Real leading rows of the replay in progress; see current_valid_rows.
+_replay_valid_rows: int | None = None
 
 
 @contextmanager
@@ -106,6 +113,23 @@ def active_forward(ctx: Any) -> Generator[None]:
 def current_forward_ctx() -> Any:
     """The ambient forward context, or ``None`` outside an :func:`active_forward`."""
     return _ambient_ctx
+
+
+def current_valid_rows() -> int | None:
+    """Real leading row count of the replay in progress, or ``None`` when unpadded.
+
+    A padded-bucket replay hands every break ``bucket`` rows whose tail is filler.
+    Breaks whose kernels are indexed by the live metadata's token count -- and so
+    would read past the real batch -- narrow their token-shaped inputs to this
+    prefix via :func:`slice_to_real_tokens`. ``None`` during capture and on the
+    eager path, where the rows already are exactly the real ones.
+    """
+    return _replay_valid_rows
+
+
+def _set_replay_valid_rows(valid_rows: int | None) -> None:
+    global _replay_valid_rows
+    _replay_valid_rows = valid_rows
 
 
 def weak_ref_tensor(t: Any) -> Any:
@@ -151,13 +175,18 @@ class BreakableCapture:
             2478MB -> 564MB for buckets [8192,4096,2048,1024] on the repro). This
             mirrors ``torch.cuda.graph``'s shared ``default_capture_stream`` and
             its documented "pass the same stream for effective memory sharing".
+        handoff_storage: An optional handoff storage map shared with captures that
+            never replay while this one's handoffs are live; see ``_handoff_view``.
     """
 
     _active: BreakableCapture | None = None
     _default_capture_stream: torch.cuda.Stream | None = None
 
     def __init__(
-        self, pool: Any | None = None, stream: torch.cuda.Stream | None = None
+        self,
+        pool: Any | None = None,
+        stream: torch.cuda.Stream | None = None,
+        handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
     ) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
@@ -169,9 +198,19 @@ class BreakableCapture:
             stream = BreakableCapture._default_capture_stream
         self._stream = stream
         self._stream_ctx: Any | None = None
+        # Kernel state the segments' launches need zeroed; it lives as long as
+        # this capture, which holds the segments.
+        self._capture_session: AbstractContextManager[None] | None = None
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
-        self._handoff: dict[Any, torch.Tensor] = {}
-        self._valid_rows: int | None = None
+        self._handoff: dict[HandoffKey, torch.Tensor] = {}
+        self._handoff_storage: dict[HandoffSlot, torch.Tensor] = (
+            {} if handoff_storage is None else handoff_storage
+        )
+
+    @property
+    def stream(self) -> torch.cuda.Stream:
+        """The stream used for warmup and capture."""
+        return self._stream
 
     @classmethod
     def current(cls) -> BreakableCapture | None:
@@ -194,6 +233,8 @@ class BreakableCapture:
         self._stream_ctx = torch.cuda.stream(self._stream)
         self._stream_ctx.__enter__()
         BreakableCapture._active = self
+        self._capture_session = capture_session(self)
+        self._capture_session.__enter__()
         self._begin_segment()
         return self
 
@@ -201,6 +242,9 @@ class BreakableCapture:
         try:
             self._end_segment()
         finally:
+            if self._capture_session is not None:
+                self._capture_session.__exit__(*exc)
+                self._capture_session = None
             BreakableCapture._active = None
             if self._stream_ctx is not None:
                 self._stream_ctx.__exit__(*exc)
@@ -261,96 +305,12 @@ class BreakableCapture:
                 before the following graph segment consumes them. ``None``
                 leaves handoff buffers unchanged.
         """
-        # One-shot torch.profiler on the eager replays (never capture), for
-        # per-kernel GPU attribution of the break cost. Gated on NVTXVISION /
-        # TOKENSPEED_PROFILE_PFCAP; writes per-rank JSON then disarms itself.
-        import os as _pfc_os
-        # One-shot per value-band of TOKENSPEED_PROFILE_PFCAP so the capture
-        # can be re-armed (e.g. "1" then "2") for a trace at a chosen phase
-        # instead of only the very first replay after boot.
-        _pfc_band = _pfc_os.environ.get("TOKENSPEED_PROFILE_PFCAP")
-        _pfc_state = globals().setdefault("_pfc_armed_band", None)
-        if _pfc_band == _pfc_state:
-            self._replay_segments(valid_rows)
-            return
-        if not (_pfc_band == "1" or _pfc_band == "2" or _pfc_band == "3"):
-            globals()["_pfc_armed_band"] = _pfc_band
-            self._replay_segments(valid_rows)
-            return
-        if (
-            _pfc_os.environ.get("TOKENSPEED_PROFILE_PFCAP") == "2"
-            and not self._capturing
-            and not getattr(self, "_smoke_test", False)
-        ):
-            # Band 2 only fires on a real multi-token decode batch (valid_rows
-            # >> 1) so the trace captures the throughput-critical path, not the
-            # 1-token warmup/EXTEND replay that band 1 grabs.
-            if valid_rows is None or valid_rows <= 4:
-                self._replay_segments(valid_rows)
-                return
-            import torch as _pfc_t
-            _pfc_rank = 0
-            try:
-                import torch.distributed as _pfc_dist
-                if _pfc_dist.is_initialized():
-                    _pfc_rank = _pfc_dist.get_rank()
-            except Exception:
-                pass
-            _pfc_prof = _pfc_t.profiler.profile(
-                activities=[
-                    _pfc_t.profiler.ProfilerActivity.CPU,
-                    _pfc_t.profiler.ProfilerActivity.CUDA,
-                ],
-                with_stack=False,
-                record_shapes=False,
-            )
-            _pfc_prof.start()
-            try:
-                self._replay_segments(valid_rows)
-            finally:
-                _pfc_prof.stop()
-                _pfc_path = f"/tmp/pfc_prof_{_pfc_rank}.json"
-                try:
-                    _pfc_prof.export_chrome_trace(_pfc_path)
-                    _pfc_os.write(
-                        2, b"PFC_PROFILE: trace -> %s\n" % _pfc_path.encode()
-                    )
-                except Exception as _pfc_e:
-                    _pfc_os.write(2, b"PFC_PROFILE: export failed %s\n" % str(_pfc_e).encode())
-                    _pfc_os.environ["TOKENSPEED_PROFILE_PFCAP"] = "0"
-                globals()["_pfc_armed_band"] = _pfc_band
-                return
-        self._replay_segments(valid_rows)
-
-    def _replay_segments(self, valid_rows: int | None = None) -> None:
-        previous_valid_rows = self._valid_rows
-        self._valid_rows = valid_rows
+        previous_valid_rows = _replay_valid_rows
+        _set_replay_valid_rows(valid_rows)
         try:
-            _g = 0.0
-            _e = 0.0
-            _n = 0
-            _env = __import__("os").environ.get("TOKENSPEED_PROFILE_REPLAY_SEG") == "1"
-            for run in self.segments:
-                _n += 1
-                if _env:
-                    _t0 = __import__("time").monotonic()
-                run()
-                if _env:
-                    _dt = __import__("time").monotonic() - _t0
-                    if run is getattr(run, "_is_eager", run) and callable(run):
-                        pass
-                    # classify by identity against graph .replay via name
-                    if run.__class__.__name__ == "method" and "replay" in run.__name__:
-                        _g += _dt
-                    else:
-                        _e += _dt
-            if _env:
-                logger.info(
-                    "[SEGREP] segs=%d graph=%.1fms eager=%.1fms total=%.1fms",
-                    _n, _g * 1000, _e * 1000, (_g + _e) * 1000,
-                )
+            deque((run() for run in self.segments), maxlen=0)
         finally:
-            self._valid_rows = previous_valid_rows
+            _set_replay_valid_rows(previous_valid_rows)
 
     @property
     def num_segments(self) -> int:
@@ -396,8 +356,6 @@ def _record_break(
 
     def replay_fn() -> torch.Tensor:
         live_ctx = current_forward_ctx()
-        _env = __import__("os").environ.get("TOKENSPEED_PROFILE_BREAKREPLAY") == "1"
-        _t = __import__("time").monotonic() if _env else 0.0
 
         def sub(a: Any) -> Any:
             return live_ctx if a is captured_ctx else a
@@ -406,28 +364,37 @@ def _record_break(
             *(sub(a) for a in weak_args),
             **{k: sub(v) for k, v in weak_kwargs.items()},
         )
-        if _env:
-            _tf = __import__("time").monotonic()
         dst = state.get("dst")
         if dst is None:
             dst = state["dst"] = resolve_dst(result)
         _land_in(dst, result)
-        if _env:
-            _tl = __import__("time").monotonic()
-        if cap._valid_rows is not None:
-            scrub_padding_tail(cap._valid_rows, dst)
-        if _env:
-            _ts = __import__("time").monotonic()
-            _qname = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", "?")
-            _mod = type(fn).__module__
-            logger.info(
-                "[BREAKREP] fn=%.3f land=%.3f scrub=%.3f total=%.3fms op=%s.%s",
-                (_tf - _t) * 1000, (_tl - _tf) * 1000, (_ts - _tl) * 1000,
-                (_ts - _t) * 1000, _mod, _qname,
-            )
+        if _replay_valid_rows is not None:
+            scrub_padding_tail(_replay_valid_rows, dst)
         return dst
 
     return cap.add_eager(replay_fn)
+
+
+def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
+    """Leading rows of the shared storage slot for this capture's new handoff ``key``.
+
+    The slot is the trailing shape, dtype and device plus how many of this
+    capture's handoffs already have them, so one capture's distinct shapes stay
+    in distinct storage. Storage too short for ``key`` is replaced; captures that
+    already hold the old storage keep it alive.
+    """
+    shape, dtype, device = key
+    if not shape:
+        return torch.empty(shape, dtype=dtype, device=device)
+    trailing = (shape[1:], dtype, device)
+    rank = sum(1 for s, d, v in cap._handoff if s and (s[1:], d, v) == trailing)
+    slot = (*trailing, rank)
+    storage = cap._handoff_storage.get(slot)
+    if storage is None or storage.shape[0] < shape[0]:
+        storage = cap._handoff_storage[slot] = torch.empty(
+            shape, dtype=dtype, device=device
+        )
+    return storage[: shape[0]]
 
 
 def break_here(
@@ -505,9 +472,7 @@ def break_point(method: Callable | None = None) -> Callable:
                 key = (tuple(result.shape), result.dtype, result.device)
                 dst = cap._handoff.get(key)
                 if dst is None:
-                    dst = cap._handoff[key] = torch.empty(
-                        result.shape, dtype=result.dtype, device=result.device
-                    )
+                    dst = cap._handoff[key] = _handoff_view(cap, key)
                 return dst
 
             return _record_break(cap, method, resolve_dst, args, kwargs)

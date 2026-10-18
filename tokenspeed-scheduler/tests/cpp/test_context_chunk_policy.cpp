@@ -91,8 +91,7 @@ TEST_F(ContextChunkPolicySuite, FcfsGivesTheStepToOneRequest) {
     const auto plan = PlanOnce();
     // The historical behaviour, asserted so that a change to it fails here
     // rather than silently in a benchmark six hours later.
-    EXPECT_EQ(PrefillOpCount(plan), 1u)
-        << "a request that can absorb the whole step must leave nothing behind";
+    EXPECT_EQ(PrefillOpCount(plan), 1u) << "a request that can absorb the whole step must leave nothing behind";
 }
 
 TEST_F(ContextChunkPolicySuite, EqualProgressSharesTheStep) {
@@ -100,8 +99,7 @@ TEST_F(ContextChunkPolicySuite, EqualProgressSharesTheStep) {
     scheduler_ = std::make_unique<Scheduler>(config_);
     SubmitUnequal();
     const auto plan = PlanOnce();
-    EXPECT_GT(PrefillOpCount(plan), 1u)
-        << "equal progress must offer the step to more than one request";
+    EXPECT_GT(PrefillOpCount(plan), 1u) << "equal progress must offer the step to more than one request";
 }
 
 TEST_F(ContextChunkPolicySuite, EqualProgressDoesNotOverspendTheBudget) {
@@ -113,8 +111,7 @@ TEST_F(ContextChunkPolicySuite, EqualProgressDoesNotOverspendTheBudget) {
     // Sharing must not become spending more. The makespan argument for equal
     // progress depends on the total being unchanged.
     EXPECT_LE(total, config_.max_scheduled_tokens)
-        << "round-robin allocated " << total << " against a budget of "
-        << config_.max_scheduled_tokens;
+        << "round-robin allocated " << total << " against a budget of " << config_.max_scheduled_tokens;
 }
 
 TEST_F(ContextChunkPolicySuite, SingleRequestFallsBackToFcfs) {
@@ -125,10 +122,8 @@ TEST_F(ContextChunkPolicySuite, SingleRequestFallsBackToFcfs) {
     const std::int32_t total = PrefillTokenTotal(plan);
     // With nobody to share with, capping at one unit would be strictly worse
     // than FCFS for no benefit -- the policy must decline to engage.
-    EXPECT_GT(total, config_.block_size)
-        << "a lone request was capped at one unit with no one to share with";
+    EXPECT_GT(total, config_.block_size) << "a lone request was capped at one unit with no one to share with";
 }
-
 
 // A plan that is correct once is not a plan that terminates.
 //
@@ -169,10 +164,8 @@ TEST_F(ContextChunkPolicySuite, SubPageUnitStillMakesProgress) {
     scheduler_ = std::make_unique<Scheduler>(config_);
     SubmitUnequal();
     const auto plan = PlanOnce();
-    EXPECT_GT(PrefillTokenTotal(plan), 0)
-        << "a unit smaller than a page must not stall the step";
+    EXPECT_GT(PrefillTokenTotal(plan), 0) << "a unit smaller than a page must not stall the step";
 }
-
 
 // Every offer must be page-aligned, or complete the request.
 //
@@ -204,9 +197,8 @@ TEST_F(ContextChunkPolicySuite, EveryOfferIsPageAlignedOrFinishesTheRequest) {
                 const bool aligned = (len % config_.block_size) == 0;
                 const bool finishes = len == total || len < config_.block_size;
                 EXPECT_TRUE(aligned || finishes)
-                    << "step " << step << " offered " << len
-                    << " tokens, neither a multiple of the " << config_.block_size
-                    << "-token page nor the request's tail (" << total << ")";
+                    << "step " << step << " offered " << len << " tokens, neither a multiple of the "
+                    << config_.block_size << "-token page nor the request's tail (" << total << ")";
             }
         }
     }

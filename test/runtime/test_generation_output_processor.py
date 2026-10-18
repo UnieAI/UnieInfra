@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from http import HTTPStatus
+
 import pytest
 import torch
 
@@ -27,11 +29,13 @@ from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
     RequestState,
 )
+from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.request_stats import (
     NOOP_STATS,
     RequestStats,
     RequestStatsTracker,
 )
+from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
@@ -56,16 +60,24 @@ class _Metrics:
 
     def __init__(self):
         self.nan_aborts = 0
+        self.capacity_aborts = 0
 
     def record_nan_abort(self):
         self.nan_aborts += 1
+
+    def record_capacity_abort(self):
+        self.capacity_aborts += 1
 
 
 class _ForwardOp:
     request_ids = ["prefill", "decode"]
     request_pool_indices = [0, 1]
     input_lengths = [4, 1]
+    # Total prefill size per extend slot, as C++ Request::PrefillSize() reports
+    # it: for a fresh request this equals prefix + input.
+    prefill_lengths = [4]
     extend_prefix_lens = [0]
+    extend_replay_lens = [0]
 
     def num_extends(self):
         return 1
@@ -78,9 +90,12 @@ class _ExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = None
-
-    def sync(self):
-        return None
+    input_token_logprobs = None
+    input_logprob_plan = None
+    input_top_logprobs_val = None
+    input_top_logprobs_idx = None
+    output_top_logprobs_val = None
+    output_top_logprobs_idx = None
 
 
 def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
@@ -89,6 +104,7 @@ def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
         sampling_params=SamplingParams(max_new_tokens=8, stop=[], ignore_eos=True),
         stream=False,
         tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
     )
     state.computed_length = computed_length
     return state
@@ -104,7 +120,9 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
     processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
 
-    events = processor.post_process_forward_op(_ForwardOp(), _ExecutionResult())
+    events = processor.post_process_forward_op(
+        _ForwardOp(), _ExecutionResult(), is_prefill_instance=False
+    )
 
     reserve_events = [
         event for event in events if type(event).__name__ == "UpdateReserveNumTokens"
@@ -112,6 +130,64 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert len(reserve_events) == 1
     assert reserve_events[0].request_id == "decode"
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
+
+
+def test_a_landed_forward_of_a_finished_request_still_reports_to_the_scheduler():
+    """A request finished on an earlier result while this forward was already
+    dispatched (the overlap schedule): its row is untracked here, but the
+    scheduler counts the landing and publishes the frontier it consumed, so
+    the row's ExtendResult goes out with its tokens -- empty for a chunk that
+    owes none."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+
+    events = processor.post_process_forward_op(
+        _ForwardOp(), _ExecutionResult(), is_prefill_instance=False
+    )
+
+    extends = {
+        event.request_id: list(event.tokens)
+        for event in events
+        if type(event).__name__ == "ExtendResult"
+    }
+    assert extends == {"prefill": [11], "decode": [22]}
+    assert "decode" not in processor.rid_to_state
+
+    class _MidChunkOp(_ForwardOp):
+        request_ids = ["gone"]
+        request_pool_indices = [0]
+        input_lengths = [4]
+        prefill_lengths = [8]
+
+        def num_extends(self):
+            return 1
+
+    class _OneRow(_ExecutionResult):
+        output_tokens = torch.tensor([11], dtype=torch.int32)
+        output_lengths = torch.tensor([1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
+        _MidChunkOp(), _OneRow(), is_prefill_instance=False
+    )
+    (extend,) = [event for event in events if type(event).__name__ == "ExtendResult"]
+    assert extend.request_id == "gone"
+    assert list(extend.tokens) == []
+
+
+def test_cached_tokens_count_the_replayed_window_as_a_hit():
+    """A bounded-replay chunk starts its model input below the prefix hit;
+    the request still hit through the end of the replayed window, and a
+    later chunk of the same request adds nothing."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["hit"] = _state(list(range(20)))
+    processor.rid_to_state["fresh"] = _state(list(range(5)))
+    # "hit": hit at 8, window 4 -> input starts at 4 with 4 replayed rows.
+    processor.add_cached_tokens(["hit", "fresh"], [4, 0], [4, 0])
+    assert processor.rid_to_state["hit"].cached_tokens == 8
+    assert processor.rid_to_state["fresh"].cached_tokens == 0
+    processor.rid_to_state["hit"].computed_length = 12
+    processor.add_cached_tokens(["hit"], [12], [0])
+    assert processor.rid_to_state["hit"].cached_tokens == 8
 
 
 def test_mark_abort_notify_client_flag():
@@ -151,7 +227,9 @@ def test_nan_flag_finishes_request_with_numerical_error():
     # Flag only the decode slot.
     result.output_nan_flags = torch.tensor([0, 1], dtype=torch.int32)
 
-    events = processor.post_process_forward_op(_ForwardOp(), result)
+    events = processor.post_process_forward_op(
+        _ForwardOp(), result, is_prefill_instance=False
+    )
 
     # Flagged request: aborted with NumericalError, removed from tracking.
     # The scheduler gets an Abort (NOT Finish) event — AbortEvent skips the
@@ -196,7 +274,9 @@ def test_nan_flag_keeps_single_sanitized_token():
         request_ids = ["decode"]
         request_pool_indices = [0]
         input_lengths = [1]
+        prefill_lengths = []
         extend_prefix_lens = []
+        extend_replay_lens = []
 
         def num_extends(self):
             return 0
@@ -206,7 +286,9 @@ def test_nan_flag_keeps_single_sanitized_token():
     result.output_lengths = torch.tensor([3], dtype=torch.int32)
     result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
 
-    events = processor.post_process_forward_op(_SpecForwardOp(), result)
+    events = processor.post_process_forward_op(
+        _SpecForwardOp(), result, is_prefill_instance=False
+    )
 
     assert decode_state.finished
     # Only the first of the 3 accepted tokens is kept.
@@ -218,8 +300,9 @@ def test_nan_flag_keeps_single_sanitized_token():
 
 
 def test_nan_flag_skips_first_token_pd_handoff():
-    """NaN-terminated requests must not hand their bootstrap token to the PD
-    transfer layer — their KV is suspect."""
+    """A NaN-terminated P-side request must never transfer its KV: it aborts
+    at the scheduler (no remote decode is emitted), while healthy requests in
+    the same batch proceed."""
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
@@ -229,15 +312,62 @@ def test_nan_flag_skips_first_token_pd_handoff():
     result.next_input_ids = None
     result.output_nan_flags = torch.tensor([1, 0], dtype=torch.int32)
 
-    handoffs = []
-    processor.post_process_forward_op(
+    events = processor.post_process_forward_op(
         _ForwardOp(),
         result,
-        on_first_token=lambda rid, *a: handoffs.append(rid),
+        is_prefill_instance=True,
     )
 
-    # Flagged prefill slot is skipped; the healthy decode slot still hands off.
-    assert handoffs == ["decode"]
+    by_request = [(type(e).__name__, e.request_id) for e in events]
+    assert ("Abort", "prefill") in by_request
+    assert ("Abort", "decode") not in by_request
+    assert "prefill" not in processor.rid_to_state
+
+
+def test_nan_outranks_a_client_abort_on_a_local_engine():
+    """A request that is both client-aborted and NaN-flagged aborts at the
+    scheduler rather than finishing: an ending the client asked for does not
+    make the numbers trustworthy, and Finish would cache the corrupt pages."""
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+    processor.mark_abort("decode", notify_client=False)
+
+    result = _ExecutionResult()
+    result.next_input_ids = None
+    result.output_nan_flags = torch.tensor([0, 1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
+        _ForwardOp(),
+        result,
+        is_prefill_instance=False,
+    )
+
+    by_request = [(type(e).__name__, e.request_id) for e in events]
+    assert ("Abort", "decode") in by_request
+    assert ("Finish", "decode") not in by_request
+
+
+def test_nan_outranks_a_client_abort_on_the_prefill_node():
+    """Numerical corruption must win over every other ending: a request that
+    is both client-aborted and NaN-flagged still aborts at the scheduler, so
+    its suspect KV is never shipped to the peer."""
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    processor.mark_abort("prefill", notify_client=False)
+
+    result = _PrefillExecutionResult()
+    result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
+        _PrefillForwardOp(),
+        result,
+        is_prefill_instance=True,
+    )
+
+    assert [type(event).__name__ for event in events] == ["ExtendResult", "Abort"]
+    assert "prefill" not in processor.rid_to_state
 
 
 class _RecordingLogger:
@@ -271,12 +401,18 @@ def test_log_request_stats_disabled_by_default():
             request_ids = ["d"]
             request_pool_indices = [0]
             input_lengths = [1]
+            prefill_lengths = []
             extend_prefix_lens = []
+            extend_replay_lens = []
 
             def num_extends(self):
                 return 0
 
-        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+        processor.post_process_forward_op(
+            _DecodeOp(),
+            _ExecutionResult(),
+            is_prefill_instance=False,
+        )
     finally:
         gop.logger = gop_logger
 
@@ -359,8 +495,8 @@ def test_log_request_stats_aborted_with_spec_acceptance():
 
     line = rec.lines[0]
     assert "status='aborted', reason='abort'" in line
-    # acc_rate = (acc_len - 1) / draft = (3 - 1) / 4 = 0.5
-    assert "acc_len=3.0, acc_rate=0.5" in line
+    # acc_rate = (acc_len - 1) / proposed drafts = (3 - 1) / (4 - 1)
+    assert "acc_len=3.0, acc_rate=0.6667" in line
 
 
 def test_log_request_stats_noop_without_tracker():
@@ -438,12 +574,18 @@ def test_log_request_stats_records_timestamps_through_forward():
             request_ids = ["d"]
             request_pool_indices = [0]
             input_lengths = [1]
+            prefill_lengths = []
             extend_prefix_lens = []
+            extend_replay_lens = []
 
             def num_extends(self):
                 return 0
 
-        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+        processor.post_process_forward_op(
+            _DecodeOp(),
+            _ExecutionResult(),
+            is_prefill_instance=False,
+        )
     finally:
         gop.logger = gop_logger
 
@@ -496,6 +638,7 @@ class _PrefillForwardOp:
     input_lengths = [4]
     prefill_lengths = [4]
     extend_prefix_lens = [0]
+    extend_replay_lens = [0]
 
     def num_extends(self):
         return 1
@@ -508,9 +651,12 @@ class _PrefillExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = torch.tensor([[101, 102, 103]], dtype=torch.int32)
-
-    def sync(self):
-        return None
+    input_token_logprobs = None
+    input_logprob_plan = None
+    input_top_logprobs_val = None
+    input_top_logprobs_idx = None
+    output_top_logprobs_val = None
+    output_top_logprobs_idx = None
 
 
 class _EmptyPrefillExecutionResult(_PrefillExecutionResult):
@@ -522,36 +668,39 @@ class _MismatchedPrefillExecutionResult(_PrefillExecutionResult):
     next_input_ids = torch.tensor([[201, 202, 203]], dtype=torch.int32)
 
 
-def test_prefill_first_token_passes_spec_candidates():
+def test_prefill_final_chunk_folds_spec_candidates_into_the_extend_result():
+    """The scheduler's remote decode is self-contained: the drafter candidates
+    ride the final chunk's ExtendResult (the bootstrap token is tokens[0],
+    which the scheduler reads back as LastToken)."""
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
-    calls = []
 
-    processor.post_process_forward_op(
+    events = processor.post_process_forward_op(
         _PrefillForwardOp(),
         _PrefillExecutionResult(),
         is_prefill_instance=True,
-        on_first_token=lambda *args: calls.append(args),
     )
 
-    assert calls == [("prefill", 3, 101, [101, 102, 103])]
+    extend = next(e for e in events if type(e).__name__ == "ExtendResult")
+    assert list(extend.tokens)[0] == 101
+    assert list(extend.spec_candidate_ids) == [101, 102, 103]
 
 
-def test_prefill_first_token_does_not_guess_from_next_input_ids():
+def test_prefill_extend_result_does_not_guess_from_next_input_ids():
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
-    calls = []
 
-    processor.post_process_forward_op(
+    events = processor.post_process_forward_op(
         _PrefillForwardOp(),
         _EmptyPrefillExecutionResult(),
         is_prefill_instance=True,
-        on_first_token=lambda *args: calls.append(args),
     )
 
-    assert calls == []
+    for event in events:
+        if type(event).__name__ == "ExtendResult":
+            assert list(event.spec_candidate_ids) == []
 
 
 def test_prefill_first_token_checks_spec_candidate_bootstrap():
@@ -564,7 +713,6 @@ def test_prefill_first_token_checks_spec_candidate_bootstrap():
             _PrefillForwardOp(),
             _MismatchedPrefillExecutionResult(),
             is_prefill_instance=True,
-            on_first_token=lambda *args: None,
         )
 
 
@@ -580,7 +728,6 @@ def test_aborted_prefill_waits_for_pd_transfer_completion(notify_client):
         _PrefillForwardOp(),
         _PrefillExecutionResult(),
         is_prefill_instance=True,
-        on_first_token=lambda *args: None,
     )
 
     assert [type(event).__name__ for event in events] == ["ExtendResult"]
@@ -599,7 +746,7 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     state.sampling_params.max_new_tokens = 1
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2, None)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -612,7 +759,50 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     assert output.rids == ["decode"]
     assert output.output_ids == [[101]]
     assert output.completion_tokens == [1]
+    assert output.cached_tokens == [2]
     assert output.finished_reasons[0] == {"type": "length", "length": 1}
+
+
+class _Matcher:
+    """A matcher that records the tokens it was asked to accept."""
+
+    def __init__(self) -> None:
+        self.accepted = []
+
+    def accept_token(self, token_id: int) -> None:
+        self.accepted.append(token_id)
+
+    def is_terminated(self) -> bool:
+        return False
+
+
+def test_pd_decode_matcher_accepts_the_prefill_nodes_token():
+    """The decode node compiled its own matcher; the prefill node's token is
+    the one token it never samples, so it must be accepted here or every
+    decode step would mask from a state one token behind."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.grammar = _Matcher()
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", 101, 2, None)
+
+    assert state.output_ids == [101]
+    assert state.grammar.accepted == [101]
+
+
+def test_pd_decode_drops_the_grammar_when_the_bootstrap_token_is_lost():
+    """Nothing can bring the matcher in sync without that token, and masking
+    from a stale state corrupts the output more quietly than not masking."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.grammar = _Matcher()
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", -1, 2, None)
+
+    assert state.output_ids == []
+    assert state.grammar is None
 
 
 def test_pd_multi_token_request_continues_after_remote_prefill_done():
@@ -622,7 +812,7 @@ def test_pd_multi_token_request_continues_after_remote_prefill_done():
     state.sampling_params.max_new_tokens = 2
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2, None)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -630,3 +820,309 @@ def test_pd_multi_token_request_continues_after_remote_prefill_done():
     assert processor.rid_to_state["decode"] is state
     assert events == []
     assert sender.items == []
+
+
+class _SpecMetrics:
+    enabled = True
+
+    def __init__(self):
+        self.steps = []
+
+    def record_spec_decode_step(
+        self, *, num_decode_slots, accepted_draft_tokens, draft_width
+    ):
+        self.steps.append((num_decode_slots, accepted_draft_tokens, draft_width))
+
+
+def test_spec_decode_metrics_count_mixed_rounds_and_proposed_drafts():
+    """A mixed prefill/decode round still records its decode slot, and 3/4
+    proposes 3 drafts per verify step because slot 0 is the accepted root."""
+    metrics = _SpecMetrics()
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        spec_algorithm="eagle",
+        spec_num_tokens=4,
+        metrics=metrics,
+    )
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+
+    class _SpecResult(_ExecutionResult):
+        output_lengths = torch.tensor([1, 3], dtype=torch.int32)
+
+    processor._emit_spec_decode_metrics(
+        forward_op=_ForwardOp(), model_execution_results=_SpecResult()
+    )
+    assert metrics.steps == [(1, 2, 3)]
+
+
+@pytest.mark.parametrize(
+    "local_hits,prefill_hits",
+    [(0, 1280), (256, 1280), (1280, 256), (1280, 0)],
+)
+def test_remote_prefill_usage_reports_prefill_hits(local_hits, prefill_hits):
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state(list(range(2048)), computed_length=2048)
+    state.sampling_params.max_new_tokens = 1
+    state.cached_tokens = local_hits
+    processor.rid_to_state["decode"] = state
+    processor.on_remote_prefill_done("decode", 101, prefill_hits, None)
+    processor.finish_remote_prefill_only_request("decode")
+    assert sender.items[0].cached_tokens == [prefill_hits]
+
+
+def test_non_pd_cached_tokens_reach_output():
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state(list(range(2048)))
+    processor.rid_to_state["local"] = state
+    processor.add_cached_tokens(["local"], [1024], [256])
+    state.output_ids = [101]
+    state.finished_reason = FINISH_LENGTH(length=1)
+    processor.stream_output(["local"], [state])
+    assert sender.items[0].cached_tokens == [1280]
+
+
+def test_scheduler_aborts_finish_toward_the_client_with_a_capacity_code():
+    """A capacity retraction whose victim could not be imaged aborted that
+    request inside the plan build: the processor finishes it to the client
+    with ``ABORT_CODE.CapacityAbort`` and the scheduler's detail, counts it,
+    returns no event (the scheduler already dropped it) and leaves the other
+    requests alone; an id the client aborted in the same round is skipped."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.engine.request_types import ABORT_CODE
+
+    sender = _Sender()
+    metrics = _Metrics()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=metrics)
+    victim = _state([1, 2, 3], computed_length=3)
+    victim.output_ids = [41, 42]
+    processor.rid_to_state["victim"] = victim
+    processor.rid_to_state["other"] = _state([4, 5, 6], computed_length=3)
+    aborts = [
+        SimpleNamespace(
+            request_id="victim",
+            reason="ImageDoesNotFit",
+            detail="no blob slot free (max_retracted_requests=2); raise "
+            "--retraction-snapshot-max-requests",
+        ),
+        SimpleNamespace(request_id="gone", reason="ImageDoesNotFit", detail="x"),
+    ]
+
+    assert processor.finish_scheduler_aborted_requests(aborts) is None
+
+    assert set(processor.rid_to_state) == {"other"}
+    assert victim.finished and victim.finished_reason.is_error
+    reason = victim.finished_reason.to_json()
+    assert reason["type"] == "abort"
+    assert reason["err_type"] == ABORT_CODE.CapacityAbort.value == 524
+    assert "max_retracted_requests=2" in reason["message"]
+    assert metrics.capacity_aborts == 1
+    (out,) = sender.items
+    assert out.rids == ["victim"] and out.finished_reasons[0] == reason
+
+
+def test_a_client_abort_crossing_a_capacity_abort_keeps_the_clients_finish():
+    """The scheduler's abort of a request the client already cancelled in the
+    same round: the client's reason stands, no capacity abort is counted and
+    nothing is streamed (the tokenizer manager tore down) -- unless a
+    pause-initiated abort left a passive client that still needs its finish.
+    Either way the state is released: the scheduler emits nothing further."""
+    from types import SimpleNamespace
+
+    sender = _Sender()
+    metrics = _Metrics()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=metrics)
+    cancelled = _state([1, 2, 3], computed_length=3)
+    paused = _state([4, 5, 6], computed_length=3)
+    processor.rid_to_state["cancelled"] = cancelled
+    processor.rid_to_state["paused"] = paused
+    processor.mark_abort("cancelled")
+    processor.mark_abort("paused", notify_client=True)
+    aborts = [
+        SimpleNamespace(request_id=rid, reason="ImageDoesNotFit", detail="x")
+        for rid in ("cancelled", "paused")
+    ]
+
+    processor.finish_scheduler_aborted_requests(aborts)
+
+    assert processor.rid_to_state == {}
+    assert metrics.capacity_aborts == 0
+    assert cancelled.finished_reason.message == "AbortReq from client"
+    assert paused.finished_reason.message == "Aborted by pause"
+    (out,) = sender.items
+    assert out.rids == ["paused"]
+    assert out.finished_reasons[0] == paused.finished_reason.to_json()
+
+
+class _EosTokenizer(_Tokenizer):
+    eos_token_id = 3
+    additional_stop_token_ids = {4}
+
+
+def test_stop_token_ids_merge_every_source_unless_eos_is_ignored():
+    """The finish check and the device's verify cut read one stop set: the
+    request's own ids, the model's EOS ids and the tokenizer's."""
+    state = RequestState(
+        prompt_input_ids=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_new_tokens=8, stop=[], stop_token_ids={5}),
+        stream=False,
+        tokenizer=_EosTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[2],
+    )
+    assert state.stop_token_ids == {2, 3, 4, 5}
+    assert state.stop_criteria.stop_token_ids == (2, 3, 4, 5)
+    assert state.stop_criteria.token_limit == 5 + 8
+    state.output_ids = [4]
+    state.check_finished()
+    assert state.finished_reason.to_json()["matched"] == 4
+
+    ignoring = RequestState(
+        prompt_input_ids=[1],
+        sampling_params=SamplingParams(
+            max_new_tokens=8, stop=[], stop_token_ids={5}, ignore_eos=True
+        ),
+        stream=False,
+        tokenizer=_EosTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[2],
+    )
+    assert ignoring.stop_criteria.stop_token_ids == ()
+
+
+class _DecodeOp:
+    request_ids = ["decode"]
+    request_pool_indices = [1]
+    input_lengths = [3]
+    prefill_lengths = []
+    extend_prefix_lens = []
+    extend_replay_lens = []
+
+    def num_extends(self):
+        return 0
+
+
+class _DecodeResult(_ExecutionResult):
+    output_tokens = torch.tensor([11, 12, 13], dtype=torch.int32)
+    output_lengths = torch.tensor([3], dtype=torch.int32)
+
+
+def test_a_finish_before_the_last_kept_token_reports_the_whole_round():
+    """A stop string ends the request on the round's first token, but the
+    device kept all three (it cuts only at stop tokens and the token limit):
+    the client sees the first, the scheduler gets every kept token so the
+    frontier it publishes matches the state and KV the device holds."""
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+    )
+    state = RequestState(
+        prompt_input_ids=[5, 6, 7],
+        sampling_params=SamplingParams(max_new_tokens=8, stop=["11"]),
+        stream=False,
+        tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
+    )
+    state.computed_length = 3
+    processor.rid_to_state["decode"] = state
+
+    events = processor.post_process_forward_op(
+        _DecodeOp(), _DecodeResult(), is_prefill_instance=False
+    )
+
+    (extend,) = [e for e in events if type(e).__name__ == "ExtendResult"]
+    assert list(extend.tokens) == [11, 12, 13]
+    assert state.output_ids == [11]
+    assert any(type(e).__name__ == "Finish" for e in events)
+
+
+def test_a_live_decode_that_keeps_no_token_is_an_error():
+    """Only a request the device already stopped keeps nothing, and the
+    processor no longer tracks a finished request."""
+
+    class _Empty(_DecodeResult):
+        output_lengths = torch.tensor([0], dtype=torch.int32)
+
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+    )
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+    with pytest.raises(RuntimeError, match="kept no token"):
+        processor.post_process_forward_op(
+            _DecodeOp(), _Empty(), is_prefill_instance=False
+        )
+
+
+def test_a_request_with_more_stop_tokens_than_the_device_table_is_refused():
+    def state(num_ids):
+        return RequestState(
+            prompt_input_ids=[1],
+            sampling_params=SamplingParams(
+                max_new_tokens=8, stop=[], stop_token_ids=set(range(100, 100 + num_ids))
+            ),
+            stream=False,
+            tokenizer=_EosTokenizer(),
+            computes_prompt_logprobs=True,
+        )
+
+    handler = object.__new__(RequestHandler)
+    # The tokenizer's two stop ids count against the limit.
+    fits = state(MAX_STOP_TOKEN_IDS - 2)
+    handler._refuse_too_many_stop_token_ids(fits)
+    assert not fits.finished
+    refused = state(MAX_STOP_TOKEN_IDS - 1)
+    handler._refuse_too_many_stop_token_ids(refused)
+    reason = refused.finished_reason.to_json()
+    assert reason["status_code"] == HTTPStatus.BAD_REQUEST
+    assert f"at most {MAX_STOP_TOKEN_IDS - 2} other" in reason["message"]
+
+
+def test_a_row_behind_a_stopped_request_reads_its_own_token():
+    """A request the device stopped keeps no token, but its decode row still
+    holds its stored token: the next row's token is at the next position, so
+    a live request never takes its neighbour's token (and so never misses
+    its own stop token)."""
+
+    class _TwoDecodes:
+        request_ids = ["stopped", "live"]
+        request_pool_indices = [1, 2]
+        input_lengths = [1, 1]
+        prefill_lengths = []
+        extend_prefix_lens = []
+        extend_replay_lens = []
+
+        def num_extends(self):
+            return 0
+
+    class _Result(_ExecutionResult):
+        output_tokens = torch.tensor([11, 22], dtype=torch.int32)
+        output_lengths = torch.tensor([0, 1], dtype=torch.int32)
+
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    live = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["live"] = live
+
+    events = processor.post_process_forward_op(
+        _TwoDecodes(), _Result(), is_prefill_instance=False
+    )
+
+    extends = {
+        event.request_id: list(event.tokens)
+        for event in events
+        if type(event).__name__ == "ExtendResult"
+    }
+    assert extends == {"stopped": [], "live": [22]}
+    assert live.output_ids == [22]

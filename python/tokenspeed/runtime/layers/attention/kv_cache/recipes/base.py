@@ -1,0 +1,532 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""The cache pipeline every model family runs: layers, group, pack, bind."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
+from functools import cached_property
+from typing import TYPE_CHECKING, ClassVar
+
+from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+from tokenspeed.runtime.layers.attention.configs.base import (
+    SoftmaxAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
+    configured_token_limit,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    CacheLayout,
+    pack,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    SchedulerLimits,
+    capacity_model,
+    scheduler_role,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    CacheGroupDeclaration,
+    CacheGroupSpec,
+    group,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+    compute_offload_capacity,
+    plan_cache_storage,
+)
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.offload_config import (
+        KVOffloadPolicy,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+        CacheModelFamily,
+        CacheSetup,
+    )
+
+
+class CacheRecipe(ABC):
+    """One model family's cache recipe.
+
+    The pipeline is the same for every family and lives once, in :meth:`setup`:
+
+    ``layers -> group -> pack -> bind``
+
+    A family fills in the seams -- which layers exist and how they collapse
+    into groups, what bytes each layer costs, how tightly groups pack into a
+    physical parent, and how many parents the budget affords. It never
+    restates the order of the stages.
+    """
+
+    # Set as a class attribute by every subclass; OrdinaryRecipe takes it per
+    # instance because its four families differ by nothing else.
+    family: CacheModelFamily
+    # Families whose linear backend verifies speculative rounds from paged
+    # state set this; their ``workspace_bytes`` is that backend's staging.
+    uses_paged_state_verify: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        *,
+        server_args,
+        model_config,
+        attn_config,
+        draft_model_config,
+        draft_attn_config,
+        cache_budget_bytes: int,
+        probe_batch_rows: int | None,
+        decode_input_tokens: int,
+        overlap_schedule_depth: int,
+    ) -> None:
+        self.server_args = server_args
+        self.model_config = model_config
+        self.attn_config = attn_config
+        self.draft_model_config = draft_model_config
+        self.draft_attn_config = draft_attn_config
+        self.cache_budget_bytes = cache_budget_bytes
+        # A probe sizes the arena by a block-count floor instead of by budget.
+        self.probe_batch_rows = probe_batch_rows
+        self.decode_input_tokens = decode_input_tokens
+        self.overlap_schedule_depth = overlap_schedule_depth
+
+    # ------------------------------------------------------------------
+    # The pipeline. One place, one order.
+    # ------------------------------------------------------------------
+
+    def setup(self) -> CacheSetup:
+        """Run the pipeline for this family and bind it to the budget."""
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+            CachePoolSpec,
+            CacheSetup,
+        )
+
+        groups = self.groups()
+        layout = pack(
+            groups,
+            prefix_granularity=self.prefix_granularity,
+            cache_blocks_per_lcm_block=self.packing(groups),
+            alignment=self.alignment,
+            max_padding_fraction=self.max_padding_fraction,
+        )
+        self.check_layout(layout)
+        specs = tuple(spec for spec, _ in groups)
+        policy = self.offload_policy()
+        offload = (
+            None
+            if policy is None
+            else policy.bind(
+                request_slots=RequestSlotLayout(self.attn_config.max_bs).capacity,
+                device_rows=RequestSlotLayout(self.attn_config.max_bs).capacity
+                * (policy.hot_tokens + policy.reserved_tokens),
+            )
+        )
+        if offload is not None:
+            num_lcm_blocks, offload = compute_offload_capacity(
+                layout,
+                specs,
+                offload=offload,
+                device_budget_bytes=self.cache_budget_bytes - self.workspace_bytes(),
+                max_lcm_blocks=self._capped_parents(
+                    2**31 - 1,
+                    parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
+                ),
+                probe_lcm_blocks=(
+                    max(self.probe_batch_rows, self.parents_needed(layout, 1))
+                    if self.probe_batch_rows is not None
+                    else None
+                ),
+            )
+        elif self.probe_batch_rows is not None:
+            num_lcm_blocks = max(self.probe_batch_rows, self.parents_needed(layout, 1))
+        else:
+            num_lcm_blocks = self.num_lcm_blocks(layout)
+        memory_plan = layout.bind(num_lcm_blocks)
+        storage_plan = plan_cache_storage(memory_plan, specs, offload=offload)
+        return CacheSetup(
+            spec=CachePoolSpec(
+                family=self.family,
+                memory_plan=memory_plan,
+                layer_types=self.layer_types,
+                # The same declarations the layout was packed from, so plan and
+                # specs cannot name different groups.
+                cache_group_specs=tuple(spec for spec, _ in groups),
+                token_capacity=self.token_capacity(layout, num_lcm_blocks),
+                layer_kv_head_counts=self.layer_kv_head_counts,
+                pool_options=self.pool_options(),
+                storage_plan=storage_plan,
+            ),
+            num_draft_layers=self.num_draft_layers,
+            cache_budget_bytes=(
+                self.cache_budget_bytes
+                if self.probe_batch_rows is None
+                else self.workspace_bytes() + storage_plan.device_budget_bytes
+            ),
+            fixed_workspace_bytes=self.workspace_bytes(),
+            uses_paged_state_verify=self.uses_paged_state_verify,
+        )
+
+    def offload_policy(self) -> KVOffloadPolicy | None:
+        """Reject enabled offloading by default; return None when disabled.
+
+        Recipes supporting offloading must override this method to translate
+        the runtime configuration into a model-specific storage policy.
+        """
+        if self.server_args.kv_offload_config is not None:
+            raise ValueError("this cache recipe does not support --kv-offload-config")
+        return None
+
+    # ------------------------------------------------------------------
+    # Seams: the layer vocabulary
+    #
+    # Subclasses mark every seam they fill with @override, so a renamed or
+    # mistyped seam fails type checking instead of silently falling back to
+    # the default below. The abstract seam is the exception: ABC already
+    # refuses to instantiate a subclass that misses it.
+    # ------------------------------------------------------------------
+
+    @property
+    @abstractmethod
+    def layer_types(self) -> tuple[str, ...]:
+        """Per-layer cache-group label, target layers then draft layers.
+
+        Always one label per merged layer -- consumers size the model from
+        ``len(layer_types)`` -- so a family whose config declares no labels
+        resolves them (full-history) instead of returning fewer.
+        """
+
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        """Per-layer cache group id, target layers then draft layers.
+
+        Only the default per-layer :meth:`groups` walk consumes this seam:
+        it is the storage policy "layer i's fields go to group_ids[i]".
+        Families that override :meth:`groups` wholesale express that policy
+        directly in their field declarations and need not implement it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} uses the default per-layer groups() walk "
+            "but does not define group_ids"
+        )
+
+    @property
+    def num_target_layers(self) -> int:
+        """Leading layers that belong to the target model."""
+        return self.model_config.num_attention_layers
+
+    @property
+    def num_draft_layers(self) -> int:
+        """Trailing layers that belong to the draft model, zero without one.
+
+        A draft's layers are continuation layers of the merged plan, so their
+        count is a fact of the draft config -- override this only to constrain
+        it further, never to restate it.
+        """
+        if self.draft_attn_config is None:
+            return 0
+        return self.draft_model_config.num_attention_layers
+
+    @property
+    def layer_kv_head_counts(self) -> tuple[int, ...] | None:
+        """Per-layer KV head count, when a family's layers differ."""
+        return None
+
+    # ------------------------------------------------------------------
+    # Seams: geometry knobs
+    # ------------------------------------------------------------------
+
+    @property
+    def prefix_granularity(self) -> int:
+        """Scheduler-wide identity grain in tokens."""
+        return int(self.attn_config.prefix_granularity)
+
+    @property
+    def alignment(self) -> int:
+        """Byte alignment for plane sizes."""
+        return 256
+
+    @property
+    def max_padding_fraction(self) -> float:
+        """Padding budget a group may waste inside its parent."""
+        return 0.25
+
+    @cached_property
+    def token_limit(self) -> int | None:
+        """The configured token cap, if any: --max-total-tokens or the CI cap."""
+        return configured_token_limit(self.server_args)
+
+    @property
+    def pd_disaggregation_enabled(self) -> bool:
+        return bool(self.attn_config.pd_disaggregation_enabled)
+
+    # ------------------------------------------------------------------
+    # Seams: groups
+    # ------------------------------------------------------------------
+
+    def fields_for_layer(
+        self, layer_id: int, group_id: str, occurrence: int
+    ) -> tuple[CacheFieldSpec, ...]:
+        """The bytes this layer costs its group.
+
+        ``occurrence`` is the layer's slot in its group's plane numbering.
+        Families whose groups are not per-layer override :meth:`groups`
+        instead and need not implement this.
+        """
+        raise NotImplementedError
+
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        """Declare this family's cache groups, spec and fields together.
+
+        The default walks the layers once (:func:`spec.group`). Families with
+        groups that are not per-layer either append whole-group declarations
+        here or replace the walk entirely.
+        """
+        return group(
+            layer_types=self.layer_types,
+            group_ids=self.group_ids,
+            sliding_window_tokens=self.attn_config.component(
+                SoftmaxAttnConfig
+            ).sliding_window_tokens,
+            prefix_granularity=self.prefix_granularity,
+            fields_for_layer=self.fields_for_layer,
+            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
+        )
+
+    def check_layout(self, layout: CacheLayout) -> None:
+        """Assert whatever this family requires of the packed parent.
+
+        Runs once, between pack and bind: the layout is final but nothing has
+        been sized or allocated yet.
+        """
+
+    def packing(
+        self, groups: Sequence[CacheGroupDeclaration]
+    ) -> Mapping[str, int] | None:
+        """How many of each group's CacheBlocks share one physical parent.
+
+        ``None`` lets :func:`plan.pack` derive it from byte ratios and the
+        exact-page-stride constraints the fields impose.
+        """
+        return None
+
+    # ------------------------------------------------------------------
+    # Seams: capacity
+    # ------------------------------------------------------------------
+
+    def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        """Physical parents to allocate, excluding the reserved null parent.
+
+        The budget minus this family's fixed workspace, capped by the
+        configured token limit.
+        """
+        usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
+        return self._capped_parents(
+            self._budgeted_parents(usable_bytes, layout.lcm_block_bytes),
+            parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
+        )
+
+    def _budgeted_parents(self, usable_bytes: int, parent_bytes: int) -> int:
+        """Parents a byte budget affords beyond the reserved null parent.
+
+        The one place the budget floor is checked, so every family fails the
+        same way when it cannot hold the null parent plus one usable parent.
+        """
+        budgeted = usable_bytes // parent_bytes - 1
+        if budgeted < 1:
+            raise ValueError(
+                f"{self.family} cache budget must hold a null parent and one "
+                f"usable LCM parent of {parent_bytes / (1 << 30):.2f} GiB each, "
+                f"but the cache budget leaves {usable_bytes / (1 << 30):.2f} GiB "
+                "after this family's fixed workspaces"
+            )
+        return budgeted
+
+    def _capped_parents(self, budgeted: int, *, parent_tokens: int) -> int:
+        """Trim a budget-derived parent count to the configured token limit.
+
+        The one place the token limit turns into a parent count, so a family
+        that sizes its budget differently still reads the limit the same way.
+        """
+        if self.token_limit is None:
+            return budgeted
+        requested = self.token_limit // parent_tokens
+        if requested < 1:
+            raise ValueError(
+                "the configured token limit must hold at least one LCM parent "
+                f"({parent_tokens} child tokens)"
+            )
+        return min(budgeted, requested)
+
+    def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
+        """Tokens the scheduler may admit against these parents.
+
+        The one definition of child-token capacity: parents times the tightest
+        packing times the identity grain.
+        """
+        return num_lcm_blocks * self._max_packing(layout) * layout.prefix_granularity
+
+    @cached_property
+    def scheduler_limits(self) -> SchedulerLimits:
+        """The concurrency the cache has to hold at once.
+
+        The one place a recipe reads them, so per-group page demand and the
+        capacity search cannot size against different numbers. Under a probe
+        the concurrency is the probe's own fabricated batch, not the
+        scheduler's -- the arena it sizes serves a capture, not requests --
+        unless verify scratch lives in the pool, which then needs a row per
+        request whatever pool is bound.
+        """
+        return SchedulerLimits(
+            role=scheduler_role(self.server_args.disaggregation_mode),
+            # One live request per fabricated row; serving concurrency is elsewhere.
+            max_live_requests=(
+                self.attn_config.max_bs
+                if self.probe_batch_rows is None or self.verify_scratch_in_pool()
+                else min(self.attn_config.max_bs, self.probe_batch_rows)
+            ),
+            max_scheduled_tokens=int(self.server_args.chunked_prefill_size),
+            max_context_len=self.attn_config.context_len,
+            decode_input_tokens=self.decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
+            disable_prefix_cache=not self.server_args.enable_prefix_caching,
+        )
+
+    def parents_needed(self, layout: CacheLayout, token_capacity: int) -> int:
+        """Physical parents this capacity needs at the configured concurrency.
+
+        The scheduler's own capacity model answers, over the groups as the
+        scheduler will read them, so the pool is sized with the per-request
+        working set the Scheduler later bounds requests with. Reads only
+        capacity-independent facts of the layout, so it can probe a layout
+        directly instead of binding a stand-in plan first.
+        """
+        model = capacity_model(
+            self._group_specs,
+            prefix_granularity=layout.prefix_granularity,
+            virtual_packing={
+                group_id: packing * self._shard_counts[group_id]
+                for group_id, packing in layout.group_packing
+            },
+            limits=self.scheduler_limits,
+        )
+        return model.lcm_blocks_needed_for(
+            model.concurrent_group_pages(
+                max_total_tokens=token_capacity,
+                max_context_len=self.scheduler_limits.max_context_len,
+            )
+        )
+
+    def _capacity_from_parents(
+        self, layout: CacheLayout, num_lcm_blocks: int, *, upper_bound: int
+    ) -> int:
+        """Largest capacity these parents admit, by monotonic binary search.
+
+        The inverse of :meth:`parents_needed`, for families that size parents
+        from per-group demand instead of the flat packing product.
+        """
+        if num_lcm_blocks <= 0:
+            raise ValueError("num_lcm_blocks must be positive")
+        if upper_bound <= 0:
+            raise ValueError("upper_bound must be positive")
+        low, high = 0, upper_bound
+        while low < high:
+            candidate = (low + high + 1) // 2
+            if self.parents_needed(layout, candidate) <= num_lcm_blocks:
+                low = candidate
+            else:
+                high = candidate - 1
+        if low == 0:
+            raise ValueError(
+                f"num_lcm_blocks={num_lcm_blocks} cannot admit one token with "
+                f"the configured {self.family} cache scheduler limits"
+            )
+        return low
+
+    @cached_property
+    def _group_specs(self) -> tuple[CacheGroupSpec, ...]:
+        return tuple(spec for spec, _ in self.groups())
+
+    @cached_property
+    def _shard_counts(self) -> dict[str, int]:
+        return {spec.group_id: spec.shard_count for spec in self._group_specs}
+
+    def _max_packing(self, layout: CacheLayout) -> int:
+        """Virtual CacheBlocks per parent of the most finely packed group."""
+        return max(
+            count * self._shard_counts[group_id]
+            for group_id, count in layout.group_packing
+        )
+
+    # ------------------------------------------------------------------
+    # Seams: extras
+    # ------------------------------------------------------------------
+
+    def workspace_bytes(self) -> int:
+        """Cache-adjacent fixed allocation this family also needs."""
+        return 0
+
+    def verify_scratch_in_pool(self) -> bool:
+        """Whether speculative verify stages its scratch in the bound pool.
+
+        A family that does needs a row per request at the serving concurrency
+        from whichever pool is bound, so its probe arena keeps that concurrency.
+        """
+        return False
+
+    def pool_options(self) -> object | None:
+        """Family-specific options the pool constructor needs."""
+        return None
+
+
+def kda_verify_scratch_in_pool(server_args, attn_config) -> bool:
+    """Raw-gate KDA replay reuses the committed conv slab as verify scratch."""
+    # A PD prefill role never verifies, so it stages no verify scratch.
+    if (
+        server_args.speculative_algorithm is None
+        or server_args.disaggregation_mode == "prefill"
+    ):
+        return False
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_batched_replay_uses_raw_gate,
+        kda_recurrent_layout,
+        kda_replay_commit_supported,
+    )
+
+    linear_attn = attn_config.component(LinearAttnConfig)
+    if linear_attn is None:
+        # No linear attention, so no conv slab for verify scratch to alias.
+        return False
+
+    heads, head_dim, _ = linear_attn.temporal_state_shape
+    return bool(
+        kda_replay_commit_supported(
+            attn_config.dtype,
+            recurrent_layout=kda_recurrent_layout(),
+            num_heads=heads,
+            head_dim=head_dim,
+        )
+        and kda_batched_replay_uses_raw_gate(
+            attn_config.dtype, num_heads=heads, head_dim=head_dim
+        )
+    )

@@ -112,7 +112,7 @@ workload before implementing it.
    `@break_point` on the whole attention module also re-runs its projections,
    norms, RoPE, o-proj and the TP all-reduce from Python on every replay. On
    V4.1 H200 TP4 that was ~3 ms of host time per layer and prefill steps ran
-   ~145 ms wall for ~45 ms of GPU work (b647604c splits it: graphed
+   ~145 ms wall for ~45 ms of GPU work (3a2b67eb splits it: graphed
    projections → break holding cache writes, selection, attention → graphed
    o-proj + all-reduce). Symptom in a trace: per-rank idle and all-reduce
    wait trade off between ranks while their sum stays constant — the step is

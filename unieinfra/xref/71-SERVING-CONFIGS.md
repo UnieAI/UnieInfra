@@ -31,7 +31,7 @@ bash -c 'cd $W && source $W/legacy/benchmark/scripts/sm120_env.sh; \
 ```
 
 **No `--disable-mixed-batch`.** That flag existed only to dodge the corruption
-fixed by `c277b35c`; keeping it now costs throughput and hides nothing.
+fixed by `e3fc4b2e`; keeping it now costs throughput and hides nothing.
 Verified after the fix: token-identical replies against upstream vLLM
 6/256 → 208/256, mean output length 58.02 → 43.31 tokens, throughput +3.9%.
 
@@ -43,9 +43,9 @@ default and reads as tuning that is not happening.
 | | value | where |
 |---|---|---|
 | cache page size | `P=64` | `Cache profile:` |
-| LCM parent | `10,485,760` B, `parents=2702` | after `21c4f936` (was 2x that) |
+| LCM parent | `10,485,760` B, `parents=2702` | after `f5d72a8a` (was 2x that) |
 | token capacity | `172,928` | `Cache profile:` |
-| geometry families | 2 (10 global 4x512, 50 sliding 16x256), overlaid | all 40 planes are 524,288 B, so overlay is legal — see `873b731a` |
+| geometry families | 2 (10 global 4x512, 50 sliding 16x256), overlaid | all 40 planes are 524,288 B, so overlay is legal — see `6135d2ac` |
 | prefill CUDA graph | kept | no linear_attention layer, so the GDN capture hazard does not apply |
 
 ### Measured under the no-replay protocol (ours / upstream vLLM, wall time)
@@ -105,7 +105,7 @@ peaking at 316/347 and zero admission refusals. Recorded, not fixed.
 
 Splitting the plane namespaces to recover it corrupts: the two families then
 have different per-plane sizes and the arena overlay writes into another
-family's parent. `873b731a` now refuses that overlay and falls back to a union
+family's parent. `6135d2ac` now refuses that overlay and falls back to a union
 layout.
 
 ### gemma-4-31B: where the remaining decode time goes
@@ -180,7 +180,7 @@ authoritative; resolved values are read off each server's own startup output.
 | extra | `--enable-metrics --enable-cache-report` (reporting only) | — |
 | env | `TOKENSPEED_ENABLE_FI_PAGED_EXTEND=1`, `sm120_env.sh` | `FLASHINFER_DISABLE_VERSION_CHECK=1` |
 
-No `--disable-mixed-batch` (obsolete after `c277b35c`) and no
+No `--disable-mixed-batch` (obsolete after `e3fc4b2e`) and no
 `--chunked-prefill-size` (8192 is already the resolved default; passing it
 restates the default and reads as tuning that is not happening).
 

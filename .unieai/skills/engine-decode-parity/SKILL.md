@@ -316,7 +316,7 @@ bucket's padded rows → a narrow break with cache writes, selection, attention 
 o-proj and all-reduce back in the graph. The split only matters at capture
 (replay never runs the dispatcher), so the eager path stays byte-identical; a
 mixed extend+decode batch replays the same graph, so check that the token-local
-part is identical across those modes. V4.1 H200 TP4 (b647604c): AgentX
+part is identical across those modes. V4.1 H200 TP4 (3a2b67eb): AgentX
 66.7/45.3/37.9 → 52.2/36.6/33.0 s at c8/16/32, short-prefill TTFT 130 → 70 ms,
 GPU busy 77 → 91%. Padded rows must be safe for every graphed op (positions
 zeroed, RoPE clamps negatives).

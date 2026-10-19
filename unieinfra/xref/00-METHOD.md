@@ -48,7 +48,7 @@ feature 臨時做一次」變成查表。跳過那一步在單一 feature 上曾
 
 | engine | 路徑 | commit | 備註 |
 |---|---|---|---|
-| UnieInfra (tokenspeed) | `/workspace/roy/UnieInfra` | `4d35899ca734` | 工作樹，upstream = `lightseekorg/tokenspeed` |
+| UnieInfra (tokenspeed) | `/workspace/roy/UnieInfra` | `4538319c4354` | 工作樹，upstream = `lightseekorg/tokenspeed` |
 | vLLM | `/workspace/roy/vllm` | `4ad14044b254` | UnieAI fork；與 upstream 的合流點 `7cc2e8e74fa0`（2026-07-08），之後 40 個 UnieAI commit |
 | SGLang | `.../legacy/third_party/sglang` | `b61a06921ef0` | |
 | TensorRT-LLM | `.../legacy/third_party/TensorRT-LLM` | `d8b67db26082` | |

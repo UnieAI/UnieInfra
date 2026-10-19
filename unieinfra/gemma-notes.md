@@ -16,7 +16,7 @@
 
 **這些數字對 TokenSpeed 同樣成立**，所以換引擎不會變出空間；能變的只有「離天花板多遠」。
 
-## 已修：Gemma 的層標籤從 text_config 讀（commit 09f124ac）
+## 已修：Gemma 的層標籤從 text_config 讀（commit 8edbc92d）
 
 `configs/mha.py` 從頂層 `hf_config` 讀 `layer_types` 與 `sliding_window`。Gemma 3/4 是
 `*ForConditionalGeneration`，兩個欄位**只在 `text_config`**，頂層都沒有 → 取到空 → pool 只
@@ -283,7 +283,7 @@ ours 在 c=2 的 wall 與 c=1 相同——**兩個請求進同一個 forward**�
 右邊，我們本來就贏；一般 RAG 形狀（約 1k）在 c=1 輸 20%，但併發一起來就被批次吸收。
 **它是真缺陷，但不是貴的缺陷**，優先度低於下一節。
 
-## 沿路修掉的一個真缺陷（commit fc897601）
+## 沿路修掉的一個真缺陷（commit 6634c067）
 
 `event_loop.py` 的 `resolve_fi_gdn_prefill_graph` 為了躲 FlashInfer GDN chunk-prefill
 在 graph capture 下輸出 `!!!!!!` 的 bug，**只看環境變數就關掉 prefill CUDA graph**，
@@ -396,7 +396,7 @@ mha_extend_with_kvcache -> triton_mha_extend_with_kvcache
 | **ours** | `'額LLLLLLL額額額額額額額額額...'` |
 | **vLLM** | `'The capital of France is Paris. It is famous for its world-class art museums...'` |
 
-## 已修的第一個 bug（commit 220e4a61）：softmax scale 從來沒被傳下去
+## 已修的第一個 bug（commit f1a73061）：softmax scale 從來沒被傳下去
 
 `backends/mha.py` 呼叫 `mha_extend_with_kvcache` 與 `mha_decode_with_kvcache` 時沒有傳
 `softmax_scale`，而每顆 kernel 對缺席的 scale 都退回 `1/sqrt(head_dim)`。這對樹裡
@@ -530,7 +530,7 @@ layer 0 是對照。兩者都在同一支腳本裡，改完直接重跑。
 
 ---
 
-# 已修：每層要拿到屬於自己寬度的 cache 列（commit 40f2478a）
+# 已修：每層要拿到屬於自己寬度的 cache 列（commit b1ff6d1f）
 
 ## 修法
 
@@ -542,7 +542,7 @@ head_dim 時才等於該層的寬度。
 
 | 檔 | 改動 |
 |---|---|
-| `configs/mha.py` | `_per_layer_kv_geometry` 從 decoder config 讀 `num_global_key_value_heads` 與 `global_head_dim`（gemma 是 `*ForConditionalGeneration`，頂層兩個都沒有——與 `09f124ac` 同一個陷阱）。所有層共用一個幾何時回 `(None, None)`；宣告了不同幾何但層標籤蓋不滿整個堆疊時**拒絕**，因為那時無法指認哪些層是全域的 |
+| `configs/mha.py` | `_per_layer_kv_geometry` 從 decoder config 讀 `num_global_key_value_heads` 與 `global_head_dim`（gemma 是 `*ForConditionalGeneration`，頂層兩個都沒有——與 `8edbc92d` 同一個陷阱）。所有層共用一個幾何時回 `(None, None)`；宣告了不同幾何但層標籤蓋不滿整個堆疊時**拒絕**，因為那時無法指認哪些層是全域的 |
 | `configs/mha.py` | `cache_cell_size` 取**最寬**的層。gemma-4 比頂層窄所以數值不變，但全域層更寬的模型本來會被配置不足 |
 | `recipes/{setup,ordinary}.py` | 把 `layer_kv_head_dims` 與 counts 一起帶、一起切片；拒絕「只有 dims 沒有 counts」（那會讓層以配置的頭數配自己的 head_dim，比它的欄位還寬） |
 | `kv_cache/mha.py` | `_layer_row_view` 改 reshape 成 `(-1, heads_l, dim_l)`；`_layer_page_tokens` 也改用**寬度**而非頭數——同一個錯誤，隔壁一個函式 |
@@ -606,7 +606,7 @@ KV geometry: allocation 16 heads x 256, per-layer widths ['16x256', '4x512']
 
 ---
 
-# 回歸：`fc897601` 讓 gemma 拿回 prefill graph，但那在 GMU 0.945 起不來
+# 回歸：`6634c067` 讓 gemma 拿回 prefill graph，但那在 GMU 0.945 起不來
 
 agent-127k 的第一格 `ours` 直接啟動失敗：
 
@@ -640,7 +640,7 @@ RuntimeError` 都會退回 eager prefill，**只有 OOM 是重新拋出**。一�
 |---|---|---|
 | A | 捕捉前先估成本，不合就跳過並印出數字 | 估計不準；但「跳過」永遠比「死掉」安全，且不會留下半個捕捉 |
 | B | OOM 改成退場（清掉 captures、`empty_cache`、`disable = True`） | 需要驗證繼續服務不會因殘留 mempool 而在執行期 OOM |
-| C | 撤回 `fc897601` | 閘門的邏輯是對的，撤回會把一個真缺陷放回去 |
+| C | 撤回 `6634c067` | 閘門的邏輯是對的，撤回會把一個真缺陷放回去 |
 
 本輪的 a127 量測用 `--prefill-graph-max-tokens 0` 跑，並在腳本裡寫明原因——**把代價記下來，
 不是繞過去**。
@@ -649,7 +649,7 @@ RuntimeError` 都會退回 eager prefill，**只有 OOM 是重新拋出**。一�
 
 # 修正不完整：長 context／併發下仍是垃圾，而我先前的「已驗證」有盲點
 
-`40f2478a` 之後跑 agent-26k（`agent_real`、c=4、NREQ=32、GMU 0.90、chunk 8192），
+`b1ff6d1f` 之後跑 agent-26k（`agent_real`、c=4、NREQ=32、GMU 0.90、chunk 8192），
 32 條全部成功、TTFT/TPOT 都有數字，**但生成的文字是垃圾**：
 
 ```

@@ -15,7 +15,7 @@
    核對點：`hybrid_prefix_cache.cpp:191` 從 KV 終點往上找帶快照的祖先，
    `:207-216` 在找到時把 `match.device.last_node` **截斷**到快照節點，
    `:197-205` 在找不到時把兩層都設回 `root` —— 整段 KV 匹配丟棄，而且無聲。
-2. `0830a199` 修的是 `MambaCheckpointPublishDepth`（`forward_events.cpp:134-165`）：
+2. `e021b555` 修的是 `MambaCheckpointPublishDepth`（`forward_events.cpp:134-165`）：
    `:138` 在 16-token KV 頁網格上算候選深度，`:162` 現在用
    `AlignMambaCacheSeqlen()` **向下取整**到 64 的 scan grain，而不再要求兩者恰好重合。
    `AlignMambaCacheSeqlen` 見 `hybrid_prefix_cache.cpp:260-263`，grain 來自
@@ -85,7 +85,7 @@ multi 的索引就是最終使用的索引。
 - **(b) `_publish_depths_for` 這面 Python 鏡子已經和 C++ 對不上了。**
   `:1746-1774` 自稱 "bit-for-bit mirror"，但：
   - `:1759` 的 `deepest = (final_len // page_size) * page_size - page_size` **沒有**做
-    `0830a199` 加進 C++ 的 grain 向下取整（`forward_events.cpp:162`）。
+    `e021b555` 加進 C++ 的 grain 向下取整（`forward_events.cpp:162`）。
     於是 Python 算出的 `deepest` 常常不是 64 的倍數 → `:1731` 的
     `track_len % FLA_CHUNK_SIZE` 判斷 `continue` → 該 slot **不寫**，
     但 C++ 已經把 radix 節點掛上去了 → 之後的命中從未初始化記憶體接續。
@@ -349,7 +349,7 @@ if (branch_depth > chunk_begin && branch_depth < deepest &&
 - **改 `augmentMatch` 的結構**（35 §不變式 3、`AGENTS.local.md` 提到的 SGLang
   `MambaRadixCache` 折進 descent）：現在 `:207-216` 已經是**截斷**而不是丟棄，
   只有「整條路徑上沒有任何祖先快照」時才歸零，而那種情況下確實無狀態可用。
-  折進 descent 的收益在本 build 上已經大部分被 `0830a199` 吃掉，
+  折進 descent 的收益在本 build 上已經大部分被 `e021b555` 吃掉，
   改動範圍卻很大。先不做，但若 P1-1 之後仍有大量 `mamba=MISS`，回頭再議。
 
 ---

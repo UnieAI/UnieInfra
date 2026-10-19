@@ -1,7 +1,7 @@
 {
   "timestamp": "2026-08-22T10:34:03.165163+00:00",
   "request_id": "f6d14093-c1df-4f19-a70b-63a3fa49519b",
-  "commit_hash": "54f827a873f07315cb5012964441d521035cc763",
+  "commit_hash": "3e469489e128fa2bd005e8d2e9c56739aa7ce05e",
   "tag": "cli_generate",
   "total_duration_ms": 105471.84301167727,
   "steps": [

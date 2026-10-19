@@ -3,7 +3,7 @@
 日期 2026-08-22　卡：1x RTX PRO 6000 Blackwell（sm_120, 97887 MiB）
 參考引擎：SGLang main pin `05c584c`，`sglang 0.0.0.dev1+g05c584c44` /
 `torch 2.13.0+cu130` / `diffusers 0.37.0`
-被測 commit（perf dump 自動記錄）：`54f827a8`
+被測 commit（perf dump 自動記錄）：`3e469489`
 跑法：`unieinfra/bench/h3_reference_run.sh {smoke,nightly} <gpu>`
 
 ## 0　這是什麼、不是什麼

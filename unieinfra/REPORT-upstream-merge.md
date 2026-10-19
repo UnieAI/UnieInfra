@@ -13,14 +13,14 @@ deleted by the merge; only the 11 we had also modified surfaced as conflicts.
 
 The whole of `tokenspeed-scheduler/` was taken from upstream, because eight of
 fifteen conflicts referenced deleted types on our side and the files are too
-coupled to mix. That dropped four fork commits outright: 0830a199, b10ef2be,
-5f001714, 46b6614b.
+coupled to mix. That dropped four fork commits outright: e021b555, 6b10527a,
+32768b98, 90587c65.
 
 **Two of the four were then retired by measurement rather than argument:**
 
-- `5f001714` (C>32 crash) — upstream's pool covers it. GATE_c64 passes with
+- `32768b98` (C>32 crash) — upstream's pool covers it. GATE_c64 passes with
   zero occurrences of `failed to allocate Mamba checkpoint slot`.
-- `0830a199` (hybrid prefix cache) — upstream's block-pool cache reuses
+- `e021b555` (hybrid prefix cache) — upstream's block-pool cache reuses
   *better* than our radix version in every arm measured: 68.2% against 66.5%
   at C=128, 48.7% against 40.8% at C=32.
 
@@ -33,7 +33,7 @@ True`. The startup guard that existed to catch exactly this (c81fa7fa) had lost
 its enforcement site in the merge, so the failure landed as 128 of 128 requests
 returning Internal Server Error instead of a refusal at startup.
 
-Guard restored (a8c0c872), then the implementation re-ported (5382c99e).
+Guard restored (861c8106), then the implementation re-ported (f6d63747).
 
 ### 2. Prefill chunks capped below one page
 
@@ -43,7 +43,7 @@ everything, because a prefix hit rarely ends on a page boundary — advanced
 under 128 tokens per prefill step against prompts of 606-1015.
 
 Found by looking at exact chunk sizes on single-sequence prefill steps: they
-clustered at 96-127. Fixed in ba69ea89 (+75.7% throughput, -44% TTFT).
+clustered at 96-127. Fixed in 31c70efa (+75.7% throughput, -44% TTFT).
 
 ### 3. The two L2 transfer streams race each other
 
@@ -67,7 +67,7 @@ path's shutdown as unexamined rather than the fix as incomplete for serving.
 
 `write_stream` and `load_stream` are never ordered against one another while
 both address the same device blocks and the same pinned Host buffer, so a block
-can be loaded into while its writeback is still reading it. Fixed in 26470983.
+can be loaded into while its writeback is still reading it. Fixed in 3c63f3f9.
 
 This one took a day, and the reason is worth recording: **three separate things
 made the fault disappear and none of them localised it.**
@@ -89,8 +89,8 @@ RAG shape, C=128, GMU 0.80, 256 requests, all gate-passing with 0 failed:
 | + flashinfer GDN, prefill graph off | **592.40** | 5840.5 | — |
 | default backend + stream ordering | 468.89 | 7505.7 | — |
 | | | | |
-| f162d993 nomix target | 754.0 | 3905.8 | 66.5% |
-| f162d993 mix target (needs a deleted flag) | 1086.8 | 2227.6 | 85.8% |
+| 382c2b9e nomix target | 754.0 | 3905.8 | 66.5% |
+| 382c2b9e mix target (needs a deleted flag) | 1086.8 | 2227.6 | 85.8% |
 
 231 -> 592 over the session, and the default configuration serves again. Still
 79% of the nomix target. The mix target was measured with
@@ -128,7 +128,7 @@ Net: the prefill graph is worth +8.4% on Triton, the kernel is worth +21.8%
 over Triton without it, and the combination measures **592.40 tok/s, mean TTFT
 5840 ms, mean TPOT 96.26 ms** with coherent output. The wrapper now raises
 under `torch.cuda.is_current_stream_capturing()` rather than letting a graph
-corrupt every reply (8eb78a11).
+corrupt every reply (2037f00a).
 
 Left open, and narrowed by elimination rather than solved. The GDN mixer
 already carries `@break_point`, so the kernel runs as an eager break — outside
@@ -146,7 +146,7 @@ guard. The payoff is the graph's +8.4% stacked on the kernel's +21.8%.
 ## The largest lever found, measured, and NOT shipped
 
 Concurrency is the gap. On a clean arm at the new defaults the engine holds
-**69 in-flight against a client driving 128**, while f162d993 held 128. KV is
+**69 in-flight against a client driving 128**, while 382c2b9e held 128. KV is
 not the constraint -- 2964 blocks free -- the recurrent state pool is: 247
 blocks per linear group, three groups, and roughly 3.5 blocks charged per
 request.
@@ -221,12 +221,12 @@ So the ceiling is **fragmentation of the shared arena**, not exhaustion of any
 pool. That is the structural cost of coupling KV and recurrent state into one
 allocation unit.
 
-**Correction, from the peer session's committed f162d993 data.** I wrote that
+**Correction, from the peer session's committed 382c2b9e data.** I wrote that
 this "is exactly what the fork's separate mamba pool could not suffer from".
 That is wrong. The fork hit the same ceiling, in its own allocator, and the
 ladder is committed:
 
-| f162d993 pool | in-flight, client driving 128 |
+| 382c2b9e pool | in-flight, client driving 128 |
 |---|---|
 | 165 chunks (`--mamba-full-memory-ratio 1.0`) | 74 |
 | 221 chunks (GMU 0.80, the baseline) | 80 |
@@ -290,7 +290,7 @@ Every harness in `/workspace/roy/.cq*.sh` pins `--gpu-memory-utilization 0.80`
 (only `.cq90.sh` and `.cq_uniq90.sh` use 0.90), so every number here was taken
 with a non-default flag forced, on a pool about 10% smaller than this build's
 own resolved default of 0.88. The comparison against 754.0 is still fair --
-the peer's f162d993 baseline was captured through the same harness at the same
+the peer's 382c2b9e baseline was captured through the same harness at the same
 0.80 -- but "at defaults" was never true of either side, and a real deployment
 that never touches the flag already gets a bigger pool than anything measured
 here.
@@ -352,7 +352,7 @@ reverted; the suite is green at 402/402.
 The ceiling is real -- 69 in-flight against a client driving 128, with KV
 uncontended -- and the arithmetic names the trade rather than a bug:
 
-|  | f162d993 | merged |
+|  | 382c2b9e | merged |
 |---|---|---|
 | recurrent state pool | 221 chunks, SEPARATE | 247 blocks, shared LCM arena |
 | charged per in-flight request | ~1.73 | ~3.58 |
@@ -384,7 +384,7 @@ Two consequences worth stating plainly:
 
 **It is not prefill scheduling, and that took two experiments to establish.**
 
-Tokens admitted per prefill step is ~456 against f162d993's 1994, which looks
+Tokens admitted per prefill step is ~456 against 382c2b9e's 1994, which looks
 damning until the reuse is folded in: at 76.7% reuse a 606-1015 token prompt
 needs ~194 new tokens, and 456 tokens over 2.35 sequences per step is exactly
 that. 113 prefill steps for 256 requests is about one step per request. The low
@@ -489,7 +489,7 @@ would separate "less overhead per step" from "better kernel shape".
 ## The A/B that was built and not run
 
 Every number in this report is absolute. None is a same-harness differential
-against f162d993, so "78% of 754.0" compares across two builds, two
+against 382c2b9e, so "78% of 754.0" compares across two builds, two
 architectures and several hours. The baseline's configuration cannot even be
 expressed on this tree: `--mixed-prefill-decode-min-load` was deleted by the
 merge and upstream has no equivalent, and the radix cache and fork admission it
@@ -497,7 +497,7 @@ ran on are gone.
 
 The apparatus to settle it is built and verified:
 
-- `/workspace/roy/.f162` — worktree at f162d993, scheduler ext built
+- `/workspace/roy/.f162` — worktree at 382c2b9e, scheduler ext built
   (md5 `fbbf22be77cd`).
 - `/workspace/roy/.f162venv` — a venv with `--system-site-packages` holding the
   baseline `tokenspeed_scheduler`. Getting it to load took one trick worth
@@ -519,18 +519,18 @@ Run it as:
 
     GPU=3 CONC=128 NREQ=256 ./.cq_f162.sh ours F162AB
 
-and check `head:` in the log reads `f162d993` before trusting the number.
+and check `head:` in the log reads `382c2b9e` before trusting the number.
 
 ### It was run, and it cannot start
 
-The A/B was executed. f162d993 does not come up on today's environment, and the
+The A/B was executed. 382c2b9e does not come up on today's environment, and the
 reason is not the merge or the permissions:
 
     AttributeError: 'ServerArgs' object has no attribute
     'enable_int8_mamba_checkpoint'
 
-`f162d993/python/.../attention/registry.py:618` reads that attribute
-unguarded, while f162d993's own `ServerArgs` never declares it -- zero dataclass
+`382c2b9e/python/.../attention/registry.py:618` reads that attribute
+unguarded, while 382c2b9e's own `ServerArgs` never declares it -- zero dataclass
 fields, and the only other reference is a defensive
 `getattr(args, "enable_int8_mamba_checkpoint", False)` in the arg-normalisation
 path. So the attribute existed on the args object only because the CLI and
@@ -641,7 +641,7 @@ the check that caught this being reported as a +13.3% win in the first place.
 
 Every "% of baseline" in this report compared **our mixing-on number against the
 baseline's mixing-off number**. Once mixing could be switched off -- it could
-not be, until `1eb1d46f` added `--disable-mixed-batch` -- the mismatch was
+not be, until `807d6979` added `--disable-mixed-batch` -- the mismatch was
 measurable, and it is large.
 
 RAG shape, `CONC=128 NREQ=256`, GMU 0.92, 256/256 successful and 0 failed on
@@ -653,12 +653,12 @@ both arms:
 | mixing off (`--disable-mixed-batch`) | 461.25 | 4379 | 103 |
 
 **Mixed batching is worth +39.9% here**, and it engages by upstream's own policy
-with no threshold knob. The f162d993 arms differ on exactly that axis: 754.0 was
+with no threshold knob. The 382c2b9e arms differ on exactly that axis: 754.0 was
 captured with `--enable-mixed-batch` at its default threshold, where mixing
 seldom fires, and 1086.8 with `--mixed-prefill-decode-min-load 0`, which forces
 it. So the matched pairs are:
 
-| pair | ours | f162d993 | ratio |
+| pair | ours | 382c2b9e | ratio |
 |---|---|---|---|
 | mixing engaging | 645.49 | 1086.8 | **59.4%** |
 | mixing not engaging | 461.25 | 754.0 | **61.2%** |
@@ -684,7 +684,7 @@ sides:
 | | peak in-flight | tok/s | per request |
 |---|---|---|---|
 | ours, GMU 0.92 | 103 | 461.25 | **4.48 tok/s** |
-| f162d993, GMU 0.80 | 128 | 753.97 | **5.89 tok/s** |
+| 382c2b9e, GMU 0.80 | 128 | 753.97 | **5.89 tok/s** |
 
 **Corrected from the peer session.** An earlier revision of this table put the
 fork at 80 in-flight and 9.43 tok/s per request, and concluded we were 2.1x
@@ -735,7 +735,7 @@ tok/s, a 6.1% spread. Nothing smaller than that should be read as an effect.
 
 ### The fork's own curve, and the test that decides the branch
 
-The peer session's committed f162d993 ladder, RAG shape, mixing off, GMU 0.80:
+The peer session's committed 382c2b9e ladder, RAG shape, mixing off, GMU 0.80:
 
 | C | tok/s | peak in-flight | per request | reuse |
 |---|---|---|---|---|
@@ -753,7 +753,7 @@ concurrency" on its own distinguishes nothing.
 What does distinguish: whether our curve sits a constant factor below the
 fork's everywhere, or only diverges at large batch.
 
-| | ours | f162d993 | ratio |
+| | ours | 382c2b9e | ratio |
 |---|---|---|---|
 | C=32 | 502.11 (mixing ON) | 384.61 | not comparable |
 | C=128 | 461.25 (mixing off) | 753.97 | 0.61x |
@@ -762,7 +762,7 @@ fork's everywhere, or only diverges at large batch.
 `--disable-mixed-batch`, GMU 0.80 -- the fork's own conditions -- measures
 **500.56 tok/s**, 256/256 with 0 failed, against the fork's 384.61:
 
-| | ours | f162d993 | ratio |
+| | ours | 382c2b9e | ratio |
 |---|---|---|---|
 | C=32, mixing off, GMU 0.80 | **500.56** | 384.61 | **1.30x faster** |
 | C=128, mixing off | 461.25 | 753.97 | **0.61x** |
@@ -774,7 +774,7 @@ constant factor.
 **C=64 completes the curve, and it is a cliff rather than a slope.** Same
 matched conditions:
 
-| C | ours (mixing off, GMU 0.80) | f162d993 | ratio |
+| C | ours (mixing off, GMU 0.80) | 382c2b9e | ratio |
 |---|---|---|---|
 | 32 | 500.56 | 384.61 | **1.30x faster** |
 | 64 | **743.61** | 560.77 | **1.33x faster** |
@@ -882,7 +882,7 @@ the process requires, changes the job.
 | new request (`Submitted`) | 4 |
 | decode (`Decoding` / `PrefillDone`) | **3 with mixing, 5 without** |
 
-With mixing on -- the default since `a2aa5385` -- decode ties with in-flight
+With mixing on -- the default since `dd98b070` -- decode ties with in-flight
 prefill and interleaves by request id, with new requests behind both. That is
 vLLM's "scan `running`, which holds decode and in-flight prefill chunks
 together, then scan `waiting`". The xref table describing separate priorities

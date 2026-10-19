@@ -2,11 +2,11 @@
 
 Measured 2026-08-13 on one RTX PRO 6000 Blackwell (sm_120, HBM peak 1792 GB/s),
 both engines driven by the same client over HTTP, a cold server per arm.
-Build `f162d993` (branch `unieai`); see *Known defects* for the one file in it
+Build `382c2b9e` (branch `unieai`); see *Known defects* for the one file in it
 that is not committed.
 
-**This report describes `f162d993` and cannot be reproduced on current `unieai`.**
-The tree has since merged 184 upstream commits (`7471e09c`), which deleted the
+**This report describes `382c2b9e` and cannot be reproduced on current `unieai`.**
+The tree has since merged 184 upstream commits (`2c15a196`), which deleted the
 radix prefix-cache subsystem and, with the fork's scheduler config, the
 `--mixed-prefill-decode-min-load` flag that every `mix` row below depends on.
 Upstream's mixing is a plain boolean with no threshold, so the 1086.8 tok/s

@@ -33,14 +33,14 @@
 > | 預設值（快取實際關閉） | 447.87 / 1620.73 / 4134.22 ms |
 > | 明確傳 `enable_prefix_caching=True` | **112.76 / 358.40 / 1160.97 ms** |
 >
-> 受影響的錯誤宣稱：`bf156ad4` commit message 的
+> 受影響的錯誤宣稱：`10f2543f` commit message 的
 > "vLLM reuses nothing in either case"、`35-hybrid-prefix-reuse.md` 的
 > 「RAG 兩邊都是 0」。**兩句都是錯的。**
 >
-> `bf156ad4` 自己的收益不變（437 → 89.7 ms 是對我們自己量的），
+> `10f2543f` 自己的收益不變（437 → 89.7 ms 是對我們自己量的），
 > 但它補的**不是 vLLM 沒有的能力，是 vLLM 開個開關就有的能力**。
 >
-> 已修：harness 明確傳旗標並印出 **resolved** 值而非 requested 值（`4e20e1b8`）。
+> 已修：harness 明確傳旗標並印出 **resolved** 值而非 requested 值（`a1d62870`）。
 > §12 的所有數字都是修正後重量的。
 
 ---
@@ -77,7 +77,7 @@ upstream 跑不動 Qwen3.5-27B。三個 bug，都是同一個形狀 ——
 | `48a80ebb` | 擋掉兩個在 sm_120 上會贏得 selection 卻必定失敗的 FlashInfer kernel | 啟動不再 crash |
 | `73b27362` | Triton MHA prefill 的 tile 改用**實測**的 shared memory 決定 | `OutOfResources: Required 114688, limit 101376` 消失 |
 | `228886f0` | `max_shared_memory_per_sm` 改讀 torch 真正有的屬性 | 從**每張 CUDA 卡都回報 0** 變成 101376 |
-| `94d0fa12` | 把 libstdc++ shim 放上 `LD_LIBRARY_PATH` | 4 個預編譯 kernel 從「呼叫時 raise」變成可用；65 個測試變成可跑 |
+| `4b19c79c` | 把 libstdc++ shim 放上 `LD_LIBRARY_PATH` | 4 個預編譯 kernel 從「呼叫時 raise」變成可用；65 個測試變成可跑 |
 | `d97efd1c` | 在 engine 啟動時呼叫 `discover_plugins()` | plugin 系統從**完全無效**變成有效 |
 | `57312157` | 讓 proton import 變成 optional | — |
 | `b93a8a8e` | Triton MHA prefill 跳過越界的 query block | mixed batch **2.04–2.27x**；均勻批次不變 |
@@ -182,12 +182,12 @@ throughput harness 每次用全新隨機 prompt —— 刻意為之，為了讓�
 
 | commit | 做了什麼 | 效果 |
 |---|---|---|
-| `e1852925` | mamba 快照發佈到**匹配搆得到**的深度 | 27B 重複 prompt 重用從 **0% 變成可用** |
-| `46b6614b` | 寫回主機的 KV 留在裝置上，直到裝置池真的缺頁 | 部分命中請求 device time **48.76 → 36.41 ms**，loadback kernel 從 trace 消失（772 → 734 kernels）|
-| `54c6b607` | KV 分頁從 64 token 改成 16 | TTFT **−13~14%**；throughput −0.5~1.1%（在重複跨度內）|
-| `bf156ad4` | 保留**多個**遞迴快照，讓共享文件可重用 | **RAG 437 → 89.7 ms，重用 0 → 2560 tokens（4.9x）** |
+| `1b1083ef` | mamba 快照發佈到**匹配搆得到**的深度 | 27B 重複 prompt 重用從 **0% 變成可用** |
+| `90587c65` | 寫回主機的 KV 留在裝置上，直到裝置池真的缺頁 | 部分命中請求 device time **48.76 → 36.41 ms**，loadback kernel 從 trace 消失（772 → 734 kernels）|
+| `8363edc4` | KV 分頁從 64 token 改成 16 | TTFT **−13~14%**；throughput −0.5~1.1%（在重複跨度內）|
+| `10f2543f` | 保留**多個**遞迴快照，讓共享文件可重用 | **RAG 437 → 89.7 ms，重用 0 → 2560 tokens（4.9x）** |
 
-### `e1852925` —— 快照發在一個匹配永遠到不了的深度
+### `1b1083ef` —— 快照發在一個匹配永遠到不了的深度
 
 ```
 [TSDBG] InsertMamba   node=0x9874eaf0 depthTok=4096
@@ -198,7 +198,7 @@ throughput harness 每次用全新隨機 prompt —— 刻意為之，為了讓�
 `FindLastMambaNode` 往**上**走，快照是後代不是祖先，於是 `augmentMatch` 把**整個 KV 匹配
 丟掉** —— 重複形狀丟 4032 個 token，RAG 形狀丟 2944 個。兩者都恰好差一頁。
 
-### `54c6b607` —— 沒有人分頁分得這麼粗
+### `8363edc4` —— 沒有人分頁分得這麼粗
 
 部分前綴命中只能重用整頁，64-token 的頁在每個邊界最多丟 63 個 token。
 vLLM 預設 16，SGLang 預設 1，這裡是 64 —— **而且沒有任何東西需要 64**。
@@ -212,7 +212,7 @@ block_size   TTFT rag   cached   TTFT repeat   tput unique   tput shared
 注意**完全重複**那一列：那裡沒有多算任何 token，卻仍然快 3.2 ms ——
 所以大部分收益是**頁表成本**，不是失去的重用。
 
-### `bf156ad4` —— 一個快照只能待在一個深度
+### `10f2543f` —— 一個快照只能待在一個深度
 
 線性注意力不能像 KV 那樣切前綴（要從 token n 續算，需要 n 之後的遞迴狀態），
 所以重用是 `min(KV 深度, 最深可用快照)`。我們每個 chunk 只發佈**一個**快照。
@@ -247,27 +247,27 @@ backend 把每個請求展開成每個深度一對 (src, dst)。
 
 | commit | 做了什麼 | 效果 |
 |---|---|---|
-| `936b835f` | CUDA RoPE wrapper 砍掉每次呼叫 3.2 µs 的 Python | **10.51 → 7.31 µs**，低於 vLLM 的 7.77 |
-| `edd295cf` | Qwen3 全家改用融合的 RoPE+KV write | 每層少一個 launch；**端到端無可量測變化**（見下） |
-| `da0619da` | 不再於每次 kernel 呼叫重新推導 dispatch 狀態 | `mm` 18.95 → 16.57 µs；`mha_extend` wrapper 24.36 → 14.93 µs；**端到端 0** |
-| `de851d8d` | 加入 FA2 paged extend kernel，每個 forward 只 plan 一次 | 對 Triton **1.86x@1024 → 4.57x@16384**；RAG 形狀 **15.2x** |
-| `bdbb3571` | 啟用融合的 sm_120 GDN chunk-prefill kernel | 48 層一次 prefill **17.9 → 11.4 ms**；比 vLLM 自己走的路徑快 **1.65x** |
-| `a90de320` | 為 bf16 專家註冊 ragged Triton matmul | 對現行 cutlass kernel **2.1–2.6x**；仍落後 vLLM 1.2–8x |
-| `4d35899c` | 用**探測**取代版本旗標來找該 arch 的 GDN kernel | 解開 4 道各自足以擋死的閘門 |
-| `29f8eda0` | 為大模型高併發放大 FA2 workspace（128 → 512 MB） | 27B 在 conc≥4 不再 `Buffer overflow` |
+| `a09c1215` | CUDA RoPE wrapper 砍掉每次呼叫 3.2 µs 的 Python | **10.51 → 7.31 µs**，低於 vLLM 的 7.77 |
+| `31733ae9` | Qwen3 全家改用融合的 RoPE+KV write | 每層少一個 launch；**端到端無可量測變化**（見下） |
+| `07031561` | 不再於每次 kernel 呼叫重新推導 dispatch 狀態 | `mm` 18.95 → 16.57 µs；`mha_extend` wrapper 24.36 → 14.93 µs；**端到端 0** |
+| `ab08f780` | 加入 FA2 paged extend kernel，每個 forward 只 plan 一次 | 對 Triton **1.86x@1024 → 4.57x@16384**；RAG 形狀 **15.2x** |
+| `a54a3be3` | 啟用融合的 sm_120 GDN chunk-prefill kernel | 48 層一次 prefill **17.9 → 11.4 ms**；比 vLLM 自己走的路徑快 **1.65x** |
+| `3938769a` | 為 bf16 專家註冊 ragged Triton matmul | 對現行 cutlass kernel **2.1–2.6x**；仍落後 vLLM 1.2–8x |
+| `4538319c` | 用**探測**取代版本旗標來找該 arch 的 GDN kernel | 解開 4 道各自足以擋死的閘門 |
+| `5a011ce1` | 為大模型高併發放大 FA2 workspace（128 → 512 MB） | 27B 在 conc≥4 不再 `Buffer overflow` |
 
 三個值得記的細節：
 
-**`936b835f`**：kernel 本來就贏 vLLM（1.38–1.46 µs 對 2.35–2.52），
+**`a09c1215`**：kernel 本來就贏 vLLM（1.38–1.46 µs 對 2.35–2.52），
 **差距完全在 wrapper**。逐項 ablate：四個 `.view()` 花 3.08 µs、
 `positions.to(int64)` 0.81 µs、重新解析 module handle 0.24 µs，
 而 FFI 呼叫本身的地板是 4.63 µs。
 
-**`da0619da` 與 `edd295cf` 都誠實記錄「端到端沒有變化」**，並寫明算術：
+**`07031561` 與 `31733ae9` 都誠實記錄「端到端沒有變化」**，並寫明算術：
 36 層 × (4 個 GEMM + 1 個 attention) ≈ 0.68 ms，對比 176 ms 的 TTFT。
 **dispatch 成本只有在 kernel 比它還短的時候才看得見。**
 
-**`4d35899c`** 是最值得警惕的一個。flashinfer 的 `chunk_gated_delta_rule_sm120`
+**`4538319c`** 是最值得警惕的一個。flashinfer 的 `chunk_gated_delta_rule_sm120`
 一直都在、能跑、而且正確（對 Triton scan max|diff| = 3.1e-4），但四道閘門各自擋死它：
 
 1. `if platform.is_blackwell:` —— `is_blackwell` 是 `major == 10`，sm_120 是 12，
@@ -284,7 +284,7 @@ backend 把每個請求展開成每個深度一對 (src, dst)。
 
 | commit | 做了什麼 | 效果 |
 |---|---|---|
-| `9e08f8ce` | 不為一個已經結束的請求再跑一步 | Qwen3-8B TTFT **29.96 → 15.85 ms** |
+| `f142d441` | 不為一個已經結束的請求再跑一步 | Qwen3-8B TTFT **29.96 → 15.85 ms** |
 
 overlap 迴圈下，scheduler 要等結果 commit 才知道請求結束了，
 而那發生在**下一個 forward 已經派發之後** —— 所以最後一個 token 上的請求
@@ -307,20 +307,20 @@ vLLM 在排程時就數這一步會產出幾個 token（`num_output_placeholders
 
 | commit | 做了什麼 | 效果 |
 |---|---|---|
-| `a1483ec5` | 補回 w4a16 Marlin 路徑的 Python 半邊 | 30 個測試；**端到端仍不可跑**（CUDA kernel 沒建） |
+| `2656e742` | 補回 w4a16 Marlin 路徑的 Python 半邊 | 30 個測試；**端到端仍不可跑**（CUDA kernel 沒建） |
 | `3ebb577c` | 記錄 w4a16 未校準時 ppl +7.2% | 負面結果 |
 | `d4e075ce` | 記錄 w4a16 沒有可重用的既有路徑 —— scheme 是死碼 | 能力缺口，非效能問題 |
 | `36e416a4` | 修正 w4a16 patch 裡一個未經驗證的宣稱 | — |
 
 `compressed_tensors_wNa16` 匯入了**十個樹裡根本不存在的名字**，
 還掛著一整檔的 `# ruff: noqa: F821` 讓 linter 閉嘴 —— 這個 scheme 是會在載入時 raise 的死碼。
-`a1483ec5` 把 noqa 拿掉，**重點就是這個：檔案現在會誠實地失敗。**
+`2656e742` 把 noqa 拿掉，**重點就是這個：檔案現在會誠實地失敗。**
 
 ---
 
 ## 9. 文件、量測基礎建設與被否定的嘗試（31 commits）
 
-### 五引擎橫向對照（`18f1fa92`, `f7d6015f`, `55004cc2`, `8def103b`, `5f5635a7`）
+### 五引擎橫向對照（`755189ed`, `f390a66e`, `359ca0f3`, `ff83bb4c`, `24e276d3`）
 
 `unieinfra/xref/`：API → scheduler → prefill → decode 四階段、spec decode、quant，
 五個引擎逐 function / 逐 kernel 攤平成同一張表，附 `check_xref.py` 驗證每個
@@ -330,13 +330,13 @@ vLLM 在排程時就數這一步會產出幾個 token（`num_output_placeholders
 debug cycle；GDN mixed batching 的 survey 第一次還讀錯模組（讀 vLLM 的 mamba2 而非
 GDN 路徑，兩個關鍵決策都不一樣）。
 
-### Benchmark 套件（`44b780bd`, `9c411865`）
+### Benchmark 套件（`074dc152`, `a78a7b88`）
 
 `unieinfra/bench/`：`e2e_concurrency.py`（`shared` / `unique` / `rag` 三種形狀）、
 `e2e_throughput.py`、`e2e_shapes.py`、`e2e_sla_capacity.py`、kernel 層 harness。
 輸出固定欄位：輸入總 token / 輸出總 token / 平均每請求長度 / RPS / TTFT / ITL / TPS。
 
-`9c411865` 把 `fa` 改名成 `flashinfer_fa2`：**FlashAttention 與 FlashInfer 不是同一個東西**，
+`a78a7b88` 把 `fa` 改名成 `flashinfer_fa2`：**FlashAttention 與 FlashInfer 不是同一個東西**，
 名字要指出血緣。vLLM 呼叫的 `flash_attn` 套件在這裡是個空 namespace，
 所以我們用 flashinfer 包同一批 FA2 kernel 的 wrapper。
 
@@ -362,7 +362,7 @@ GDN 路徑，兩個關鍵決策都不一樣）。
 |---|---|
 | `--mamba-ssm-dtype bfloat16` | 246.4 對 245.8，**同一個數字**。白白降低遞迴狀態精度 |
 | 縮小 attention page P（原本的容量計畫） | 會讓 state memory 漲 **13x**（478 MB → 6.2 GB）。檔案在會被改的那行往下 11 行就寫了 |
-| LRU 驅動的降級（`5f5635a7`） | 無 throughput 增益 **且輸出不確定**。已回退 |
+| LRU 驅動的降級（`24e276d3`） | 無 throughput 增益 **且輸出不確定**。已回退 |
 | 256-token 快照 stride | 連完全重複都壞掉（`AlignMambaCacheSeqlen(track_len) != track_len` → 什麼都沒發佈）。已回退 |
 
 **記錄負面結果的理由**：一個量到的負值和一個勝利一樣值錢，而且重做一次的成本一樣高。
@@ -471,7 +471,7 @@ conc=1 還小贏 1.10x，所以這不是單請求的計算速度問題，是**�
 - **兩個引擎的 decode 速度基本相同**（ITL p50 在 conc=1 都是 37 ms 上下，差 2.4%）。
   所有差異都在 **TTFT**，也就是 prefill 與前綴重用。
 - **有重用可拿的時候我們明顯較好**，而且併發越高差距越大 —— 這是本輪
-  `e1852925` / `46b6614b` / `54c6b607` / `bf156ad4` 四個 commit 的直接結果。
+  `1b1083ef` / `90587c65` / `8363edc4` / `10f2543f` 四個 commit 的直接結果。
 - **沒有重用可拿的時候我們較差**，而且併發越高差距越大。這是目前最大的一個缺口，
   也是唯一一個「vLLM 有、我們沒有」的機制（混合批次）在數字上的樣子。
 - 只看 `rag` 或只看 `shared` 會得到「我們全面領先」的錯誤結論；
@@ -498,7 +498,7 @@ conc=1 還小贏 1.10x，所以這不是單請求的計算速度問題，是**�
 593.2），而 TTFT p99 從 3.8 秒跳到 13.4 秒。以「TTFT p99 ≤ 1 秒」為 SLA，這台單卡在
 27B 上的容量在 conc=16 與 32 之間，不在 128。
 
-### `bf156ad4` 在 conc=64 的 unique 形狀上會讓引擎當掉
+### `10f2543f` 在 conc=64 的 unique 形狀上會讓引擎當掉
 
 ```
 RuntimeError: SchedulePrefillEvent: failed to allocate Mamba checkpoint slot
@@ -506,7 +506,7 @@ RuntimeError: SchedulePrefillEvent: failed to allocate Mamba checkpoint slot
 
 **歸因（不是推測）**：把 `kMambaSnapshotMaxPerRequest` 改回 1 重新編譯，
 同一個工作負載跑得乾淨（conc=64 unique，TTFT p50 14377 ms，TPS 133.6）。
-改回 6 就當。所以這是 `bf156ad4` 的回歸。
+改回 6 就當。所以這是 `10f2543f` 的回歸。
 
 機制：`unique` 形狀永遠沒有重用，但每個結束的請求仍然留下最多 6 個快照，
 而那個 slot 池同時要裝每個在飛序列的 working 與 checkpoint。強制配置沒有退路，
@@ -674,27 +674,27 @@ client。** 這是本檔案第三次因為量測方法而改寫結論（前兩�
 | 42 | `cf63637e` | 日誌 E55：decode profile，三個「缺的」融合有兩個已存在 | — |
 | 43 | `fc09f69c` | **撤回** E55：kernel 名稱不是舊指令的證據 | — |
 | 44 | `8922ba60` | 日誌 E55b：**撤回** roofline 估計（算出 159% HBM） | — |
-| 45 | `e1852925` | 快照發佈到匹配搆得到的深度 | 27B 重複 prompt 重用 0 → 可用 |
-| 46 | `4d35899c` | 用探測取代版本旗標找 GDN kernel | 解開 4 道閘門 |
-| 47 | `94d0fa12` | libstdc++ shim 上 `LD_LIBRARY_PATH` | 4 個 kernel 從 raise 變可用；RoPE 贏 vLLM 1.70x |
-| 48 | `936b835f` | RoPE wrapper 砍 3.2 µs Python | 10.51 → **7.31 µs**（vLLM 7.77） |
-| 49 | `edd295cf` | Qwen3 改用融合 RoPE+KV write | 每層少一 launch，**端到端無變化** |
-| 50 | `da0619da` | 不再每次呼叫重推 dispatch 狀態 | wrapper 24.36 → 14.93 µs，**端到端 0** |
-| 51 | `de851d8d` | FA2 paged extend，每 forward 只 plan 一次 | 對 Triton 1.86–4.57x；RAG 15.2x |
-| 52 | `9e08f8ce` | 不為已結束的請求再跑一步 | 8B TTFT 29.96 → **15.85 ms** |
-| 53 | `bdbb3571` | 啟用融合 sm_120 GDN chunk-prefill kernel | 48 層 17.9 → **11.4 ms**，比 vLLM 快 1.65x |
-| 54 | `a90de320` | 為 bf16 專家註冊 ragged Triton matmul | 對 cutlass 2.1–2.6x；仍落後 vLLM 1.2–8x |
-| 55 | `a1483ec5` | 補回 w4a16 Marlin 的 Python 半邊 | 30 測試通過；端到端仍不可跑 |
-| 56 | `18f1fa92` | 五引擎橫向對照 + sm_120 kernel 計分板 | 19 個分歧點 |
-| 57 | `46b6614b` | 寫回主機的 KV 留在裝置上 | 部分命中 48.76 → **36.41 ms** |
-| 58 | `55004cc2` | 記錄 KV 降級發現與冷 JIT 量測陷阱 | — |
-| 59 | `2d0fe6cd` | 對兩個新檔案套用格式化 | — |
-| 60 | `54c6b607` | KV 分頁 64 → 16 token | TTFT **−13~14%** |
-| 61 | `8def103b` | 共享吞吐缺口是降級挑錯節點 | 定位，未修 |
-| 62 | `5f5635a7` | 記錄失敗的 LRU 降級嘗試 | 無增益且輸出不確定，已回退 |
-| 63 | `44b780bd` | 可執行的 benchmark 套件與併發曲線 | — |
-| 64 | `9c411865` | 回報完整請求形狀；FA2 依血緣改名 | — |
-| 65 | `29f8eda0` | FA2 workspace 128 → 512 MB | 27B 在 conc≥4 不再 Buffer overflow |
-| 66 | `f7d6015f` | 讀完四家後的 hybrid 前綴重用設計 | — |
-| 67 | `bf156ad4` | 保留多個遞迴快照 | **RAG 437 → 89.7 ms，重用 0 → 2560** |
-| 68 | `4e20e1b8` | vLLM 前綴快取旗標 + 更正 + 本報告 | 揭露先前所有 hybrid 對照皆無效 |
+| 45 | `1b1083ef` | 快照發佈到匹配搆得到的深度 | 27B 重複 prompt 重用 0 → 可用 |
+| 46 | `4538319c` | 用探測取代版本旗標找 GDN kernel | 解開 4 道閘門 |
+| 47 | `4b19c79c` | libstdc++ shim 上 `LD_LIBRARY_PATH` | 4 個 kernel 從 raise 變可用；RoPE 贏 vLLM 1.70x |
+| 48 | `a09c1215` | RoPE wrapper 砍 3.2 µs Python | 10.51 → **7.31 µs**（vLLM 7.77） |
+| 49 | `31733ae9` | Qwen3 改用融合 RoPE+KV write | 每層少一 launch，**端到端無變化** |
+| 50 | `07031561` | 不再每次呼叫重推 dispatch 狀態 | wrapper 24.36 → 14.93 µs，**端到端 0** |
+| 51 | `ab08f780` | FA2 paged extend，每 forward 只 plan 一次 | 對 Triton 1.86–4.57x；RAG 15.2x |
+| 52 | `f142d441` | 不為已結束的請求再跑一步 | 8B TTFT 29.96 → **15.85 ms** |
+| 53 | `a54a3be3` | 啟用融合 sm_120 GDN chunk-prefill kernel | 48 層 17.9 → **11.4 ms**，比 vLLM 快 1.65x |
+| 54 | `3938769a` | 為 bf16 專家註冊 ragged Triton matmul | 對 cutlass 2.1–2.6x；仍落後 vLLM 1.2–8x |
+| 55 | `2656e742` | 補回 w4a16 Marlin 的 Python 半邊 | 30 測試通過；端到端仍不可跑 |
+| 56 | `755189ed` | 五引擎橫向對照 + sm_120 kernel 計分板 | 19 個分歧點 |
+| 57 | `90587c65` | 寫回主機的 KV 留在裝置上 | 部分命中 48.76 → **36.41 ms** |
+| 58 | `359ca0f3` | 記錄 KV 降級發現與冷 JIT 量測陷阱 | — |
+| 59 | `a2ed0bcf` | 對兩個新檔案套用格式化 | — |
+| 60 | `8363edc4` | KV 分頁 64 → 16 token | TTFT **−13~14%** |
+| 61 | `ff83bb4c` | 共享吞吐缺口是降級挑錯節點 | 定位，未修 |
+| 62 | `24e276d3` | 記錄失敗的 LRU 降級嘗試 | 無增益且輸出不確定，已回退 |
+| 63 | `074dc152` | 可執行的 benchmark 套件與併發曲線 | — |
+| 64 | `a78a7b88` | 回報完整請求形狀；FA2 依血緣改名 | — |
+| 65 | `5a011ce1` | FA2 workspace 128 → 512 MB | 27B 在 conc≥4 不再 Buffer overflow |
+| 66 | `f390a66e` | 讀完四家後的 hybrid 前綴重用設計 | — |
+| 67 | `10f2543f` | 保留多個遞迴快照 | **RAG 437 → 89.7 ms，重用 0 → 2560** |
+| 68 | `a1d62870` | vLLM 前綴快取旗標 + 更正 + 本報告 | 揭露先前所有 hybrid 對照皆無效 |

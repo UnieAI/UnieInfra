@@ -1,6 +1,6 @@
 """Split a suspect attention layer into "the cache" and "what we hand it".
 
-This is the regression test for the per-layer head_dim fix (commit 40f2478a).
+This is the regression test for the per-layer head_dim fix (commit b1ff6d1f).
 Run it whenever the KV pool's row view or its per-layer geometry changes.
 
 Feed it the one-shot dump from models/gemma.py:

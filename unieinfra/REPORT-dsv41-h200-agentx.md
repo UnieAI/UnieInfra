@@ -13,10 +13,10 @@ seconds for 256 AgentX requests, [range]:
 | engine | c8 | c16 | c32 |
 |---|---|---|---|
 | vLLM 0.31.0 | 57.7 [56.5-59.5] | 47.3 [46.4-56.2] | 41.0 [39.6-42.3] |
-| tokenspeed `dsv41` (a5ba317a) | 34.4 [33.9-35.9] | 26.2 [26.0-27.0] | 21.2 [21.1-22.2] |
+| tokenspeed `dsv41` (795db10c) | 34.4 [33.9-35.9] | 26.2 [26.0-27.0] | 21.2 [21.1-22.2] |
 | **speedup** | **1.68x** | **1.80x** | **1.93x** |
 
-GSM8K (evalscope, 1319 problems, greedy): 0.9340 on a5ba317a (CI gate 0.90).
+GSM8K (evalscope, 1319 problems, greedy): 0.9340 on 795db10c (CI gate 0.90).
 
 ### Serving metrics
 
@@ -79,18 +79,18 @@ Rows marked *recipe* are flag changes on the same build.
 
 | step | commit | c8 | c16 | c32 | GSM8K |
 |---|---|---|---|---|---|
-| upstream main, as merged | 74f4a14f | 87.2 | 51.4 | 41.4 | |
-| batch prefill attention, fuse Hopper index top-k glue | bdfa98a2 | 66.7 | 45.3 | 37.9 | |
-| capture the attention projections in prefill graphs | b647604c | 52.2 | 36.5 | 33.0 | |
+| upstream main, as merged | 975fa69b | 87.2 | 51.4 | 41.4 | |
+| batch prefill attention, fuse Hopper index top-k glue | e3cc26b3 | 66.7 | 45.3 | 37.9 | |
+| capture the attention projections in prefill graphs | 3a2b67eb | 52.2 | 36.5 | 33.0 | |
 | *recipe:* prefill graphs up to 4096 tokens | | 49.0 | 33.5 | 27.5 | |
 | *recipe:* FP8 activations into the MXFP4 experts (W4A8) | | 43.3 | 32.8 | 27.7 | 0.9287 |
-| capture the CED narrowing layer around its row selection | 201b083f | 43.5 | 29.8 | 23.6 | 0.9318 |
+| capture the CED narrowing layer around its row selection | f57f6f27 | 43.5 | 29.8 | 23.6 | 0.9318 |
 | *recipe:* 5 DSpark draft steps (vLLM's width) | | 42.6 | 28.7 | 22.0 | 0.9272 |
-| memoize kernel selection on the eager path | 81fc782d | 38.5 | 27.4 | 21.8 | |
-| query pad + compressor projection in graph | 43e715b8 | 40.3 | 27.5 | 22.3 | 0.9227 |
-| graph the prefill `index_topk` spans, shared SWA workspace | b20ed1a4 | 40.0 | 27.1 | 21.9 | 0.9265 |
+| memoize kernel selection on the eager path | 52b91676 | 38.5 | 27.4 | 21.8 | |
+| query pad + compressor projection in graph | 110f60fb | 40.3 | 27.5 | 22.3 | 0.9227 |
+| graph the prefill `index_topk` spans, shared SWA workspace | 70a4f893 | 40.0 | 27.1 | 21.9 | 0.9265 |
 | *recipe:* 8192-token chunks and prefill graphs | | 35.9 / 34.4 | 26.2 / 26.1 | 21.4 / 22.4 | 0.9303 |
-| narrowing layer's ratio-1 compressor in graph | a5ba317a | 35.9 | 26.0 | 21.2 | 0.9340 |
+| narrowing layer's ratio-1 compressor in graph | 795db10c | 35.9 | 26.0 | 21.2 | 0.9340 |
 
 Cells of about 1 s are within run-to-run noise (the repeated runs in the
 results table show the spread); the large steps are host-bound prefill

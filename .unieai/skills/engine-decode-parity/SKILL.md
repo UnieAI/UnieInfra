@@ -1,6 +1,6 @@
 ---
 name: engine-decode-parity
-description: "Read this skill when an inference engine (or a fork of one) has to match or beat a reference engine on decode — phrasings like '追平 vLLM', '輸 sglang', 'total tps 差多少', 'TTFT tail 爆炸', 'throughput 飽和', 'why is our decode slower', 'agent workload 比 vLLM 慢', 'GPU 沒吃滿', or a request to port an upstream engine's optimizations. It chains step-level measurement (device-busy ms/step, launches/step, family attribution, per-rank idle vs collective wait, py-spy on the forward thread when the step is host-bound, e2e = TTFT + per-token decode under load) to an arithmetic floor, then applies the strategy catalogue distilled from Tokenspeed/vLLM upstream commits: fold epilogues, one launch per seam, recompute instead of materialize, select instead of sort, compute over the visible set, produce in the consumer's dtype, hoist per-step metadata, prepare weights once at load, pick kernels per token bucket, overlap independent branches, collapse collective chains, keep eager graph breaks to the metadata-reading ops, cover the batched prefill size with a captured bucket, re-profile after every fix. It covers how to port 1:1 without replacing the existing path, how to declare and gate kernel capabilities, and how to verify with ULP-relative bounds. It is not for single-request prefill-only tuning, single-kernel micro-benchmarks, or flag/scheduler-parameter sweeps. Before kernel work on a new model, run model-structure-optimization first (work the model never needed is the bigger lever); for bringing a model up from scratch use model-bring-up."
+description: "Read this skill when an inference engine (or a fork of one) has to match or beat a reference engine on decode — phrasings like '追平 vLLM', '輸 sglang', 'total tps 差多少', 'TTFT tail 爆炸', 'throughput 飽和', 'why is our decode slower', 'agent workload 比 vLLM 慢', 'GPU 沒吃滿', or a request to port an upstream engine's optimizations. It chains step-level measurement (device-busy ms/step, launches/step, family attribution, per-rank idle vs collective wait, py-spy on the forward thread when the step is host-bound, e2e = TTFT + per-token decode under load) to an arithmetic floor, then applies the strategy catalogue distilled from Tokenspeed/vLLM upstream commits: fold epilogues, one launch per seam, recompute instead of materialize, select instead of sort, compute over the visible set, produce in the consumer's dtype, hoist per-step metadata, prepare weights once at load, pick kernels per token bucket, overlap independent branches, collapse collective chains, keep eager graph breaks to the metadata-reading ops, cover the batched prefill size with a captured bucket, re-profile after every fix. Section 7 is the measured loop that took DeepSeek-V4.1 from 1.0x to 1.8x vLLM on AgentX (merge upstream, classify the step, take the host off the critical path, recipe, re-profile at the recipe, bound each lever before building it) plus the benchmark protocol that kept those numbers honest. It covers how to port 1:1 without replacing the existing path, how to declare and gate kernel capabilities, and how to verify with ULP-relative bounds. It is not for single-request prefill-only tuning, single-kernel micro-benchmarks, or flag/scheduler-parameter sweeps. Before kernel work on a new model, run model-structure-optimization first (work the model never needed is the bigger lever); for bringing a model up from scratch use model-bring-up."
 ---
 
 > Companion skills: **model-bring-up** (new model → correct engine path),
@@ -466,3 +466,64 @@ Order matters: numeric equivalence, then no perf regression, then win.
 9. **State what was not measured** in the write-up ("kernel microbenchmark
    only; end-to-end not measured"). An unmeasured claim is a follow-up, not a
    result.
+
+## 7. The loop, as run on DeepSeek-V4.1 (H200 TP4, AgentX: 1.0x -> 1.8x vLLM)
+
+The catalogue above says *what* can be done; this is the order that decided
+*which*, step by step, with the evidence that closed each step. Run it as a
+loop: one change per iteration, each one measured end to end before the next.
+
+1. **Take upstream's model support instead of porting it.** Upstream
+   tokenspeed already served V4.1 (CED narrowing, sparse indexer, DSpark), so
+   the branch merged upstream and recorded a decision for every fork commit it
+   touched (model-bring-up §6). Starting point: 87.2 / 51.4 / 41.4 s at
+   c8/c16/c32 against vLLM's 57.7 / 47.3 / 41.0.
+2. **Classify the step before touching anything** (§1): device-busy per step,
+   per-rank idle against collective wait, decode against prefill steps. V4.1
+   decode was GPU-bound; prefill steps were host-bound (65 ms wall for 36 ms of
+   GPU work, the slowest rank's host deciding every all-reduce).
+3. **Host-bound: take the host off the critical path, biggest first.**
+   - Batch per-request Python loops inside per-layer calls (e3cc26b3-style:
+     O(requests x layers) launches become O(layers)).
+   - Capture everything token-local in the prefill graph, so the eager break
+     keeps only the ops that read per-request metadata (strategy P), and give
+     every batched prefill size a captured bucket (strategy Q).
+   - Memoize kernel selection on the eager path (S); graph a shape-only eager
+     sub-op in its own buckets (U).
+   - Time each eager op with perf_counter wrappers on the live server; py-spy
+     and the profiler both attribute waits to whatever is on the stack.
+4. **Then the recipe.** Flags that change what the engine does, each A/B'd
+   alone and kept only if it moves the median: FP8 activations into MXFP4
+   experts, the reference's speculative width (T), 8192-token chunks with
+   8192-token prefill graphs (memory utilization lowered so the capture fits).
+5. **Re-profile at the serving recipe after every step** (R). The bound moves:
+   after steps 3-4 both decode and prefill were bound by streaming routed
+   expert weights, and further host work bought nothing (§3, "Bound a lever").
+6. **Bound every remaining lever before building it.** A trace split, a
+   microbenchmark of the candidate kernel, or the reference's own kernel at
+   your shapes, then the end-to-end ceiling from step 2's accounting. On V4.1
+   this killed in-graph prefill attention (neutral), FP8 dense GEMMs (slower),
+   EPLB (< 2%), mHC fusion (the cost was waiting), MoE TP (slower), mixed
+   batches (slower), GIL and NUMA knobs (noise).
+7. **Close each step with the same three numbers:** the AgentX median of
+   repeated arms, GSM8K on the same server, and the unit tests that cover the
+   change (failures compared against the merge base, never "they were already
+   red").
+
+### Benchmark protocol (what made the numbers trustworthy)
+
+- Equal work per request: `min_tokens = max_tokens` (128), greedy, so
+  throughput and TPOT can be computed from a fixed output length. The
+  driver's chunk count is not tokens under speculative decoding.
+- Flush the prefix cache before every cell and **abort the cell if the flush
+  is not a 200**: vLLM serves `/reset_prefix_cache` only with
+  `VLLM_SERVER_DEV_MODE=1`, and a silent 404 halved its c16 duration.
+- Three arms per engine, each with the cells in a different order; report
+  medians with the range. The first cell after a launch pays JIT warmup.
+- Report the whole serving picture per cell, not one duration: RPM, output
+  and total token/s, TTFT mean / p50 / p90 (client-side, queueing included),
+  TPOT, E2E p50 / p90 (`unieinfra/bench/agentx/summarize.py`).
+- Never read a profiled cell's duration; never trust a cell whose run log
+  shows failed requests.
+- Check that the benchmarked build is the code under review: diff the
+  image's runtime against the branch before quoting its numbers.

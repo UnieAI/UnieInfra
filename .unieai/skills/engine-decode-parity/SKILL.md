@@ -335,6 +335,12 @@ undercounted); at 0.90 with 8192-token chunks it fits and took c8/c16/c32
 trace said MoE 36% and all-reduce 21% with 10 ms idle per prefill step: the
 host problem was gone and the next work is GPU kernels. Doing kernel work first
 would have bought nothing, because the GPU was idle 40% of the step.
+Re-profile at the configuration you serve, too: V4.1's host-bound prefill
+analysis came from 4096-token chunks; at the 8192-token recipe the same step
+was 52 ms with the GPU busy 46-48 ms. Moving 32 of 41 per-layer attention
+breaks into the graph (a correct, ~400-line change) then measured
+26.2 s against 26.0 s. A profile of the baseline at the exact serving flags,
+taken before the refactor, would have shown there was nothing to win.
 
 **S. Memoize kernel selection on the eager path.** Selection is cached, but the
 cache key is a format signature built and hashed on every call -- ~18 µs per op
@@ -368,6 +374,23 @@ the quietest NUMA node: 42.4/28.6/23.6 s, worse (the default per-GPU NUMA-local
 affinity stays). Padding the prefill index width to a multiple of 128: already
 640 = 5 × 128, a no-op -- read the shape before optimizing it. Neither changes what bounds the
 step; check the step's bound (above) before trying a scheduling knob.
+Re-measured on the graph-heavy build: mixed batches 38.6/28.4/26.7 s against
+35.9/26.0/21.2 s; GIL switch interval 100 / 20 µs: within noise (the scheduler
+thread mostly blocks); MoE TP4 instead of EP4 (intermediate padded 576 -> 640
+for the 128-aligned W4A8 kernel): 38.5/27.7/22.6 against 40.0/27.1/21.9 -- the
+padding and narrower GEMMs cost more than the balance gains.
+
+**Bound a lever before building it.** Three V4.1 levers died on a cheap
+measurement:
+- *FP8 dense projections.* vLLM serves them through Marlin MXFP8 (W8A16);
+  benchmarking vLLM's own kernel at V4.1's shapes on H200 gave 1.7-4x the time
+  of cuBLAS BF16 (M = 16-192). The BF16 widening is right on Hopper.
+- *EPLB.* Split the EP imbalance per layer into its across-step mean
+  (systematic, what a placement can fix) and the rest: the slowest rank's
+  MoE excess was 0.93 ms per decode step, 0.62 ms systematic -- under 2% of
+  end-to-end, not worth wiring V4.1's router into the placement tables.
+- *mHC fusion.* A trace showed 8.3 µs per pre-norm call; in isolation the
+  kernel takes 2.5 µs (the rest is waiting on the aux-stream branch).
 
 ## 4. Laws that keep the measurement honest
 

@@ -48,6 +48,16 @@ CONCURRENCY="${GB10_CONCURRENCY:-1 4 16 64}"
 # Prompts per benchmark point: 4 per concurrent slot, at least this many. A
 # 27B dense decode is ~5 tok/s per stream here, so c=1 sets the run time.
 BENCH_MIN_PROMPTS="${GB10_BENCH_MIN_PROMPTS:-8}"
+# Benchmark shapes, each at every concurrency: unique 1024-token prompts, a
+# shared 1024-token prefix plus 256 new tokens, and unique 6144-token prompts
+# (where the KV cache is a real share of each decode step's reads).
+BENCH_SHAPES="${GB10_BENCH_SHAPES:-unique shared long}"
+# gsm8k questions to score after the benchmark (0 skips it). Generation config
+# as the GB10 CI eval; a subset, since the full set takes hours on one GB10.
+EVAL_LIMIT="${GB10_EVAL_LIMIT:-0}"
+EVAL_BATCH="${GB10_EVAL_BATCH:-64}"
+# Names this run's log directory, e.g. baseline / fp8-kv / plugin.
+LABEL="${GB10_LABEL:-run}"
 # Engine flags for level 2: the GB10 CI model-test flags (test/ci/eval/*.yaml)
 # with the two changes GB10 needs to start at all.
 # - No `--kv-cache-dtype fp8_e4m3`: an fp8 cache makes the runtime cast q to
@@ -262,11 +272,68 @@ print(f"  {sys.argv[2]:7s} c={int(sys.argv[3]):3d}  ok={r['completed']:4d}  "
 PY
 }
 
+# gsm8k accuracy with evalscope, from the bench image (its Python), in a venv
+# cached under $WORK/cache so later runs skip the install.
+eval_gsm8k() {
+  docker run --rm --network host --memory 6g --entrypoint bash \
+    -v "$WORK/cache:/cache" -v "$LOGDIR:/logs" "$BENCH_IMAGE" -lc "
+      set -e
+      V=/cache/evalscope-venv
+      [ -x \$V/bin/evalscope ] || { python3 -m venv \$V && \$V/bin/pip install -q 'evalscope[perf]'; }
+      \$V/bin/evalscope eval --model '$MODEL_ID' --api-url http://127.0.0.1:$PORT/v1 \
+        --api-key EMPTY_TOKEN --datasets gsm8k --dataset-hub huggingface \
+        --dataset-args '{\"gsm8k\":{\"dataset_id\":\"openai/gsm8k\"}}' \
+        --limit $EVAL_LIMIT --eval-batch-size $EVAL_BATCH --stream \
+        --generation-config '{\"do_sample\":false,\"temperature\":0.0,\"max_tokens\":1024}' \
+        --work-dir /logs/eval" >"$LOGDIR/eval.txt" 2>&1 ||
+    { log "WARNING: gsm8k eval failed (eval.txt)"; return 0; }
+  grep -E "gsm8k" "$LOGDIR/eval.txt" | grep -iE "acc|score" | tail -3
+}
+
+# One JSON per run with what the charts need: startup, cache size, every
+# benchmark point, and the gsm8k score.
+write_metrics() {
+  python3 - "$LOGDIR" "$LABEL" "$(src_rev)" "$SERVE_ARGS" <<'PY'
+import glob, json, os, re, sys
+d, label, rev, serve_args = sys.argv[1:5]
+log = open(os.path.join(d, "serve.log"), errors="replace").read()
+run = open(os.path.join(d, "run.log"), errors="replace").read()
+m = {"label": label, "rev": rev, "serve_args": serve_args}
+r = re.search(r"server ready in (\d+) s", run)
+m["ready_s"] = int(r.group(1)) if r else None
+kv = re.findall(r"KV Cache is allocated\. K size: ([\d.]+) GB, V size: ([\d.]+) GB", log)
+m["kv_cache_gb"] = round(float(kv[-1][0]) + float(kv[-1][1]), 2) if kv else None
+slots = re.findall(r"cache view over (\d+) slots as (\S+)", log)
+if slots:
+    m["kv_cache_slots"], m["kv_cache_dtype"] = int(slots[-1][0]), slots[-1][1].rstrip(",")
+m["bench"] = []
+for f in sorted(glob.glob(os.path.join(d, "bench-*.json"))):
+    shape, conc = re.match(r"bench-(\w+)-c(\d+)\.json", os.path.basename(f)).groups()
+    b = json.load(open(f))
+    m["bench"].append({"shape": shape, "concurrency": int(conc),
+        "completed": b["completed"], "output_tok_s": b["output_throughput"],
+        "ttft_p50_ms": b["median_ttft_ms"], "ttft_p99_ms": b["p99_ttft_ms"],
+        "tpot_p50_ms": b["median_tpot_ms"], "tpot_p99_ms": b["p99_tpot_ms"]})
+scores = []
+for f in glob.glob(os.path.join(d, "eval", "**", "reports", "**", "*.json"), recursive=True):
+    try:
+        rep = json.load(open(f))
+    except Exception:
+        continue
+    if isinstance(rep, dict) and "score" in rep:
+        scores.append(rep["score"])
+m["gsm8k"] = scores[0] if scores else None
+json.dump(m, open(os.path.join(d, "metrics.json"), "w"), indent=2)
+print(f"metrics: ready {m['ready_s']} s, kv {m['kv_cache_gb']} GB, gsm8k {m['gsm8k']}, "
+      f"{len(m['bench'])} bench points -> {d}/metrics.json")
+PY
+}
+
 cmd_window() {
   [ -f "$MODEL_DIR/config.json" ] || die "no model at $MODEL_DIR; run prep first"
   [ -f "$WORK/src/unieinfra/gb10/Dockerfile" ] || die "no source; run sync.sh first"
   docker image inspect "$BENCH_IMAGE" >/dev/null 2>&1 || die "no $BENCH_IMAGE; run prep first"
-  open_log window
+  open_log "window-$LABEL"
   [ -n "${TMUX:-}${STY:-}" ] || log "WARNING: not in tmux/screen; an SSH drop ends the window early"
 
   # Restart the service on exit only if this run is the one that stopped it;
@@ -318,9 +385,22 @@ cmd_window() {
   # of a full prefill, so a mismatch is a lead to chase, not proof of a bug.
   [ "$a1" = "$a2" ] || log "WARNING: temperature-0 answers differ: '$a2'"
 
-  log "[4/4] benchmark: unique 1024-in prompts, then a shared 1024-token prefix + 256 new"
-  for c in $CONCURRENCY; do bench unique "$c" 0 1024 128; done
-  for c in $CONCURRENCY; do bench shared "$c" 1024 256 128; done
+  log "[4/4] benchmark ($BENCH_SHAPES) at concurrency $CONCURRENCY"
+  for shape in $BENCH_SHAPES; do
+    for c in $CONCURRENCY; do
+      case "$shape" in
+        unique) bench unique "$c" 0 1024 128 ;;
+        shared) bench shared "$c" 1024 256 128 ;;
+        long) bench long "$c" 0 6144 128 ;;
+        *) die "unknown bench shape: $shape" ;;
+      esac
+    done
+  done
+  if [ "$EVAL_LIMIT" -gt 0 ]; then
+    log "gsm8k accuracy on $EVAL_LIMIT questions (batch $EVAL_BATCH)"
+    eval_gsm8k
+  fi
+  write_metrics
 
   log "done; results in $LOGDIR"
 }

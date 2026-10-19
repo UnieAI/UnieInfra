@@ -29,20 +29,28 @@ set -euo pipefail
 
 SERVICE="${GB10_SERVICE:-DeepSeek-V4-Flash-Vision-Exp-EXL3}"
 WORK="${GB10_WORK:-$HOME/unieinfra-main}"
-MODEL_REPO="${GB10_MODEL_REPO:-Qwen/Qwen3-8B}"
+MODEL_REPO="${GB10_MODEL_REPO:-Qwen/Qwen3.8-27B}"
 MODEL_DIR="${GB10_MODEL_DIR:-$HOME/models/$MODEL_REPO}"
 BASE_IMAGE="lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.7.1rc2"
 # Load generator for level 2; only its `vllm bench serve` client is used.
 BENCH_IMAGE="${GB10_BENCH_IMAGE:-vllm/vllm-openai:nightly-aarch64}"
-IMAGE="unieinfra:gb10-main"
-CTR="unieinfra-main-test"
-INSTALL_CTR="unieinfra-main-install"
+# Not `unieinfra:gb10-main`: the GB10 CI runs its tasks in that image, so a
+# manual build under that name would change what CI tests.
+IMAGE="unieinfra:gb10-dev"
+CTR="unieinfra-dev-test"
+INSTALL_CTR="unieinfra-dev-install"
 PORT="${GB10_PORT:-18080}"
 # Fraction of the unified 128 GB the engine may plan for. Lower than the 0.88
 # used on discrete cards: here the same pool also backs the host processes and
 # the page cache the weights are read through.
 MEM_UTIL="${GB10_MEM_UTIL:-0.6}"
 CONCURRENCY="${GB10_CONCURRENCY:-1 4 16 64}"
+# Prompts per benchmark point: 4 per concurrent slot, at least this many. A
+# 27B dense decode is ~5 tok/s per stream here, so c=1 sets the run time.
+BENCH_MIN_PROMPTS="${GB10_BENCH_MIN_PROMPTS:-8}"
+# Engine flags for level 2. The default matches the GB10 CI model tests
+# (test/ci/eval/*.yaml) so a manual run reproduces what CI serves.
+SERVE_ARGS="${GB10_SERVE_ARGS:---trust-remote-code --attention-backend triton --moe-backend triton --chunked-prefill-size 8192 --max-model-len 8192 --max-num-seqs 64 --kv-cache-dtype fp8_e4m3}"
 # `check` only: container memory cap, and the host MemAvailable floor below
 # which the watchdog kills the test.
 CHECK_MEM_GB="${GB10_CHECK_MEM_GB:-5}"
@@ -217,16 +225,17 @@ wait_ready() {
 chat() {
   curl -sf "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\": \"$1\", \"temperature\": 0, \"max_tokens\": 64,
-         \"messages\": [{\"role\": \"user\", \"content\": \"$2 /no_think\"}]}" |
-    python3 -c 'import sys, json; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+    -d "{\"model\": \"$1\", \"temperature\": 0, \"max_tokens\": 256,
+         \"chat_template_kwargs\": {\"enable_thinking\": false},
+         \"messages\": [{\"role\": \"user\", \"content\": \"$2\"}]}" |
+    python3 -c 'import sys, json; m = json.load(sys.stdin)["choices"][0]["message"]; print(m.get("content") or "[reasoning] " + str(m.get("reasoning_content")))'
 }
 
 # One `vllm bench serve` run against the test server. The client needs the GPU
 # visible only because vLLM's CLI refuses to start without a device.
 bench() {
   local name="$1" conc="$2" prefix="$3" inlen="$4" outlen="$5" n
-  n=$((conc * 4 > 32 ? conc * 4 : 32))
+  n=$((conc * 4 > BENCH_MIN_PROMPTS ? conc * 4 : BENCH_MIN_PROMPTS))
   docker run --rm --gpus all --network host --memory 4g --entrypoint vllm \
     -v "$MODEL_DIR:/models/model:ro" -v "$LOGDIR:/logs" "$BENCH_IMAGE" bench serve \
     --backend openai --base-url "http://127.0.0.1:$PORT" --endpoint /v1/completions \
@@ -290,7 +299,7 @@ cmd_window() {
   log "[3/4] serve and smoke test (first start JIT-compiles for sm_121; can take a while)"
   docker exec -d "$CTR" bash -lc "echo \$\$ >/logs/serve.pid; exec tokenspeed serve \
     /models/model --host 127.0.0.1 --port $PORT --gpu-memory-utilization $MEM_UTIL \
-    --max-model-len 8192 >/logs/serve.log 2>&1"
+    $SERVE_ARGS >/logs/serve.log 2>&1"
   t0=$SECONDS
   wait_ready
   log "server ready in $((SECONDS - t0)) s"

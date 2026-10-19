@@ -23,7 +23,7 @@ unieinfra/gb10/sync.sh                      # HEAD -> gb10-unieai:~/unieinfra-ma
 
 # on the GB10
 R=~/unieinfra-main/src/unieinfra/gb10/run.sh
-$R prep      # pull base + bench images, download Qwen3-8B
+$R prep      # pull base + bench images, download Qwen3.8-27B
 $R check     # level 1: kernels and kernel tests, no model
 tmux new -s gb10
 $R window    # level 2: serve, smoke test, benchmark
@@ -46,14 +46,18 @@ plugins, and runs a set of kernel tests. Safe beside the resident service.
 
 **Level 2, `window`.** Stops the resident service if it is running, and then
 restarts it on every exit path; a service stopped by hand stays stopped. Serves
-the model with `tokenspeed serve` on `127.0.0.1:18080`, asks one temperature-0
-question twice, then load-tests the server with `vllm bench serve` (from the
+the model (default Qwen3.8-27B, a BF16 GDN hybrid) with `tokenspeed serve` on
+`127.0.0.1:18080` with the same engine flags as the GB10 CI model tests, asks
+one temperature-0 question twice with thinking off, then load-tests the server with `vllm bench serve` (from the
 vLLM image already on the box) at concurrency 1/4/16/64 on two shapes: unique
 1024-token prompts, and a shared 1024-token prefix plus 256 new tokens.
 
-Knobs: `GB10_MODEL_REPO`, `GB10_MEM_UTIL` (default 0.6), `GB10_CONCURRENCY`,
-`GB10_PORT`, `GB10_SERVICE`, `GB10_CHECK_MEM_GB`, `GB10_GUARD_MB`,
-`GB10_BENCH_IMAGE`.
+Knobs: `GB10_MODEL_REPO`, `GB10_SERVE_ARGS`, `GB10_MEM_UTIL` (default 0.6),
+`GB10_CONCURRENCY`, `GB10_BENCH_MIN_PROMPTS`, `GB10_PORT`, `GB10_SERVICE`,
+`GB10_CHECK_MEM_GB`, `GB10_GUARD_MB`, `GB10_BENCH_IMAGE`.
+
+The image is tagged `unieinfra:gb10-dev`, not `unieinfra:gb10-main`, which the
+GB10 CI runs its tasks in.
 
 The test server binds 127.0.0.1 on its own port on purpose: the host runs a
 cloudflared tunnel, and anything on the service's port would be published

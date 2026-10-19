@@ -21,7 +21,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
     _has_large_shared_memory,
 )

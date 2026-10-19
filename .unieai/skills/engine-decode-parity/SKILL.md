@@ -148,6 +148,23 @@ that straddle every graph bucket boundary (128…8192 new tokens, cold and with 
 cached prefix) — a flat floor (130 ms for 128 to 1024 tokens) is per-step host
 cost, a jump at a size is a capture bucket ending.
 
+**The profiler inflates graph launches; time them bare.** Under CUPTI a
+`cudaGraphLaunch` showed 130-190 µs for a 38-node prefill segment and 3.6-4.4 ms
+for the 2113-node decode graph; a microbenchmark without the profiler measured
+3-5 µs regardless of node count. Never add up profiled host windows into a host
+budget; compare each step's host launch window with its GPU window instead
+(V4.1 prefill: 78-88 ms of host enqueue against 55 ms of GPU work is a
+host-bound step whatever the per-call numbers say).
+
+**Swap the device order before blaming a rank.** When the same ranks are late
+step after step, rerun with `CUDA_VISIBLE_DEVICES` permuted (e.g. `2,3,0,1`)
+inside the container. If the lateness moves with the physical GPUs, it is the
+host CPUs those GPUs sit next to, not the rank's role. On the V4.1 host the late
+ranks followed GPUs 6-7 (NUMA node 2, whose cores share SMT siblings with
+another tenant's busy-polling schedulers): host launch 2.7-4.1 ms later per
+decode step, ~25% slower per launch. That is the environment, and the vLLM
+baseline pays it too; measure both on the same GPUs and stop tuning it.
+
 ## 2. Turn the gap into a work list by subtraction
 
 Convert the whole difference into **per-step milliseconds** (a c16 gap from
@@ -309,9 +326,10 @@ prefill-graph bucket the whole forward runs eager (`graphs=0` in a per-step
 count of `cudaGraphLaunch`). The default cap was min(2048, chunk); an agent
 workload batches several 1-2k-token prompts per step, so many steps fell off the
 cliff (2083 tokens: 216 ms; with a 4096 cap: 91 ms). `--prefill-graph-max-tokens
-4096` took c32 from 33.0 to 27.5 s. 8192 OOMed during decoder capture on
-141 GB H200 (the reserve estimate undercounted) — size it to memory, and log
-the decision.
+4096` took c32 from 33.0 to 27.5 s. 8192 OOMed during decoder capture at
+`--gpu-memory-utilization 0.95` on 141 GB H200 (the reserve estimate
+undercounted); at 0.90 with 8192-token chunks it fits and took c8/c16/c32
+40.0/27.1/21.9 → 35.9/26.2/21.5 s. Size it to memory, and log the decision.
 
 **R. Re-profile after every fix; the bottleneck moves.** After P and Q the same
 trace said MoE 36% and all-reduce 21% with 10 ms idle per prefill step: the
@@ -330,9 +348,25 @@ ran DSPARK with 5 draft tokens (the checkpoint's block size); tokenspeed
 defaulted to 3. MoE decode is weight-bandwidth-bound, so verifying more tokens
 per step is nearly free: c8/c16/c32 43.5/29.8/23.6 → 42.6/28.7/22.0 s.
 
+**U. Graph an eager sub-op in its own shape buckets.** What must stay in an
+eager break can still be replayed if its launch sequence depends only on
+shapes. V4.1's per-span `index_topk` (one request, dense history) ran nine
+kernels: ~170 µs of GPU, 530-690 µs of host, ten times a step. Pad rows, pages
+and candidate pools to power-of-two buckets with inert padding (position -1 sees
+no history, null pages are never read, candidate pools padded with -1), capture
+each bucket once on a side stream into a shared pool, and replay with in/out
+copies: 112-122 µs host per call. Key the cache on everything the capture froze
+(including the cache tensor's pointer and every width that varies per step: the
+first version crashed when the reindex pool width changed), and leave any key
+that fails to capture eager for good. Test replay with different inputs and a
+narrower shape than the one captured.
+
 **Measured dead ends (V4.1, H200 TP4, AgentX).** Mixed prefill+decode batches:
 50.7/38.9/33.4 s against 42.6/28.7/22.0 separate. A 0.5 ms GIL switch interval
-for the scheduler processes: within noise. Neither changes what bounds the
+for the scheduler processes: within noise. Pinning all four ranks to
+the quietest NUMA node: 42.4/28.6/23.6 s, worse (the default per-GPU NUMA-local
+affinity stays). Padding the prefill index width to a multiple of 128: already
+640 = 5 × 128, a no-op -- read the shape before optimizing it. Neither changes what bounds the
 step; check the step's bound (above) before trying a scheduling knob.
 
 ## 4. Laws that keep the measurement honest
@@ -345,6 +379,10 @@ step; check the step's bound (above) before trying a scheduling knob.
 - **A silent trim is a correctness bug.**
 - **The corrupt arm can look faster.** A 1.217× A/B once traced to a numerics
   bug, not speed.
+- **A wait-for-free-GPUs gate names what it waits for.** Gating on "no
+  container holds these devices" hung a queue overnight because an idle dev
+  container owned two of them; filter on the benchmark containers (or on
+  memory used) and print what the gate is waiting on.
 - **Know your noise floor.** Re-run the control: ours was 1.008×. Anything under
   ~2% is nothing.
 - **Ask what quantity the code computes before asking what value to give it.**

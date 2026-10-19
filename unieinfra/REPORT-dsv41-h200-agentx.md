@@ -14,9 +14,24 @@ seconds for 256 AgentX requests, [range]:
 |---|---|---|---|
 | vLLM 0.31.0 | 57.7 [56.5-59.5] | 47.3 [46.4-56.2] | 41.0 [39.6-42.3] |
 | tokenspeed `dsv41` (795db10c) | 34.4 [33.9-35.9] | 26.2 [26.0-27.0] | 21.2 [21.1-22.2] |
-| **speedup** | **1.68x** | **1.80x** | **1.93x** |
+| + `--prefill-coalesce-ms 100` (04e27531) | 32.8 [32.7-34.7] | 24.2 [23.8-25.4] | 19.1 [18.8-20.0] |
+| **speedup** (with coalescing) | **1.76x** | **1.95x** | **2.15x** |
 
-GSM8K (evalscope, 1319 problems, greedy): 0.9340 on 795db10c (CI gate 0.90).
+GSM8K (evalscope, 1319 problems, greedy): 0.9340 on 795db10c, 0.9356 with
+coalescing (CI gate 0.90).
+
+Low and high concurrency, two arms per engine (orders 1-64-128 / 128-1-64
+for ours, 128-64-1 / 64-1-128 for vLLM), both engines at 128 sequences:
+
+| engine | c1 | c64 | c128 |
+|---|---|---|---|
+| vLLM 0.31.0 | 136.4 [134.3-138.5] | 36.1 [35.2-37.0] | 37.7 [37.5-37.8] |
+| tokenspeed `dsv41` (795db10c) | 106.1 [105.7-106.5] | 19.4 [18.9-19.8] | 20.7 [20.6-20.9] |
+| + `--prefill-coalesce-ms 100` | 106.9 [105.5-108.4] | 18.5 [18.4-18.6] | 20.4 [19.6-21.1] |
+| **speedup** (with coalescing) | **1.28x** | **1.95x** | **1.85x** |
+
+Both engines saturate around c64; c128 only queues more. At c1 decode is at
+parity (TPOT 2.6 vs 2.7 ms) and the lead is TTFT (84 vs 186 ms).
 
 ### Serving metrics
 
@@ -25,23 +40,34 @@ Each request sends 9.7k input tokens on average (p50 10.1k, p90 11.9k,
 generates exactly 128 output tokens (`min_tokens = max_tokens = 128`).
 RPM and output TPS come from the cell's wall time. TTFT is measured at the
 client, so it includes queueing. TPOT is (E2E - TTFT) / 127. Every value is
-the median over the three arms.
+the median over the arms. dsv41 rows are 04e27531 with
+`--prefill-coalesce-ms 100` (c64/c128 with 128 sequences).
 
 | c | engine | RPM | output TPS | TTFT mean / p50 / p90 (ms) | TPOT (ms) | E2E p50 / p90 (ms) |
 |---|---|---|---|---|---|---|
+| 1 | vLLM 0.31 | 113 | 240 | 186 / 185 / 395 | 2.7 | 512 / 729 |
+| 1 | **dsv41** | **144** | **307** | **84 / 66 / 155** | **2.6** | **405 / 497** |
 | 8 | vLLM 0.31 | 266 | 568 | 338 / 221 / 509 | 11.5 | 1458 / 3121 |
-| 8 | **dsv41** | **447** | **954** | **151 / 101 / 214** | **7.2** | **953 / 1428** |
+| 8 | **dsv41** | **469** | **1000** | **262 / 209 / 343** | **5.9** | **916 / 1711** |
 | 16 | vLLM 0.31 | 325 | 693 | 576 / 282 / 1131 | 18.7 | 2347 / 4842 |
-| 16 | **dsv41** | **586** | **1249** | **235 / 129 / 399** | **10.9** | **1388 / 2330** |
+| 16 | **dsv41** | **634** | **1354** | **354 / 238 / 608** | **9.1** | **1291 / 2911** |
 | 32 | vLLM 0.31 | 375 | 799 | 1207 / 410 / 2899 | 30.3 | 3834 / 13588 |
-| 32 | **dsv41** | **724** | **1545** | **481 / 170 / 1089** | **16.8** | **2142 / 6100** |
+| 32 | **dsv41** | **805** | **1717** | **597 / 307 / 1043** | **14.0** | **1868 / 5414** |
+| 64 | vLLM 0.31 | 426 | 908 | 3093 / 655 / 13620 | 45.2 | 6329 / 19048 |
+| 64 | **dsv41** | **830** | **1770** | **1415 / 514 / 5127** | **24.4** | **3143 / 9539** |
+| 128 | vLLM 0.31 | 408 | 870 | 9265 / 4877 / 20753 | 68.6 | 17402 / 30222 |
+| 128 | **dsv41** | **755** | **1610** | **4894 / 3320 / 12963** | **37.4** | **12547 / 17011** |
+
+Coalescing trades a little TTFT at low load (c8 mean 151 -> 262 ms, still
+below vLLM's 338 ms) for throughput: a request that arrives while others
+decode waits up to 100 ms to share a prefill step.
 
 Counting input tokens as well, total throughput at c16 is
-(2.48M + 33k) / 26.2 s ≈ 95.8k tok/s for dsv41, against 53.0k tok/s for
+(2.48M + 33k) / 24.2 s ≈ 103.7k tok/s for dsv41, against 53.0k tok/s for
 vLLM 0.31.
 
-The 2x target (c16 ≤ 23.7 s against this median) is not reached: c16 is
-2.5 s short. Every flush before a cell returned 200 (`run_cells.sh` now
+The 2x target (c16 ≤ 23.7 s against this median) is reached at c32 (2.15x)
+but not at c16 (1.95x, 0.5 s short). Every flush before a cell returned 200 (`run_cells.sh` now
 aborts otherwise: one vLLM repeat without `VLLM_SERVER_DEV_MODE=1` got 404
 flushes and replayed a warm cache, and was discarded).
 
@@ -66,9 +92,11 @@ flushes and replayed a warm cache, and was discarded).
 ts serve --model DeepSeek-V4.1-Flash-1017 --tensor-parallel-size 4 --enable-expert-parallel \
   --speculative-algorithm DSPARK --speculative-num-steps 5 --speculative-num-draft-tokens 6 \
   --moe-mxfp4-fp8-activation --chunked-prefill-size 8192 --prefill-graph-max-tokens 8192 \
-  --gpu-memory-utilization 0.90 --engram-host-table --max-num-seqs 64 --max-cudagraph-capture-size 64
+  --gpu-memory-utilization 0.90 --engram-host-table --max-num-seqs 64 --max-cudagraph-capture-size 64 \
+  --prefill-coalesce-ms 100
 ```
 
+For c64 and above use `--max-num-seqs 128 --max-cudagraph-capture-size 128`.
 `--prefill-graph-max-tokens 8192` needs `--gpu-memory-utilization 0.90`: at
 0.95 the decoder-graph capture runs out of memory.
 
@@ -91,11 +119,16 @@ Rows marked *recipe* are flag changes on the same build.
 | graph the prefill `index_topk` spans, shared SWA workspace | 70a4f893 | 40.0 | 27.1 | 21.9 | 0.9265 |
 | *recipe:* 8192-token chunks and prefill graphs | | 35.9 / 34.4 | 26.2 / 26.1 | 21.4 / 22.4 | 0.9303 |
 | narrowing layer's ratio-1 compressor in graph | 795db10c | 35.9 | 26.0 | 21.2 | 0.9340 |
+| coalesce prefills arriving during decode, 50 ms | 04e27531 | 35.2 | 24.2 | 19.4 | |
+| *recipe:* coalescing 100 ms (median of 3) | 04e27531 | 32.8 | 24.2 | 19.1 | 0.9356 |
+| *recipe:* coalescing 150 ms | 04e27531 | 34.5 | 24.1 | 19.0 | |
 
 Cells of about 1 s are within run-to-run noise (the repeated runs in the
 results table show the spread); the large steps are host-bound prefill
 fixes (graph capture of everything token-local, batching, memoized kernel
-selection) and the serving recipe.
+selection) and the serving recipe. Coalescing addresses the prefill step's
+fixed cost: before it, 73% of AgentX prefill steps at c16 carried a single
+sequence and each paid the full ~24 ms weight stream.
 
 ## Where a step's time goes now
 
@@ -128,5 +161,6 @@ Profiled at the recipe (c16, 120 steps after the cache flush, TP0):
 
 `unieinfra/bench/agentx/` (see its README): `arm_ts.sh TAG IMAGE <recipe flags>`
 (`GSM=1` adds the GSM8K gate, `CONCS="16 32 8"` reorders the cells),
-`arm_vllm.sh TAG`, and `summarize.py results vllm=TAGS ours=TAGS` for the
-medians above.
+`arm_vllm.sh TAG` (`MAX_SEQS=128` for c64/c128), and
+`summarize.py results vllm=TAGS ours=TAGS` for the medians above
+(`CONCS="1 64 128"` for the other cells).

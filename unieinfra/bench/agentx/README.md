@@ -11,6 +11,8 @@ CONCS="32 16 8" ./arm_ts.sh ours_b IMAGE <flags>        # same arm, cells reorde
 GSM=1 ./arm_ts.sh ours_gsm IMAGE <flags>                # + GSM8K gate after the cells
 ./prof_arm.sh prof IMAGE /path/to/traces <flags>        # torch traces of a c16 cell
 python summarize.py results vllm=vllm031,vllm031b ours=ours,ours_b,ours_c
+MAX_SEQS=128 CONCS="1 64 128" ./arm_vllm.sh vllm_hi        # high-concurrency cells
+CONCS="1 64 128" python summarize.py results vllm=vllm_hi ours=ours_hi
 ```
 
 - `run_cells.sh` flushes the prefix cache before each concurrency cell, warms

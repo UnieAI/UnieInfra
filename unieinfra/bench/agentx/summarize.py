@@ -20,7 +20,7 @@
 
 """Median AgentX metrics per engine and cell over repeated arms.
 
-    python summarize.py RESULTS_DIR ENGINE=TAG[,TAG...] [ENGINE=TAG,...]
+    [CONCS="1 64 128"] python summarize.py RESULTS_DIR ENGINE=TAG[,TAG...] [ENGINE=TAG,...]
 
 The first engine is the baseline the speedups are computed against. A cell
 with failed requests is reported, never silently averaged.
@@ -33,6 +33,7 @@ Each metric is computed per arm, then the median over the arms is reported.
 """
 
 import json
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -105,7 +106,7 @@ def metrics_table(results: Path, engines: list[list[str]], concs) -> None:
 def main() -> None:
     results = Path(sys.argv[1])
     engines = [arg.split("=", 1) for arg in sys.argv[2:]]
-    concs = (8, 16, 32)
+    concs = [int(c) for c in os.environ.get("CONCS", "8 16 32").split()]
     medians = {}
     print("| engine | runs | " + " | ".join(f"c{c} (s)" for c in concs) + " |")
     print("|---|---|" + "---|" * len(concs))

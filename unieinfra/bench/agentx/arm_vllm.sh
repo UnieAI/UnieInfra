@@ -2,7 +2,7 @@
 # One vLLM 0.31 arm with the baseline's arguments: launch, wait, run AgentX cells, save log, tear down.
 # VLLM_SERVER_DEV_MODE exposes /reset_prefix_cache; without it every cell after
 # the first replays a warm prefix cache.
-#   arm_vllm.sh TAG [IMAGE]
+#   arm_vllm.sh TAG [IMAGE]   (MAX_SEQS overrides --max-num-seqs, default 64)
 set -u
 TAG=$1; IMG=${2:-vllm/vllm-openai:v0.31.0}
 HERE=$(cd "$(dirname "$0")" && pwd); GPUS=${GPUS:-4,5,6,7}; R=${RESULTS:-$HERE/results}; mkdir -p "$R"
@@ -13,7 +13,7 @@ docker run -d --name $NAME --gpus "\"device=$GPUS\"" --ipc host --init --ulimit 
   -v ${MODEL_DIR:-/models}:/models:ro $IMG /models/deepseek-ai/DeepSeek-V4.1-Flash-1017 --host 0.0.0.0 --port $PORT \
   --tokenizer-mode deepseek_v41 --trust-remote-code --max-model-len 262144 --served-model-name dsv41 \
   --reasoning-parser deepseek_v41 --tensor-parallel-size 4 --enable-expert-parallel --enable-prefix-caching \
-  --max-num-seqs 64 --speculative-config '{"method":"dspark","model":"/models/deepseek-ai/DeepSeek-V4.1-Flash-1017","num_speculative_tokens":5}' >/dev/null || exit 1
+  --max-num-seqs ${MAX_SEQS:-64} --speculative-config '{"method":"dspark","model":"/models/deepseek-ai/DeepSeek-V4.1-Flash-1017","num_speculative_tokens":5}' >/dev/null || exit 1
 echo "launched $NAME $(date +%T)"
 until curl -sf -m 5 localhost:$PORT/health >/dev/null; do
   sleep 20

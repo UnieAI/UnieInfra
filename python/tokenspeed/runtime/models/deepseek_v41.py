@@ -637,12 +637,18 @@ class DeepseekV41Compressor(nn.Module):
 
     def forward(self, x, owner, positions, requests, backend, mode):
         if self.ratio == 1:
-            content, _ = self.wkv(x, block_scale=None, output_dtype=None)
-            return _attention_norm(content, self.norm), positions, requests
+            return self.project(x), positions, requests
         return self.pool(self.project(x), owner, backend, mode)
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
-        """Token-local FP32 ``[content | scores]`` projection of a ratio-2 owner."""
+        """The token-local part of the compressor.
+
+        A ratio-1 owner's normalized latent rows, or a ratio-2 owner's FP32
+        ``[content | scores]`` projection that :meth:`pool` pairs up.
+        """
+        if self.ratio == 1:
+            content, _ = self.wkv(x, block_scale=None, output_dtype=None)
+            return _attention_norm(content, self.norm)
         if not x.is_cuda:
             return F.linear(x.float(), self.wkv_wgate.weight.float())
         return dsv4_linear_fp32(
@@ -857,15 +863,11 @@ class DeepseekV41Attention(nn.Module):
             )
         return self._padded_attn_sink
 
-    def _projects_global_kv(self) -> bool:
-        """Whether the compressor input is the token-local ratio-2 projection."""
-        return self.compressor is not None and self.compressor.ratio == 2
-
     def _global_kv_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """What :meth:`_write_global_kv` consumes, projected while still captured."""
-        if self._projects_global_kv():
-            return self.compressor.project(hidden_states)
-        return hidden_states
+        if self.compressor is None:
+            return hidden_states
+        return self.compressor.project(hidden_states)
 
     def _write_global_kv(
         self, kv_input, positions, requests, backend, mode, projected=False
@@ -873,11 +875,13 @@ class DeepseekV41Attention(nn.Module):
         """Write the owner's global rows from ``kv_input``.
 
         ``kv_input`` is the hidden states, or with ``projected`` the output of
-        :meth:`_global_kv_input` (the ratio-2 compressor projection).
+        :meth:`_global_kv_input` (the compressor's token-local projection).
         """
         if self.compressor is None:
             return
-        if projected and self._projects_global_kv():
+        if projected and self.compressor.ratio == 1:
+            latent, row_positions, row_requests = kv_input, positions, requests
+        elif projected:
             latent, row_positions, row_requests = self.compressor.pool(
                 kv_input, self.layer_id, backend, mode
             )
@@ -942,7 +946,7 @@ class DeepseekV41Attention(nn.Module):
         halves (in the encoder and decoder graphs) around an eager selection.
         """
         qr, swa = self._input_projection(hidden_states)
-        self._narrowing_global_kv(hidden_states, ctx)
+        self._narrowing_global_kv(self._global_kv_input(hidden_states), ctx)
         return qr, swa
 
     def narrowed_forward(
@@ -1029,20 +1033,23 @@ class DeepseekV41Attention(nn.Module):
 
     @break_point
     def _narrowing_global_kv(
-        self, hidden_states: torch.Tensor, ctx: ForwardContext
+        self, kv_input: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
         """The decoder's global KV from every live row of the narrowing layer.
 
-        Returns an empty tensor: a break hands one tensor to the next segment.
+        ``kv_input`` comes from :meth:`_global_kv_input`, so the compressor's
+        token-local projection is captured in the graph segment. Returns an
+        empty tensor: a break hands one tensor to the next segment.
         """
         meta = _row_plan(self.layer_id, self.ced_decoder_start, ctx).source
-        (hidden_states,) = slice_to_real_tokens(meta.positions.numel(), hidden_states)
+        (kv_input,) = slice_to_real_tokens(meta.positions.numel(), kv_input)
         self._write_global_kv(
-            hidden_states,
+            kv_input,
             meta.positions,
             meta.request_indices,
             ctx.attn_backend,
             ctx.forward_mode,
+            projected=True,
         )
         return meta.positions[:0]
 

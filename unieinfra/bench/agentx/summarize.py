@@ -18,12 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Median AgentX duration per engine and cell over repeated arms.
+"""Median AgentX metrics per engine and cell over repeated arms.
 
     python summarize.py RESULTS_DIR ENGINE=TAG[,TAG...] [ENGINE=TAG,...]
 
 The first engine is the baseline the speedups are computed against. A cell
 with failed requests is reported, never silently averaged.
+
+Every request generates exactly OUTPUT_TOKENS tokens (run_cells.sh sets
+min_tokens = max_tokens = 128), so output throughput and TPOT come from that
+count, not from the driver's ``ntok`` (SSE chunks: speculative decoding
+streams several tokens per chunk). TTFT is client-side (queueing included).
+Each metric is computed per arm, then the median over the arms is reported.
 """
 
 import json
@@ -44,6 +50,56 @@ def durations(results: Path, tags: list[str], conc: int) -> list[float]:
             raise SystemExit(f"{path}: {failed} failed requests")
         values.append(run["duration_s"])
     return values
+
+
+OUTPUT_TOKENS = 128
+
+
+def percentile(values: list[float], q: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))]
+
+
+def cell_metrics(path: Path) -> dict[str, float]:
+    run = json.loads(path.read_text())
+    rows = run["rows"]
+    duration = run["duration_s"]
+    ttft = [row["ttft"] for row in rows]
+    e2e = [row["ms"] for row in rows]
+    tpot = [(row["ms"] - row["ttft"]) / (OUTPUT_TOKENS - 1) for row in rows]
+    return {
+        "duration (s)": duration,
+        "RPM": len(rows) / duration * 60,
+        "output TPS": len(rows) * OUTPUT_TOKENS / duration,
+        "TTFT mean (ms)": statistics.mean(ttft),
+        "TTFT p50 (ms)": percentile(ttft, 0.5),
+        "TTFT p90 (ms)": percentile(ttft, 0.9),
+        "TPOT mean (ms)": statistics.mean(tpot),
+        "E2E p50 (ms)": percentile(e2e, 0.5),
+        "E2E p90 (ms)": percentile(e2e, 0.9),
+    }
+
+
+def metrics_table(results: Path, engines: list[list[str]], concs) -> None:
+    for conc in concs:
+        per_engine = {}
+        for name, tags in engines:
+            runs = []
+            for tag in tags.split(","):
+                path = results / f"{tag}_c{conc}.json"
+                if path.exists():
+                    durations(results, [tag], conc)  # refuses failed cells
+                    runs.append(cell_metrics(path))
+            per_engine[name] = {
+                key: statistics.median(run[key] for run in runs) for key in runs[0]
+            }
+        names = [name for name, _ in engines]
+        print(f"\n**c{conc}** (median over arms)\n")
+        print("| metric | " + " | ".join(names) + " |")
+        print("|---|" + "---|" * len(names))
+        for key in per_engine[names[0]]:
+            cells = [f"{per_engine[name][key]:.1f}" for name in names]
+            print(f"| {key} | " + " | ".join(cells) + " |")
 
 
 def main() -> None:
@@ -71,6 +127,7 @@ def main() -> None:
             if medians[base, c] and medians[name, c]
         ]
         print(f"\n{name} vs {base}: " + ", ".join(ratios))
+    metrics_table(results, engines, concs)
 
 
 if __name__ == "__main__":

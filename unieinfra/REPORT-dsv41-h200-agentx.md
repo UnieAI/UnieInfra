@@ -17,6 +17,29 @@ seconds for 256 AgentX requests, [range]:
 | **speedup** | **1.68x** | **1.80x** | **1.93x** |
 
 GSM8K (evalscope, 1319 problems, greedy): 0.9340 on a5ba317a (CI gate 0.90).
+
+### Serving metrics
+
+Each request sends 9.7k input tokens on average (p50 10.1k, p90 11.9k,
+2.48M per cell; about 86% hit the prefix cache inside a session) and
+generates exactly 128 output tokens (`min_tokens = max_tokens = 128`).
+RPM and output TPS come from the cell's wall time. TTFT is measured at the
+client, so it includes queueing. TPOT is (E2E - TTFT) / 127. Every value is
+the median over the three arms.
+
+| c | engine | RPM | output TPS | TTFT mean / p50 / p90 (ms) | TPOT (ms) | E2E p50 / p90 (ms) |
+|---|---|---|---|---|---|---|
+| 8 | vLLM 0.31 | 266 | 568 | 338 / 221 / 509 | 11.5 | 1458 / 3121 |
+| 8 | **dsv41** | **447** | **954** | **151 / 101 / 214** | **7.2** | **953 / 1428** |
+| 16 | vLLM 0.31 | 325 | 693 | 576 / 282 / 1131 | 18.7 | 2347 / 4842 |
+| 16 | **dsv41** | **586** | **1249** | **235 / 129 / 399** | **10.9** | **1388 / 2330** |
+| 32 | vLLM 0.31 | 375 | 799 | 1207 / 410 / 2899 | 30.3 | 3834 / 13588 |
+| 32 | **dsv41** | **724** | **1545** | **481 / 170 / 1089** | **16.8** | **2142 / 6100** |
+
+Counting input tokens as well, total throughput at c16 is
+(2.48M + 33k) / 26.2 s ≈ 95.8k tok/s for dsv41, against 53.0k tok/s for
+vLLM 0.31.
+
 The 2x target (c16 ≤ 23.7 s against this median) is not reached: c16 is
 2.5 s short. Every flush before a cell returned 200 (`run_cells.sh` now
 aborts otherwise: one vLLM repeat without `VLLM_SERVER_DEV_MODE=1` got 404

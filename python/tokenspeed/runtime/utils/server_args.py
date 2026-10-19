@@ -66,26 +66,6 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_RULES,
 )
 
-# Paged-MHA architectures that run mixed prefill+decode rounds by default,
-# paired with a 4096-token prefill chunk (lower TTFT at equal throughput).
-MIXED_BATCH_DEFAULT_ARCHITECTURES = frozenset(
-    {
-        "Gemma3ForConditionalGeneration",
-        "Gemma3ForCausalLM",
-        "Gemma4ForConditionalGeneration",
-        "Gemma4ForCausalLM",
-    }
-)
-MIXED_BATCH_DEFAULT_CHUNK = 4096
-# Gemma 4 takes an 8192-token budget instead. The scheduler sizes the prefill
-# that rides beside decodes from a 4096-token reference chunk
-# (TOKENSPEED_MIXED_REF_CHUNK), so the larger budget only widens decode-free
-# rounds, e.g. a burst of short prompts prefilling in one forward.
-MIXED_BATCH_LARGE_CHUNK = 8192
-MIXED_BATCH_LARGE_CHUNK_ARCHITECTURES = frozenset(
-    {"Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"}
-)
-
 logger = get_colorful_logger(__name__)
 
 # Sampling backends whose verify runs the draft-prob chain kernel
@@ -235,31 +215,26 @@ def kernel_override_env_key(family: str, mode: str) -> str:
 
 
 def validate_context_parallel_roles(
-    *, kvp_size: int, dcp_size: int, qcp_size: int, disaggregation_mode: str
+    *,
+    kvp_size: int,
+    dcp_size: int,
+    qcp_size: int,
+    disaggregation_mode: str,
+    enable_mixed_batch: bool,
 ) -> None:
-    """Pin the three context-parallel sizes to the PD roles that serve them.
+    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
 
-    KVP (``--kv-parallel-size``) is the storage layout: a PD prefill or decode
-    engine shards its pages (a transfer edge copies only the pages both its
-    ranks own, so the two caches shard independently); an aggregated engine
-    does not, because reading a sharded cache in steady-state decode is the
-    decode role's compute below. DCP (``--decode-context-parallel-size``)
-    names that compute -- attend the owned pages, merge the partials by LSE
-    -- and is the only way a decode engine reads a sharded cache, so on the
-    decode role the two sizes come together and equal. QCP
-    (``--query-context-parallel-size``) names the prefill role's query-row
-    sharding over the same sharded pages; a prefill engine may also shard
-    its pages without it (chunked history gather).
+    Aggregated and PD decode engines require explicit DCP matching KVP.
+    Aggregated DCP requires separate prefill and decode rounds.
     """
     if dcp_size < 1:
         raise ValueError(
             f"--decode-context-parallel-size must be a positive integer, got {dcp_size}"
         )
-    if kvp_size > 1 and disaggregation_mode not in ("prefill", "decode"):
+    if kvp_size > 1 and disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(
-            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or "
-            f"decode (got {disaggregation_mode!r}): decode over sharded pages is "
-            "--decode-context-parallel-size, which serves the decode role only"
+            "--kv-parallel-size > 1 requires --disaggregation-mode null, prefill "
+            f"or decode (got {disaggregation_mode!r})"
         )
     if qcp_size > 1:
         if disaggregation_mode != "prefill":
@@ -277,10 +252,10 @@ def validate_context_parallel_roles(
                 "splits by the page owners of the whole shard group"
             )
     if dcp_size > 1:
-        if disaggregation_mode != "decode":
+        if disaggregation_mode not in ("null", "decode"):
             raise ValueError(
                 "--decode-context-parallel-size > 1 requires --disaggregation-mode "
-                f"decode (got {disaggregation_mode!r})"
+                f"null or decode (got {disaggregation_mode!r})"
             )
         if dcp_size != kvp_size:
             raise ValueError(
@@ -289,9 +264,14 @@ def validate_context_parallel_roles(
                 "group owns pages of every request, so all of them merge the "
                 "partials"
             )
-    elif kvp_size > 1 and disaggregation_mode == "decode":
+        if disaggregation_mode == "null" and enable_mixed_batch:
+            raise ValueError(
+                "Aggregated DCP does not support --enable-mixed-batch; "
+                "remove it to schedule prefill and decode separately"
+            )
+    elif kvp_size > 1 and disaggregation_mode in ("null", "decode"):
         raise ValueError(
-            "--kv-parallel-size > 1 on --disaggregation-mode decode requires "
+            f"--kv-parallel-size > 1 on --disaggregation-mode {disaggregation_mode} requires "
             f"--decode-context-parallel-size {kvp_size}: decode over sharded "
             "pages is DCP, and the launch names it explicitly"
         )
@@ -373,16 +353,6 @@ class ServerArgs:
     revision: str | None = None
     language_model_only: bool = False
 
-    # Embedding (pooling) serving: one pooled vector per request and no token
-    # generation. A server is either generative or embedding, never both.
-    # Left None, the mode is inferred from the checkpoint's
-    # sentence-transformers pooling config (1_Pooling/config.json).
-    is_embedding: bool | None = None
-    # Override the pooling reduction / L2 normalization the checkpoint declares.
-    # Only needed for a checkpoint that ships no sentence-transformers config.
-    pooling_type: str | None = None
-    pooling_normalize: bool | None = None
-
     # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
     # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
     # output sockets) over the msgpack wire. Default OFF;
@@ -406,14 +376,7 @@ class ServerArgs:
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
-    # None = auto: on for validated paged-MHA architectures (see
-    # MIXED_BATCH_DEFAULT_ARCHITECTURES), off otherwise.
-    enable_mixed_batch: bool | None = None
-    # Hold new generate requests up to this long (ms) while other requests
-    # are decoding, so requests arriving close together prefill in one step.
-    # A prefill step costs a fixed weight stream plus a per-token part; on
-    # DeepSeek-V4.1 H200 TP4 about 24 ms + 17.5 ms per 1k tokens. 0 is off.
-    prefill_coalesce_ms: float = 0.0
+    enable_mixed_batch: bool = False
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
     # JSON on the CLI, normalized once to generic runtime options.
@@ -597,9 +560,9 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # KV parallelism: shard the full-history KV pages page-cyclically over a
-    # consecutive subgroup of attention TP (1 = off; PD roles only).
+    # consecutive subgroup of attention TP (1 = off).
     kv_parallel_size: int = 1
-    # Decode context parallelism on the PD decode role: attend the owned
+    # Decode context parallelism in aggregated or PD decode engines: attend owned
     # pages and merge the partials across the KVP group (1 = off; equals
     # kv_parallel_size when on). Names the compute; the backends key the DCP
     # path on the mapping's kvp_size, which the drafter's steps on a sharded
@@ -965,38 +928,6 @@ class ServerArgs:
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
-    def _mixed_batch_by_default(self) -> bool:
-        """Whether mixed prefill+decode batches are on when not set explicitly.
-
-        Only architectures whose attention runs on the paged MHA backend (which
-        splits a MIXED round into extend rows and decode rows) and that were
-        validated end to end opt in. Features that reject mixed rounds
-        (PD disaggregation, prefill context parallel, speculative decoding)
-        keep the old default.
-        """
-        if self.disaggregation_mode != "null" or self.speculative_algorithm:
-            return False
-        attn = getattr(self.mapping, "attn", None)
-        if getattr(attn, "qcp_size", 1) > 1:
-            return False
-        try:
-            from tokenspeed.runtime.utils.hf_transformers_utils import get_config
-
-            config = get_config(
-                self.model,
-                trust_remote_code=self.trust_remote_code,
-                revision=self.revision,
-            )
-        except Exception:
-            return False
-        archs = getattr(config, "architectures", None) or []
-        self._mixed_batch_chunk = (
-            MIXED_BATCH_LARGE_CHUNK
-            if any(a in MIXED_BATCH_LARGE_CHUNK_ARCHITECTURES for a in archs)
-            else MIXED_BATCH_DEFAULT_CHUNK
-        )
-        return any(a in MIXED_BATCH_DEFAULT_ARCHITECTURES for a in archs)
-
     def resolve_memory_and_scheduling(self):
         if current_platform().is_amd:
             gpu_mem = get_amdgpu_memory_capacity()
@@ -1009,14 +940,6 @@ class ServerArgs:
         # Set GPU memory utilization.
         if self.gpu_memory_utilization is None:
             self.gpu_memory_utilization = 0.95
-
-        # Mixed prefill+decode default (auto) and the chunk size it pairs with.
-        if self.enable_mixed_batch is None:
-            self.enable_mixed_batch = self._mixed_batch_by_default()
-            if self.enable_mixed_batch and self.chunked_prefill_size is None:
-                self.chunked_prefill_size = getattr(
-                    self, "_mixed_batch_chunk", MIXED_BATCH_DEFAULT_CHUNK
-                )
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
@@ -1227,6 +1150,7 @@ class ServerArgs:
             dcp_size=self.decode_context_parallel_size,
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
+            enable_mixed_batch=self.enable_mixed_batch,
         )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
@@ -2448,28 +2372,6 @@ class ServerArgs:
             help="If set, skip init tokenizer and pass input_ids in generate request",
         )
         parser.add_argument(
-            "--is-embedding",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.is_embedding,
-            help="Serve this checkpoint as an embedding model: one pooled "
-            "vector per request, no token generation. Inferred from the "
-            "checkpoint's 1_Pooling/config.json when unset.",
-        )
-        parser.add_argument(
-            "--pooling-type",
-            type=str,
-            choices=["last", "cls", "mean"],
-            default=ServerArgs.pooling_type,
-            help="Override the pooling reduction. Needed only for an "
-            "embedding checkpoint that ships no sentence-transformers config.",
-        )
-        parser.add_argument(
-            "--pooling-normalize",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.pooling_normalize,
-            help="Override whether pooled embeddings are L2-normalized.",
-        )
-        parser.add_argument(
             "--language-model-only",
             action="store_true",
             default=ServerArgs.language_model_only,
@@ -2660,27 +2562,8 @@ class ServerArgs:
             action="store_true",
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
-            help="Allow the scheduler to issue prefill and decode requests in the same "
-            "iteration. Default: on (with --chunked-prefill-size 4096 unless set) for "
-            "validated paged-MHA architectures such as Gemma 3, off otherwise.",
-        )
-        parser.add_argument(
-            "--disable-mixed-batch",
-            action="store_false",
-            dest="enable_mixed_batch",
-            help="Never mix prefill and decode requests in one iteration.",
-        )
-        parser.add_argument(
-            "--prefill-coalesce-ms",
-            type=float,
-            default=ServerArgs.prefill_coalesce_ms,
-            help=(
-                "Hold new requests up to this many milliseconds while other "
-                "requests are decoding, so requests that arrive close together "
-                "prefill in one step and pay the step's fixed cost once "
-                "(0 = admit immediately). A request arriving while nothing "
-                "decodes is never held."
-            ),
+            help="Allow the scheduler to issue prefill and decode requests in the "
+            "same iteration. Not supported with aggregated DCP.",
         )
         parser.add_argument(
             "--prefix-granularity",
@@ -3783,9 +3666,9 @@ class ServerArgs:
             help="KV parallelism (KVP): shard full-history KV pages (MLA/DSA "
             "latent, DeepSeek V4 compressed KV) cyclically over a consecutive "
             "subgroup of attention TP, each rank storing one shard of every "
-            "request's pages. Must divide --attn-tp-size. PD roles only: the "
-            "decode role reads the shards with --decode-context-parallel-size "
-            "(required there, equal to this), the prefill role writes them and "
+            "request's pages. Must divide --attn-tp-size. Aggregated and PD "
+            "decode engines require equal --decode-context-parallel-size; "
+            "the PD prefill role writes the shards and "
             "may split its query rows over them with "
             "--query-context-parallel-size. Works with the Host KVStore and the "
             "retraction snapshot pool; not with L3 storage "
@@ -3795,12 +3678,11 @@ class ServerArgs:
             "--decode-context-parallel-size",
             type=int,
             default=ServerArgs.decode_context_parallel_size,
-            help="Decode context parallelism (DCP) on the PD decode role: every "
+            help="Decode context parallelism (DCP) in aggregated or PD decode engines: every "
             "rank attends the KV pages it owns under --kv-parallel-size and the "
             "partials are merged across the KVP group by their log-sum-exp. "
-            "Requires --disaggregation-mode decode and must equal "
-            "--kv-parallel-size, which requires it in turn on that role (a "
-            "sharded cache has no other decode).",
+            "Requires --disaggregation-mode null or decode and must equal "
+            "--kv-parallel-size. Aggregated DCP does not support --enable-mixed-batch.",
         )
         parser.add_argument(
             "--attn-head-tp-size",

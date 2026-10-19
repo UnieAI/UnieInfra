@@ -467,7 +467,7 @@ Order matters: numeric equivalence, then no perf regression, then win.
    only; end-to-end not measured"). An unmeasured claim is a follow-up, not a
    result.
 
-## 7. The loop, as run on DeepSeek-V4.1 (H200 TP4, AgentX: 1.0x -> 1.8x vLLM)
+## 7. The loop, as run on DeepSeek-V4.1 (H200 TP4, AgentX: 1.0x -> 1.95x vLLM)
 
 The catalogue above says *what* can be done; this is the order that decided
 *which*, step by step, with the evidence that closed each step. Run it as a
@@ -505,6 +505,18 @@ loop: one change per iteration, each one measured end to end before the next.
    this killed in-graph prefill attention (neutral), FP8 dense GEMMs (slower),
    EPLB (< 2%), mHC fusion (the cost was waiting), MoE TP (slower), mixed
    batches (slower), GIL and NUMA knobs (noise).
+   - What survived the bounding was the *scheduling* of the bound: once a
+     step is weight-stream bound it has a large fixed cost, so the lever is
+     how many tokens share it. Fit step time = fixed + per-token from the
+     trace (V4.1 prefill: 24 ms + 17.5 ms / 1k tokens), count steps with one
+     sequence (73% at c16), and replay arrivals to estimate what holding
+     requests N ms would merge (6-10%). `--prefill-coalesce-ms 100`
+     (04e27531) measured 8-11% at c16-c64, GSM8K unchanged, at the cost of
+     up to N ms TTFT at low load. Hold only while something decodes, and let
+     any non-generate message flush the held requests to keep ordering.
+   - Sweep concurrency past the expected knee (c1 to c128, both engines at
+     the same sequence cap) before claiming a speedup: both engines
+     saturated around c64, c1 isolated TTFT from decode (TPOT at parity).
 7. **Close each step with the same three numbers:** the AgentX median of
    repeated arms, GSM8K on the same server, and the unit tests that cover the
    change (failures compared against the merge base, never "they were already

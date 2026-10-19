@@ -417,6 +417,11 @@ class ServerArgs:
     # step prefills the same prefix once per request. Measured cold vs warm
     # TTFT p50 on gemma-4-31B / RAG c=64: 4,022 ms against 1,837 ms.
     max_cold_prefills: int = 0
+    # Hold new generate requests up to this long (ms) while other requests
+    # are decoding, so requests arriving close together prefill in one step.
+    # A prefill step costs a fixed weight stream plus a per-token part; on
+    # DeepSeek-V4.1 H200 TP4 about 24 ms + 17.5 ms per 1k tokens. 0 is off.
+    prefill_coalesce_ms: float = 0.0
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
     # JSON on the CLI, normalized once to generic runtime options.
@@ -2674,6 +2679,18 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+        )
+        parser.add_argument(
+            "--prefill-coalesce-ms",
+            type=float,
+            default=ServerArgs.prefill_coalesce_ms,
+            help=(
+                "Hold new requests up to this many milliseconds while other "
+                "requests are decoding, so requests that arrive close together "
+                "prefill in one step and pay the step's fixed cost once "
+                "(0 = admit immediately). A request arriving while nothing "
+                "decodes is never held."
+            ),
         )
         parser.add_argument(
             "--max-cold-prefills",

@@ -10,6 +10,7 @@ from tokenspeed.runtime.layers.moe.loader import (
     ExpertWeightPlanEntry,
     FusedExpertWeightPlanEntry,
     MoECheckpointLoader,
+    MoECheckpointLoadError,
     _build_default_expert_plan,
     _ExpertPlanIndex,
     build_moe_checkpoint_loader,
@@ -131,6 +132,59 @@ def test_mtp_fp8_block_scales_load_into_local_ep_expert(
     assert loader.is_expert_checkpoint_weight(
         "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv"
     )
+
+
+def test_release_params_removes_the_loaders_hold_on_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_moe_plan(weight_dtype: str, **kwargs) -> dict:
+        return {
+            "solution": "flashinfer_trtllm",
+            "support_routing": False,
+            "supports_deferred_finalize": True,
+        }
+
+    trtllm_backend = type("TrtllmBackend", (), {"value": "flashinfer_trtllm"})()
+    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: trtllm_backend)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
+    quant_config = ModelOptMixedConfig(
+        quantized_layers={
+            "mtp.layers.0.mlp.experts": "FP8_BLOCK_SCALES",
+        }
+    )
+    layer = MoELayer(
+        top_k=2,
+        num_experts=4,
+        hidden_size=256,
+        intermediate_size=640,
+        quant_config=quant_config,
+        layer_index=0,
+        prefix="mtp.layers.0.mlp",
+        ep_rank=1,
+        ep_size=2,
+    )
+    params = {
+        f"model.layers.0.mlp.experts.{name}": param
+        for name, param in layer.named_parameters()
+    }
+    loader = build_moe_checkpoint_loader(
+        params_dict=params,
+        expert_schema=ExpertCheckpointSchema(),
+        num_experts=4,
+        ep_rank=1,
+        ep_size=2,
+    )
+    prefix = "model.layers.0.mlp.experts.2"
+    down_scale = torch.full((2, 5), 4.0, dtype=torch.bfloat16)
+    loader.load(f"{prefix}.down_proj.weight_scale_inv", down_scale)
+
+    loader.release_params()
+
+    # The map is the caller's dict: releasing it must drop the loader's only
+    # reference, so the post-load parameter swap can free the loader layout.
+    assert params == {}
+    with pytest.raises(MoECheckpointLoadError, match="not found"):
+        loader.load(f"{prefix}.down_proj.weight_scale_inv", down_scale)
 
 
 @pytest.mark.parametrize("ep_rank", [0, 1])

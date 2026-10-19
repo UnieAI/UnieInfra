@@ -2192,6 +2192,11 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             )
         self.checkpoint_load_report = {"loaded": len(loaded), "skipped": dict(skipped)}
         logger.info(f"V4.1 checkpoint coverage: {self.checkpoint_load_report!s}")
+        # The post-load hooks swap MoE parameters for kernel layouts. Release
+        # the loader's name-to-parameter map first: it still references the
+        # loader-layout copy of every experts parameter, which would otherwise
+        # stay resident on the device beside its replacement.
+        moe_loader.release_params()
         self.post_load_weights()
 
     def _load_missing_engram_tables(self, loaded: set[str]) -> None:

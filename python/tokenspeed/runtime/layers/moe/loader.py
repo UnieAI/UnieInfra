@@ -601,6 +601,17 @@ class MoECheckpointLoader:
 
         self._raise_unmatched(name)
 
+    def release_params(self) -> None:
+        """Drop the shared name-to-parameter map once loading is complete.
+
+        The map is the caller's dict, holding every parameter of the model. The
+        post-load hooks replace MoE parameters with kernel layouts, so each
+        replaced loader-layout copy stays referenced here until the map is
+        released -- a second copy of the expert weights, held on the device.
+        Call this after the last :meth:`load` and before those hooks.
+        """
+        self._params_dict.clear()
+
 
 def build_moe_checkpoint_loader(
     *,

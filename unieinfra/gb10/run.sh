@@ -48,9 +48,14 @@ CONCURRENCY="${GB10_CONCURRENCY:-1 4 16 64}"
 # Prompts per benchmark point: 4 per concurrent slot, at least this many. A
 # 27B dense decode is ~5 tok/s per stream here, so c=1 sets the run time.
 BENCH_MIN_PROMPTS="${GB10_BENCH_MIN_PROMPTS:-8}"
-# Engine flags for level 2. The default matches the GB10 CI model tests
-# (test/ci/eval/*.yaml) so a manual run reproduces what CI serves.
-SERVE_ARGS="${GB10_SERVE_ARGS:---trust-remote-code --attention-backend triton --moe-backend triton --chunked-prefill-size 8192 --max-model-len 8192 --max-num-seqs 64 --kv-cache-dtype fp8_e4m3}"
+# Engine flags for level 2: the GB10 CI model-test flags (test/ci/eval/*.yaml)
+# with the two changes GB10 needs to start at all.
+# - No `--kv-cache-dtype fp8_e4m3`: an fp8 cache makes the runtime cast q to
+#   fp8, and no mha_extend_with_kvcache kernel on sm_12x accepts fp8 q.
+# - `--disable-kvstore --retraction-snapshot-ratio 0`: both host tiers are on by
+#   default and sized off the device cache (103 GB for Qwen3.8-27B), but on GB10
+#   host memory is the same memory the device cache already holds.
+SERVE_ARGS="${GB10_SERVE_ARGS:---trust-remote-code --attention-backend triton --moe-backend triton --chunked-prefill-size 8192 --max-model-len 8192 --max-num-seqs 64 --disable-kvstore --retraction-snapshot-ratio 0}"
 # `check` only: container memory cap, and the host MemAvailable floor below
 # which the watchdog kills the test.
 CHECK_MEM_GB="${GB10_CHECK_MEM_GB:-5}"

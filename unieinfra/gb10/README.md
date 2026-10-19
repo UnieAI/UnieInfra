@@ -47,7 +47,8 @@ plugins, and runs a set of kernel tests. Safe beside the resident service.
 **Level 2, `window`.** Stops the resident service if it is running, and then
 restarts it on every exit path; a service stopped by hand stays stopped. Serves
 the model (default Qwen3.8-27B, a BF16 GDN hybrid) with `tokenspeed serve` on
-`127.0.0.1:18080` with the same engine flags as the GB10 CI model tests, asks
+`127.0.0.1:18080` with the GB10 CI model-test flags less fp8 KV and the host
+cache tiers (see `SERVE_ARGS` in `run.sh` for why), asks
 one temperature-0 question twice with thinking off, then load-tests the server with `vllm bench serve` (from the
 vLLM image already on the box) at concurrency 1/4/16/64 on two shapes: unique
 1024-token prompts, and a shared 1024-token prefix plus 256 new tokens.

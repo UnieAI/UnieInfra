@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import sys
 import threading
 import types
@@ -63,9 +64,26 @@ def _install_fake_flashinfer(monkeypatch, *, metadata):
 
     autotuner_module = types.ModuleType("flashinfer.autotuner")
 
+    def flashinfer_search_cache(
+        self,
+        custom_op,
+        runners,
+        input_shapes,
+        tuning_config,
+        inputs=None,
+        *,
+        require_profiling_policy=False,
+    ):
+        del self, custom_op, runners, input_shapes, tuning_config, inputs
+        del require_profiling_policy
+        return (False, 0, -1, None)
+
     class AutoTuner:
         choose_one = Mock()
-        search_cache = Mock()
+        # spec keeps the real keyword-only surface, so the wrapper's signature
+        # probe sees what flashinfer actually accepts.
+        search_cache = Mock(spec=flashinfer_search_cache)
+        search_cache.__signature__ = inspect.signature(flashinfer_search_cache)
 
         @staticmethod
         def get():
@@ -462,6 +480,51 @@ def test_partial_rank_cache_hit_profiles_on_every_rank(monkeypatch):
         ) == (False, 0, -1, None)
     assert search.call_args.kwargs["require_profiling_policy"] is True
     assert tuner.is_tuning_mode
+
+
+def test_older_flashinfer_search_cache_is_called_without_the_policy(
+    monkeypatch,
+) -> None:
+    """0.7.1rc2's search_cache() takes no profiling policy keyword."""
+
+    def search_cache(
+        self, custom_op, runners, input_shapes, tuning_config, inputs=None
+    ):
+        del self, custom_op, runners, input_shapes, tuning_config, inputs
+        return (True, 0, 3, None)
+
+    autotuner_module = types.ModuleType("flashinfer.autotuner")
+
+    class AutoTuner:
+        pass
+
+    original = Mock(spec=search_cache)
+    original.__signature__ = inspect.signature(search_cache)
+    original.return_value = (True, 0, 3, None)
+    AutoTuner.search_cache = original
+    autotuner_module.AutoTuner = AutoTuner
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", autotuner_module)
+    monkeypatch.setattr(tuning, "_autotuner", autotuner_module)
+
+    tuner = types.SimpleNamespace(
+        _lock=threading.RLock(),
+        is_tuning_mode=False,
+        _blocklist=types.SimpleNamespace(filter=lambda *args: []),
+    )
+    with tuning._reuse_autotune_cache():
+        assert AutoTuner.search_cache(
+            tuner, "probe", [object()], ((1, 128),), object()
+        ) == (True, 0, 3, None)
+        assert "require_profiling_policy" not in original.call_args.kwargs
+        with pytest.raises(TypeError, match="accepts no profiling policy"):
+            AutoTuner.search_cache(
+                tuner,
+                "probe",
+                [object()],
+                ((1, 128),),
+                object(),
+                require_profiling_policy=True,
+            )
 
 
 def test_save_keeps_rank_specific_tactics(monkeypatch, tmp_path):

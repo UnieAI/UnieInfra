@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -68,6 +69,12 @@ def _reuse_autotune_cache():
         return
     AutoTuner = _autotuner.AutoTuner
     original_search = AutoTuner.search_cache
+    # Later flashinfer releases let the caller demand a profiling policy; older
+    # ones (0.7.1rc2 among them) do not accept the keyword. Ask the installed
+    # function rather than the version string, and forward only what it takes.
+    forwards_profiling_policy = (
+        "require_profiling_policy" in inspect.signature(original_search).parameters
+    )
 
     def search(
         tuner,
@@ -79,6 +86,14 @@ def _reuse_autotune_cache():
         *,
         require_profiling_policy: bool = False,
     ):
+        if require_profiling_policy and not forwards_profiling_policy:
+            raise TypeError(
+                "the installed flashinfer AutoTuner.search_cache() accepts no "
+                "profiling policy; the caller asked for one"
+            )
+        lookup_kwargs = {"inputs": inputs}
+        if forwards_profiling_policy:
+            lookup_kwargs["require_profiling_policy"] = require_profiling_policy
         with tuner._lock:
             # FI 0.7 skips persisted entries for cold-L2 tuning. Use serving
             # lookup rules, then restore tuning so cache misses still profile.
@@ -91,8 +106,7 @@ def _reuse_autotune_cache():
                     runners,
                     input_shapes,
                     tuning_config,
-                    inputs=inputs,
-                    require_profiling_policy=require_profiling_policy,
+                    **lookup_kwargs,
                 )
             finally:
                 tuner.is_tuning_mode = was_tuning

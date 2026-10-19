@@ -32,9 +32,14 @@ git archive --format=tar HEAD -- . ':(exclude)legacy' |
     chmod +x ~/$REMOTE/src/unieinfra/gb10/*.sh"
 echo "synced source $REV to $HOST:~/$REMOTE/src"
 
-if compgen -G "$WHEELS/*.whl" >/dev/null; then
-  wrev="$(cat "$WHEELS/.gb10-rev" 2>/dev/null || echo norev)"
-  [ "$wrev" = "$REV" ] || echo "sync.sh: wheels are from $wrev, source is $REV" >&2
+wrev="$(cat "$WHEELS/.gb10-rev" 2>/dev/null || echo norev)"
+if compgen -G "$WHEELS/*.whl" >/dev/null && [ "$wrev" != "$REV" ]; then
+  # run.sh installs whatever wheels it finds, so stale ones would silently
+  # replace this source. Clear the remote set; run.sh then builds from source.
+  ssh "$HOST" "rm -rf ~/$REMOTE/wheels"
+  echo "sync.sh: wheels are from $wrev, source is $REV; not sending them" >&2
+  echo "  (run build_wheels.sh, or let run.sh build from source on the GB10)" >&2
+elif compgen -G "$WHEELS/*.whl" >/dev/null; then
   COPYFILE_DISABLE=1 tar -c -C "$WHEELS" . |
     ssh "$HOST" "set -e
       rm -rf ~/$REMOTE/wheels.new

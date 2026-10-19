@@ -86,20 +86,28 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
 from tokenspeed_kernel.ops.gemm import (
     dsv4_linear_fp32,
     grouped_bf16_projection,
+    grouped_bf16_projection_quantize_fp8,
     mm,
     prepare_mxfp8_weight_scales,
 )
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
+    silu_and_mul_quantize_fp8_group32,
 )
+from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
+    all_reduce,
+    all_reduce_mhc_post,
+    can_acquire_all_reduce_outputs,
+)
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -112,6 +120,7 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
 )
@@ -389,7 +398,22 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         activation: nn.Module,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Fused activation quantizers do not implement the reference amax floor.
+        if (
+            isinstance(activation, SiluAndMul)
+            and self.prepared_weight_scales is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x.stride(-1) == 1
+        ):
+            # The canonical path quantizes silu_and_mul's BF16 output with the
+            # reference rounding anyway; one kernel does both.
+            codes, scales = silu_and_mul_quantize_fp8_group32(
+                x, activation.swiglu_limit
+            )
+            return self.apply(layer, codes, bias, scales, x.dtype)
+        # Other fused activation quantizers do not implement the reference
+        # amax floor.
         return self.apply(layer, activation(x), bias)
 
 
@@ -636,6 +660,42 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     return mhc_apply_pre(
         x, pre, norm_weight=norm.weight, norm_eps=norm.variance_epsilon
     )
+
+
+def _all_reduce_output(
+    shape: tuple[int, int], like: torch.Tensor, group
+) -> torch.Tensor | None:
+    """Memory the all-reduce over ``group`` reads without staging, or None."""
+    if not can_acquire_all_reduce_outputs((shape,), like, group):
+        return None
+    return acquire_all_reduce_outputs((shape,), like, group)[0]
+
+
+def _reduce_hc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    group,
+) -> torch.Tensor:
+    """mHC post of x, all-reduced over group first unless group is None."""
+    if group is not None:
+        fused = (
+            all_reduce_mhc_post(x, residual, post, comb, group) if x.is_cuda else None
+        )
+        if fused is not None:
+            return fused
+        x = all_reduce(x, group=group, backend=None, op=torch.distributed.ReduceOp.SUM)
+    return v41_hc_post(x, residual, post, comb)
+
+
+def _v41_hc_input_fp8(
+    x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """HC input, plus its group-32 FP8 codes and scales on CDNA4 (else None)."""
+    if not (x.is_cuda and current_platform().is_cdna4):
+        return _v41_hc_input(x, pre, norm), None, None
+    return mhc_apply_pre_quantize_fp8(x, pre, norm.weight, norm.variance_epsilon)
 
 
 class DeepseekV41Compressor(nn.Module):
@@ -990,7 +1050,11 @@ class DeepseekV41Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None = None,
+        hidden_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
+<<<<<<< HEAD
         # Under a prefill capture only the cache writes, selection and attention
         # stay an eager break; the token-local projections around them are
         # captured into the graph segments. The narrowing layer changes the row
@@ -1204,6 +1268,13 @@ class DeepseekV41Attention(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
+=======
+        """Return the attention output, reducing its TP partial when requested.
+
+        hidden_codes/hidden_scales optionally carry hidden_states already
+        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
+        """
+>>>>>>> 5794e514 (perf(dsv41): apply various fusion optimizations (#2480))
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
@@ -1212,8 +1283,14 @@ class DeepseekV41Attention(nn.Module):
         # Prefill buckets pad token-local compute; cache writes and selection
         # must use only the live rows, including the decode suffix of a mixed batch.
         if current_forward_ctx() is not None:
-            positions, hidden_states = slice_to_real_tokens(
-                meta.positions.numel(), positions, hidden_states
+            positions, hidden_states, hidden_codes, hidden_scales = (
+                slice_to_real_tokens(
+                    meta.positions.numel(),
+                    positions,
+                    hidden_states,
+                    hidden_codes,
+                    hidden_scales,
+                )
             )
         if (
             positions.shape != meta.positions.shape
@@ -1225,12 +1302,16 @@ class DeepseekV41Attention(nn.Module):
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
             self._write_global_kv(hidden_states, positions, requests, backend, mode)
             return hidden_states[:0]
-        qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
+        qkv, _ = self.wq_a_wkv(
+            hidden_states if hidden_codes is None else hidden_codes,
+            block_scale=hidden_scales,
+            output_dtype=None if hidden_codes is None else hidden_states.dtype,
+        )
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         if (
             qr.is_cuda
             and qr.dtype == torch.bfloat16
-            and current_platform().is_nvidia
+            and (current_platform().is_nvidia or current_platform().is_cdna4)
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
             qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
@@ -1337,7 +1418,7 @@ class DeepseekV41Attention(nn.Module):
             if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
                 self.rotary_emb._prepare_cache(swa.device)
                 swa_rope_cache = self.rotary_emb.cos_sin_cache
-                if current_platform().is_blackwell:
+                if current_platform().is_blackwell or current_platform().is_cdna4:
                     swa_norm_weight = self.kv_norm.weight
                 else:
                     swa = _attention_norm(swa, self.kv_norm)
@@ -1356,6 +1437,12 @@ class DeepseekV41Attention(nn.Module):
             if record.candidates is not None:
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
+        # CDNA4 rotates the attention output back inside the attention kernel.
+        out_rope_cache = (
+            self.rotary_emb.inverse_cos_sin_cache
+            if q.is_cuda and current_platform().is_cdna4
+            else None
+        )
         out = backend.forward_v41(
             q,
             swa,
@@ -1371,8 +1458,45 @@ class DeepseekV41Attention(nn.Module):
             swa_rope_cache=swa_rope_cache,
             swa_norm_weight=swa_norm_weight,
             swa_norm_eps=self.kv_norm.variance_epsilon,
+            out_rope_cache=out_rope_cache,
         )
+<<<<<<< HEAD
         return self._output_projection(out[:, : self.n_local_heads], positions)
+=======
+        out = out[:, : self.n_local_heads]
+        if out_rope_cache is None:
+            out = self.rotary_emb.apply_owned(out, positions, True)
+        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
+        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+        target = None
+        if self.mapping.attn.has_tp:
+            target = _all_reduce_output(
+                (grouped.shape[0], self.wo_b.output_size),
+                grouped,
+                self.mapping.attn.tp_group,
+            )
+        method = self.wo_b.quant_method
+        if (
+            grouped.is_cuda
+            and current_platform().is_cdna4
+            and isinstance(method, _ReferenceFp8LinearMethod)
+            and method.prepared_weight_scales is None
+        ):
+            # wo_b's group-32 activation quantization runs in wo_a's epilogue.
+            codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
+            out, _ = self.wo_b(codes, scale=scales, out=target)
+        else:
+            out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+            out, _ = self.wo_b(out, scale=None, out=target)
+        if self.mapping.attn.has_tp and reduce_output:
+            out = all_reduce(
+                out,
+                group=self.mapping.attn.tp_group,
+                backend=None,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        return out
+>>>>>>> 5794e514 (perf(dsv41): apply various fusion optimizations (#2480))
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
@@ -1512,7 +1636,7 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def forward(self, hidden_states, pre_mix, positions, image_mask, ctx):
         if hidden_states.shape[0] == 0:
-            self._forward_ffn(hidden_states[:, 0, :], image_mask, ctx)
+            self._forward_ffn(hidden_states[:, 0, :], image_mask, ctx, False)
             return hidden_states, pre_mix
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         residual = hidden_states
@@ -1520,10 +1644,10 @@ class DeepseekV41DecoderLayer(nn.Module):
             # HC input is needed by the global producer; output mixes and
             # every decoder consumer are unnecessary for an open chunk.
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
-            self.attn(positions, x, ctx)
+            self.attn(positions, x, ctx, reduce_output=True)
             if self.ffn.owns_ep_communication:
                 self._forward_ffn(
-                    x[:0], None if image_mask is None else image_mask[:0], ctx
+                    x[:0], None if image_mask is None else image_mask[:0], ctx, False
                 )
             return residual[:0], pre_mix[:0]
         overlap = (
@@ -1550,8 +1674,22 @@ class DeepseekV41DecoderLayer(nn.Module):
             if overlap:
                 for tensor in (attn_pre, post, comb):
                     tensor.record_stream(consumer)
-            x = _v41_hc_input(residual, pre_mix, self.attn_norm)
-            x = self.attn(positions, x, ctx)
+            if isinstance(self.attn.wq_a_wkv.quant_method, _ReferenceFp8LinearMethod):
+                x, codes, scales = _v41_hc_input_fp8(residual, pre_mix, self.attn_norm)
+            else:
+                x, codes, scales = (
+                    _v41_hc_input(residual, pre_mix, self.attn_norm),
+                    None,
+                    None,
+                )
+            x = self.attn(
+                positions,
+                x,
+                ctx,
+                reduce_output=False,
+                hidden_codes=codes,
+                hidden_scales=scales,
+            )
         if rows.keep_rows is not None:
             # Keep mHC's original split-K shape before selecting the tail.
             residual, post, comb, attn_pre = (
@@ -1560,7 +1698,13 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        hidden_states = v41_hc_post(x, residual, post, comb)
+        hidden_states = _reduce_hc_post(
+            x,
+            residual,
+            post,
+            comb,
+            self.attn.mapping.attn.tp_group if self.attn.mapping.attn.has_tp else None,
+        )
         residual = hidden_states
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
@@ -1579,9 +1723,10 @@ class DeepseekV41DecoderLayer(nn.Module):
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-            x = self._forward_ffn(x, image_mask, ctx)
-        return v41_hc_post(x, residual, post, comb), ffn_pre
+            x, group = self._forward_ffn(x, image_mask, ctx, True)
+        return _reduce_hc_post(x, residual, post, comb, group), ffn_pre
 
+<<<<<<< HEAD
     def narrowing_head(
         self, residual: torch.Tensor, pre_mix: torch.Tensor, ctx: ForwardContext
     ) -> list[torch.Tensor]:
@@ -1630,11 +1775,20 @@ class DeepseekV41DecoderLayer(nn.Module):
         return v41_hc_post(x, residual, post, comb), ffn_pre
 
     def _forward_ffn(self, x, image_mask, ctx):
+=======
+    def _forward_ffn(self, x, image_mask, ctx, defer_reduce):
+        """MoE output after its communication.
+
+        With defer_reduce, return (output, group): a pending plain all-reduce
+        over group is left to the caller, or group is None when the output is
+        final.
+        """
+>>>>>>> 5794e514 (perf(dsv41): apply various fusion optimizations (#2480))
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
         if self.ffn.owns_ep_communication:
             counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
-            return self.ffn(
+            out = self.ffn(
                 x,
                 image_mask,
                 sum(counts),
@@ -1642,11 +1796,22 @@ class DeepseekV41DecoderLayer(nn.Module):
                 ctx=ctx if self.ffn.use_mega_moe else None,
                 comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
             )
+            return (out, None) if defer_reduce else out
         x = self.comm_manager.pre_mlp_comm(x, ctx)
         total, maximum = self.comm_manager.get_num_tokens(ctx)
-        x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
+        all_reduced = self.comm_manager.moe_output_all_reduced(ctx)
+        group = self.comm_manager.mapping.moe.tp_ep_group
+        target = None
+        if x.shape[0] and all_reduced:
+            # The routed + shared sum lands where the all-reduce reads it.
+            target = _all_reduce_output(tuple(x.shape), x, group)
+        x = self.ffn(
+            x, image_mask, total, maximum, ctx=None, comm_manager=None, out=target
+        )
+        if defer_reduce and all_reduced:
+            return x, group
         x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
-        return x
+        return (x, None) if defer_reduce else x
 
 
 def _ced_decoder_start(config) -> int:

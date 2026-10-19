@@ -54,10 +54,14 @@ from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQu
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.registry import KernelRegistry
 <<<<<<< HEAD
+<<<<<<< HEAD
 from tokenspeed_kernel.selection import resolve_kernel_override, select_kernel
 =======
 from tokenspeed_kernel.selection import select_kernel
 >>>>>>> d6c64a4b (fix(dsv41): address the post-merge review of the DSV4.1 performance PRs (#2477))
+=======
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+>>>>>>> 5794e514 (perf(dsv41): apply various fusion optimizations (#2480))
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -77,7 +81,11 @@ __all__ = [
     "index_query_rope_weights",
     "index_query_rope_quant",
     "selected_attention",
+<<<<<<< HEAD
     "prefill_indices",
+=======
+    "selected_attention_rope",
+>>>>>>> 5794e514 (perf(dsv41): apply various fusion optimizations (#2480))
     "new_attention_schedule",
     "index_score",
     "index_topk",
@@ -467,6 +475,7 @@ def selected_attention(
     )
 
 
+<<<<<<< HEAD
 def prefill_indices(
     swa_indices: torch.Tensor,
     logical_rows: torch.Tensor,
@@ -518,6 +527,70 @@ def prefill_indices(
         return out
     return _kernel("prefill_indices", swa_indices)(
         swa_indices, logical_rows, global_slots, history_base, rows, out
+=======
+def selected_attention_rope(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    global_cache: torch.Tensor | None,
+    global_slots: torch.Tensor | None,
+    global_lens: torch.Tensor | None,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    schedule: object | None,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Paged decode ``selected_attention`` followed by ``rope_inplace`` on its output.
+
+    Arguments follow ``selected_attention`` (paged inputs, query_chunk_size 256)
+    and ``rope_inplace``. A kernel that rotates the output in its epilogue is
+    used when one is registered; otherwise the two ops run back to back.
+    """
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsv41_selected_attention_rope",
+            format_signature(x=dense_tensor_format(q.dtype)),
+            features=None,
+            platform=None,
+            traits={},
+            solution=None,
+            override=None,
+        )
+    except NoKernelFoundError:
+        out = selected_attention(
+            q,
+            swa_cache,
+            swa_slots,
+            swa_lens,
+            global_cache,
+            global_slots,
+            global_lens,
+            attn_sink,
+            softmax_scale,
+            None,
+            256,
+            schedule,
+            None,
+            None,
+        )
+        return rope_inplace(out, positions, cos_sin_cache, None)
+    return kernel(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        schedule,
+        positions,
+        cos_sin_cache,
+>>>>>>> 5794e514 (perf(dsv41): apply various fusion optimizations (#2480))
     )
 
 

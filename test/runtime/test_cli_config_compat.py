@@ -1043,6 +1043,7 @@ class TestCLIConfigCompat:
         assert (sa.attn_tp_size) == (8)
         assert sa.enable_expert_parallel
         assert (sa.served_model_name) == ("ds31")
+        assert sa.canonical_served_model_name == "ds31"
 
     def test_data_parallel_size_arg(self):
         args = self._parse_args(["--model", "test/model", "--data-parallel-size", "2"])

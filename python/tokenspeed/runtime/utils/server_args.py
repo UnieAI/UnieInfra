@@ -786,6 +786,18 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "none"
 
+    @property
+    def canonical_served_model_name(self) -> str:
+        """The served model id the metrics and gRPC ``GetModelInfo`` report.
+
+        One engine serves one model under one name. The pinned gRPC frontend
+        reads this as a single string when it builds the model info reply, so
+        it stays a scalar even though the CLI accepts the flag.
+        """
+        if self.served_model_name is None:
+            return self.model
+        return self.served_model_name
+
     def resolve_model_defaults(self, download: bool = False):
         """Model defaults that must be known before any process starts.
 

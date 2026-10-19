@@ -242,7 +242,7 @@ def serve(argv: list[str], *, host: str, port: int) -> None:
 
     server_args = prepare_server_args(argv)
     engine = Engine(server_args=server_args)
-    served = server_args.served_model_name or server_args.model
+    served = server_args.canonical_served_model_name
     logger.info(
         "pooling server: model=%s is_embedding=%s pooling_type=%s normalize=%s",
         served,

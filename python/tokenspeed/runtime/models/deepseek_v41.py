@@ -638,25 +638,28 @@ class DeepseekV41Compressor(nn.Module):
     def forward(self, x, owner, positions, requests, backend, mode):
         if self.ratio == 1:
             content, _ = self.wkv(x, block_scale=None, output_dtype=None)
-        else:
-            projected = (
-                dsv4_linear_fp32(
-                    x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
-                )
-                if x.is_cuda
-                else F.linear(x.float(), self.wkv_wgate.weight.float())
-            )
-            content, scores = projected.chunk(2, dim=-1)
-            content, positions, requests = backend.compress(
-                owner,
-                content,
-                scores,
-                mode,
-                self.norm.weight,
-                self.norm.variance_epsilon,
-            )
-            return content, positions, requests
-        return _attention_norm(content, self.norm), positions, requests
+            return _attention_norm(content, self.norm), positions, requests
+        return self.pool(self.project(x), owner, backend, mode)
+
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """Token-local FP32 ``[content | scores]`` projection of a ratio-2 owner."""
+        if not x.is_cuda:
+            return F.linear(x.float(), self.wkv_wgate.weight.float())
+        return dsv4_linear_fp32(
+            x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
+        )
+
+    def pool(self, projected, owner, backend, mode):
+        """Pool the projected rows of the canonical query window into pairs."""
+        content, scores = projected.chunk(2, dim=-1)
+        return backend.compress(
+            owner,
+            content,
+            scores,
+            mode,
+            self.norm.weight,
+            self.norm.variance_epsilon,
+        )
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -854,12 +857,34 @@ class DeepseekV41Attention(nn.Module):
             )
         return self._padded_attn_sink
 
-    def _write_global_kv(self, hidden_states, positions, requests, backend, mode):
+    def _projects_global_kv(self) -> bool:
+        """Whether the compressor input is the token-local ratio-2 projection."""
+        return self.compressor is not None and self.compressor.ratio == 2
+
+    def _global_kv_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """What :meth:`_write_global_kv` consumes, projected while still captured."""
+        if self._projects_global_kv():
+            return self.compressor.project(hidden_states)
+        return hidden_states
+
+    def _write_global_kv(
+        self, kv_input, positions, requests, backend, mode, projected=False
+    ):
+        """Write the owner's global rows from ``kv_input``.
+
+        ``kv_input`` is the hidden states, or with ``projected`` the output of
+        :meth:`_global_kv_input` (the ratio-2 compressor projection).
+        """
         if self.compressor is None:
             return
-        latent, row_positions, row_requests = self.compressor(
-            hidden_states, self.layer_id, positions, requests, backend, mode
-        )
+        if projected and self._projects_global_kv():
+            latent, row_positions, row_requests = self.compressor.pool(
+                kv_input, self.layer_id, backend, mode
+            )
+        else:
+            latent, row_positions, row_requests = self.compressor(
+                kv_input, self.layer_id, positions, requests, backend, mode
+            )
         index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
         main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
         backend.write_global(
@@ -902,7 +927,8 @@ class DeepseekV41Attention(nn.Module):
         q, swa, index_q, index_weights = self._extend_queries(
             positions, hidden_states, qr, swa
         )
-        out = self._extend_attention(hidden_states, q, swa, index_q, index_weights, ctx)
+        kv_input = self._global_kv_input(hidden_states)
+        out = self._extend_attention(kv_input, q, swa, index_q, index_weights, ctx)
         return self._output_projection(out, positions)
 
     def narrowing_projection(
@@ -956,9 +982,13 @@ class DeepseekV41Attention(nn.Module):
             else (None, None)
         )
         q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
-        q = self.rotary_emb.apply_owned(
-            q.unflatten(-1, (self.n_local_heads, self.head_dim)), positions, False
-        )
+        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        if q.is_cuda and self.head_dim == 512:
+            # As in decode: rotate straight into the FlashMLA head width, so the
+            # eager attention break does not pad the query again every layer.
+            q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
+        else:
+            q = self.rotary_emb.apply_owned(q, positions, False)
         swa = _attention_norm(swa, self.kv_norm)
         if not self._fused_swa_rope():
             swa = self.rotary_emb.apply_owned(swa, positions, False)
@@ -970,21 +1000,30 @@ class DeepseekV41Attention(nn.Module):
     @break_point
     def _extend_attention(
         self,
-        hidden_states: torch.Tensor,
+        kv_input: torch.Tensor,
         q: torch.Tensor,
         swa: torch.Tensor,
         index_q: torch.Tensor | None,
         index_weights: torch.Tensor | None,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Cache writes, global selection and attention over the live rows."""
+        """Cache writes, global selection and attention over the live rows.
+
+        ``kv_input`` comes from :meth:`_global_kv_input`, so a ratio-2 owner's
+        compressor projection is already captured in the graph segment.
+        """
         backend, mode = ctx.attn_backend, ctx.forward_mode
         meta = _row_plan(self.layer_id, self.ced_decoder_start, ctx).source
-        hidden_states, q, swa, index_q, index_weights = slice_to_real_tokens(
-            meta.positions.numel(), hidden_states, q, swa, index_q, index_weights
+        kv_input, q, swa, index_q, index_weights = slice_to_real_tokens(
+            meta.positions.numel(), kv_input, q, swa, index_q, index_weights
         )
         self._write_global_kv(
-            hidden_states, meta.positions, meta.request_indices, backend, mode
+            kv_input,
+            meta.positions,
+            meta.request_indices,
+            backend,
+            mode,
+            projected=True,
         )
         return self._attend(meta, q, swa, index_q, index_weights, ctx)
 

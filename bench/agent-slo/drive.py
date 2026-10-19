@@ -19,6 +19,28 @@ import aiohttp
 
 base, model, data, conc, nreq, out = sys.argv[1:7]
 conc, nreq = int(conc), int(nreq)
+# Which endpoint carries the work. This is not cosmetic: `chat` makes each
+# engine render our single user turn into its own prompt format, and the
+# engines do not agree on that format (sglang/vLLM render DeepSeek-V4.1 through
+# a Python encoder; a gateway needs a chat template the checkpoint does not
+# ship). Two engines that prefill different token counts cannot be compared on
+# TTFT, so the comparable arm sends the corpus text verbatim to
+# `/v1/completions`: same prompt, same tokens, same work by construction.
+# Required, because defaulting it would silently pick one of those two
+# measurements.
+ENDPOINT = os.environ["ENDPOINT"]
+if ENDPOINT not in ("chat", "completions"):
+    raise SystemExit(f"ENDPOINT must be chat or completions, got {ENDPOINT!r}")
+# Fallback token counter for servers that do not send a usage chunk. Optional:
+# `usage.completion_tokens` is authoritative when present. Point TOKENIZER at
+# the checkpoint so counts are the model's own tokens, not chunks of text.
+TOKENIZER = None
+if os.environ.get("TOKENIZER"):
+    from transformers import AutoTokenizer
+
+    TOKENIZER = AutoTokenizer.from_pretrained(
+        os.environ["TOKENIZER"], trust_remote_code=True
+    )
 # Some engines terminate on EOS/stop tokens that `ignore_eos` does not cover
 # (sglang's chat template contributes its own stop_token_ids, which
 # SamplingParams.ignore_eos does not suppress). A cell that stops at token 41
@@ -38,6 +60,48 @@ warm_prompts = (
 )
 
 
+def url(path: str) -> str:
+    return f"{base}/v1/{path}"
+
+
+def request_body(p: str, max_tokens: int) -> dict:
+    """Request body for the selected endpoint, at a fixed generated length."""
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
+        # Ask for the authoritative generated length (see the usage handling in
+        # `one()`); engines that ignore the field simply omit the usage chunk.
+        "stream_options": {"include_usage": True},
+    }
+    if ENDPOINT == "chat":
+        body["messages"] = [{"role": "user", "content": p}]
+    else:
+        body["prompt"] = p
+    # Match `vllm bench serve --ignore-eos`: without it a reply that stops early
+    # generates fewer tokens, which shortens the run and inflates req/min
+    # against the official tool's fixed 128. Measured 33.4 vs 26.4 rpm on the
+    # same cell before this was matched.
+    body["ignore_eos"] = True
+    if MIN_TOKENS:
+        body["min_tokens"] = int(MIN_TOKENS)
+    return body
+
+
+def emitted(j: dict) -> str | None:
+    """The text this stream item added, whichever endpoint shapes it."""
+    choice = (j.get("choices") or [{}])[0]
+    if ENDPOINT == "chat":
+        delta = choice.get("delta") or {}
+        # Reasoning model: output is streamed in `reasoning_content` until the
+        # final answer, which lands in `content`. Counting only `content`
+        # records ~80% of DeepSeek-V4 requests as empty and zeroes their
+        # throughput. Count and time the whole stream.
+        return delta.get("content") or delta.get("reasoning_content")
+    return choice.get("text")
+
+
 async def one(sess, sem, i, p, res):
     async with sem:
         t0 = time.perf_counter()
@@ -47,22 +111,11 @@ async def one(sess, sem, i, p, res):
         # different fixes, so a combined number cannot drive either.
         ttft = None
         chunks = []
+        reported = None
         err = None
         async with sess.post(
-            f"{base}/v1/chat/completions",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": p}],
-                "max_tokens": 128,
-                **({"min_tokens": int(MIN_TOKENS)} if MIN_TOKENS else {}),
-                "temperature": 0,
-                "stream": True,
-                # Match `vllm bench serve --ignore-eos`: without it a reply that
-                # stops early generates fewer tokens, which shortens the run and
-                # inflates req/min against the official tool's fixed 128. Measured
-                # 33.4 vs 26.4 rpm on the same cell before this was matched.
-                "ignore_eos": True,
-            },
+            url("chat/completions" if ENDPOINT == "chat" else "completions"),
+            json=request_body(p, 128),
             timeout=aiohttp.ClientTimeout(total=1800),
         ) as r:
             status = r.status
@@ -99,18 +152,25 @@ async def one(sess, sem, i, p, res):
                 if "error" in j:
                     err = j["error"]
                     break
-                delta = (j.get("choices") or [{}])[0].get("delta", {})
-                # Reasoning model: output is streamed in `reasoning_content` until
-                # the final answer, which lands in `content`. Counting only
-                # `content` records ~80% of DeepSeek-V4 requests as empty and
-                # zeroes their throughput. Count and time the whole stream.
-                tok = delta.get("content") or delta.get("reasoning_content")
+                # Servers that support stream_options include a final chunk
+                # whose usage.completion_tokens is the generated length. That
+                # number, not the chunk count, is what throughput is made of:
+                # one SSE chunk carries one token on some servers and several
+                # on others (measured 122 vs 57 chunks for the same 128-token
+                # request on two engines), so counting chunks understates a
+                # batching engine by up to 2x.
+                usage = j.get("usage") or {}
+                if usage.get("completion_tokens"):
+                    reported = usage["completion_tokens"]
+                tok = emitted(j)
                 if tok:
                     if ttft is None:
                         ttft = round((time.perf_counter() - t0) * 1000)
                     chunks.append(tok)
         e2e = round((time.perf_counter() - t0) * 1000)
-        ntok = len(chunks)
+        text = "".join(chunks)
+        # Without a usage chunk, count real tokens from the model's tokenizer.
+        ntok = reported or (len(TOKENIZER.encode(text)) if TOKENIZER else len(chunks))
         res[i] = {
             "i": i,
             "ms": e2e,
@@ -119,7 +179,8 @@ async def one(sess, sem, i, p, res):
             "tpot": (
                 round((e2e - ttft) / max(1, ntok - 1)) if ttft and ntok > 1 else None
             ),
-            "text": "".join(chunks),
+            "nchunk": len(chunks),
+            "text": text,
             "err": err,
         }
 
@@ -130,14 +191,8 @@ async def warmup(sess):
 
     async def one_warm(p):
         async with sess.post(
-            f"{base}/v1/chat/completions",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": p}],
-                "max_tokens": 16,
-                "temperature": 0,
-                "stream": False,
-            },
+            url("chat/completions" if ENDPOINT == "chat" else "completions"),
+            json={**request_body(p, 16), "stream": False},
             timeout=aiohttp.ClientTimeout(total=1800),
         ) as r:
             await r.read()

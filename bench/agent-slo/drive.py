@@ -11,6 +11,7 @@ engines must agree token for token.
 
 import asyncio
 import json
+import os
 import sys
 import time
 
@@ -18,6 +19,14 @@ import aiohttp
 
 base, model, data, conc, nreq, out = sys.argv[1:7]
 conc, nreq = int(conc), int(nreq)
+# Some engines terminate on EOS/stop tokens that `ignore_eos` does not cover
+# (sglang's chat template contributes its own stop_token_ids, which
+# SamplingParams.ignore_eos does not suppress). A cell that stops at token 41
+# while another runs to 128 is not doing the same work, so its throughput and
+# its prefill amortisation are not comparable. Setting MIN_TOKENS forces a floor
+# on the generated length, which makes the arms equal-work by construction.
+# Env-gated so the default protocol is unchanged.
+MIN_TOKENS = os.environ.get("MIN_TOKENS") or None
 prompts = [json.loads(l)["prompt"] for l in open(data)][:nreq]
 # Engine warmup on a DIFFERENT corpus. Repeating the measured corpus warms the
 # prefix cache with the exact prompts about to be timed, which is replay, not
@@ -45,6 +54,7 @@ async def one(sess, sem, i, p, res):
                 "model": model,
                 "messages": [{"role": "user", "content": p}],
                 "max_tokens": 128,
+                **({"min_tokens": int(MIN_TOKENS)} if MIN_TOKENS else {}),
                 "temperature": 0,
                 "stream": True,
                 # Match `vllm bench serve --ignore-eos`: without it a reply that
@@ -55,6 +65,26 @@ async def one(sess, sem, i, p, res):
             },
             timeout=aiohttp.ClientTimeout(total=1800),
         ) as r:
+            status = r.status
+            if status != 200:
+                # Never swallow an HTTP rejection: a non-200 body is not an SSE
+                # stream, so the data: loop below would silently record empty text.
+                # Capture the status + error body so the caller can see it.
+                try:
+                    body = (await r.read()).decode("utf-8", "replace")[:300]
+                except Exception:
+                    body = "<unreadable>"
+                err = f"HTTP {status}: {body}"
+                res[i] = {
+                    "i": i,
+                    "ms": round((time.perf_counter() - t0) * 1000),
+                    "ttft": None,
+                    "ntok": 0,
+                    "tpot": None,
+                    "text": "",
+                    "err": err,
+                }
+                return
             async for raw in r.content:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
@@ -69,11 +99,21 @@ async def one(sess, sem, i, p, res):
                 if "error" in j:
                     err = j["error"]
                     break
-                delta = (j.get("choices") or [{}])[0].get("delta", {}).get("content")
-                if delta:
+                delta = (j.get("choices") or [{}])[0].get("delta", {})
+                # Reasoning model: output is streamed in `reasoning_content` until
+                # the final answer, which lands in `content`. Counting only
+                # `content` records ~80% of DeepSeek-V4 requests as empty and
+                # zeroes their throughput. Count and time the whole stream.
+                tok = (
+                    delta.get("content")
+                    or delta.get("reasoning_content")
+                    # vLLM >= 0.30 streams reasoning as `reasoning`
+                    or delta.get("reasoning")
+                )
+                if tok:
                     if ttft is None:
                         ttft = round((time.perf_counter() - t0) * 1000)
-                    chunks.append(delta)
+                    chunks.append(tok)
         e2e = round((time.perf_counter() - t0) * 1000)
         ntok = len(chunks)
         res[i] = {

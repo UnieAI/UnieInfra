@@ -210,7 +210,9 @@ def _fwd_kernel(
                     other=0.0,
                 )
 
-            qk = tl.dot(q.to(k.dtype), k)
+            # An fp8 cache is upcast to the query dtype: the query sets the
+            # compute precision, the cache only its storage. No-op otherwise.
+            qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 if HAS_KV_CACHE:
                     offs_kpe = (
@@ -235,7 +237,7 @@ def _fwd_kernel(
                         mask=mask_n[None, :],
                         other=0.0,
                     )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -273,8 +275,8 @@ def _fwd_kernel(
                     mask=mask_n[:, None] & mask_dv[None, :],
                     other=0.0,
                 )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            p = p.to(q.dtype)
+            acc = acc * re_scale[:, None] + tl.dot(p, v.to(q.dtype))
 
             e_max = n_e_max
 

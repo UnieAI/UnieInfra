@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import PlatformInfo, current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
@@ -169,6 +169,63 @@ def mha_plan(
         else "prewrite"
     )
     return {"extend_mode": extend_mode}
+
+
+def mha_fp8_cache_query_dtype(
+    kv_cache_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    head_dim: int,
+    solution: str | None,
+    platform: PlatformInfo | None = None,
+) -> torch.dtype:
+    """The query dtype the cached MHA kernels take over an fp8 KV cache.
+
+    Two kinds of kernel read an fp8 cache: those that take an fp8 query too
+    (FA4 and trtllm-gen on sm_100) and those that take the model-dtype query
+    and upcast the cache to it (Triton). The first is preferred wherever both
+    the decode and extend ops have one, so those platforms keep their path.
+
+    Args:
+        kv_cache_dtype: The fp8 KV cache storage dtype.
+        model_dtype: The activation dtype the query is produced in.
+        head_dim: Attention head dimension.
+        solution: Kernel solution the backend is restricted to, or None.
+        platform: Hardware to match; the current platform when None.
+
+    Returns:
+        ``kv_cache_dtype`` or ``model_dtype``: the query dtype to pass both ops.
+
+    Raises:
+        ValueError: If neither query dtype has a decode and an extend kernel.
+    """
+    platform = platform or current_platform()
+    registry = KernelRegistry.get()
+    traits = {"head_dim": head_dim}
+
+    def served(mode: str, q_dtype: torch.dtype) -> bool:
+        signature = format_signature(
+            q=dense_tensor_format(q_dtype),
+            k_cache=dense_tensor_format(kv_cache_dtype),
+            v_cache=dense_tensor_format(kv_cache_dtype),
+        )
+        candidates = registry.get_for_operator(
+            "attention",
+            mode,
+            platform=platform,
+            format_signature=signature,
+            solution=solution,
+        )
+        return any(spec_matches_traits(spec, traits) for spec in candidates)
+
+    for q_dtype in (kv_cache_dtype, model_dtype):
+        if served("mha_extend_with_kvcache", q_dtype) and served(
+            "mha_decode_with_kvcache", q_dtype
+        ):
+            return q_dtype
+    raise ValueError(
+        f"no MHA decode and extend kernels read a {kv_cache_dtype} KV cache "
+        f"(head_dim={head_dim}, solution={solution}) on {platform.device_name}"
+    )
 
 
 def mha_prefill(
@@ -568,6 +625,7 @@ import tokenspeed_kernel.ops.attention.mha.gluon  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "mha_fp8_cache_query_dtype",
     "mha_plan",
     "mha_prefill",
     "mha_extend_with_kvcache",

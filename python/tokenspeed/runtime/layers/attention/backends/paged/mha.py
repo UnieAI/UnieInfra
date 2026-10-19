@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_fp8_cache_query_dtype,
     mha_plan,
     mha_prefill,
 )
@@ -127,6 +128,19 @@ class MHAAttnBackend(PagedAttentionBackend):
         self.is_fp8 = (
             self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.is_mxfp8
+        )
+        # Over an fp8 cache the query goes to fp8 where the kernels take it
+        # that way (sm_100) and stays in the model dtype where they upcast the
+        # cache instead (Triton, e.g. on sm_12x).
+        self.fp8_cache_query_dtype: torch.dtype | None = (
+            mha_fp8_cache_query_dtype(
+                self.kv_cache_dtype,
+                self.qkv_dtype,
+                self.head_dim,
+                solution=self.kernel_solution,
+            )
+            if self.is_fp8
+            else None
         )
         self.plan = partial(
             mha_plan,
@@ -290,7 +304,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
         elif self.is_fp8:
-            q = q.to(self.kv_cache_dtype)
+            q = q.to(self.fp8_cache_query_dtype)
             scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
@@ -382,7 +396,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
         elif self.is_fp8:
-            q = q.to(self.kv_cache_dtype)
+            q = q.to(self.fp8_cache_query_dtype)
             scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)

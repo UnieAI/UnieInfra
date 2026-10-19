@@ -252,6 +252,12 @@ class V41SWAQueryPlan:
     prefix_slots: torch.Tensor
     swa_indices: torch.Tensor
     histories: dict[int, V41PrefillHistory]
+    # (owner, workspace) of the last layer whose single-group history was
+    # gathered: later layers of that owner read the same global history this
+    # forward and rewrite only the workspace head. ``shared_indices`` keeps the
+    # last prefill indices with the owner and selection tensors they encode.
+    shared_workspace: tuple[int, torch.Tensor] | None = None
+    shared_indices: tuple | None = None
 
 
 @dataclass
@@ -1886,6 +1892,31 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         plan.histories[ratio] = history
         return history
 
+    def _prefill_indices(
+        self, plan, owner, shared, logical_rows, global_slots, base, rows
+    ):
+        """``dsv41.prefill_indices``, reused by the layers that share a selection.
+
+        Reuse layers of one source attend the same selection through the same
+        history placement, so with a shared workspace their indices agree.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        hit = plan.shared_indices if shared else None
+        if (
+            hit is not None
+            and hit[0] == owner
+            and hit[1] is global_slots
+            and hit[2] is logical_rows
+        ):
+            return hit[3]
+        indices = dsv41.prefill_indices(
+            plan.swa_indices, logical_rows, global_slots, base, rows, None
+        )
+        if shared:
+            plan.shared_indices = (owner, global_slots, logical_rows, indices)
+        return indices
+
     def _batched_prefill_eligible(
         self, plan, canonical, q, index_process_group, owner
     ) -> bool:
@@ -1948,9 +1979,17 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             self._prefill_history(plan, owner, forward_mode) if owner >= 0 else None
         )
         history_start = n + prefix_count
-        workspace = q.new_empty(
-            (history_start + (history.capacity if history is not None else 0), 512)
-        )
+        shared = history is not None and len(history.groups) == 1
+        workspace, history_ready = None, False
+        if shared and plan.shared_workspace is not None:
+            if plan.shared_workspace[0] == owner:
+                workspace, history_ready = plan.shared_workspace[1], True
+        if workspace is None:
+            workspace = q.new_empty(
+                (history_start + (history.capacity if history is not None else 0), 512)
+            )
+            if shared:
+                plan.shared_workspace = (owner, workspace)
         # Read every old prefix before this layer publishes its own rows.
         dsv41.cache_gather(
             cache,
@@ -2016,21 +2055,25 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # the context-length workspace; each group then attends its rows.
             out = None if len(history.groups) == 1 else torch.zeros_like(q)
             for rows, slots in history.groups:
-                dsv41.cache_gather(
-                    global_cache,
-                    slots,
-                    self.global_format,
-                    workspace[history_start : history_start + slots.numel()],
-                )
+                # Stream order keeps a shared history intact: this layer's
+                # writes to the workspace head follow the previous layer's read.
+                if not history_ready:
+                    dsv41.cache_gather(
+                        global_cache,
+                        slots,
+                        self.global_format,
+                        workspace[history_start : history_start + slots.numel()],
+                    )
                 result = attend(
                     rows,
-                    dsv41.prefill_indices(
-                        plan.swa_indices,
+                    self._prefill_indices(
+                        plan,
+                        owner,
+                        shared,
                         logical_rows,
                         global_slots,
                         history.base,
                         rows,
-                        None,
                     ),
                 )
                 if rows is None:

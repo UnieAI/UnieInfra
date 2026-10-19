@@ -17,9 +17,9 @@ SLURM_RUNNER_PREFIXES = (
     "slurm-gb200-",
     "slurm-gb300-",
 )
+# UnieAI runs no B200 PR workflow (removed with the fork's CI init).
 PR_TEST_WORKFLOWS = (
     "amd-tests.yml",
-    "nvidia-b200-tests.yml",
     "pr-test-nvidia-arm.yml",
 )
 

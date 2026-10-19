@@ -168,6 +168,14 @@ def get_available_gpu_memory(
         if empty_cache:
             device_module.empty_cache()
         free_gpu_memory, _ = device_module.mem_get_info(gpu_id)
+        # On an integrated GPU (GB10) device memory is host memory, and
+        # mem_get_info reports only MemFree: the page cache left by reading the
+        # checkpoint counts as used although the kernel reclaims it on demand.
+        if (
+            device == "cuda"
+            and device_module.get_device_properties(gpu_id).is_integrated
+        ):
+            free_gpu_memory = max(free_gpu_memory, psutil.virtual_memory().available)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)

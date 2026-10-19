@@ -55,6 +55,9 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_query_shard,
 )
+from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41_topk_graphs import (
+    V41PrefillTopkGraphs,
+)
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -232,6 +235,12 @@ class V41SWAQueryPlan:
     prefix_slots: torch.Tensor
     swa_indices: torch.Tensor
     histories: dict[int, V41PrefillHistory]
+    # (owner, workspace) of the last layer whose single-group history was
+    # gathered: later layers of that owner read the same global history this
+    # forward and rewrite only the workspace head. ``shared_indices`` keeps the
+    # last prefill indices with the owner and selection tensors they encode.
+    shared_workspace: tuple[int, torch.Tensor] | None = None
+    shared_indices: tuple | None = None
 
 
 class DeepseekV41AttentionBackend(AttentionBackend):
@@ -291,6 +300,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
         ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
+        self._topk_graphs: V41PrefillTopkGraphs | None = None
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -1241,6 +1251,43 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         block_lens = selection_output((n,), 0)
         for start, stop, span in windows:
+            cb = None
+            if reindex:
+                if same_candidate_rows:
+                    cb = candidates.block_ids[start:stop]
+                else:
+                    ci = candidate_index[start:stop]
+                    cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(
+                        ci[:, None] < 0, -1
+                    )
+            span_out = (
+                rows[start:stop],
+                lens[start:stop],
+                blocks[start:stop],
+                block_lens[start:stop],
+            )
+            if (
+                span is not None
+                and index_process_group is None
+                and self._prefill_topk_graphs().select(
+                    index_q[start:stop],
+                    index_weights[start:stop],
+                    index_cache,
+                    table[
+                        span.request : span.request + 1,
+                        : max(1, ((span.prefix + span.count) // ratio + 63) // 64),
+                    ],
+                    positions[start:stop],
+                    ratio,
+                    cb,
+                    self.spec.index_topk,
+                    self.spec.candidate_topk if produce_candidates else 0,
+                    self.spec.candidate_block_size,
+                    query_tile,
+                    span_out,
+                )
+            ):
+                continue
             if span is not None:
                 visible = (
                     ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
@@ -1255,15 +1302,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 tile_table, visible = selection_table(
                     positions[start:stop], request_indices[start:stop], table, ratio
                 )
-            cb = None
-            if reindex:
-                if same_candidate_rows:
-                    cb = candidates.block_ids[start:stop]
-                else:
-                    ci = candidate_index[start:stop]
-                    cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(
-                        ci[:, None] < 0, -1
-                    )
             dsv41.index_topk(
                 index_q[start:stop],
                 index_weights[start:stop],
@@ -1277,12 +1315,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 query_tile,
                 256,
                 index_process_group,
-                (
-                    rows[start:stop],
-                    lens[start:stop],
-                    blocks[start:stop],
-                    block_lens[start:stop],
-                ),
+                span_out,
                 None,
             )
         if produce_candidates:
@@ -1305,6 +1338,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         else:
             share.prefill = record
         return slots, lens
+
+    def _prefill_topk_graphs(self) -> V41PrefillTopkGraphs:
+        if self._topk_graphs is None:
+            self._topk_graphs = V41PrefillTopkGraphs(self.device)
+        return self._topk_graphs
 
     def prepare_global_selection(
         self,
@@ -1711,9 +1749,17 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             self._prefill_history(plan, owner, forward_mode) if owner >= 0 else None
         )
         history_start = n + prefix_count
-        workspace = q.new_empty(
-            (history_start + (history.capacity if history is not None else 0), 512)
-        )
+        shared = history is not None and len(history.groups) == 1
+        workspace, history_ready = None, False
+        if shared and plan.shared_workspace is not None:
+            if plan.shared_workspace[0] == owner:
+                workspace, history_ready = plan.shared_workspace[1], True
+        if workspace is None:
+            workspace = q.new_empty(
+                (history_start + (history.capacity if history is not None else 0), 512)
+            )
+            if shared:
+                plan.shared_workspace = (owner, workspace)
         # Read every old prefix before this layer publishes its own rows.
         dsv41.cache_gather(
             cache,
@@ -1776,21 +1822,25 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # the context-length workspace; each group then attends its rows.
             out = None if len(history.groups) == 1 else torch.zeros_like(q)
             for rows, slots in history.groups:
-                dsv41.cache_gather(
-                    global_cache,
-                    slots,
-                    self.global_format,
-                    workspace[history_start : history_start + slots.numel()],
-                )
+                # Stream order keeps a shared history intact: this layer's
+                # writes to the workspace head follow the previous layer's read.
+                if not history_ready:
+                    dsv41.cache_gather(
+                        global_cache,
+                        slots,
+                        self.global_format,
+                        workspace[history_start : history_start + slots.numel()],
+                    )
                 result = attend(
                     rows,
-                    dsv41.prefill_indices(
-                        plan.swa_indices,
+                    self._prefill_indices(
+                        plan,
+                        owner,
+                        shared,
                         logical_rows,
                         global_slots,
                         history.base,
                         rows,
-                        None,
                     ),
                 )
                 if rows is None:
@@ -1800,6 +1850,31 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if swa_rope_cache is None:
             dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
         return out
+
+    def _prefill_indices(
+        self, plan, owner, shared, logical_rows, global_slots, base, rows
+    ):
+        """``dsv41.prefill_indices``, reused by the layers that share a selection.
+
+        Reuse layers of one source attend the same selection through the same
+        history placement, so with a shared workspace their indices agree.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        hit = plan.shared_indices if shared else None
+        if (
+            hit is not None
+            and hit[0] == owner
+            and hit[1] is global_slots
+            and hit[2] is logical_rows
+        ):
+            return hit[3]
+        indices = dsv41.prefill_indices(
+            plan.swa_indices, logical_rows, global_slots, base, rows, None
+        )
+        if shared:
+            plan.shared_indices = (owner, global_slots, logical_rows, indices)
+        return indices
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(

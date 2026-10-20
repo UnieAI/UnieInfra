@@ -134,7 +134,20 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         conv_state_batch_coord = idx_seq
     if USE_PAD_SLOT:
         if conv_state_batch_coord == pad_slot_id:
-            # not processing as this is not the actual sequence
+            # A padded slot owns no cache line, so this program has no
+            # convolution to do. Its output rows are still read by the caller
+            # (a mixed batch's scan covers every row up to the last boundary),
+            # so leave them defined as zeros rather than the allocation's
+            # leftovers.
+            mask_pad = idx_feats < dim
+            zeros = tl.zeros((BLOCK_N,), dtype=o_ptr.dtype.element_ty)
+            for idx_token in range(segment_len):
+                o_ptrs_pad = (
+                    o_ptr
+                    + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                    + (idx_feats * stride_o_dim)
+                )
+                tl.store(o_ptrs_pad, zeros, mask=mask_pad)
             return
     conv_states_base = (
         conv_states_ptr

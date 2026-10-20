@@ -160,8 +160,11 @@ class MHAAttnBackend(PagedAttentionBackend):
         self.forward_num_extends = 0
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
-        # Decode metadata exists only in decode rounds.
-        return forward_mode.is_decode()
+        # A target builds decode metadata only in decode rounds. A drafter is
+        # refreshed with a decode window in every round (forward_step), so its
+        # first step can read the live rows over the accepted prefix even when
+        # the target round was an extend or a MIXED one.
+        return forward_mode.is_decode() or self.is_draft
 
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         # Both reads hand them to the kernel (_fp8_scale_kwargs).
@@ -318,9 +321,10 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
             self.page_table_buf[:bs].copy_(page_table[:bs])
         metadata = self._decode_views(bs)
-        # A MIXED round refreshed for both halves: its decode read starts after
-        # the leading extend span. Pure decode and drafts refresh with 0.
-        metadata.num_extends = num_extends
+        # A target's MIXED round refreshed for both halves: its decode read
+        # starts after the leading extend span. A drafter reads one live row
+        # per request across the whole batch, so its window never skips any.
+        metadata.num_extends = 0 if self.is_draft else num_extends
         self.forward_decode_metadata = metadata
 
     # ------------------------------------------------------------------

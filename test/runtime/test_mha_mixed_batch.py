@@ -119,7 +119,12 @@ def log(monkeypatch):
     return log
 
 
-def _backend(*, spec_num_tokens: int = 1, draft_block_decode: bool = False):
+def _backend(
+    *,
+    spec_num_tokens: int = 1,
+    draft_block_decode: bool = False,
+    is_draft: bool = False,
+):
     """A CPU ``MHAAttnBackend`` with its persistent decode buffers allocated.
 
     The real constructor wants a model config and a device, neither of which
@@ -127,7 +132,7 @@ def _backend(*, spec_num_tokens: int = 1, draft_block_decode: bool = False):
     """
     backend = MHAAttnBackend.__new__(MHAAttnBackend)
     backend.device = "cpu"
-    backend.is_draft = False
+    backend.is_draft = is_draft
     backend.spec_num_tokens = spec_num_tokens
     backend.draft_block_decode = draft_block_decode
     backend.kernel_page_size = 4
@@ -382,3 +387,40 @@ def test_block_decode_refuses_a_mixed_round():
 
     with pytest.raises(NotImplementedError, match="MIXED round"):
         backend.refresh_decode_metadata(2, 2, seq_lens, page_table, num_extends=1)
+
+
+def test_a_drafter_window_after_an_extend_round_reads_the_whole_batch(log):
+    """An MTP drafter's decode steps after a prefill read one row per request.
+
+    The executor refreshes the draft window with the round's extend count. A
+    target uses it to skip a MIXED round's prompt rows; a drafter must not, or
+    a round of only new requests leaves it an empty window (the step divides
+    its rows by zero requests).
+    """
+    backend = _backend(is_draft=True)
+    seq_lens = torch.tensor([104, 203], dtype=torch.int32)
+    page_table = torch.zeros(2, MAX_NUM_PAGES, dtype=torch.int32)
+    backend.refresh_decode_metadata(2, 2, seq_lens, page_table, num_extends=2)
+
+    backend.forward_decode(
+        _q(2),
+        None,
+        None,
+        _Layer(),
+        torch.zeros(2, dtype=torch.int64),
+        _Pool(),
+        2,
+    )
+
+    assert backend.forward_decode_metadata.num_extends == 0
+    assert log.decode[0]["rows"] == 2
+    assert log.decode[0]["cache_seqlens"] == seq_lens.tolist()
+
+
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.DECODE]
+)
+def test_only_a_drafter_narrows_outside_decode_rounds(mode):
+    """A drafter has a decode window in every round; a target only in decode."""
+    assert _backend(is_draft=True).supports_narrowed_draft_decode(mode)
+    assert _backend().supports_narrowed_draft_decode(mode) == mode.is_decode()

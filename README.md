@@ -1,80 +1,74 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/banner/tokenspeed-banner.png" alt="TokenSpeed: Tokens at the speed of light" width="100%" />
-</p>
+# UnieInfra
 
-TokenSpeed is a speed-of-light LLM inference engine designed for **agentic workloads**, with TensorRT-LLM-level performance and vLLM-level usability. The goal is to be the most performant inference engine for production agentic workloads.
-
-Core components:
+UnieInfra is UnieAI's LLM inference engine for **agent workloads**: a fixed
+system prompt and tool schemas shared by every request, conversations that grow
+turn by turn, and many agents running at once. It is built on
+[TokenSpeed](https://github.com/lightseekorg/tokenspeed) and tracks it
+closely, adding UnieAI's model support, scheduling and kernel work on top.
 
 - **Scheduler**: C++ control plane and Python execution plane. Request
-  lifecycle, KV cache ownership, and overlap timing are encoded as a
-  finite-state machine, with safe KV resource reuse enforced by the type system at compile time.
-- **Kernels**: pluggable, layered kernel system with a portable public API and
-  a centralized registry including one of the fastest **MLA**
-  (Multi-head Latent Attention) implementations on Blackwell for agentic workloads.
-- **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
+  lifecycle and KV cache ownership are a finite-state machine, with safe KV
+  reuse enforced by the type system at compile time.
+- **Kernels**: a pluggable kernel system with a portable public API and a
+  central registry, so each platform selects its own implementation.
+- **Entrypoint**: an OpenAI-compatible server with low-overhead request
   handling.
 
-## Differentiation
+## Performance
 
-TokenSpeed takes a fundamentally different architectural approach from existing LLM inference engines. The **PyTorch Foundation highlighted these architectural differentiators** when [welcoming TokenSpeed](https://pytorch.org/blog/pytorch-ecosystem-landscape-q3-update/) to the PyTorch Ecosystem Landscape:
+### DeepSeek-V4.1-Flash on 4x H200, against vLLM 0.31
 
-> TokenSpeed is an open source LLM inference engine and the first to separate the control plane from the execution plane. The control plane is implemented in C++ as a finite-state machine, using the type system to enforce safe resource management, including request lifecycles and KV cache state, at compile time rather than runtime. The execution plane is implemented in Python, enabling fast iteration and lowering the cognitive load for researchers and engineers. This architecture combines strong correctness guarantees in the core scheduling system with the development velocity of a high-level execution layer.
->
-> TokenSpeed also treats kernels as a first-class, modular subsystem, separating them from the core engine through a portable public API, centralized registry and selection model, and an extensible plugin mechanism for heterogeneous accelerators.
+AgentX agent traces: 256 requests per cell, about 9.7k input tokens each
+(most of it a prefix shared within a session) and exactly 128 output tokens.
+The prefix cache is flushed before every cell. Each value is the wall time for
+the cell, median over repeated arms run in swapped orders; lower is better.
 
-More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors like NVIDIA and AMD.
+| concurrency | 1 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| vLLM 0.31 (s) | 136.4 | 57.7 | 47.3 | 41.0 | 36.1 | 37.7 |
+| **UnieInfra (s)** | **106.9** | **32.8** | **24.2** | **19.1** | **18.5** | **20.4** |
+| **speedup** | **1.28x** | **1.76x** | **1.95x** | **2.15x** | **1.95x** | **1.85x** |
 
-## News
+At concurrency 16, UnieInfra serves 634 requests per minute at a mean TTFT of
+354 ms; vLLM serves 325 at 576 ms. GSM8K accuracy is 0.9356 on the same
+deployment.
 
-- [2026/10] 🔥 [TokenSpeed MLA 2](https://github.com/lightseekorg/tokenspeed/tree/main/tokenspeed-mla#mla-2-decode-benchmarks) for [NVIDIA Vera Rubin](https://www.nvidia.com/en-us/data-center/technologies/rubin/). [[blog](https://lightseek.org/blog/tokenspeed-mla-2.html)]
-- [2026/10] 🔥 685 tokens/s per user: serving Qwen3.8-Flash-Next on NVIDIA GB300 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-qwen3-8-flash-next.html)]
-- [2026/10] 🔥 Advancing Kimi K3 inference on AMD Instinct MI355X GPUs with TokenSpeed. [[AMD blog](https://www.amd.com/en/developer/resources/technical-articles/2026/kimi-k3-on-amd-instinct-gpus-with-tokenspeed.html)]
-- [2026/09] Kimi K3 Optimization on GB300 — Part I. [[blog](https://lightseek.org/blog/kimi-k3-optimization-gb300-part-i.html)]
-- [2026/08] [Qwen3.8 Flash Next](https://developer.nvidia.com/blog/experiment-with-qwen3-8-flash-next-176b-model-on-nvidia-gb300-nvl72-for-agentic-coding/) at Day 0 and [GLM 5.3 Flash](https://huggingface.co/zai-org/GLM-5.3-Flash#serve-glm-53-flash-locally) at Day 0.
-- [2026/08] [Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B#serving-qwen38) at Day 0: 2.4T-Scale Inference with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-qwen3-8.html)]
-- [2026/08] TokenSpeed joins the [PyTorch Ecosystem](https://pytorch.org/blog/pytorch-ecosystem-landscape-q3-update/).
-- [2026/07] [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3#5-deployment) at Day 0: Frontier Model Enablement on Leading Platforms with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-kimi-k3.html)]
-- [2026/07] [TML Inkling](https://thinkingmachines.ai/news/introducing-inkling/) at Day 0: FP4 Inference on NVIDIA and [AMD](https://huggingface.co/lightseekorg/Inkling-MXFP4) with [TokenSpeed](https://thinkingmachines.ai/news/introducing-inkling/#inkling-availability). [[blog](https://lightseek.org/blog/tokenspeed-inkling.html)]
-- [2026/06] Deep dive into the design and optimization of TokenSpeed-Kernel. [[PyTorch blog](https://pytorch.org/blog/lightseek-tokenspeed-kernel/)]
-- [2026/05] 🚀 TokenSpeed hits 580 TPS on Qwen3.5-397B-A17B for agentic workloads. [[PyTorch blog](https://pytorch.org/blog/up-to-580tps-new-speed-record-of-qwen3-5-397b-a17b-on-gpu-for-agentic-workloads-with-tokenspeed/)]
-- [2026/05] TokenSpeed announced — a speed-of-light LLM inference engine for agentic workloads. [[blog](https://lightseek.org/blog/lightseek-tokenspeed.html)]
+Serving recipe (TP4 with expert parallelism, DSpark speculative decoding):
 
-## Blogs and talks
+```bash
+ts serve --model deepseek-ai/DeepSeek-V4.1-Flash-1017 --trust-remote-code \
+  --tensor-parallel-size 4 --enable-expert-parallel --dtype bfloat16 \
+  --speculative-algorithm DSPARK --speculative-num-steps 5 --speculative-num-draft-tokens 6 \
+  --moe-mxfp4-fp8-activation --engram-host-table \
+  --chunked-prefill-size 8192 --prefill-graph-max-tokens 8192 \
+  --max-num-seqs 64 --max-cudagraph-capture-size 64 \
+  --prefill-coalesce-ms 100 --gpu-memory-utilization 0.90 \
+  --reasoning-parser deepseek_v31
+```
 
-For technical blogs, conference talks, and engineering articles from LightSeek Foundation, visit the [LightSeek Blog](https://lightseek.org/blog/).
+`--prefill-coalesce-ms` holds a newly arrived request for up to that many
+milliseconds while others are decoding, so requests that arrive close together
+share one prefill step. A request that arrives while the engine is idle is
+never held. The concurrency 64 and 128 cells ran with `--max-num-seqs 128
+--max-cudagraph-capture-size 128`.
 
-## Sponsors and partners
+## Getting started
 
-LightSeek's work is advanced by the support of [sponsors and partners](https://lightseek.org/sponsors) across the AI ecosystem.
+UnieInfra installs, launches and is configured the same way as TokenSpeed, and
+its documentation applies:
 
-## Performance comparison
-
-<p align="center">
-  <img
-    src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/perf/tokenspeed-kimi-k2.5-performance.png"
-    alt="TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workloads (Kimi K2.5, B200)"
-    width="800"
-  />
-</p>
-
-<p align="center">
-  <em>TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workloads (Kimi K2.5, B200)</em>
-</p>
-
-## Documentation
-
-Start here:
-
-- [Docs Index](https://lightseek.org/tokenspeed/)
 - [Getting Started](https://lightseek.org/tokenspeed/guides/getting-started)
 - [Launching a Server](https://lightseek.org/tokenspeed/guides/launching)
 - [Model Recipes](https://lightseek.org/tokenspeed/recipes/models)
 - [Server Parameters](https://lightseek.org/tokenspeed/configuration/server)
-- [Compatible Parameters](https://lightseek.org/tokenspeed/configuration/compatible-parameters)
 - [Parallelism](https://lightseek.org/tokenspeed/serving/parallelism)
 
-## Citation
+## Built on TokenSpeed
+
+UnieInfra regularly merges upstream TokenSpeed, which is developed by the
+[LightSeek Foundation](https://lightseek.org/) and released under the MIT
+license (see [LICENSE](LICENSE)). Fixes that belong upstream are sent back
+upstream. When citing the engine design, please cite TokenSpeed:
 
 ```bibtex
 @misc{tokenspeed2026,

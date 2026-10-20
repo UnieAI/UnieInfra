@@ -744,7 +744,6 @@ def register_moe() -> None:
         # trtllm entry and the PERFORMANT cutlass one), so this is the only
         # working block-scaled FP8 apply on sm_120.
         priority=Priority.PLUGIN,
-        tags={"unieinfra", "sm120"},
     )(unieinfra_triton_moe_apply)
 
     register_kernel(
@@ -776,7 +775,6 @@ def register_moe() -> None:
         # ships. It stays reachable — as a fallback, and for the A/B that would
         # justify promoting it — without being chosen by default.
         priority=Priority.PORTABLE + 3,
-        tags={"unieinfra", "sm120"},
     )(unieinfra_triton_moe_apply)
 
     logger.info(

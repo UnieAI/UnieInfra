@@ -47,6 +47,8 @@ RUN python3 -m pip install cmake ninja && \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
     python3 -m pip install tokenspeed-scheduler/ && \
     python3 -m pip install ./python --no-build-isolation && \
+    { [ ! -d unieinfra/kernel-sm120 ] || \
+      python3 -m pip install --no-deps ./unieinfra/kernel-sm120; } && \
     python3 -c "import importlib.metadata as m; \
 print({p: m.version(p) for p in ('tokenspeed', 'tokenspeed_kernel', \
 'tokenspeed-scheduler', 'torch', 'flashinfer-python')})"

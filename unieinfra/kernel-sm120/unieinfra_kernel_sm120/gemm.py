@@ -327,7 +327,6 @@ def register_gemm() -> None:
             # Beats the in-tree reference (PORTABLE, 4) by ~12x at large
             # batched shapes; there is no other bmm kernel to outrank.
             priority=Priority.PLUGIN,
-            tags={"unieinfra", "sm120", "throughput"},
         )(unieinfra_bmm_fp8_scaled_sm120)
         logger.info(
             "unieinfra-kernel-sm120 gemm: registered "
@@ -374,7 +373,6 @@ def register_gemm() -> None:
             "self_quantizes_mxfp8": frozenset({True}),
         },
         priority=Priority.PLUGIN,
-        tags={"unieinfra", "sm120", "throughput", "latency"},
     )(unieinfra_mm_fp8_blockscale_sm120)
     logger.info(
         "unieinfra-kernel-sm120 gemm: registered "

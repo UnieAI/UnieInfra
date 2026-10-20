@@ -94,12 +94,13 @@ def register() -> None:
         ),
         priority=Priority.PLUGIN,
         traits={
+            # FlashInfer's FA2 paged template; head_dim 256 is the case measured.
+            "head_dim": frozenset({64, 128, 256}),
             "sliding_window": frozenset({False}),
-            "support_sinks": frozenset({False}),
-            "support_logit_cap": frozenset({False}),
+            "sinks": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
         },
-        tags={"unieinfra", "sm120"},
     )(flashinfer_paged_mha_decode)
 
     logger.info(
@@ -116,8 +117,10 @@ def register() -> None:
     for module_name, entry_point in (
         ("unieinfra_kernel_sm120.flash_attn2", "register_flash_attn2"),
         ("unieinfra_kernel_sm120.gdn", "register_gdn"),
-        ("unieinfra_kernel_sm120.gemm", "register_gemm"),
-        ("unieinfra_kernel_sm120.moe", "register_moe"),
+        # gemm and moe are not registered on main yet: main's gemm.mm/bmm and
+        # moe.apply select on traits these kernels do not declare (activation,
+        # EP, bias, routing, strides, ...), and an undeclared trait matches every
+        # value, so they would be picked for problems they do not implement.
         ("unieinfra_kernel_sm120.quant", "register_quant"),
     ):
         try:

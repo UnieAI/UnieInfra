@@ -176,7 +176,7 @@ def _exp(x):
 
 @triton.jit
 def _safe_exp(x):
-    # Matches tokenspeed_kernel.ops.attention.triton.linear.op.safe_exp: the
+    # Matches tokenspeed_kernel.ops.attention.gdn._triton.op.safe_exp: the
     # gate differences fed to this are <= 0 by construction, and anything else
     # is a masked-out lane that must not blow up.
     return tl.exp(tl.where(x <= 0, x, float("-inf")))
@@ -466,7 +466,6 @@ def unieinfra_gdn_chunk_prefill_sm120(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
-    h_dtype: torch.dtype | None = None,
 ):
     """``attention/gdn_chunk_prefill`` with ``chunk_h``/``chunk_o`` fused.
 
@@ -485,11 +484,11 @@ def unieinfra_gdn_chunk_prefill_sm120(
         ``None`` -- this kernel is registered with ``output_h: {False}``
         because never materializing the checkpoints is the point of it.
     """
-    from tokenspeed_kernel.ops.attention.gdn_utils import (
+    from tokenspeed_kernel.ops.attention.gdn import (
         GdnCheckpointLayout,
         GdnChunkPrefillResult,
     )
-    from tokenspeed_kernel.ops.attention.triton.gated_delta_rule import (
+    from tokenspeed_kernel.ops.attention.gdn.triton import (
         triton_gdn_chunk_prefill,
     )
 
@@ -509,17 +508,14 @@ def unieinfra_gdn_chunk_prefill_sm120(
             qk_l2norm=qk_l2norm,
             output_final_state=output_final_state,
             output_h=output_h,
-            h_dtype=h_dtype,
         )
-    # h_dtype only sets the storage of published checkpoints (output_h), which
-    # the fused path never produces; the in-tree Triton kernel ignores it then too.
-    from tokenspeed_kernel.ops.attention.triton.linear.chunk_scaled_dot_kkt import (
+    from tokenspeed_kernel.ops.attention.gdn._triton.chunk_scaled_dot_kkt import (
         chunk_scaled_dot_kkt_fwd,
     )
-    from tokenspeed_kernel.ops.attention.triton.linear.cumsum import chunk_local_cumsum
-    from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
-    from tokenspeed_kernel.ops.attention.triton.linear.solve_tril import solve_tril
-    from tokenspeed_kernel.ops.attention.triton.linear.wy_fast import recompute_w_u_fwd
+    from tokenspeed_kernel.ops.attention.gdn._triton.cumsum import chunk_local_cumsum
+    from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import l2norm_fwd
+    from tokenspeed_kernel.ops.attention.gdn._triton.solve_tril import solve_tril
+    from tokenspeed_kernel.ops.attention.gdn._triton.wy_fast import recompute_w_u_fwd
 
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError("batch size must be 1 when cu_seqlens is given")
@@ -609,8 +605,7 @@ def register_gdn() -> None:
         traits={
             # K is unrolled as two 64-wide register tiles; nothing else fits.
             "head_dim": frozenset({128}),
-            "head_v_dim": frozenset({128}),
-            "head_v_eq_head_k": frozenset({True}),
+            "value_head_dim": frozenset({128}),
             # Grouped-value attention only (Hv >= Hk), like the model.
             "num_v_gte_num_q": frozenset({True}),
             "qk_l2norm": frozenset({False, True}),
@@ -618,7 +613,6 @@ def register_gdn() -> None:
             # the in-tree Triton kernel, which actually writes checkpoints.
             "output_h": frozenset({False}),
         },
-        tags={"unieinfra", "sm120", "gdn"},
     )(unieinfra_gdn_chunk_prefill_sm120)
 
     logger.info(

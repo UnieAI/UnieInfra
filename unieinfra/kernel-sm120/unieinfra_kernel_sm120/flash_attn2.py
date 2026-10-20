@@ -259,6 +259,7 @@ def fa2_mha_extend_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MHA extend against a paged KV cache, on FlashAttention-2.
 
@@ -348,6 +349,7 @@ def fa2_mha_decode_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MHA decode against a paged KV cache, on the same FA2 varlen entry point.
 
@@ -436,6 +438,7 @@ def fa2_mha_prefill(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Unpaged causal MHA prefill on FA2's varlen entry point.
 
@@ -554,9 +557,11 @@ def register_flash_attn2() -> None:
     # verified here", never "off". Selection routes such requests to the
     # in-tree Triton kernel.
     traits = {
+        "head_dim": frozenset({64, 128, 256}),
+        "skip_softmax": frozenset({False}),
         "sliding_window": frozenset({False}),
-        "support_sinks": frozenset({False}),
-        "support_logit_cap": frozenset({False}),
+        "sinks": frozenset({False}),
+        "logit_cap": frozenset({False}),
         "return_lse": frozenset({False, True}),
     }
 
@@ -569,7 +574,6 @@ def register_flash_attn2() -> None:
         signatures=signatures,
         priority=priority,
         traits={"is_causal": frozenset({False, True}), **traits},
-        tags={"unieinfra", "sm120"},
     )(fa2_mha_extend_with_kvcache)
 
     if _REGISTER_DECODE:
@@ -582,7 +586,6 @@ def register_flash_attn2() -> None:
             signatures=signatures,
             priority=priority,
             traits=traits,
-            tags={"unieinfra", "sm120"},
         )(fa2_mha_decode_with_kvcache)
 
     register_kernel(
@@ -596,7 +599,6 @@ def register_flash_attn2() -> None:
         ),
         priority=priority,
         traits=traits,
-        tags={"unieinfra", "sm120"},
     )(fa2_mha_prefill)
 
     logger.info(

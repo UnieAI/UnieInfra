@@ -566,7 +566,6 @@ def register_quant() -> None:
             "has_global_scale": frozenset({False}),
             "scale_encoding": frozenset({"ue8m0"}),
         },
-        tags={"unieinfra", "sm120"},
     )(quantize_mxfp4_sm120)
 
     register_kernel(
@@ -581,7 +580,6 @@ def register_quant() -> None:
             "scale_layout": frozenset({"linear", "swizzled"}),
             "has_scale": frozenset({True}),
         },
-        tags={"unieinfra", "sm120"},
     )(quantize_nvfp4_sm120)
 
     register_kernel(
@@ -599,7 +597,6 @@ def register_quant() -> None:
             "granularity": frozenset({"tensor", "token"}),
             "scale_encoding": frozenset({"float32"}),
         },
-        tags={"unieinfra", "sm120"},
     )(quantize_fp8_with_scale_sm120)
 
     register_kernel(
@@ -611,8 +608,10 @@ def register_quant() -> None:
         signatures=sigs,
         # Same numerics as the in-tree PORTABLE kernel, flat launch geometry.
         priority=Priority.PLUGIN,
-        traits={"has_scale": frozenset({True, False})},
-        tags={"unieinfra", "sm120"},
+        traits={
+            "dequantize": frozenset({False}),
+            "has_scale": frozenset({True, False}),
+        },
     )(quantize_fp8_flat_sm120)
 
     logger.info(

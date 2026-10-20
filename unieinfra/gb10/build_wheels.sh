@@ -44,7 +44,9 @@ docker run --rm --platform linux/arm64 \
     cd /src
     python3 -m pip wheel --no-deps --no-build-isolation -w /out ./tokenspeed-kernel/python
     python3 -m pip wheel --no-deps -w /out ./tokenspeed-scheduler
-    python3 -m pip wheel --no-deps --no-build-isolation -w /out ./python'
+    python3 -m pip wheel --no-deps --no-build-isolation -w /out ./python
+    [ ! -d unieinfra/kernel-sm120 ] ||
+      python3 -m pip wheel --no-deps --no-build-isolation -w /out ./unieinfra/kernel-sm120'
 
 echo "$REV" >"$OUT/.gb10-rev"
 ls -lh "$OUT"

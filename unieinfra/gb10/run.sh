@@ -152,7 +152,11 @@ ensure_image() {
       set -e
       apt-get update -qq
       apt-get install -y -qq --no-install-recommends libssl-dev libopenmpi-dev libnuma1 pkg-config
-      python3 -m pip install /wheels/*.whl' >"$LOGDIR/install.log" 2>&1 ||
+      python3 -m pip install $(ls /wheels/*.whl | grep -v unieinfra_kernel_sm120)
+      # The plugin pins tokenspeed-kernel>=0.1.3, which a source-built
+      # 0.1.3.devDATE does not satisfy under PEP 440.
+      ! ls /wheels/unieinfra_kernel_sm120-*.whl >/dev/null 2>&1 ||
+        python3 -m pip install --no-deps /wheels/unieinfra_kernel_sm120-*.whl' >"$LOGDIR/install.log" 2>&1 ||
     { tail -30 "$LOGDIR/install.log"; docker rm -f "$INSTALL_CTR" >/dev/null; die "wheel install"; }
   docker commit \
     --change "LABEL gb10.build=$want" \

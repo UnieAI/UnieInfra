@@ -1,0 +1,36 @@
+total kernels in trace: 64084
+lm_head-class gemv count (dur>250us): 50
+  lm_head dur: min=817440 med=820015 max=823680 ns
+num full steps segmented: 49
+analyzing steady-state steps [16:32) = 16 steps
+
+=== STEADY-STATE PER-TOKEN (median over 16 steps) ===
+wall period/token : 38020.1 us  -> 26.3 tok/s (this run, under nsys)
+GPU busy/token    : 11984.1 us  -> 83.4 tok/s (back-to-back floor)
+idle gap/token    : 26035.9 us  = 68.5% of wall
+kernels/token     : 1253
+
+=== GPU-BUSY BREAKDOWN BY CATEGORY (avg per token) ===
+  gemv           10581.54 us/tok   88.3%  (145 launches/tok)
+  other_glue       893.20 us/tok    7.5%  (855 launches/tok)
+  rmsnorm          175.62 us/tok    1.5%  (109 launches/tok)
+  attention        152.57 us/tok    1.3%  (36 launches/tok)
+  silu              93.51 us/tok    0.8%  (36 launches/tok)
+  rope              51.95 us/tok    0.4%  (36 launches/tok)
+  kv_store          35.41 us/tok    0.3%  (36 launches/tok)
+
+=== GEMV DURATION CLUSTERS (per token) ===
+  dur~   26.99us  count/tok=36.0  n=576
+  dur~   39.62us  count/tok=36.0  n=576
+  dur~   70.66us  count/tok=36.0  n=576
+  dur~  133.82us  count/tok=36.0  n=576
+  dur~  819.98us  count/tok= 1.0  n=16
+
+  (peak DRAM 1.60 TB/s; achieved BW = weight_bytes / dur)
+  reference weight bytes: qkv_fused=50.3MB o=33.6MB mlp_each=100.7MB lmhead=1244.7MB
+    qkv_fused(50.3MB)   :    50.3 MB -> at peak needs    31.5 us
+    q(33.6MB)           :    33.6 MB -> at peak needs    21.0 us
+    kv(8.4MB)           :     8.4 MB -> at peak needs     5.2 us
+    o(33.6MB)           :    33.6 MB -> at peak needs    21.0 us
+    mlp(100.7MB)        :   100.7 MB -> at peak needs    62.9 us
+    lmhead(1244.7MB)    :  1244.7 MB -> at peak needs   777.9 us

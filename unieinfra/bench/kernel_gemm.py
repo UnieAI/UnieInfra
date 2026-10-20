@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Copyright (c) 2026 UnieAI
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Dense bf16 GEMM at Qwen3-8B prefill shapes: tokenspeed_kernel.mm vs torch.
+
+Prefill of ~1016 tokens costs 151 ms here against vLLM's 128. Attention is only
+~2.5 ms of that (36 layers x 70 us), so the rest is the four linear layers per
+block -- a kernel family with no row on the scoreboard at all. vLLM's
+unquantized linear is plain F.linear (cuBLAS), so that is the reference.
+"""
+
+import os
+import time
+
+import torch
+from torch.profiler import ProfilerActivity, profile
+
+BACKEND = os.environ["BACKEND"]
+H, I, NQ, NKV, D = 4096, 12288, 32, 8, 128  # Qwen3-8B
+QKV_OUT = (NQ + 2 * NKV) * D
+
+# (name, K, N) for one decoder block
+SHAPES = [
+    ("qkv_proj", H, QKV_OUT),
+    ("o_proj", NQ * D, H),
+    ("gate_up_proj", H, 2 * I),
+    ("down_proj", I, H),
+]
+TOKENS = [int(t) for t in os.environ.get("GEMM_TOKENS", "1,128,1024").split(",")]
+
+if BACKEND == "ts":
+    import tokenspeed_kernel
+
+    mm = lambda x, w: tokenspeed_kernel.mm(x, w, bias=None)
+else:
+    mm = lambda x, w: torch.nn.functional.linear(x, w)
+
+
+def host_us(fn, n=500):
+    for _ in range(50):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n):
+        fn()
+    dt = (time.perf_counter() - t0) * 1e6 / n
+    torch.cuda.synchronize()
+    return dt
+
+
+def device_us(fn, reps=50):
+    for _ in range(20):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(reps):
+            fn()
+        torch.cuda.synchronize()
+    total = launches = 0
+    for ev in prof.key_averages():
+        if ev.device_time_total > 0 and ev.count:
+            total += ev.device_time_total
+            launches += ev.count
+    return total / reps, launches / reps
+
+
+print(f"backend={BACKEND}")
+for m in TOKENS:
+    block_dev = 0.0
+    print(f"  tokens={m}")
+    print(
+        f"    {'layer':>14} {'K':>6} {'N':>6} {'device us':>10} {'launch':>7} "
+        f"{'host us':>9} {'TFLOP/s':>9}"
+    )
+    for name, k, n in SHAPES:
+        x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+        fn = lambda: mm(x, w)
+        d, launches = device_us(fn)
+        h = host_us(fn)
+        tflops = 2 * m * k * n / (d / 1e6) / 1e12
+        block_dev += d
+        print(
+            f"    {name:>14} {k:6d} {n:6d} {d:10.2f} {launches:7.1f} "
+            f"{h:9.2f} {tflops:9.1f}"
+        )
+    print(
+        f"    {'block total':>14} {'':6} {'':6} {block_dev:10.2f}"
+        f"   -> 36 layers = {block_dev * 36 / 1000:.2f} ms"
+    )

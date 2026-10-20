@@ -28,7 +28,11 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.activation import silu_and_mul
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.activation.flashinfer import (
+    gelu_tanh_and_mul as _flashinfer_gelu_tanh_and_mul,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
@@ -112,6 +116,34 @@ class SiluAndMul(torch.nn.Module):
             gate = gate.clamp_max(self.swiglu_limit)
             up = up.clamp(-self.swiglu_limit, self.swiglu_limit)
         return (torch.nn.functional.silu(gate) * up).to(x.dtype)
+
+
+class GeluTanhAndMul(torch.nn.Module):
+    """GeGLU gated activation over a fused ``[..., gate | up]`` input.
+
+    Computes ``gelu(gate, approximate="tanh") * up``, the activation Gemma 3
+    and Gemma 4 use (``hidden_activation="gelu_pytorch_tanh"``).
+
+    On NVIDIA CUDA tensors this is one fused kernel launch; elsewhere (AMD,
+    CPU, meta) it falls back to the native chunk/gelu/multiply, which allocates
+    an extra intermediate but is numerically the reference.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] % 2 != 0:
+            raise ValueError(
+                f"GeGLU expects an even [gate, up] width, got {x.shape[-1]}"
+            )
+        if x.is_cuda and not _is_amd and _flashinfer_gelu_tanh_and_mul is not error_fn:
+            d = x.shape[-1] // 2
+            out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+            return _flashinfer_gelu_tanh_and_mul(x, out, enable_pdl=pdl_enabled())
+        return self.forward_native(x)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate, up = x[..., :d], x[..., d:]
+        return torch.nn.functional.gelu(gate, approximate="tanh") * up
 
 
 class SituAndMul(torch.nn.Module):

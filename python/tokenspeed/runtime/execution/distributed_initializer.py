@@ -21,9 +21,11 @@
 from dataclasses import dataclass
 
 import torch
+import torch.distributed
 
 from tokenspeed.runtime.distributed.comm_backend import set_global_backend
 from tokenspeed.runtime.distributed.comm_backend.emulated import EmulatedRankBackend
+from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -35,10 +37,6 @@ from tokenspeed.runtime.utils.common import maybe_set_numa_aware_cpu_affinity
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
-
-# Launches of the in-switch all-reduce whose results must agree bitwise before
-# a batch-invariant deployment serves.
-MULTIMEM_SELF_CHECK_REPETITIONS = 8
 
 
 @dataclass
@@ -92,9 +90,6 @@ class DistributedConfig:
 
     # Feature flags
     force_deterministic_rsag: bool = False
-    # --batch-invariant-collectives: the in-switch all-reduce it routes to is
-    # verified on this deployment's groups before anything serves.
-    batch_invariant_collectives: bool = False
 
     # The full Mapping object for pg_manager initialization
     mapping: object = None
@@ -135,7 +130,6 @@ class DistributedConfig:
             hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
-            batch_invariant_collectives=server_args.batch_invariant_collectives,
             mapping=mapping,
         )
 
@@ -196,6 +190,12 @@ class DistributedInitializer:
         # group of one still is. init_process_group is idempotent and handles
         # size 1.
         pg_manager.init_process_group(config.mapping.attn.kvp_group)
+        if config.mapping.attn.has_kvp:
+            pg_manager.init_process_group(
+                config.mapping.attn.kvp_group,
+                backend=backend,
+                name=KVP_HISTORY_GROUP_NAME,
+            )
         # The query-context-parallel group of a sharded extend; equal to the
         # attention TP group while qcp == tp, so this is idempotent there.
         pg_manager.init_process_group(config.mapping.attn.qcp_group)
@@ -223,10 +223,6 @@ class DistributedInitializer:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
             )
-            from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-            from tokenspeed.runtime.distributed.comm_backend.self_check import (
-                verify_multimem_all_reduce,
-            )
 
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
@@ -251,30 +247,6 @@ class DistributedInitializer:
                             f"{('enabled' if ok else 'unavailable (NCCL fallback)')!s}",
                         )
 
-            # Verify, don't trust: the batch-invariant all-reduce routes to
-            # the in-switch reduction on the groups below; it serves only
-            # where it reproduces its bits here (comm_backend/self_check.py).
-            if config.batch_invariant_collectives and isinstance(backend, AutoBackend):
-                outcome = verify_multimem_all_reduce(
-                    backend,
-                    groups=(
-                        ("attention TP", config.mapping.attn.tp_group),
-                        ("dense TP", config.mapping.dense.tp_group),
-                        ("MoE TP-EP", config.mapping.moe.tp_ep_group),
-                    ),
-                    world_group=config.mapping.world_group,
-                    rank=config.mapping.rank,
-                    hidden_size=config.hidden_size,
-                    device=torch.device(config.device, config.gpu_id),
-                    repetitions=MULTIMEM_SELF_CHECK_REPETITIONS,
-                )
-                routes = ", ".join(f"{kind}: {route.value}" for kind, route in outcome)
-                logger.info(
-                    "batch-invariant all-reduce: in-switch reduction verified "
-                    f"bitwise -- {routes or 'no group headed for the switch'}; every "
-                    "other reduction takes the ordered fold"
-                )
-
         logger.info(
             "Init comm buff end. Avail mem="
             f"{get_available_gpu_memory(config.device, config.gpu_id):.4f} GB",
@@ -286,17 +258,31 @@ class DistributedInitializer:
             f"{mapping.attn.dp_rank!s}",
         )
 
-        # Get minimum available GPU memory across all ranks
-        min_per_gpu_memory = get_available_gpu_memory(
-            config.device,
-            config.gpu_id,
-            distributed=config.world_size > 1,
-            cpu_group=pg_manager.get_process_group("gloo", mapping.world_group),
-        )
+        # One reading, then reduce it. This used to take the collective MIN
+        # first and re-read this rank's free memory afterwards, comparing two
+        # samples taken at different times against a flat 10% tolerance --
+        # 9.6 GB on a 96 GB card. Both calls run torch.cuda.empty_cache(), so
+        # the second could free more and inflate `local` against a `min`
+        # already frozen, and across two ranks loading a 118 GB checkpoint a
+        # >9.6 GB divergence in that gap is ordinary.
+        #
+        # Qwen3.5-122B-A10B-FP8 at --attn-tp-size 2 hit this repeatedly and it
+        # reads as a neighbour taking the card: on 2026-08-22 an arm failed
+        # here at 01:39 while the only other job on the box did not start until
+        # 01:56, with both cards verified at 3 MiB when it launched. Comparing
+        # a value against the minimum of *itself* across ranks is what the
+        # check means, and it cannot false-positive on sampling skew.
+        local_gpu_memory = get_available_gpu_memory(config.device, config.gpu_id)
+        min_per_gpu_memory = local_gpu_memory
 
-        # Verify memory balance for tensor parallelism
         if config.world_size > 1:
-            local_gpu_memory = get_available_gpu_memory(config.device, config.gpu_id)
+            tensor = torch.tensor(local_gpu_memory, dtype=torch.float32)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=pg_manager.get_process_group("gloo", mapping.world_group),
+            )
+            min_per_gpu_memory = tensor.item()
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. "

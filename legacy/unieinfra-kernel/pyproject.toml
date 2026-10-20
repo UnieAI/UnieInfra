@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 UnieInfra contributors
+
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unieinfra_kernel"
+version = "0.2.0"
+description = "UnieInfra's capability-based kernel selection layer plus its first-party, KDA-generated and community kernels. Runs standalone (vLLM) or on top of tokenspeed-kernel."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "UnieInfra contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+
+# The selection core (`unieinfra_kernel.selection`) imports nothing but torch
+# and the stdlib, which is what makes this package base-independent: it drops
+# into stock vLLM with no tokenspeed present.
+#
+# When `tokenspeed_kernel` IS importable (the tokenspeed base), the boundary
+# module routes registration into that package's registry instead, so runtime
+# code there still sees exactly one kernel boundary, per AGENTS.md.
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+tokenspeed = ["tokenspeed_kernel"]
+
+# Optional discovery hook. A third-party distribution that wants its own kernels
+# picked up by UnieInfra startup can advertise an importable module under this
+# entry-point group; `unieinfra_kernel._discovery` imports each on load. The
+# in-tree ops/kda/contrib trees are always scanned regardless of entry points.
+[project.entry-points."unieinfra_kernel.plugins"]
+
+# vLLM loads this group in EVERY process (front end, EngineCore, Worker) before
+# the engine config is built. `register()` discovers our kernels and registers
+# the out-of-tree `unieinfra` quantization config, whose `get_quant_method`
+# yields a `LinearMethodBase` whose `apply()` is the GEMM for every dense
+# Linear. Stock vLLM is untouched; with the flag absent nothing changes.
+[project.entry-points."vllm.general_plugins"]
+unieinfra_kernel = "unieinfra_vllm_plugin:register"
+
+[tool.setuptools]
+# Top-level module, deliberately outside the package: see its docstring.
+py-modules = ["unieinfra_vllm_plugin"]
+
+[tool.setuptools.packages.find]
+include = ["unieinfra_kernel*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

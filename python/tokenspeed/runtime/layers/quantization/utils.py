@@ -137,6 +137,15 @@ def should_ignore_quant_layer(
                     and prefix_v_proj in ignored_layers
                 ):
                     should_ignore_layer = True
+            elif prefix.endswith(".ple.kv_proj"):
+                # Qwen4-Exp PLE fuses key_proj and value_proj into kv_proj.
+                if all(
+                    check_equal_or_regex_match(
+                        prefix.replace("kv_proj", shard), ignored_layers
+                    )
+                    for shard in ("key_proj", "value_proj")
+                ):
+                    should_ignore_layer = True
             elif "in_proj_qkvzba" in prefix:
                 shard_groups = (
                     ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
@@ -199,6 +208,8 @@ def find_matched_target(
     Third, we try to map the layer_name to a list of fused module names.
         *All* component module names must match in order for a match to be
         successful. A successful match returns the first component target
+    Last, a target naming a class of the module (compressed-tensors' class
+        match: any class in its MRO, ``Linear`` for every ``LinearBase``)
 
     :param layer_name: layer name
     :param module: torch.nn.Module
@@ -215,6 +226,7 @@ def find_matched_target(
         _find_first_match(layer_name, targets)
         or _find_first_match(module.__class__.__name__, targets, True)
         or _match_fused_layer(layer_name, targets, fused_mapping)
+        or next((t for t in targets if matches_module_class(module, t)), None)
     )
 
     if matched_target is None:
@@ -224,6 +236,16 @@ def find_matched_target(
         )
 
     return matched_target
+
+
+def matches_module_class(module: Module, target: str) -> bool:
+    """Whether ``target`` names a class of ``module`` as compressed-tensors
+    matches ``targets`` and ``ignore`` entries: a class in the module's MRO,
+    with ``Linear`` naming every ``LinearBase``."""
+    return any(
+        cls.__name__ == target or (cls.__name__ == "LinearBase" and target == "Linear")
+        for cls in type(module).__mro__
+    )
 
 
 def _find_first_match(
@@ -367,6 +389,37 @@ def get_pack_factor(num_bits):
     if num_bits <= 0 or 32 % num_bits != 0:
         raise ValueError(f"Unsupported num_bits = {num_bits}")
     return 32 // num_bits
+
+
+def pack_cols(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    """Pack ``num_bits`` values along the column dim into int32.
+
+    The inverse of :func:`unpack_cols`. Adapted from SGLang
+    (``sglang/srt/layers/quantization/utils.py``), Apache-2.0.
+    """
+    expected_shape = (size_k, size_n)
+    if q_w.shape != expected_shape:
+        raise ValueError(f"q_w.shape = {q_w.shape}, expected {expected_shape}")
+
+    pack_factor = get_pack_factor(num_bits)
+    if size_n % pack_factor != 0:
+        raise ValueError(f"size_n={size_n} must be divisible by {pack_factor}.")
+
+    orig_device = q_w.device
+
+    q_w_cpu = q_w.cpu().numpy().astype(numpy.uint32)
+    q_res = numpy.zeros((size_k, size_n // pack_factor), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w_cpu[:, i::pack_factor] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
+    return q_res.contiguous()
 
 
 def unpack_cols(

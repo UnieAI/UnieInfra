@@ -20,8 +20,12 @@ people and average people is more than tenfold.
 
 ## Code changes
 
-* Add tests for the changed code. Don't be excessive--avoid checking trivial
-  details or exceptions.
+* Add tests for the changed code. A unit test must fail only when the code
+  under test is wrong: test behavior through real classes, not structure
+  (symbol existence, hierarchies, signatures, source text), mock call
+  choreography, or third-party packages. Avoid mocks and `SimpleNamespace`
+  unless definitely required; mock only what the test environment genuinely
+  lacks: GPUs, process groups, network, model weights.
 * Update docs for the changed code. Use concise comments to explain code
   where it might be tricky for humans to understand. Leave project/component
   level (design) docs focusing on high-level picture. Put suitable docs at
@@ -53,17 +57,6 @@ people and average people is more than tenfold.
   committing. Always run the exact `pre-commit run --all-files` command and
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
-
-## Code review
-
-When Codex or Claude Code reviews code changes, consult these references for
-the languages involved:
-
-* For C++ changes, consult the
-  [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and
-  the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
-* For Python changes, consult the
-  [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
 
 ## Design principles
 
@@ -111,6 +104,75 @@ change.
   parameter of the chain path (compaction), position vs slot, one tree
   attention path (trtllm-gen prefix plus window cascade), and position-keyed
   sampled verify.
+
+
+## Performance work: go to the algorithm, not the flags
+
+**A parameter sweep is a diagnostic, never a deliverable.** Set parameters to
+their measured optimum once, then stop touching them and go find what makes that
+optimum necessary. If a flag changes the number, the flag is telling you where
+the defect is; it is not the fix.
+
+The pattern that keeps costing days, with the 2026-08-26 gemma-4 case as the
+worked example:
+
+1. A metric looks wrong (TTFT tail: p50 3.8 s, max 41 s, against vLLM's max
+   12.7 s at the same mean).
+2. Flags get swept -- `admission-reserve`, `preempt-on-blocked-request`,
+   `disable-mixed-batch`, `chunked-prefill-size`, `max-num-seqs`. Some move the
+   number. None explains it, and the ones that "worked" were later refuted
+   (`preempt_on_blocked_request` measured -36%, then -61% when paired).
+3. The actual defect was one missing virtual override:
+   `SwaManager` never overrode `AdmissionBlocksNeededFor`, so all five sliding
+   groups were charged the whole prompt span (172 pages) instead of their true
+   peak (window + one step = 145). Admission demanded 947 parents against 925
+   free and refused -- 6,136 times across 92 requests in one 112-request run.
+
+**Rules that follow from it:**
+
+* **Ask what quantity the code computes before asking what value to give it.**
+  The gemma defect was a wrong quantity, and no value of any flag could fix a
+  wrong quantity.
+* **Read the engine's own diagnostics first.** `parents_needed=947
+  empty_parents=925` with a per-group breakdown was already being printed behind
+  `.plan_trace.on`. It named the defect in one line. Several days of flag
+  sweeping preceded anyone reading it.
+* **A capability-gated kernel is an algorithm problem, not a config problem.**
+  `mha_extend_with_kvcache` registered only a trtllm-gen kernel (needs tcgen05,
+  <= sm_103) and a Triton fallback, so sm_120 silently ran the fallback at 1.4x
+  the TTFT. The fix was to register the flashinfer FA2 path -- and it still sits
+  behind an env var, which is the same defect one level up.
+* **When a survey exists, read it before measuring.** `unieinfra/xref/` already
+  placed all five engines on the admission axis and named the recommended cell.
+  Re-deriving it from A/B runs cost hours and produced a worse answer.
+
+### Worked example 2: a flag that existed to hide a defect
+
+`.matrix.sh` served gemma-4 with `--disable-mixed-batch`. The flag was not a
+tuning choice -- it was there because mixed batching corrupted gemma's output.
+So the RAG cell's 0.71x versus vLLM was not "our scheduler is slower"; it was
+"we are running with prefill/decode overlap switched off to avoid a bug".
+
+What found it: making the engine print the quantity it was actually computing.
+One line at the mixed KV write site reported
+`locs=8191 total=8192 prefill=8191 decode=1`. The per-group write locations were
+built from `extend_seq_lens_cpu`, which on a MIXED step covers the prefill rows
+only, and `_trim_kv_to_locs` then silently trimmed k/v to that count -- so every
+decode row's newest token never entered the cache.
+
+Three rules this adds:
+
+1. **A disable flag is a bug report.** Before treating a disabled feature as a
+   performance ceiling, find out why it is disabled. Read the commit or the
+   comment that introduced it.
+2. **A silent trim is a correctness bug.** Any helper that reconciles two sizes
+   by shrinking one of them must say so, or be replaced by a check. This one was
+   documented as a padded-replay convenience and was load-bearing for a defect.
+3. **The corrupt arm can look faster.** It scored +25.9% tok/s because the broken
+   KV made it emit longer garbage. Gate every A/B on output length AND on
+   token-for-token agreement with a reference engine at temperature 0 -- 6/256
+   agreement versus 205/256 is what actually separated them, and neither
+   character-repetition nor "well-formed JSON" would have caught it.
 
 ## Public pull requests
 

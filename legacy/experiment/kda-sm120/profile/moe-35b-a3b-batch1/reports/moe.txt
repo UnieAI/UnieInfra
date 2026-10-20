@@ -1,0 +1,651 @@
+Error processing line 1 of /usr/local/lib/python3.12/dist-packages/__editable__.unieinfra_kernel-0.2.0.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 212, in addpackage
+    File "<string>", line 1, in <module>
+  ModuleNotFoundError: No module named '__editable___unieinfra_kernel_0_2_0_finder'
+
+Remainder of file ignored
+Error processing line 1 of /usr/local/lib/python3.12/dist-packages/__editable__.unieinfra_vllm-0.1.0+vllm.d02df748.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 212, in addpackage
+    File "<string>", line 1, in <module>
+  ModuleNotFoundError: No module named '__editable___unieinfra_vllm_0_1_0_vllm_d02df748_finder'
+
+Remainder of file ignored
+INFO 08-01 08:15:59 [api_utils.py:273] non-default args: {'trust_remote_code': True, 'dtype': 'bfloat16', 'max_model_len': 1024, 'gpu_memory_utilization': 0.85, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/workspace/models/Qwen/Qwen3.6-35B-A3B'}
+INFO 08-01 08:15:59 [model.py:627] Resolved architecture: Qwen3_5MoeForConditionalGeneration
+INFO 08-01 08:15:59 [model.py:1792] Using max model len 1024
+INFO 08-01 08:15:59 [scheduler.py:242] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 08-01 08:15:59 [vllm.py:1114] Asynchronous scheduling is enabled.
+WARNING 08-01 08:15:59 [vllm.py:1168] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 08-01 08:15:59 [vllm.py:1218] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 08-01 08:15:59 [kernel.py:303] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 08-01 08:15:59 [vllm.py:1397] Cudagraph is disabled under eager mode
+INFO 08-01 08:15:59 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+WARNING 08-01 08:15:59 [unieinfra_gemm.py:110] UnieInfra kernel layer unavailable; falling back to the upstream dense linear path. Install unieinfra-kernel to enable it.
+WARNING 08-01 08:15:59 [unieinfra_gemm.py:110] Traceback (most recent call last):
+WARNING 08-01 08:15:59 [unieinfra_gemm.py:110]   File "/workspace/roy/UnieInfra/unieinfra-vllm/vllm/model_executor/layers/unieinfra_gemm.py", line 94, in <module>
+WARNING 08-01 08:15:59 [unieinfra_gemm.py:110]     import unieinfra_kernel  # noqa: F401
+WARNING 08-01 08:15:59 [unieinfra_gemm.py:110]     ^^^^^^^^^^^^^^^^^^^^^^^
+WARNING 08-01 08:15:59 [unieinfra_gemm.py:110] ModuleNotFoundError: No module named 'unieinfra_kernel'
+WARNING 08-01 08:15:59 [unieinfra_selection.py:174] UnieInfra attention selection unavailable; falling back to the upstream hardcoded selector. Install unieinfra-kernel to enable it.
+WARNING 08-01 08:15:59 [unieinfra_selection.py:174] Traceback (most recent call last):
+WARNING 08-01 08:15:59 [unieinfra_selection.py:174]   File "/workspace/roy/UnieInfra/unieinfra-vllm/vllm/v1/attention/unieinfra_selection.py", line 144, in <module>
+WARNING 08-01 08:15:59 [unieinfra_selection.py:174]     from unieinfra_kernel.boundary import (
+WARNING 08-01 08:15:59 [unieinfra_selection.py:174] ModuleNotFoundError: No module named 'unieinfra_kernel'
+==PROF== Connected to process 3629 (/usr/bin/python3.12)
+[transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+WARNING 08-01 08:16:08 [system_utils.py:157] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+Error processing line 1 of /usr/local/lib/python3.12/dist-packages/__editable__.unieinfra_kernel-0.2.0.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 212, in addpackage
+    File "<string>", line 1, in <module>
+  ModuleNotFoundError: No module named '__editable___unieinfra_kernel_0_2_0_finder'
+
+Remainder of file ignored
+Error processing line 1 of /usr/local/lib/python3.12/dist-packages/__editable__.unieinfra_vllm-0.1.0+vllm.d02df748.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 212, in addpackage
+    File "<string>", line 1, in <module>
+  ModuleNotFoundError: No module named '__editable___unieinfra_vllm_0_1_0_vllm_d02df748_finder'
+
+Remainder of file ignored
+Error processing line 1 of /usr/local/lib/python3.12/dist-packages/__editable__.unieinfra_kernel-0.2.0.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 212, in addpackage
+    File "<string>", line 1, in <module>
+  ModuleNotFoundError: No module named '__editable___unieinfra_kernel_0_2_0_finder'
+
+Remainder of file ignored
+Error processing line 1 of /usr/local/lib/python3.12/dist-packages/__editable__.unieinfra_vllm-0.1.0+vllm.d02df748.pth:
+
+  Traceback (most recent call last):
+    File "<frozen site>", line 212, in addpackage
+    File "<string>", line 1, in <module>
+  ModuleNotFoundError: No module named '__editable___unieinfra_vllm_0_1_0_vllm_d02df748_finder'
+
+Remainder of file ignored
+(EngineCore pid=4003) INFO 08-01 08:16:14 [core.py:118] Initializing a V1 LLM engine (v0.1.0+vllm.d02df748) with config: model='/workspace/models/Qwen/Qwen3.6-35B-A3B', speculative_config=None, tokenizer='/workspace/models/Qwen/Qwen3.6-35B-A3B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=1024, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/workspace/models/Qwen/Qwen3.6-35B-A3B, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_gemm.py:110] UnieInfra kernel layer unavailable; falling back to the upstream dense linear path. Install unieinfra-kernel to enable it.
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_gemm.py:110] Traceback (most recent call last):
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_gemm.py:110]   File "/workspace/roy/UnieInfra/unieinfra-vllm/vllm/model_executor/layers/unieinfra_gemm.py", line 94, in <module>
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_gemm.py:110]     import unieinfra_kernel  # noqa: F401
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_gemm.py:110]     ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_gemm.py:110] ModuleNotFoundError: No module named 'unieinfra_kernel'
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_selection.py:174] UnieInfra attention selection unavailable; falling back to the upstream hardcoded selector. Install unieinfra-kernel to enable it.
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_selection.py:174] Traceback (most recent call last):
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_selection.py:174]   File "/workspace/roy/UnieInfra/unieinfra-vllm/vllm/v1/attention/unieinfra_selection.py", line 144, in <module>
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_selection.py:174]     from unieinfra_kernel.boundary import (
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_selection.py:174] ModuleNotFoundError: No module named 'unieinfra_kernel'
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_quant.py:166] UnieInfra quantized kernel layer unavailable; the engine's own fp8/NVFP4 path is used unchanged.
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_quant.py:166] Traceback (most recent call last):
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_quant.py:166]   File "/workspace/roy/UnieInfra/unieinfra-vllm/vllm/model_executor/layers/unieinfra_quant.py", line 143, in <module>
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_quant.py:166]     import unieinfra_kernel  # noqa: F401
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_quant.py:166]     ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=4003) WARNING 08-01 08:16:14 [unieinfra_quant.py:166] ModuleNotFoundError: No module named 'unieinfra_kernel'
+==PROF== Connected to process 4003 (/usr/bin/python3.12)
+(EngineCore pid=4003) INFO 08-01 08:16:16 [parallel_state.py:1612] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://172.17.0.7:52937 backend=nccl
+(EngineCore pid=4003) INFO 08-01 08:16:16 [parallel_state.py:1943] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=4003) INFO 08-01 08:16:16 [topk_topp_sampler.py:39] FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0.
+(EngineCore pid=4003) [transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(EngineCore pid=4003) INFO 08-01 08:16:21 [gpu_model_runner.py:5319] Starting to load model /workspace/models/Qwen/Qwen3.6-35B-A3B...
+(EngineCore pid=4003) INFO 08-01 08:16:21 [cuda.py:541] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
+(EngineCore pid=4003) INFO 08-01 08:16:21 [mm_encoder_attention.py:373] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
+(EngineCore pid=4003) INFO 08-01 08:16:21 [qwen_gdn_linear_attn.py:150] Using Triton/FLA GDN prefill kernel (requested=auto, head_k_dim=128).
+(EngineCore pid=4003) INFO 08-01 08:16:22 [unquantized.py:302] Using FlashInfer CUTLASS Unquantized MoE backend out of potential backends: ['FlashInfer TRTLLM', 'FlashInfer CUTLASS', 'TRITON', 'BATCHED_TRITON'].
+(EngineCore pid=4003) INFO 08-01 08:16:22 [cuda.py:482] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+(EngineCore pid=4003) INFO 08-01 08:16:22 [flash_attn.py:815] Using FlashAttention version 2
+(EngineCore pid=4003) INFO 08-01 08:16:22 [weight_utils.py:869] Filesystem type for checkpoints: EXT4. Checkpoint size: 66.97 GiB. Available RAM: 957.22 GiB.
+(EngineCore pid=4003) INFO 08-01 08:16:22 [weight_utils.py:892] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+(EngineCore pid=4003) Loading safetensors checkpoint shards:   0% Completed | 0/26 [00:00<?, ?it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:   4% Completed | 1/26 [00:00<00:16,  1.52it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:   8% Completed | 2/26 [00:00<00:10,  2.18it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  12% Completed | 3/26 [00:01<00:12,  1.89it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  15% Completed | 4/26 [00:02<00:12,  1.71it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  19% Completed | 5/26 [00:02<00:12,  1.64it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  23% Completed | 6/26 [00:03<00:13,  1.51it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  27% Completed | 7/26 [00:03<00:10,  1.86it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  31% Completed | 8/26 [00:04<00:10,  1.69it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  35% Completed | 9/26 [00:04<00:08,  2.02it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  38% Completed | 10/26 [00:05<00:08,  1.79it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  42% Completed | 11/26 [00:05<00:07,  2.13it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  46% Completed | 12/26 [00:06<00:07,  1.95it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  50% Completed | 13/26 [00:06<00:06,  2.15it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  54% Completed | 14/26 [00:07<00:06,  1.95it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  58% Completed | 15/26 [00:07<00:05,  2.15it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  62% Completed | 16/26 [00:08<00:05,  1.85it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  65% Completed | 17/26 [00:08<00:04,  2.16it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  69% Completed | 18/26 [00:09<00:04,  1.85it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  73% Completed | 19/26 [00:09<00:03,  2.17it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  77% Completed | 20/26 [00:10<00:03,  1.99it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  81% Completed | 21/26 [00:10<00:02,  2.17it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  85% Completed | 22/26 [00:11<00:02,  1.97it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  88% Completed | 23/26 [00:12<00:01,  1.81it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  92% Completed | 24/26 [00:12<00:01,  1.72it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards:  96% Completed | 25/26 [00:13<00:00,  1.75it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards: 100% Completed | 26/26 [00:13<00:00,  2.05it/s]
+(EngineCore pid=4003) Loading safetensors checkpoint shards: 100% Completed | 26/26 [00:13<00:00,  1.91it/s]
+(EngineCore pid=4003) 
+(EngineCore pid=4003) INFO 08-01 08:16:35 [default_loader.py:430] Loading weights took 13.61 seconds
+(EngineCore pid=4003) INFO 08-01 08:16:36 [unquantized.py:374] Using MoEPrepareAndFinalizeNoDPEPModular
+(EngineCore pid=4003) INFO 08-01 08:16:36 [unquantized.py:375] Using FlashInferExperts MoE backend
+(EngineCore pid=4003) INFO 08-01 08:16:36 [gpu_model_runner.py:5416] Model loading took 65.53 GiB memory and 14.753466 seconds
+(EngineCore pid=4003) INFO 08-01 08:16:36 [interface.py:905] Setting attention block size to 1056 tokens to ensure that attention page size is >= mamba page size.
+(EngineCore pid=4003) INFO 08-01 08:16:36 [interface.py:929] Padding mamba page size by 0.76% to ensure that mamba page size and attention page size are exactly equal.
+(EngineCore pid=4003) INFO 08-01 08:16:36 [gpu_model_runner.py:6472] Encoder cache will be initialized with a budget of 16384 tokens, and profiled with 1 image items of the maximum feature size.
+==PROF== Profiling "finalizeMoeRoutingKernel": 0%
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+....50%....100% - 9 passes
+==PROF== Profiling "topkGating": 0%....50%....100% - 9 passes
+==PROF== Profiling "expandInputRowsKernel": 0%....50%....100% - 9 passes
+==PROF== Profiling "finalizeMoeRoutingKernel": 0%....50%....100% - 9 passes
+==PROF== Profiling "topkGating": 0%....50%....100% - 9 passes
+==PROF== Profiling "expandInputRowsKernel": 0%....50%....100% - 9 passes
+==PROF== Profiling "finalizeMoeRoutingKernel": 0%....50%....100% - 9 passes
+==PROF== Profiling "topkGating": 0%....50%....100% - 9 passes
+(EngineCore pid=4003) INFO 08-01 08:19:28 [gpu_worker.py:547] Available KV cache memory: 10.09 GiB
+(EngineCore pid=4003) INFO 08-01 08:19:28 [kv_cache_utils.py:2214] GPU KV cache size: 128,000 tokens
+(EngineCore pid=4003) INFO 08-01 08:19:28 [kv_cache_utils.py:2215] Maximum concurrency for 1,024 tokens per request: 125.00x
+(EngineCore pid=4003) INFO 08-01 08:19:28 [admission.py:131] UnieInfra: clamping max_num_seqs 1024 -> 500 to fit the binding per-sequence pool (500 blocks). Upstream would refuse to start here; raise gpu_memory_utilization to recover the lost concurrency, or set UNIEINFRA_SCHEDULER_ADMISSION_CLAMP=0 to restore the upstream behaviour.
+(EngineCore pid=4003) <frozen importlib._bootstrap_external>:1301: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(EngineCore pid=4003) <frozen importlib._bootstrap_external>:1301: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(EngineCore pid=4003) INFO 08-01 08:19:28 [qwen_triton_warmup.py:370] Warming up Qwen Triton kernels for model_type=qwen3_5_moe_text.
+(EngineCore pid=4003) INFO 08-01 08:19:28 [kernel_warmup.py:243] Using FlashInfer autotune cache file: /root/.cache/vllm/flashinfer_autotune_cache/0.6.13/120f/377895198bbf26203de8d413c52931b8cbd3fc0d278c5883222d0128c84c4d15/autotune_configs.json
+(EngineCore pid=4003) 2026-08-01 08:19:29,064 - INFO - autotuner.py:1899 - flashinfer.jit: [Autotuner]: Loaded 42 configs from /root/.cache/vllm/flashinfer_autotune_cache/0.6.13/120f/377895198bbf26203de8d413c52931b8cbd3fc0d278c5883222d0128c84c4d15/autotune_configs.json
+(EngineCore pid=4003) 2026-08-01 08:19:29,065 - INFO - autotuner.py:651 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(EngineCore pid=4003) 2026-08-01 08:19:29,073 - INFO - autotuner.py:1009 - flashinfer.jit: [Autotuner]: Config cache hit for trtllm::fused_moe::gemm1 (runner=MoERunner, source=config file)
+(EngineCore pid=4003) 2026-08-01 08:19:29,075 - INFO - autotuner.py:1009 - flashinfer.jit: [Autotuner]: Config cache hit for trtllm::fused_moe::gemm2 (runner=MoERunner, source=config file)
+(EngineCore pid=4003) 2026-08-01 08:19:29,424 - INFO - autotuner.py:674 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(EngineCore pid=4003) 2026-08-01 08:19:29,622 - INFO - autotuner.py:1899 - flashinfer.jit: [Autotuner]: Loaded 42 configs from /root/.cache/vllm/flashinfer_autotune_cache/0.6.13/120f/377895198bbf26203de8d413c52931b8cbd3fc0d278c5883222d0128c84c4d15/autotune_configs.json
+(EngineCore pid=4003) INFO 08-01 08:19:29 [kernel_warmup.py:284] FlashInfer autotune cache loaded on rank 0 from /root/.cache/vllm/flashinfer_autotune_cache/0.6.13/120f/377895198bbf26203de8d413c52931b8cbd3fc0d278c5883222d0128c84c4d15/autotune_configs.json.
+(EngineCore pid=4003) INFO 08-01 08:19:29 [ll_bf16.py:85] ll_bf16_gemm disabled on compute capability 12.0: this kernel is qualified only on sm_90, sm_100-sm_109. cuteDSL cannot lower it for consumer/workstation Blackwell, and an open-ended '>= sm_90' gate was what admitted it there.
+(EngineCore pid=4003) INFO 08-01 08:19:29 [cutedsl_warmup.py:105] Skipping CuTeDSL warmup because no compile units were requested.
+(EngineCore pid=4003) INFO 08-01 08:19:29 [gpu_worker.py:773] Free memory on device (94.29/94.97 GiB) on startup. Desired GPU memory utilization is (0.85, 80.73 GiB). Actual usage is 67.0 GiB for consumed memory (weights + non-torch), 3.64 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=10675467060` (9.94 GiB) to fit into requested memory, or `--kv-cache-memory=25237733376` (23.5 GiB) to fully utilize gpu memory. Current kv cache memory in use is 10.09 GiB.
+(EngineCore pid=4003) INFO 08-01 08:19:30 [jit_monitor.py:79] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(EngineCore pid=4003) INFO 08-01 08:19:30 [core.py:364] init engine (profile, create kv cache, warmup model) took 174.02 s
+(EngineCore pid=4003) INFO 08-01 08:19:30 [vllm.py:1114] Asynchronous scheduling is enabled.
+(EngineCore pid=4003) WARNING 08-01 08:19:30 [vllm.py:1168] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore pid=4003) WARNING 08-01 08:19:30 [vllm.py:1218] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore pid=4003) INFO 08-01 08:19:30 [kernel.py:303] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+(EngineCore pid=4003) INFO 08-01 08:19:30 [vllm.py:1397] Cudagraph is disabled under eager mode
+(EngineCore pid=4003) INFO 08-01 08:19:30 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 10.73it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=4003) WARNING 08-01 08:19:30 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _compute_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=4003) WARNING 08-01 08:19:31 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _causal_conv1d_update_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=4003) WARNING 08-01 08:19:31 [jit_monitor.py:135] Triton kernel JIT compilation during inference: fused_recurrent_gated_delta_rule_packed_decode_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=4003) WARNING 08-01 08:19:31 [jit_monitor.py:135] Triton kernel JIT compilation during inference: layer_norm_fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=4003) WARNING 08-01 08:19:31 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _triton_mrope_forward. This causes a latency spike; consider extending warmup to cover this shape/config.
+Processed prompts: 100%|██████████| 1/1 [00:56<00:00, 56.17s/it, est. speed input: 1.30 toks/s, output: 0.07 toks/s]Processed prompts: 100%|██████████| 1/1 [00:56<00:00, 56.17s/it, est. speed input: 1.30 toks/s, output: 0.07 toks/s]Processed prompts: 100%|██████████| 1/1 [00:56<00:00, 56.17s/it, est. speed input: 1.30 toks/s, output: 0.07 toks/s]
+[ncu] warmup done
+Rendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 1/1 [00:00<00:00, 1312.36it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:03<00:00,  3.76s/it, est. speed input: 19.41 toks/s, output: 4.25 toks/s]Processed prompts: 100%|██████████| 1/1 [00:03<00:00,  3.76s/it, est. speed input: 19.41 toks/s, output: 4.25 toks/s]Processed prompts: 100%|██████████| 1/1 [00:03<00:00,  3.76s/it, est. speed input: 19.41 toks/s, output: 4.25 toks/s]
+[ncu] 16 tokens
+(EngineCore pid=4003) INFO 08-01 08:20:30 [core.py:1385] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=4003) INFO 08-01 08:20:30 [core.py:1504] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=4003) INFO 08-01 08:20:30 [core.py:1535] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=4003) INFO 08-01 08:20:30 [core.py:1398] [shutdown] EngineCore: exiting busy loop
+==PROF== Disconnected from process 4003
+==PROF== Disconnected from process 3629
+==PROF== Report: /tmp/ncu/moe.ncu-rep
+[4003] python3.12@127.0.0.1
+  void tensorrt_llm::finalizeMoeRoutingKernel<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, 1>(const T2 *, T1 *, const T3 *, const float *, const int *, const int *, long, long, long, int, int) (16384, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.47
+    SM Frequency                    Ghz         1.85
+    Elapsed Cycles                cycle       760386
+    Memory Throughput                 %        90.72
+    DRAM Throughput                   %        90.72
+    Duration                         us       410.53
+    L1/TEX Cache Throughput           %        19.40
+    L2 Cache Throughput               %        23.62
+    SM Active Cycles              cycle    731360.47
+    Compute (SM) Throughput           %        20.34
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of the device.   
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing DRAM in the Memory Workload Analysis section.                                              
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Tbyte/s         1.45
+    Mem Busy                       %        23.62
+    Max Bandwidth                  %        90.72
+    L1/TEX Hit Rate                %        75.76
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %         8.35
+    Mem Pipes Busy                 %        17.06
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block            5
+    Block Limit Shared Mem                block           16
+    Block Limit Warps                     block            6
+    Theoretical Active Warps per SM        warp           40
+    Theoretical Occupancy                     %        83.33
+    Achieved Occupancy                        %        80.80
+    Achieved Active Warps Per SM           warp        38.78
+    ------------------------------- ----------- ------------
+
+  void vllm::topkGating<8, 256, 4, 16, 32, int, __nv_bfloat16, 0>(const T7 *, const bool *, float *, int, T6 *, int *, int, int, int, bool, const float *, double, const bool *) (4096, 1, 1)x(32, 4, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.46
+    SM Frequency                    Ghz         1.83
+    Elapsed Cycles                cycle        48779
+    Memory Throughput                 %        68.18
+    DRAM Throughput                   %        19.89
+    Duration                         us        26.50
+    L1/TEX Cache Throughput           %        78.78
+    L2 Cache Throughput               %        17.79
+    SM Active Cycles              cycle     42034.87
+    Compute (SM) Throughput           %        68.67
+    ----------------------- ----------- ------------
+
+    INF   Compute and Memory are well-balanced: To reduce runtime, both computation and memory traffic must be reduced. 
+          Check both the Compute Workload Analysis and Memory Workload Analysis sections.                               
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Gbyte/s       317.14
+    Mem Busy                       %        34.70
+    Max Bandwidth                  %        68.18
+    L1/TEX Hit Rate                %        70.09
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %        61.49
+    Mem Pipes Busy                 %        68.18
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block           12
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           12
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        79.60
+    Achieved Active Warps Per SM           warp        38.21
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 20.4%                                                                                     
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (79.6%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+
+  void tensorrt_llm::expandInputRowsKernel<__nv_bfloat16, __nv_bfloat16, 2, 0, 0, std::integral_constant<bool, 0>>(const T1 *, T2 *, const float *, float *, const int *, long, long, long, const float *, bool, const long *, unsigned char *, const unsigned char *, bool, long, const T1 *) (1504, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.47
+    SM Frequency                    Ghz         1.85
+    Elapsed Cycles                cycle       905437
+    Memory Throughput                 %        84.69
+    DRAM Throughput                   %        84.69
+    Duration                         us       489.79
+    L1/TEX Cache Throughput           %        25.42
+    L2 Cache Throughput               %        41.82
+    SM Active Cycles              cycle    819999.60
+    Compute (SM) Throughput           %        13.02
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of the device.   
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing DRAM in the Memory Workload Analysis section.                                              
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Tbyte/s         1.35
+    Mem Busy                       %        34.73
+    Max Bandwidth                  %        84.69
+    L1/TEX Hit Rate                %        75.08
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %        38.17
+    Mem Pipes Busy                 %        11.14
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block            8
+    Block Limit Shared Mem                block           16
+    Block Limit Warps                     block            6
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        85.21
+    Achieved Active Warps Per SM           warp        40.90
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 14.79%                                                                                    
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (85.2%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+
+  void tensorrt_llm::finalizeMoeRoutingKernel<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, 1>(const T2 *, T1 *, const T3 *, const float *, const int *, const int *, long, long, long, int, int) (16384, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.47
+    SM Frequency                    Ghz         1.85
+    Elapsed Cycles                cycle       757467
+    Memory Throughput                 %        91.02
+    DRAM Throughput                   %        91.02
+    Duration                         us       409.15
+    L1/TEX Cache Throughput           %        19.50
+    L2 Cache Throughput               %        23.75
+    SM Active Cycles              cycle    727571.18
+    Compute (SM) Throughput           %        20.44
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of the device.   
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing DRAM in the Memory Workload Analysis section.                                              
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Tbyte/s         1.45
+    Mem Busy                       %        23.75
+    Max Bandwidth                  %        91.02
+    L1/TEX Hit Rate                %        75.75
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %         8.27
+    Mem Pipes Busy                 %        17.15
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block            5
+    Block Limit Shared Mem                block           16
+    Block Limit Warps                     block            6
+    Theoretical Active Warps per SM        warp           40
+    Theoretical Occupancy                     %        83.33
+    Achieved Occupancy                        %        80.83
+    Achieved Active Warps Per SM           warp        38.80
+    ------------------------------- ----------- ------------
+
+  void vllm::topkGating<8, 256, 4, 16, 32, int, __nv_bfloat16, 0>(const T7 *, const bool *, float *, int, T6 *, int *, int, int, int, bool, const float *, double, const bool *) (4096, 1, 1)x(32, 4, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.45
+    SM Frequency                    Ghz         1.82
+    Elapsed Cycles                cycle        49190
+    Memory Throughput                 %        67.67
+    DRAM Throughput                   %        19.64
+    Duration                         us        26.85
+    L1/TEX Cache Throughput           %        79.11
+    L2 Cache Throughput               %        17.57
+    SM Active Cycles              cycle     41862.76
+    Compute (SM) Throughput           %        68.16
+    ----------------------- ----------- ------------
+
+    INF   Compute and Memory are well-balanced: To reduce runtime, both computation and memory traffic must be reduced. 
+          Check both the Compute Workload Analysis and Memory Workload Analysis sections.                               
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Gbyte/s       312.98
+    Mem Busy                       %        34.45
+    Max Bandwidth                  %        67.67
+    L1/TEX Hit Rate                %        70.09
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %        61.59
+    Mem Pipes Busy                 %        67.67
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block           12
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           12
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        79.19
+    Achieved Active Warps Per SM           warp        38.01
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 20.81%                                                                                    
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (79.2%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+
+  void tensorrt_llm::expandInputRowsKernel<__nv_bfloat16, __nv_bfloat16, 2, 0, 0, std::integral_constant<bool, 0>>(const T1 *, T2 *, const float *, float *, const int *, long, long, long, const float *, bool, const long *, unsigned char *, const unsigned char *, bool, long, const T1 *) (1504, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.47
+    SM Frequency                    Ghz         1.85
+    Elapsed Cycles                cycle       886328
+    Memory Throughput                 %        85.02
+    DRAM Throughput                   %        85.02
+    Duration                         us       479.10
+    L1/TEX Cache Throughput           %        26.10
+    L2 Cache Throughput               %        42.71
+    SM Active Cycles              cycle    807535.43
+    Compute (SM) Throughput           %        13.29
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of the device.   
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing DRAM in the Memory Workload Analysis section.                                              
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Tbyte/s         1.36
+    Mem Busy                       %        35.59
+    Max Bandwidth                  %        85.02
+    L1/TEX Hit Rate                %        75.09
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %        39.62
+    Mem Pipes Busy                 %        11.37
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block            8
+    Block Limit Shared Mem                block           16
+    Block Limit Warps                     block            6
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        85.20
+    Achieved Active Warps Per SM           warp        40.89
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 14.8%                                                                                     
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (85.2%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+
+  void tensorrt_llm::finalizeMoeRoutingKernel<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, 1>(const T2 *, T1 *, const T3 *, const float *, const int *, const int *, long, long, long, int, int) (16384, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.47
+    SM Frequency                    Ghz         1.85
+    Elapsed Cycles                cycle       760502
+    Memory Throughput                 %        90.64
+    DRAM Throughput                   %        90.64
+    Duration                         us       410.69
+    L1/TEX Cache Throughput           %        19.35
+    L2 Cache Throughput               %        23.63
+    SM Active Cycles              cycle    733111.37
+    Compute (SM) Throughput           %        20.35
+    ----------------------- ----------- ------------
+
+    INF   This workload is utilizing greater than 80.0% of the available compute or memory performance of the device.   
+          To further improve performance, work will likely need to be shifted from the most utilized to another unit.   
+          Start by analyzing DRAM in the Memory Workload Analysis section.                                              
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Tbyte/s         1.45
+    Mem Busy                       %        23.63
+    Max Bandwidth                  %        90.64
+    L1/TEX Hit Rate                %        75.76
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %         8.46
+    Mem Pipes Busy                 %        17.07
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block            5
+    Block Limit Shared Mem                block           16
+    Block Limit Warps                     block            6
+    Theoretical Active Warps per SM        warp           40
+    Theoretical Occupancy                     %        83.33
+    Achieved Occupancy                        %        80.86
+    Achieved Active Warps Per SM           warp        38.81
+    ------------------------------- ----------- ------------
+
+  void vllm::topkGating<8, 256, 4, 16, 32, int, __nv_bfloat16, 0>(const T7 *, const bool *, float *, int, T6 *, int *, int, int, int, bool, const float *, double, const bool *) (4096, 1, 1)x(32, 4, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz        12.43
+    SM Frequency                    Ghz         1.84
+    Elapsed Cycles                cycle        49087
+    Memory Throughput                 %        67.62
+    DRAM Throughput                   %        19.83
+    Duration                         us        26.62
+    L1/TEX Cache Throughput           %        79.07
+    L2 Cache Throughput               %        17.71
+    SM Active Cycles              cycle     41881.72
+    Compute (SM) Throughput           %        68.11
+    ----------------------- ----------- ------------
+
+    INF   Compute and Memory are well-balanced: To reduce runtime, both computation and memory traffic must be reduced. 
+          Check both the Compute Workload Analysis and Memory Workload Analysis sections.                               
+
+    Section: Memory Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Memory Throughput        Gbyte/s       315.62
+    Mem Busy                       %        34.42
+    Max Bandwidth                  %        67.62
+    L1/TEX Hit Rate                %        70.09
+    L2 Compression Ratio                        0
+    L2 Hit Rate                    %        61.54
+    Mem Pipes Busy                 %        67.62
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block           12
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           12
+    Theoretical Active Warps per SM        warp           48
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        79.14
+    Achieved Active Warps Per SM           warp        37.99
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 20.86%                                                                                    
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (79.1%) can be the     
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+

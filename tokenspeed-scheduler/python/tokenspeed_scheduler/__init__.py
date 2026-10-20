@@ -23,9 +23,8 @@
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
     AbortReason,
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
     CapacityModel,
     ExecutionEvent,
@@ -60,14 +59,24 @@ def _forward_batch_repr(self):
 
 Forward.Batch.__repr__ = _forward_batch_repr
 
+# Optional: present only once the matching extension is installed. This module
+# is resolved through an editable .pth for every process on this box, so an
+# unconditional import of a new symbol breaks engine startup box-wide the
+# moment the Python and the .so disagree. It did, on 2026-08-20, for a
+# teammate's grid that never referenced this name.
+try:
+    from tokenspeed_scheduler.tokenspeed_scheduler_ext import ContextChunkPolicy
+except ImportError:  # installed extension predates the context-chunk policy
+    ContextChunkPolicy = None
+
 __all__ = [
+    *(["ContextChunkPolicy"] if ContextChunkPolicy is not None else []),
     # Core
     "Scheduler",
     "SchedulerConfig",
     "RequestSpec",
-    "CacheRetention",
+    "AttnKind",
     "CacheGroupConfig",
-    "CacheGroupFamily",
     "CacheTransferPolicy",
     "CapacityModel",
     # Execution plan & operations

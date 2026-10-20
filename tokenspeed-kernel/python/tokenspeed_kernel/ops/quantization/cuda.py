@@ -24,4 +24,13 @@ try:
 except ImportError:
     gptq_marlin_repack = error_fn
 
-__all__ = ["gptq_marlin_repack"]
+try:
+    from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_gemm
+except ImportError:
+    # The Marlin GEMM is not built yet -- only the repack half of the library
+    # is vendored (see thirdparty/cuda/csrc/tokenspeed_marlin.cuh, whose header
+    # says as much). Callers get a clear error at apply time instead of a
+    # NameError during weight loading.
+    gptq_marlin_gemm = error_fn
+
+__all__ = ["gptq_marlin_gemm", "gptq_marlin_repack"]

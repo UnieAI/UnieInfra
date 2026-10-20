@@ -1,0 +1,323 @@
+[ts] [2026-08-03 05:16:05] Generate request cmpl-3KWni3jOdciE9c1IfIyehC2Y-019fc60c-f21e-7ef2-99f5-a02f883b2197 (stream=False)
+[ts] [38;20m[2026-08-03 05:16:05,025  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 772, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:05,171  ATTN TP RANK 0] - INFO - Req: cmpl-3KWni3jOdciE9c1IfIyehC2Y-019fc60c-f21e-7ef2-99f5-a02f883b2197 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [2026-08-03 05:16:05] Generate request cmpl-ouCH8HHYLgXJ4AHrGsb8Jk3Z-019fc60c-f2b7-7300-9525-91049be0e4d0 (stream=False)
+[ts] [38;20m[2026-08-03 05:16:05,210  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1022, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:05,800  ATTN TP RANK 0] - INFO - Req: cmpl-ouCH8HHYLgXJ4AHrGsb8Jk3Z-019fc60c-f2b7-7300-9525-91049be0e4d0 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [2026-08-03 05:16:06] Generate request cmpl-BUgzikbsqWngZhZR4VXEuteO-019fc60c-f93d-7e22-9a5c-c7c86457b86a (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-9uPgX1kCRNQBKcgWjnJnbQlg-019fc60c-f93d-7e22-9a5c-c7e2b802c81b (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-Q0e2ACdGrQ0jAKIxPpcuD8X9-019fc60c-f93d-7e22-9a5c-c8060ad25b27 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-SaSvvO3cM1FUbZb8KFTOXv46-019fc60c-f93e-7821-930c-6c0a745811d9 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-rxaMfOSgSnKQV7IHL0rallcI-019fc60c-f93e-7821-930c-6c1b06e6b2ad (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-zEd9Qv0baBfKCd38cMKbT8TP-019fc60c-f93f-7270-9d9d-c11880db6af6 (stream=False)
+[ts] [38;20m[2026-08-03 05:16:06,848  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 2, #new-token: 2056, #cached-token: 0, #running-req: 2, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [2026-08-03 05:16:06] Generate request cmpl-5QtpTRdw2B91tyi3bAPwJKrA-019fc60c-f93f-7270-9d9d-c138ae0ba7ee (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-mIea1gozRqQCGaauJY96KHL2-019fc60c-f93f-7270-9d9d-c15086f505da (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-TN1Jift677NYPYLX5AVtCB0B-019fc60c-f940-73d2-ab9b-9f83d1f297e9 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-cWStqOxqOMrc1P9OQJgd50ao-019fc60c-f941-76c2-a24d-e08d7e6e3fa5 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-sQXNdyp73U3kfh42bL3PgORJ-019fc60c-f941-76c2-a24d-e09a6985e00b (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-CUnX2tYF12KNyV2450WK2CbW-019fc60c-f941-76c2-a24d-e0ad3c4c772b (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-orBFqH8AraJ9y5BG5dqtdj1n-019fc60c-f942-7a31-bf87-47141ef93727 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-88NXUoVVtwAMfVRBK5Gc0h9W-019fc60c-f942-7a31-bf87-4730c0748470 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-7k4KXUzclEOVyHYFGlodtPat-019fc60c-f943-7000-a97f-e767498d4549 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-5OlXkvItDYOYXnfLGgT53Bcz-019fc60c-f943-7000-a97f-e772140e686c (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-3sMjO2wXUUG76OTA7lX2Iduo-019fc60c-f943-7000-a97f-e78242534832 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-5rqjGRJEXIXJkrh9tQHRmEER-019fc60c-f944-7243-b775-45860a36e677 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-MKXzctLrKIp8nYpwAP7rJlGS-019fc60c-f944-7243-b775-45aa7cae695f (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-JudxXP1MokvOU3lm0VrlCnGo-019fc60c-f945-7090-86c9-450aa8ef7744 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-16abBo6zZofuE8bIN8TZTavC-019fc60c-f945-7090-86c9-452e72f83842 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-Ipgd8eoprJeUZg56jVXNXvJv-019fc60c-f946-77e2-b347-88bc4b64ce6d (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-frQITR35HMarpPkl2G3karLz-019fc60c-f946-77e2-b347-88c9d4f63b4e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-YveSAMqS7JsHqHfNjNpSR6Dm-019fc60c-f948-7a40-b6ee-7ad350462f4c (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-6GzfoKud3p3taTY6SHwtakLN-019fc60c-f948-7a40-b6ee-7af58ccc5413 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-8hzbl23xbt8fFsWTRmhuqjc2-019fc60c-f948-7a40-b6ee-7b08c4c44069 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-4PZDLOgAiGKvgV0ILfGzSduF-019fc60c-f948-7a40-b6ee-7b19cf0c99dc (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-F5XfcehRaVELmGtmUhKDkniM-019fc60c-f948-7a40-b6ee-7b2cbe9ffcb0 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-keMcIN9hLhR2jETxfOf8vrrO-019fc60c-f949-7222-8e7c-d5c428ff45b6 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-It646hL5Yx4rvdLngO9hBsI2-019fc60c-f949-7222-8e7c-d5d55c96ec07 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-zVWKHNjxwHF5aLRjoLoTGqcF-019fc60c-f94a-7902-8ddd-03f98a35d798 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-10OiJxax7wIuZNMZ5OJikbeY-019fc60c-f94b-79c1-a59d-8979a2be4d0b (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-MeC9Ac7e7A5vmNtYRs8dA3sY-019fc60c-f94b-79c1-a59d-8989c224b2e2 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-1YSk8Zkqy1ycArrhb0zsiWKQ-019fc60c-f94b-79c1-a59d-89bc4b84fafe (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-99TW44BH5VZsFpxm0Lhb9umB-019fc60c-f94c-7490-a975-24978b60f026 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-UfCMDYREcmpBLfFu8K7aybC3-019fc60c-f94c-7490-a975-24a5db088e45 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-njpCUJoBkGmIBnVlLgeHYrep-019fc60c-f94c-7490-a975-24d2693723dd (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-HehVUljVbtlyqx8oJ0yfsuf9-019fc60c-f94d-77d1-9534-217901de32e7 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-kRh49CuhCkuFV5AKu5k6CRxe-019fc60c-f94d-77d1-9534-219df9814916 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-yx1CZXv018yn7PLLSbCuAekT-019fc60c-f94e-7832-9f81-a4179cace9e2 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-ri20s4z6y0iJDhwb6X439qdq-019fc60c-f94f-7ec2-9962-1874aa707e12 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-NM0v4pv4y9TImBfl4L77mUrf-019fc60c-f94f-7ec2-9962-1881ac258255 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-REA9BdVntRBY3lGu5rHYqEzZ-019fc60c-f94f-7ec2-9962-189fb23e2bb0 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-6f6J7RuS85W9goNaFEIvObUH-019fc60c-f94f-7ec2-9962-18a6e1411938 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-eswkUpqayH76KdgsI7hj58Va-019fc60c-f950-7190-beb5-61c71d42be06 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-wlddtzJfIq5xbN9B06UNf3RS-019fc60c-f950-7190-beb5-61decb22dfea (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-IP5ecmCzcdDxtJfSBx9W0oSE-019fc60c-f950-7190-beb5-61edf2f3dcdc (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-e5TfNuPrzdWHYPbipnPlg25F-019fc60c-f950-7190-beb5-61f3e4d732e0 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-5ER2ueFigHGZtIaeFyygduTs-019fc60c-f951-7870-adcc-90104d36d26f (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-sHLVchnltkvZYvm34a9sBBM8-019fc60c-f951-7870-adcc-902477fff1e4 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-pHNY1BtFoASMqXYNZt961cPe-019fc60c-f951-7870-adcc-903a19403ab2 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-h9p82EMJAmbbxHSLlbay31oW-019fc60c-f952-7740-a6aa-8a79100d381b (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-1KDUd89LFwuCGH6J1tYN7ira-019fc60c-f96a-7340-add2-04ceb263dc49 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-Bbc5rz2WEo0VVSXYviFPwu4N-019fc60c-f96a-7340-add2-04d13a6f72e9 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-HBWwFE8C77kMJVbeoyPF5Ios-019fc60c-f96a-7340-add2-04e6e495aa62 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-3MmW7tvBVxkgdtnAUUESSuq7-019fc60c-f96a-7340-add2-04fceab8081e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-V7gt0IvN2qllRvl3YChewruQ-019fc60c-f96a-7340-add2-0505f044429e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-oPenP1ORF0g4AnVli3IT3DyR-019fc60c-f96a-7340-add2-051634f4dbd3 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-x0SJ1oQHgRMj4umTtoTMkw1X-019fc60c-f96a-7340-add2-0558e6827c07 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-FKQ8myZpOfQftR90QqtMC4nj-019fc60c-f96b-7722-8c31-0bad9e660c56 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-sxnLkwRXCxTWB82pOtDdmRFa-019fc60c-f96b-7722-8c31-0bb332bccec7 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-unGT5sJcweQQ2TASxYhynWc4-019fc60c-f96b-7722-8c31-0bc4b24684d0 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-qRZKhyWC4zH5UyUPYo8lQLGB-019fc60c-f96c-7b03-84cc-648cb9f78080 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-7bvqM2q7sNnEgUwMpdcpw7jL-019fc60c-f96c-7b03-84cc-649f46c9c346 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-FPaEjBNEonTzaQMkZ4F2gDHM-019fc60c-f96c-7b03-84cc-64adddc7058b (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-g9pl0JLDRAlZlQfUsKXF6eVp-019fc60c-f96c-7b03-84cc-64b9d08dc913 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-6lt1Z8h97DXITjFsFkwRss0Y-019fc60c-f96d-76b1-9d44-1f82a6ac2098 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-aFVl3MhZkDGeutesVo8s53P3-019fc60c-f96d-76b1-9d44-1fb8dd6af565 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-FAOsZu2xklYEHddEXHMvM0gn-019fc60c-f96d-76b1-9d44-1fa233ba48af (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-JuRt7a0ionha7hAaOl6wSyZz-019fc60c-f96d-76b1-9d44-1fe884534d1a (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-e2B7GZVkXXPaLG7He5uF6phl-019fc60c-f96d-76b1-9d44-1fd970462326 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-5W4dv06FvgtEAAVXnqrw0tRW-019fc60c-f96d-76b1-9d44-1ff674a01760 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-ysXgTnmpaBxTw3neWGIhDArZ-019fc60c-f96e-7951-90c9-c21c3494aad0 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-gYizhxfzdYPpmlCTc57GGtYs-019fc60c-f96e-7951-90c9-c22d1c0def3b (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-wrDg9z5OS4vZKz5AWcYNbq7U-019fc60c-f96e-7951-90c9-c2873dc21a6e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-MmGDBC4tUtgxyZRjDhXi8T7z-019fc60c-f96e-7951-90c9-c290ee794dee (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-1oMwxh2p0PQf6PGogI7VwoY7-019fc60c-f96e-7951-90c9-c2aa602fa7d3 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-fPduQR4jTSyE3guGgAVDFcaC-019fc60c-f96e-7951-90c9-c2b63d1e9c57 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-QnFKok9QepjlfynZYvldab7t-019fc60c-f96e-7951-90c9-c2dcdb3d3cd7 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-fN07ixVQMx1jFuxhMpfcw49I-019fc60c-f96e-7951-90c9-c2c23fad44ac (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-xXxigWxNI8hEvAk4moqOqfKJ-019fc60c-f96e-7951-90c9-c2e528ab7492 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-Os1UAWTwSXjOoRpFLenaLoyq-019fc60c-f96f-7b03-bdad-9fd1fdb2021e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-3Z0ICVOs4mVN1e6uqANt8R0T-019fc60c-f96f-7b03-bdad-9fe05ccf7e5a (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-IVCyiQewgk9sPgWG8kwJ7nVm-019fc60c-f96f-7b03-bdad-9ff184cd06df (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-AV4zbScN5vBeY8lxrtpvIbcw-019fc60c-f96f-7b03-bdad-a007a9fe107f (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-EdnkTB5aqXITe1WOHMHdieeo-019fc60c-f96f-7b03-bdad-a0166293b874 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-FQlP1ySt38vYj78B1zkhA5CA-019fc60c-f96f-7b03-bdad-a02eecd8ee73 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-RtRdFWByx597D9xldkrEDjE0-019fc60c-f970-7970-87d2-7ec925d48344 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-KQGgaOrxhVBZCgNVHsAWyLV9-019fc60c-f970-7970-87d2-7ed96f552b40 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-A9Dt5ka5OmJPzmZCqCHqiOLl-019fc60c-f970-7970-87d2-7ee6ce467a79 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-7y3sRtUfDnaJy4CLL4OqQVcY-019fc60c-f970-7970-87d2-7efcab628c97 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-bTswpERtMdU4iRgU5MeANeqw-019fc60c-f970-7970-87d2-7f0182716f31 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-ZlEXYwiS91rWMRJOLZ9Eyw1S-019fc60c-f970-7970-87d2-7f1c14b8d359 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-SF70V73VaxXstzvf9WjARlcs-019fc60c-f971-7e21-8069-595767eebdad (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-EWCVinj9rYa6LWzgvtnquomv-019fc60c-f971-7e21-8069-59632c8e202e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-DisWBt3MpDjme444qbtVQbgI-019fc60c-f971-7e21-8069-5979dc279ad6 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-LnOx859YolbBJk3n8CKF6PjA-019fc60c-f971-7e21-8069-59863de5c20c (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-ZOyt2f1HI0TpbkaSSQaFJWe3-019fc60c-f971-7e21-8069-599be395d306 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-YnzMzrSIRF2Cyxst1ykY8aO2-019fc60c-f971-7e21-8069-59aa49326c27 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-7bc1an0enIQWBjzrHT4XqczC-019fc60c-f971-7e21-8069-59b2b185fdae (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-GwujKLZRYl2rmkgKSxXuFo4c-019fc60c-f971-7e21-8069-59c89c37f70d (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-vLA2KLudiettrZVgCcPCNRWu-019fc60c-f971-7e21-8069-59de4ca3ad79 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-FWTOiiWhWm9392Tt7j1xNWjt-019fc60c-f971-7e21-8069-59e4b98ef0ea (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-yqLzvoYhhyhYC7AqoJgdcDcS-019fc60c-f971-7e21-8069-59f8043bdfbd (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-48yA71FwkTvVbDmdVoe0ktiK-019fc60c-f971-7e21-8069-5a07d80541ed (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-hpNN6sdh81Xvew1BEK0Uq0T3-019fc60c-f971-7e21-8069-5a1940b24b8d (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-O9O9CeLEyub949vGuXCj0QXq-019fc60c-f971-7e21-8069-5a2d70b816d0 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-gGGriLb4kqHgwlqGknyKxipc-019fc60c-f972-7f91-9335-4e7cfcd35e13 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-B96u3pLJzThcTXYpIR8GvhZR-019fc60c-f972-7f91-9335-4e8579e2d211 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-6tt5OTzGfo3fZfytfGekPEHZ-019fc60c-f972-7f91-9335-4e979a59c2d6 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-aqxcMJnUiCm2aM9G8K4toZv6-019fc60c-f972-7f91-9335-4ea1a9f53f83 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-MzRg47IF6kTtW0JcOqP9d5nb-019fc60c-f972-7f91-9335-4eb67521afe4 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-15b2OdjaS0hJXRbdiZO27YfZ-019fc60c-f972-7f91-9335-4ecda362e5fe (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-y6eMGd2hMvYBqa03DAHrNOsg-019fc60c-f973-78f0-898a-b2188e938b84 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-VBTBiAeIUB2UfsPIMdxWJ9J4-019fc60c-f973-78f0-898a-b224c1e95d2e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-n6YlpHhajbZIyoMa1vCwqUBT-019fc60c-f974-7e60-9b20-eef56f270b11 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-9AkNSzZorC3PnJl8E6JFhdWj-019fc60c-f984-7260-b475-33fccb5c691f (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-nC3A2LnXqTL5VJOqq0851YLO-019fc60c-f984-7260-b475-340a1996d5b1 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-CCeDOmgSNu675hrPVYhNCHqk-019fc60c-f985-7bf1-bb9d-7a0fe4e26828 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-8s7pLBevkMeDUUalqNGQTQWo-019fc60c-f985-7bf1-bb9d-7a17ae687da4 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-dOlV1A2NewwM8UJiRYBTHfow-019fc60c-f985-7bf1-bb9d-7a233f617da2 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-I8qHzrqSzPyEFpW0jf3T69PU-019fc60c-f985-7bf1-bb9d-7a3a5ca4d65e (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-ubNKAKOyjqxrTjfeCZ1Nr9Hn-019fc60c-f985-7bf1-bb9d-7a4c1e94d7b2 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-X7KdMbVirKvrSslW3J2jdXap-019fc60c-f985-7bf1-bb9d-7a5c2ec8e543 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-fz3gKmcwVxUyVZNhl9zZh4aO-019fc60c-f985-7bf1-bb9d-7a60ce096233 (stream=False)
+[ts] [2026-08-03 05:16:06] Generate request cmpl-MwHG0qnDsstpRj3r7VtWGIm1-019fc60c-f985-7bf1-bb9d-7a75b01b3070 (stream=False)
+[ts] /usr/local/lib/python3.12/dist-packages/tokenspeed_triton/language/core.py:2643: UserWarning: tl.make_block_ptr is deprecated. Use TensorDescriptor or tl.make_tensor_descriptor instead.
+[ts]   warn("tl.make_block_ptr is deprecated. Use TensorDescriptor or tl.make_tensor_descriptor instead.")
+[ts] [38;20m[2026-08-03 05:16:07,468  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 117 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:08,512  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 111 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:09,496  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 104 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:10,482  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 98 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:11,468  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 91 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:12,457  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 85 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:13,444  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 78 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:14,434  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 72 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:15,420  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 65 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:16,413  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 59 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:17,401  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 52 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:18,394  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 46 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:19,383  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 39 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:20,376  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 33 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:21,367  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 26 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:22,360  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 20 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:23,353  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 14 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:24,346  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 8, #new-token: 6656, #cached-token: 0, #running-req: 8, #queue-req: 7 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:25,340  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 7, #new-token: 6656, #cached-token: 0, #running-req: 7, #queue-req: 1 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:26,334  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 2, #new-token: 1150, #cached-token: 0, #running-req: 2, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:29,375  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 10.38, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:32,427  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1651.52, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:35,487  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1646.90, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:37,400  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:16:37,472  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734197.3163495 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:16:38,550  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1604.37, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:41,628  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1637.54, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:44,715  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1632.73, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:47,811  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1628.12, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:50,915  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1623.55, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:54,028  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1619.00, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:16:57,149  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1614.62, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:17:00,280  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1609.91, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:17:03,419  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1605.66, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:17:06,567  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1601.00, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:17:09,723  ATTN TP RANK 0] - INFO - Decode batch. #running-req: 126, #pages(active/cached/total): 252/257/259, page ratio: 0.97, gen throughput (token/s): 1596.80, avg_accept_len: 1.00, accept_rate: 0.00, #queue-req: 0 (model_executor.py:1343)[0m
+[ts] [38;20m[2026-08-03 05:17:09,956  ATTN TP RANK 0] - INFO - Req: cmpl-10OiJxax7wIuZNMZ5OJikbeY-019fc60c-f94b-79c1-a59d-8979a2be4d0b Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,956  ATTN TP RANK 0] - INFO - Req: cmpl-15b2OdjaS0hJXRbdiZO27YfZ-019fc60c-f972-7f91-9335-4ecda362e5fe Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,956  ATTN TP RANK 0] - INFO - Req: cmpl-16abBo6zZofuE8bIN8TZTavC-019fc60c-f945-7090-86c9-452e72f83842 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-1KDUd89LFwuCGH6J1tYN7ira-019fc60c-f96a-7340-add2-04ceb263dc49 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-1YSk8Zkqy1ycArrhb0zsiWKQ-019fc60c-f94b-79c1-a59d-89bc4b84fafe Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-1oMwxh2p0PQf6PGogI7VwoY7-019fc60c-f96e-7951-90c9-c2aa602fa7d3 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-3MmW7tvBVxkgdtnAUUESSuq7-019fc60c-f96a-7340-add2-04fceab8081e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-3Z0ICVOs4mVN1e6uqANt8R0T-019fc60c-f96f-7b03-bdad-9fe05ccf7e5a Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-3sMjO2wXUUG76OTA7lX2Iduo-019fc60c-f943-7000-a97f-e78242534832 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-48yA71FwkTvVbDmdVoe0ktiK-019fc60c-f971-7e21-8069-5a07d80541ed Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-4PZDLOgAiGKvgV0ILfGzSduF-019fc60c-f948-7a40-b6ee-7b19cf0c99dc Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-5ER2ueFigHGZtIaeFyygduTs-019fc60c-f951-7870-adcc-90104d36d26f Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-5OlXkvItDYOYXnfLGgT53Bcz-019fc60c-f943-7000-a97f-e772140e686c Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-5QtpTRdw2B91tyi3bAPwJKrA-019fc60c-f93f-7270-9d9d-c138ae0ba7ee Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-5W4dv06FvgtEAAVXnqrw0tRW-019fc60c-f96d-76b1-9d44-1ff674a01760 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-5rqjGRJEXIXJkrh9tQHRmEER-019fc60c-f944-7243-b775-45860a36e677 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-6GzfoKud3p3taTY6SHwtakLN-019fc60c-f948-7a40-b6ee-7af58ccc5413 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-6f6J7RuS85W9goNaFEIvObUH-019fc60c-f94f-7ec2-9962-18a6e1411938 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-6lt1Z8h97DXITjFsFkwRss0Y-019fc60c-f96d-76b1-9d44-1f82a6ac2098 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-6tt5OTzGfo3fZfytfGekPEHZ-019fc60c-f972-7f91-9335-4e979a59c2d6 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-7bc1an0enIQWBjzrHT4XqczC-019fc60c-f971-7e21-8069-59b2b185fdae Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-7bvqM2q7sNnEgUwMpdcpw7jL-019fc60c-f96c-7b03-84cc-649f46c9c346 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-7k4KXUzclEOVyHYFGlodtPat-019fc60c-f943-7000-a97f-e767498d4549 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-7y3sRtUfDnaJy4CLL4OqQVcY-019fc60c-f970-7970-87d2-7efcab628c97 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-88NXUoVVtwAMfVRBK5Gc0h9W-019fc60c-f942-7a31-bf87-4730c0748470 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-8hzbl23xbt8fFsWTRmhuqjc2-019fc60c-f948-7a40-b6ee-7b08c4c44069 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-8s7pLBevkMeDUUalqNGQTQWo-019fc60c-f985-7bf1-bb9d-7a17ae687da4 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-99TW44BH5VZsFpxm0Lhb9umB-019fc60c-f94c-7490-a975-24978b60f026 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-9AkNSzZorC3PnJl8E6JFhdWj-019fc60c-f984-7260-b475-33fccb5c691f Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-9uPgX1kCRNQBKcgWjnJnbQlg-019fc60c-f93d-7e22-9a5c-c7e2b802c81b Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-A9Dt5ka5OmJPzmZCqCHqiOLl-019fc60c-f970-7970-87d2-7ee6ce467a79 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-AV4zbScN5vBeY8lxrtpvIbcw-019fc60c-f96f-7b03-bdad-a007a9fe107f Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-B96u3pLJzThcTXYpIR8GvhZR-019fc60c-f972-7f91-9335-4e8579e2d211 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-BUgzikbsqWngZhZR4VXEuteO-019fc60c-f93d-7e22-9a5c-c7c86457b86a Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-Bbc5rz2WEo0VVSXYviFPwu4N-019fc60c-f96a-7340-add2-04d13a6f72e9 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-CCeDOmgSNu675hrPVYhNCHqk-019fc60c-f985-7bf1-bb9d-7a0fe4e26828 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-CUnX2tYF12KNyV2450WK2CbW-019fc60c-f941-76c2-a24d-e0ad3c4c772b Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-DisWBt3MpDjme444qbtVQbgI-019fc60c-f971-7e21-8069-5979dc279ad6 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-EWCVinj9rYa6LWzgvtnquomv-019fc60c-f971-7e21-8069-59632c8e202e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-EdnkTB5aqXITe1WOHMHdieeo-019fc60c-f96f-7b03-bdad-a0166293b874 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-F5XfcehRaVELmGtmUhKDkniM-019fc60c-f948-7a40-b6ee-7b2cbe9ffcb0 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-FAOsZu2xklYEHddEXHMvM0gn-019fc60c-f96d-76b1-9d44-1fa233ba48af Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-FKQ8myZpOfQftR90QqtMC4nj-019fc60c-f96b-7722-8c31-0bad9e660c56 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-FPaEjBNEonTzaQMkZ4F2gDHM-019fc60c-f96c-7b03-84cc-64adddc7058b Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-FQlP1ySt38vYj78B1zkhA5CA-019fc60c-f96f-7b03-bdad-a02eecd8ee73 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-FWTOiiWhWm9392Tt7j1xNWjt-019fc60c-f971-7e21-8069-59e4b98ef0ea Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-GwujKLZRYl2rmkgKSxXuFo4c-019fc60c-f971-7e21-8069-59c89c37f70d Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,957  ATTN TP RANK 0] - INFO - Req: cmpl-HBWwFE8C77kMJVbeoyPF5Ios-019fc60c-f96a-7340-add2-04e6e495aa62 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-HehVUljVbtlyqx8oJ0yfsuf9-019fc60c-f94d-77d1-9534-217901de32e7 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-I8qHzrqSzPyEFpW0jf3T69PU-019fc60c-f985-7bf1-bb9d-7a3a5ca4d65e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-IP5ecmCzcdDxtJfSBx9W0oSE-019fc60c-f950-7190-beb5-61edf2f3dcdc Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-IVCyiQewgk9sPgWG8kwJ7nVm-019fc60c-f96f-7b03-bdad-9ff184cd06df Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-Ipgd8eoprJeUZg56jVXNXvJv-019fc60c-f946-77e2-b347-88bc4b64ce6d Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-It646hL5Yx4rvdLngO9hBsI2-019fc60c-f949-7222-8e7c-d5d55c96ec07 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-JuRt7a0ionha7hAaOl6wSyZz-019fc60c-f96d-76b1-9d44-1fe884534d1a Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-JudxXP1MokvOU3lm0VrlCnGo-019fc60c-f945-7090-86c9-450aa8ef7744 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-KQGgaOrxhVBZCgNVHsAWyLV9-019fc60c-f970-7970-87d2-7ed96f552b40 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-LnOx859YolbBJk3n8CKF6PjA-019fc60c-f971-7e21-8069-59863de5c20c Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-MKXzctLrKIp8nYpwAP7rJlGS-019fc60c-f944-7243-b775-45aa7cae695f Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-MeC9Ac7e7A5vmNtYRs8dA3sY-019fc60c-f94b-79c1-a59d-8989c224b2e2 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-MmGDBC4tUtgxyZRjDhXi8T7z-019fc60c-f96e-7951-90c9-c290ee794dee Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-MwHG0qnDsstpRj3r7VtWGIm1-019fc60c-f985-7bf1-bb9d-7a75b01b3070 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-MzRg47IF6kTtW0JcOqP9d5nb-019fc60c-f972-7f91-9335-4eb67521afe4 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-NM0v4pv4y9TImBfl4L77mUrf-019fc60c-f94f-7ec2-9962-1881ac258255 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-O9O9CeLEyub949vGuXCj0QXq-019fc60c-f971-7e21-8069-5a2d70b816d0 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-Os1UAWTwSXjOoRpFLenaLoyq-019fc60c-f96f-7b03-bdad-9fd1fdb2021e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-Q0e2ACdGrQ0jAKIxPpcuD8X9-019fc60c-f93d-7e22-9a5c-c8060ad25b27 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-QnFKok9QepjlfynZYvldab7t-019fc60c-f96e-7951-90c9-c2dcdb3d3cd7 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-REA9BdVntRBY3lGu5rHYqEzZ-019fc60c-f94f-7ec2-9962-189fb23e2bb0 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-RtRdFWByx597D9xldkrEDjE0-019fc60c-f970-7970-87d2-7ec925d48344 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-SF70V73VaxXstzvf9WjARlcs-019fc60c-f971-7e21-8069-595767eebdad Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-SaSvvO3cM1FUbZb8KFTOXv46-019fc60c-f93e-7821-930c-6c0a745811d9 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-TN1Jift677NYPYLX5AVtCB0B-019fc60c-f940-73d2-ab9b-9f83d1f297e9 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-UfCMDYREcmpBLfFu8K7aybC3-019fc60c-f94c-7490-a975-24a5db088e45 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-V7gt0IvN2qllRvl3YChewruQ-019fc60c-f96a-7340-add2-0505f044429e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-VBTBiAeIUB2UfsPIMdxWJ9J4-019fc60c-f973-78f0-898a-b224c1e95d2e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-X7KdMbVirKvrSslW3J2jdXap-019fc60c-f985-7bf1-bb9d-7a5c2ec8e543 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-YnzMzrSIRF2Cyxst1ykY8aO2-019fc60c-f971-7e21-8069-59aa49326c27 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-YveSAMqS7JsHqHfNjNpSR6Dm-019fc60c-f948-7a40-b6ee-7ad350462f4c Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-ZOyt2f1HI0TpbkaSSQaFJWe3-019fc60c-f971-7e21-8069-599be395d306 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-ZlEXYwiS91rWMRJOLZ9Eyw1S-019fc60c-f970-7970-87d2-7f1c14b8d359 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-aFVl3MhZkDGeutesVo8s53P3-019fc60c-f96d-76b1-9d44-1fb8dd6af565 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-aqxcMJnUiCm2aM9G8K4toZv6-019fc60c-f972-7f91-9335-4ea1a9f53f83 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-bTswpERtMdU4iRgU5MeANeqw-019fc60c-f970-7970-87d2-7f0182716f31 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-cWStqOxqOMrc1P9OQJgd50ao-019fc60c-f941-76c2-a24d-e08d7e6e3fa5 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-dOlV1A2NewwM8UJiRYBTHfow-019fc60c-f985-7bf1-bb9d-7a233f617da2 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-e2B7GZVkXXPaLG7He5uF6phl-019fc60c-f96d-76b1-9d44-1fd970462326 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-e5TfNuPrzdWHYPbipnPlg25F-019fc60c-f950-7190-beb5-61f3e4d732e0 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-eswkUpqayH76KdgsI7hj58Va-019fc60c-f950-7190-beb5-61c71d42be06 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-fN07ixVQMx1jFuxhMpfcw49I-019fc60c-f96e-7951-90c9-c2c23fad44ac Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-fPduQR4jTSyE3guGgAVDFcaC-019fc60c-f96e-7951-90c9-c2b63d1e9c57 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-frQITR35HMarpPkl2G3karLz-019fc60c-f946-77e2-b347-88c9d4f63b4e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-fz3gKmcwVxUyVZNhl9zZh4aO-019fc60c-f985-7bf1-bb9d-7a60ce096233 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-g9pl0JLDRAlZlQfUsKXF6eVp-019fc60c-f96c-7b03-84cc-64b9d08dc913 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-gGGriLb4kqHgwlqGknyKxipc-019fc60c-f972-7f91-9335-4e7cfcd35e13 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-gYizhxfzdYPpmlCTc57GGtYs-019fc60c-f96e-7951-90c9-c22d1c0def3b Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-h9p82EMJAmbbxHSLlbay31oW-019fc60c-f952-7740-a6aa-8a79100d381b Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-hpNN6sdh81Xvew1BEK0Uq0T3-019fc60c-f971-7e21-8069-5a1940b24b8d Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-kRh49CuhCkuFV5AKu5k6CRxe-019fc60c-f94d-77d1-9534-219df9814916 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-keMcIN9hLhR2jETxfOf8vrrO-019fc60c-f949-7222-8e7c-d5c428ff45b6 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-mIea1gozRqQCGaauJY96KHL2-019fc60c-f93f-7270-9d9d-c15086f505da Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,958  ATTN TP RANK 0] - INFO - Req: cmpl-n6YlpHhajbZIyoMa1vCwqUBT-019fc60c-f974-7e60-9b20-eef56f270b11 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-nC3A2LnXqTL5VJOqq0851YLO-019fc60c-f984-7260-b475-340a1996d5b1 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-njpCUJoBkGmIBnVlLgeHYrep-019fc60c-f94c-7490-a975-24d2693723dd Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-oPenP1ORF0g4AnVli3IT3DyR-019fc60c-f96a-7340-add2-051634f4dbd3 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-orBFqH8AraJ9y5BG5dqtdj1n-019fc60c-f942-7a31-bf87-47141ef93727 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-pHNY1BtFoASMqXYNZt961cPe-019fc60c-f951-7870-adcc-903a19403ab2 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-qRZKhyWC4zH5UyUPYo8lQLGB-019fc60c-f96c-7b03-84cc-648cb9f78080 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-ri20s4z6y0iJDhwb6X439qdq-019fc60c-f94f-7ec2-9962-1874aa707e12 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-rxaMfOSgSnKQV7IHL0rallcI-019fc60c-f93e-7821-930c-6c1b06e6b2ad Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-sHLVchnltkvZYvm34a9sBBM8-019fc60c-f951-7870-adcc-902477fff1e4 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-sQXNdyp73U3kfh42bL3PgORJ-019fc60c-f941-76c2-a24d-e09a6985e00b Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-sxnLkwRXCxTWB82pOtDdmRFa-019fc60c-f96b-7722-8c31-0bb332bccec7 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-ubNKAKOyjqxrTjfeCZ1Nr9Hn-019fc60c-f985-7bf1-bb9d-7a4c1e94d7b2 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-unGT5sJcweQQ2TASxYhynWc4-019fc60c-f96b-7722-8c31-0bc4b24684d0 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-vLA2KLudiettrZVgCcPCNRWu-019fc60c-f971-7e21-8069-59de4ca3ad79 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-wlddtzJfIq5xbN9B06UNf3RS-019fc60c-f950-7190-beb5-61decb22dfea Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-wrDg9z5OS4vZKz5AWcYNbq7U-019fc60c-f96e-7951-90c9-c2873dc21a6e Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-x0SJ1oQHgRMj4umTtoTMkw1X-019fc60c-f96a-7340-add2-0558e6827c07 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-xXxigWxNI8hEvAk4moqOqfKJ-019fc60c-f96e-7951-90c9-c2e528ab7492 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-y6eMGd2hMvYBqa03DAHrNOsg-019fc60c-f973-78f0-898a-b2188e938b84 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-yqLzvoYhhyhYC7AqoJgdcDcS-019fc60c-f971-7e21-8069-59f8043bdfbd Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-ysXgTnmpaBxTw3neWGIhDArZ-019fc60c-f96e-7951-90c9-c21c3494aad0 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-yx1CZXv018yn7PLLSbCuAekT-019fc60c-f94e-7832-9f81-a4179cace9e2 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-zEd9Qv0baBfKCd38cMKbT8TP-019fc60c-f93f-7270-9d9d-c11880db6af6 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:09,959  ATTN TP RANK 0] - INFO - Req: cmpl-zVWKHNjxwHF5aLRjoLoTGqcF-019fc60c-f94a-7902-8ddd-03f98a35d798 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:17:37,319  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:17:37,388  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734257.3176029 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:18:37,319  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:18:37,389  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734317.3185606 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:19:37,321  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:19:37,390  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734377.3195188 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:20:37,322  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:20:37,392  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734437.3210757 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:21:37,323  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:21:37,392  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734497.3217375 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:22:37,324  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:22:37,393  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734557.3230255 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:23:37,324  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:23:37,394  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734617.3235257 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:24:37,325  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:24:37,395  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734677.3242457 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:25:37,326  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:25:37,395  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734737.3254116 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:26:37,328  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:26:37,397  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734797.3267465 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:27:37,330  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:27:37,399  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734857.3290296 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:28:37,331  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:28:37,402  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734917.3301861 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m
+[ts] [38;20m[2026-08-03 05:29:37,331  ATTN TP RANK 0] - INFO - Prefill batch. #new-seq: 1, #new-token: 1, #cached-token: 0, #running-req: 1, #queue-req: 0 (model_executor.py:1298)[0m
+[ts] [38;20m[2026-08-03 05:29:37,401  ATTN TP RANK 0] - INFO - Req: HEALTH_CHECK_1785734977.3301077 Finish! Accept_num_tokens_avg: 0 (generation_output_processor.py:355)[0m

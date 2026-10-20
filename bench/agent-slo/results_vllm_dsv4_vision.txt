@@ -1,0 +1,39 @@
+vLLM vision benchmark — DeepSeek-V4-Flash-Vision-Exp
+=====================================================
+
+vLLM reference engine (v0.30.1rc1.dev396 `vllm/vllm-openai:nightly`, GPUs 4/5,
+``NCCL_NVLS_ENABLE=0``, port 8889). The OpenAI chat path uses the model's
+``<|deepseek_image|>`` placeholder token (vLLM rebuilds the prompt from the
+image), so 1 image + text compresses to far fewer input tokens than the engine's
+expanded 114-token sentinel block.
+
+Command (rate-limited, 64 requests, 64 output tokens each):
+    vllm bench serve --backend openai-chat --base-url http://127.0.0.1:8889 \
+        --model dsv4 --dataset-name random --num-prompts 64 --request-rate 4 \
+        --random-input-len 64 --random-output-len 64 --ignore-eos --temperature 0 \
+        --enable-multimodal-chat --random-mm-base-items-per-request 1 \
+        --random-mm-bucket-config "{(256,256,1):1.0}" \
+        --endpoint /v1/chat/completions
+
+Result:
+  Successful requests       64
+  Failed requests           0
+  Benchmark duration (s)    27.70
+  Total input tokens        9408    (64 * [64 text + image])
+  Total generated tokens    4096    (64/req, --ignore-eos)
+  Output token throughput   147.85 tok/s
+  Peak output throughput    448.00 tok/s
+  Total token throughput    487.45 tok/s
+  TTFT    mean 5722.28ms  med 5188.51ms  P99 13150.90ms
+  TPOT    mean 193.88ms   med 151.97ms   P99 358.82ms
+  ITL     mean 190.85ms   med 149.98ms   P99 182.44ms
+
+Notes
+-----
+* ``--endpoint /v1/chat/completions`` with ``--base-url`` NOT containing ``/v1``
+  (otherwise the tool builds ``/v1/v1/...`` and all 64 requests 404).
+* ``--temperature 0`` must be explicit (this vLLM build no longer defaults to
+  greedy).
+* Input-token count 9408 reflects the placeholder path that vLLM uses; it is
+  not comparable to the engine's expanded 114-token image-span prompt, so the
+  only directly comparable axis is output-token throughput / TPOT.

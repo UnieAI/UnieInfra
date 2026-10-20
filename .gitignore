@@ -200,5 +200,9 @@ Testing/
 .serena/*
 
 AGENTS.local.md
+tokenspeed-scheduler/build*/
 AGENTS.override.md
 outputs/
+
+# local benchmark scratch drawn from other engines (vLLM autotune cache, etc.)
+bench/agent-slo/.vllm_cache/

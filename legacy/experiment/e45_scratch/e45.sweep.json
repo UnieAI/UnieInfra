@@ -1,0 +1,322 @@
+[
+  {
+    "shape": "gate_up_proj",
+    "M": 32,
+    "N": 24576,
+    "K": 4096,
+    "cublas_us": 189.3280029296875,
+    "best_us": 137.30560541152954,
+    "speedup": 1.3788803622564243,
+    "cfg": {
+      "block_m": 32,
+      "block_n": 128,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 2,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 64,
+    "N": 24576,
+    "K": 4096,
+    "cublas_us": 173.35360050201416,
+    "best_us": 139.65439796447754,
+    "speedup": 1.2413042698885024,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 64,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 128,
+    "N": 24576,
+    "K": 4096,
+    "cublas_us": 199.86720085144043,
+    "best_us": 149.50720071792603,
+    "speedup": 1.336839964173553,
+    "cfg": {
+      "block_m": 128,
+      "block_n": 256,
+      "block_k": 64,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 8,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "gate_up_proj",
+    "M": 256,
+    "N": 24576,
+    "K": 4096,
+    "cublas_us": 206.65600299835205,
+    "best_us": 190.95840454101562,
+    "speedup": 1.082204281581986,
+    "cfg": {
+      "block_m": 128,
+      "block_n": 64,
+      "block_k": 64,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "down_proj",
+    "M": 32,
+    "N": 4096,
+    "K": 12288,
+    "cublas_us": 76.85119765145438,
+    "best_us": 70.93302862984794,
+    "speedup": 1.0834331923494964,
+    "cfg": {
+      "block_m": 32,
+      "block_n": 128,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 4,
+      "num_warps": 4,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "down_proj",
+    "M": 64,
+    "N": 4096,
+    "K": 12288,
+    "cublas_us": 101.41988481794085,
+    "best_us": 71.41211373465401,
+    "speedup": 1.4202056137812515,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 64,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 4,
+      "num_warps": 4,
+      "num_stages": 4,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "down_proj",
+    "M": 128,
+    "N": 4096,
+    "K": 12288,
+    "cublas_us": 87.34994615827289,
+    "best_us": 74.79040282113212,
+    "speedup": 1.1679298795485569,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 2,
+      "num_warps": 4,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "down_proj",
+    "M": 256,
+    "N": 4096,
+    "K": 12288,
+    "cublas_us": 94.70994131905692,
+    "best_us": 99.07565798078265,
+    "speedup": 0.9559355269427277,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 64,
+      "group_m": 8,
+      "split_k": 4,
+      "num_warps": 4,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 32,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 41.51177065713065,
+    "best_us": 36.109256744384766,
+    "speedup": 1.1496157606064825,
+    "cfg": {
+      "block_m": 32,
+      "block_n": 128,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 8,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 64,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 53.729827063424246,
+    "best_us": 35.91177122933524,
+    "speedup": 1.4961619887891795,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 64,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 8,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 128,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 42.344229561941965,
+    "best_us": 40.5604566846575,
+    "speedup": 1.043978126063832,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 64,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 4,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "qkv_proj",
+    "M": 256,
+    "N": 6144,
+    "K": 4096,
+    "cublas_us": 144.02833666120256,
+    "best_us": 72.31451443263462,
+    "speedup": 1.9916933383459794,
+    "cfg": {
+      "block_m": 128,
+      "block_n": 128,
+      "block_k": 64,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "o_proj",
+    "M": 32,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 29.517999291419983,
+    "best_us": 26.42360031604767,
+    "speedup": 1.1171073940856202,
+    "cfg": {
+      "block_m": 32,
+      "block_n": 128,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 2,
+      "num_warps": 4,
+      "num_stages": 3,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "o_proj",
+    "M": 64,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 32.60680139064789,
+    "best_us": 25.31839907169342,
+    "speedup": 1.2878697937541823,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 64,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 8,
+      "num_stages": 4,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "o_proj",
+    "M": 128,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 30.325201153755188,
+    "best_us": 25.4611998796463,
+    "speedup": 1.19103582302094,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 64,
+      "block_k": 128,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 8,
+      "num_stages": 4,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  },
+  {
+    "shape": "o_proj",
+    "M": 256,
+    "N": 4096,
+    "K": 4096,
+    "cublas_us": 37.88880109786987,
+    "best_us": 38.082799315452576,
+    "speedup": 0.9949058834678682,
+    "cfg": {
+      "block_m": 64,
+      "block_n": 128,
+      "block_k": 64,
+      "group_m": 8,
+      "split_k": 1,
+      "num_warps": 4,
+      "num_stages": 4,
+      "persist_factor": 0,
+      "stream_b": true
+    }
+  }
+]

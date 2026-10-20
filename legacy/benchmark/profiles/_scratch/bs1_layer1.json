@@ -1,0 +1,542 @@
+[
+ {
+  "range": 0,
+  "action": 0,
+  "name": "vectorized_elementwise_kernel",
+  "name_demangled": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 3)]::operator ()() const::[lambda(int) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.00776508981275435,
+  "lts__t_sector_hit_rate.pct": 90.85894405043341,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 5.876846792147338,
+  "gpu__time_duration.sum": 4224.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 36,
+  "launch__waves_per_multiprocessor": 0.0004432624113475177,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 1,
+  "name": "indexSelectSmallIndex",
+  "name_demangled": "void at::native::<unnamed>::indexSelectSmallIndex<c10::BFloat16, int, unsigned int, (int)2, (int)2, (int)-2>(at::cuda::detail::TensorInfo<T1, T3>, at::cuda::detail::TensorInfo<const T1, T3>, at::cuda::detail::TensorInfo<const T2, T3>, int, int, T3, long)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.2199307316378703,
+  "lts__t_sector_hit_rate.pct": 77.65541740674956,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.285486763564336,
+  "gpu__time_duration.sum": 4736.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 32,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 26,
+  "launch__waves_per_multiprocessor": 0.014184397163120567,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 2,
+  "name": "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign16o40961_tensorptrbf16gmemalign128oi64409640961___T_0",
+  "name_demangled": "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign16o40961_tensorptrbf16gmemalign128oi64409640961___T_0",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.027520317468946214,
+  "lts__t_sector_hit_rate.pct": 80.3088803088803,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 7.566391941391941,
+  "gpu__time_duration.sum": 5152.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 56,
+  "launch__waves_per_multiprocessor": 0.0010638297872340426,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 3,
+  "name": "kernel",
+  "name_demangled": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 24.54916844175804,
+  "lts__t_sector_hit_rate.pct": 4.181491684298473,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 15.78915139056889,
+  "gpu__time_duration.sum": 44832.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1536,
+  "launch__block_size": 64,
+  "launch__registers_per_thread": 216,
+  "launch__waves_per_multiprocessor": 2.0425531914893615,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 4,
+  "name": "_fused_qk_rmsnorm_kernel",
+  "name_demangled": "_fused_qk_rmsnorm_kernel",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.29384798170231224,
+  "lts__t_sector_hit_rate.pct": 71.63302752293578,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.304202988942556,
+  "gpu__time_duration.sum": 4128.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 40,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 17,
+  "launch__waves_per_multiprocessor": 0.01773049645390071,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 5,
+  "name": "BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel",
+  "name_demangled": "void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<(bool)0, (unsigned int)128, (unsigned int)8, (unsigned int)16, __nv_bfloat16, long>(T5 *, T5 *, T5 *, T5 *, float *, T6 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.13941285554785046,
+  "lts__t_sector_hit_rate.pct": 87.20930232558139,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 3.3173724236909465,
+  "gpu__time_duration.sum": 4832.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 40,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 40,
+  "launch__waves_per_multiprocessor": 0.01773049645390071,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 6,
+  "name": "_store_kv_cache_kernel",
+  "name_demangled": "_store_kv_cache_kernel",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.007361185781869662,
+  "lts__t_sector_hit_rate.pct": 81.90639269406392,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.056513109787947,
+  "gpu__time_duration.sum": 4416.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 2,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 18,
+  "launch__waves_per_multiprocessor": 0.0008865248226950354,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 7,
+  "name": "vectorized_elementwise_kernel",
+  "name_demangled": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1>>(int, T2, T3)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.004270476449292945,
+  "lts__t_sector_hit_rate.pct": 92.81609195402298,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.202926208651402,
+  "gpu__time_duration.sum": 3008.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 16,
+  "launch__waves_per_multiprocessor": 0.0004432624113475177,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 8,
+  "name": "_fwd_grouped_kernel_stage1",
+  "name_demangled": "_fwd_grouped_kernel_stage1",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.33326779127179085,
+  "lts__t_sector_hit_rate.pct": 73.85195785091713,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.308914681847067,
+  "gpu__time_duration.sum": 6400.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 32,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 72,
+  "launch__waves_per_multiprocessor": 0.0425531914893617,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 9,
+  "name": "_fwd_kernel_stage2",
+  "name_demangled": "_fwd_kernel_stage2",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.24728296633305197,
+  "lts__t_sector_hit_rate.pct": 72.46745897000567,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.314451547224559,
+  "gpu__time_duration.sum": 4832.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 32,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 24,
+  "launch__waves_per_multiprocessor": 0.014184397163120567,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 10,
+  "name": "kernel",
+  "name_demangled": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 23.007012876634914,
+  "lts__t_sector_hit_rate.pct": 6.0321956902406315,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 15.018470046485726,
+  "gpu__time_duration.sum": 31456.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1024,
+  "launch__block_size": 64,
+  "launch__registers_per_thread": 216,
+  "launch__waves_per_multiprocessor": 1.3617021276595744,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 11,
+  "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "name_demangled": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.036526538975255145,
+  "lts__t_sector_hit_rate.pct": 82.8131333603567,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 7.767034990791896,
+  "gpu__time_duration.sum": 5056.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 124,
+  "launch__waves_per_multiprocessor": 0.0017730496453900709,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 12,
+  "name": "kernel",
+  "name_demangled": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 31.51362979582686,
+  "lts__t_sector_hit_rate.pct": 1.328649861655835,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.146324934271618,
+  "gpu__time_duration.sum": 143584.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 6144,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 216,
+  "launch__waves_per_multiprocessor": 16.340425531914892,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 13,
+  "name": "act_and_mul_kernel",
+  "name_demangled": "void flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, &silu>(T1 *, const T1 *, int)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.1211570215534421,
+  "lts__t_sector_hit_rate.pct": 55.13191181785327,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 59.260547056096435,
+  "gpu__time_duration.sum": 6208.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1,
+  "launch__block_size": 1024,
+  "launch__registers_per_thread": 39,
+  "launch__waves_per_multiprocessor": 0.005319148936170213,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 14,
+  "name": "kernel",
+  "name_demangled": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 28.76358444364176,
+  "lts__t_sector_hit_rate.pct": 4.993666085441594,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 15.706192605843897,
+  "gpu__time_duration.sum": 76320.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1024,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 216,
+  "launch__waves_per_multiprocessor": 2.723404255319149,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 15,
+  "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "name_demangled": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.035381248272726463,
+  "lts__t_sector_hit_rate.pct": 82.83935579916091,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 7.782109886170117,
+  "gpu__time_duration.sum": 5216.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 124,
+  "launch__waves_per_multiprocessor": 0.0017730496453900709,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 16,
+  "name": "kernel",
+  "name_demangled": "std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)6, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>>(T13)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 24.722566376429096,
+  "lts__t_sector_hit_rate.pct": 4.160681676889101,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 15.774717185573737,
+  "gpu__time_duration.sum": 44544.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 1536,
+  "launch__block_size": 64,
+  "launch__registers_per_thread": 216,
+  "launch__waves_per_multiprocessor": 2.0425531914893615,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 17,
+  "name": "_fused_qk_rmsnorm_kernel",
+  "name_demangled": "_fused_qk_rmsnorm_kernel",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.2767377936015029,
+  "lts__t_sector_hit_rate.pct": 71.60720853254873,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.30494972549793,
+  "gpu__time_duration.sum": 4352.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 40,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 17,
+  "launch__waves_per_multiprocessor": 0.01773049645390071,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 18,
+  "name": "BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel",
+  "name_demangled": "void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<(bool)0, (unsigned int)128, (unsigned int)8, (unsigned int)16, __nv_bfloat16, long>(T5 *, T5 *, T5 *, T5 *, float *, T6 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.13946783402846827,
+  "lts__t_sector_hit_rate.pct": 86.33128834355827,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 2.8425265026843505,
+  "gpu__time_duration.sum": 4832.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 40,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 40,
+  "launch__waves_per_multiprocessor": 0.01773049645390071,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 19,
+  "name": "_store_kv_cache_kernel",
+  "name_demangled": "_store_kv_cache_kernel",
+  "dram__throughput.avg.pct_of_peak_sustained_elapsed": null,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.007560099415307312,
+  "lts__t_sector_hit_rate.pct": 78.88826501965188,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.127467569091934,
+  "gpu__time_duration.sum": 4288.0,
+  "dram__bytes.sum": null,
+  "launch__grid_size": 2,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 18,
+  "launch__waves_per_multiprocessor": 0.0008865248226950354,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=0 dec=1",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ }
+]

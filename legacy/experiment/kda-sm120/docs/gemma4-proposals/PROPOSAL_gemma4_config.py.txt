@@ -1,0 +1,370 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Gemma 4 configuration helpers.
+
+Gemma 4 is a hybrid-geometry model: ``sliding_attention`` layers and
+``full_attention`` layers carry *different* attention shapes, and the full
+layers additionally share one projection between K and V.
+
+Per-layer geometry (verified against the shipped checkpoints)::
+
+    sliding_attention : num_key_value_heads        x head_dim         (16 x 256)
+    full_attention    : num_global_key_value_heads x global_head_dim  ( 4 x 512)
+
+The full layers therefore hold *fewer* KV bytes per token than the sliding
+ones (2048 vs 4096 elements), which is the opposite of what the ``512`` in
+``global_head_dim`` suggests at a glance.
+
+``attention_k_eq_v`` applies to ``full_attention`` layers ONLY: those layers
+have no ``v_proj`` in the checkpoint and derive V from the K projection.
+Sliding layers carry a real ``v_proj``.
+
+This module owns the derivations the runtime needs and nothing else; it does
+not subclass ``PretrainedConfig`` because ``transformers`` already ships
+``Gemma4Config`` / ``Gemma4TextConfig``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+SLIDING_ATTENTION = "sliding_attention"
+FULL_ATTENTION = "full_attention"
+
+ALLOWED_LAYER_TYPES = (FULL_ATTENTION, SLIDING_ATTENTION)
+
+
+def get_text_config(config):
+    """Return the text sub-config of a Gemma 4 config, or ``config`` itself.
+
+    ``Gemma4ForConditionalGeneration`` checkpoints nest the language model
+    under ``text_config``; the causal-LM-only paths pass the text config
+    directly.
+
+    Args:
+        config: A ``Gemma4Config`` or ``Gemma4TextConfig``.
+
+    Returns:
+        The config object carrying ``num_hidden_layers`` / ``layer_types``.
+    """
+    text_config = getattr(config, "text_config", None)
+    return text_config if text_config is not None else config
+
+
+def layer_types(config) -> tuple[str, ...]:
+    """Per-layer attention labels, validated.
+
+    Args:
+        config: A Gemma 4 config (nested or text).
+
+    Returns:
+        Tuple of ``"sliding_attention"`` / ``"full_attention"``.
+
+    Raises:
+        ValueError: An entry is not an allowed label, or the length does not
+            match ``num_hidden_layers``.
+    """
+    text_config = get_text_config(config)
+    types = tuple(getattr(text_config, "layer_types", ()) or ())
+    num_layers = int(text_config.num_hidden_layers)
+    if not types:
+        # Gemma 4 always ships layer_types; a missing list means a truncated
+        # or hand-edited config, which would silently become all-full.
+        raise ValueError(
+            "Gemma4 config is missing `layer_types`; refusing to guess the "
+            "sliding/full layout (every layer would become full attention "
+            "and the KV cache would be sized ~6x too small)."
+        )
+    if len(types) != num_layers:
+        raise ValueError(
+            f"layer_types has {len(types)} entries but num_hidden_layers="
+            f"{num_layers}"
+        )
+    bad = sorted(set(types) - set(ALLOWED_LAYER_TYPES))
+    if bad:
+        raise ValueError(f"unknown Gemma4 layer types {bad}")
+    return types
+
+
+def is_full_attention(config, layer_id: int) -> bool:
+    """Whether layer ``layer_id`` is a full-attention (global) layer."""
+    return layer_types(config)[layer_id] == FULL_ATTENTION
+
+
+def layer_head_dim(config, layer_id: int) -> int:
+    """Head dim of layer ``layer_id``: ``global_head_dim`` on full layers."""
+    text_config = get_text_config(config)
+    if is_full_attention(config, layer_id):
+        return int(getattr(text_config, "global_head_dim", text_config.head_dim))
+    return int(text_config.head_dim)
+
+
+def layer_num_kv_heads(config, layer_id: int) -> int:
+    """KV head count of layer ``layer_id``.
+
+    Full layers use ``num_global_key_value_heads`` when it is set. Note this
+    is independent of ``attention_k_eq_v``: the head count is a property of
+    the checkpoint's ``k_proj`` shape, and applies whether or not V is
+    derived from K.
+    """
+    text_config = get_text_config(config)
+    if is_full_attention(config, layer_id):
+        global_kv = getattr(text_config, "num_global_key_value_heads", None)
+        if global_kv:
+            return int(global_kv)
+    return int(text_config.num_key_value_heads)
+
+
+def layer_uses_k_eq_v(config, layer_id: int) -> bool:
+    """Whether layer ``layer_id`` derives V from the K projection.
+
+    True only for ``full_attention`` layers of a checkpoint with
+    ``attention_k_eq_v``. Those layers have no ``v_proj`` weight.
+    """
+    text_config = get_text_config(config)
+    if not getattr(text_config, "attention_k_eq_v", False):
+        return False
+    return is_full_attention(config, layer_id)
+
+
+def k_eq_v_layer_ids(config) -> frozenset[int]:
+    """Indices of layers whose ``v_proj`` must be synthesized from ``k_proj``."""
+    return frozenset(
+        i
+        for i in range(len(layer_types(config)))
+        if layer_uses_k_eq_v(config, i)
+    )
+
+
+def layer_rope_parameters(config, layer_id: int) -> dict:
+    """RoPE parameters for layer ``layer_id``.
+
+    Gemma 4 keys ``rope_parameters`` by layer type: full-attention layers use
+    ``rope_type="proportional"`` with ``partial_rotary_factor=0.25`` and
+    ``rope_theta=1e6``; sliding layers use the default rope at ``1e4``.
+
+    Returns:
+        A dict with at least ``rope_type``, ``rope_theta`` and
+        ``partial_rotary_factor``.
+    """
+    text_config = get_text_config(config)
+    label = layer_types(config)[layer_id]
+    params = getattr(text_config, "rope_parameters", None) or {}
+    entry = params.get(label) if isinstance(params, dict) else None
+    if entry is None:
+        # Legacy flat rope_parameters: sliding layers take the local base.
+        entry = dict(params) if isinstance(params, dict) else {}
+        if label == SLIDING_ATTENTION:
+            entry.setdefault(
+                "rope_theta", getattr(text_config, "rope_local_base_freq", 10000.0)
+            )
+    entry = dict(entry)
+    entry.setdefault("rope_type", "default")
+    entry.setdefault("rope_theta", 10000.0)
+    entry.setdefault("partial_rotary_factor", 1.0)
+    return entry
+
+
+def layer_sliding_windows(config) -> tuple[int | None, ...]:
+    """Per-layer sliding window (``None`` on full-attention layers).
+
+    Shaped for ``paged_cache_spec.group_specs_from_layer_types``, which
+    requires full layers to carry ``None`` and sliding layers a positive
+    window.
+    """
+    text_config = get_text_config(config)
+    window = int(getattr(text_config, "sliding_window", 0) or 0)
+    types = layer_types(config)
+    if window <= 0 and any(t == SLIDING_ATTENTION for t in types):
+        raise ValueError(
+            "Gemma4 config declares sliding_attention layers but no positive "
+            "`sliding_window`."
+        )
+    return tuple(None if t == FULL_ATTENTION else window for t in types)
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous KV pool geometry
+# ---------------------------------------------------------------------------
+#
+# ``MHATokenToKVPool`` allocates one byte-uniform slot per page id and lets a
+# layer serving fewer heads reinterpret those bytes as proportionally more
+# token rows (the #647 "hetero KV" path, originally added for Inkling).
+#
+# Gemma 4 fits that mechanism exactly once its two geometries are expressed at
+# a COMMON head dim -- the base ``head_dim`` (256).  A full layer's real
+# ``4 x 512`` is the same number of elements as ``8 x 256``, so it declares 8
+# normalized heads and its group pages at twice the token count:
+#
+#     sliding : 16 x 256 = 4096 elems -> 16 heads -> 1x page tokens
+#     full    :  4 x 512 = 2048 elems ->  8 heads -> 2x page tokens
+#
+# The pool's byte accounting, page-geometry solver and slab guards all key off
+# the normalized head count and need no changes.  Only the per-layer *view*
+# needs the real head dim, which is what ``layer_head_dims`` supplies.
+
+
+def kv_alloc_head_count(config) -> int:
+    """Normalized KV head count the pool slabs are allocated at (pre-TP).
+
+    This is the widest per-layer normalized count, i.e. the sliding layers'
+    ``num_key_value_heads``.
+    """
+    return max(
+        normalized_kv_head_counts(config), default=get_text_config(config).num_key_value_heads
+    )
+
+
+def normalized_kv_head_counts(config) -> tuple[int, ...]:
+    """Per-layer KV head counts expressed at the base ``head_dim``.
+
+    A full-attention layer holding ``4 x 512`` elements reports ``8`` here,
+    because ``8 x 256`` is the same byte count. This is the value the KV pool
+    uses for sizing and paging; the *real* head shape comes from
+    :func:`layer_head_dims` / :func:`layer_num_kv_heads`.
+
+    Raises:
+        ValueError: A layer's KV element count is not a whole multiple of the
+            base head dim, which the byte-uniform slot layout cannot express.
+    """
+    text_config = get_text_config(config)
+    base_dim = int(text_config.head_dim)
+    counts = []
+    for layer_id in range(len(layer_types(config))):
+        elems = layer_num_kv_heads(config, layer_id) * layer_head_dim(config, layer_id)
+        if elems % base_dim:
+            raise ValueError(
+                f"layer {layer_id}: KV width {elems} is not a multiple of the "
+                f"base head_dim {base_dim}; the byte-uniform KV slot layout "
+                "cannot represent this geometry."
+            )
+        counts.append(elems // base_dim)
+    return tuple(counts)
+
+
+def layer_head_dims(config) -> tuple[int, ...]:
+    """Real per-layer head dim, for the KV pool's per-layer row view."""
+    return tuple(
+        layer_head_dim(config, i) for i in range(len(layer_types(config)))
+    )
+
+
+def group_page_tokens(config, page_size: int) -> dict[str, int]:
+    """Per-group page sizes in tokens, keyed by layer-type label.
+
+    Mirrors ``_apply_inkling_hetero_kv``: a group serving ``heads``
+    normalized heads of the slab's ``alloc`` width pages at
+    ``page_size * alloc // heads`` tokens.
+
+    Args:
+        config: A Gemma 4 config.
+        page_size: The scheduler's base block size in tokens.
+
+    Returns:
+        ``{label: tokens_per_page}`` for every distinct layer type.
+    """
+    alloc = kv_alloc_head_count(config)
+    counts = normalized_kv_head_counts(config)
+    pages: dict[str, int] = {}
+    for label, heads in zip(layer_types(config), counts, strict=True):
+        tokens = page_size * alloc // heads
+        prev = pages.setdefault(label, tokens)
+        if prev != tokens:
+            raise ValueError(
+                f"layer type {label!r} maps to inconsistent page sizes "
+                f"({prev} vs {tokens}); the group split assumes one geometry "
+                "per label."
+            )
+    return pages
+
+
+def describe_kv_geometry(config, page_size: int = 64) -> str:
+    """Human-readable geometry summary, for logs and bring-up sanity checks."""
+    text_config = get_text_config(config)
+    types = layer_types(config)
+    lines = [
+        f"Gemma4 KV geometry (base head_dim={text_config.head_dim}, "
+        f"page_size={page_size}):"
+    ]
+    seen: set[str] = set()
+    pages = group_page_tokens(config, page_size)
+    for layer_id, label in enumerate(types):
+        if label in seen:
+            continue
+        seen.add(label)
+        heads = layer_num_kv_heads(config, layer_id)
+        dim = layer_head_dim(config, layer_id)
+        norm = normalized_kv_head_counts(config)[layer_id]
+        lines.append(
+            f"  {label:18s} {heads:3d} x {dim:4d} = {heads * dim:5d} elems"
+            f"  -> {norm:3d} normalized heads, {pages[label]:4d} tok/page"
+            f"{'  [k_eq_v]' if layer_uses_k_eq_v(config, layer_id) else ''}"
+            f"  ({types.count(label)} layers)"
+        )
+    return "\n".join(lines)
+
+
+def validate(config) -> None:
+    """Fail fast on Gemma 4 configs the runtime cannot serve correctly.
+
+    Raises:
+        ValueError: The config declares a feature the port does not implement,
+            where silently ignoring it would corrupt output rather than error.
+    """
+    text_config = get_text_config(config)
+    layer_types(config)  # label + length validation
+    normalized_kv_head_counts(config)  # geometry expressibility
+
+    shared = int(getattr(text_config, "num_kv_shared_layers", 0) or 0)
+    if shared:
+        raise ValueError(
+            f"num_kv_shared_layers={shared} is not implemented; the trailing "
+            "layers would read an uninitialized KV slot."
+        )
+    ple = int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0)
+    if ple:
+        raise ValueError(
+            f"hidden_size_per_layer_input={ple} (per-layer embeddings) is not "
+            "implemented."
+        )
+    if getattr(text_config, "use_double_wide_mlp", False):
+        raise ValueError("use_double_wide_mlp is not implemented.")
+
+
+__all__ = [
+    "FULL_ATTENTION",
+    "SLIDING_ATTENTION",
+    "describe_kv_geometry",
+    "get_text_config",
+    "group_page_tokens",
+    "is_full_attention",
+    "k_eq_v_layer_ids",
+    "kv_alloc_head_count",
+    "layer_head_dim",
+    "layer_head_dims",
+    "layer_num_kv_heads",
+    "layer_rope_parameters",
+    "layer_sliding_windows",
+    "layer_types",
+    "layer_uses_k_eq_v",
+    "normalized_kv_head_counts",
+    "validate",
+]

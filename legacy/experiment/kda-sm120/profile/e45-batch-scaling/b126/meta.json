@@ -1,0 +1,16 @@
+{
+  "tag": "b126",
+  "batch": 126,
+  "ilen": 1024,
+  "prompt_tokens": 1022,
+  "olen": 560,
+  "num_steps": 40,
+  "t_launch": "2026-08-03T05:16:05",
+  "t_profile_rel_s": null,
+  "rows_before_profile": [],
+  "rows_in_window": [],
+  "ok": 126,
+  "fail": 0,
+  "profiled": false,
+  "elapsed_s": 842.0
+}

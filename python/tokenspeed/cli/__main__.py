@@ -24,7 +24,128 @@ import argparse
 import sys
 
 
+def _select_scheduler_ext(raw_argv: list[str]) -> None:
+    """Pick the tokenspeed_scheduler extension this model needs.
+
+    Has to happen HERE, before the first `import tokenspeed.*`: the radix and
+    flat schedulers are two separate .so files (the flat build compiles the
+    radix insert/publish path out and its Scheduler constructor refuses an
+    empty group list), and `runtime/engine/event_loop.py` imports the
+    extension at module scope. By the time anything holds a ModelConfig the
+    choice is already made.
+
+    So read the checkpoint's `architectures` directly -- no torch, no
+    transformers, no engine import -- and record the answer in the
+    environment, where the engine subprocess inherits it. Anything unparseable
+    leaves the default alone; the loader will report it properly later.
+    """
+    from tokenspeed.flat_kvcache_select import select_flat_kvcache_ext_for_model_path
+
+    model = next((arg for arg in raw_argv if arg and not arg.startswith("-")), None)
+    if model is not None:
+        select_flat_kvcache_ext_for_model_path(model)
+
+
+# Runtimes whose route does not exist anywhere yet. Empty: generate goes to
+# the gateway, embed and rerank to entrypoints/pooling_http, asr to
+# entrypoints/asr_http, and diffusion is refused before it gets here.
+_RUNTIME_MISSING: dict[str, str] = {}
+
+
+def _announce_runtime(raw_argv: list[str]) -> None:
+    """Say which runtime this checkpoint resolved to, and what can reach it.
+
+    Printed rather than inferred silently: ``ts serve <model>`` is meant to be
+    the whole command for every model this engine runs, and the operator
+    should be able to see that the engine agreed with them about what the
+    checkpoint is. A wrong answer here is otherwise quiet -- an embedding
+    checkpoint served generatively builds an lm_head no weight fills.
+    """
+    from tokenspeed.runtime_select import describe_runtime, resolve_serving_runtime
+
+    model = next((arg for arg in raw_argv if arg and not arg.startswith("-")), None)
+    if model is None:
+        return "generate"
+    runtime = resolve_serving_runtime(model)
+    print(f"[ts serve] runtime: {runtime} -- {describe_runtime(runtime)}")
+
+    if runtime == "diffusion":
+        raise SystemExit(
+            "[ts serve] this is a diffusers pipeline (model_index.json), and "
+            "the diffusion runtime is not built yet.\n"
+            "           Survey and plan: unieinfra/xref/16-diffusion.md"
+        )
+
+    missing = _RUNTIME_MISSING.get(runtime)
+    if missing:  # pragma: no cover - nothing lands here today
+        # asr only: /v1/audio/transcriptions has no server yet. Start anyway
+        # -- the engine path is real and reachable in-process -- but say so,
+        # because "the server started" would otherwise read as "the model is
+        # being served".
+        print(
+            f"[ts serve] warning: no {missing} route exists yet, so this "
+            f"model is not reachable over HTTP.\n"
+            f"           The engine path is verified and usable in-process. "
+            f"See unieinfra/REPORT-encoder-serving.md §5."
+        )
+    return runtime
+
+
+def _split_host_port(raw_argv: list[str]) -> tuple[list[str], str, int]:
+    """Engine args plus the gateway-side --host/--port this server binds."""
+    from tokenspeed.cli._argsplit import split_argv
+
+    split = split_argv(raw_argv)
+    host, port = "127.0.0.1", 8000
+    gateway = list(split.gateway)
+    if "--host" in gateway:
+        host = gateway[gateway.index("--host") + 1]
+    if "--port" in gateway:
+        port = int(gateway[gateway.index("--port") + 1])
+    return split.engine, host, port
+
+
+def _serve_asr(raw_argv: list[str]) -> None:
+    """``ts serve`` for Whisper: audio in, transcript out.
+
+    Its own server rather than the gateway for the same reason pooling has
+    one -- the proto's only generative RPC is text in, text out, and Whisper
+    needs log-mel features to ride alongside the prompt.
+    """
+    from tokenspeed.runtime.entrypoints.asr_http import serve
+
+    engine_args, host, port = _split_host_port(raw_argv)
+    print(f"[ts serve] asr server on http://{host}:{port}")
+    serve(engine_args, host=host, port=port)
+
+
+def _serve_pooling(raw_argv: list[str]) -> None:
+    """``ts serve`` for an embedding or reranking checkpoint.
+
+    A different server, not a different flag. The smg gateway reaches the
+    engine over a proto with no Embed RPC, so pointing it at a pooling model
+    starts something that cannot answer; ``entrypoints/pooling_http`` owns
+    its engine and serves /v1/embeddings and /v1/rerank directly.
+    """
+    from tokenspeed.runtime.entrypoints.pooling_http import serve
+
+    engine_args, host, port = _split_host_port(raw_argv)
+    print(f"[ts serve] pooling server on http://{host}:{port}")
+    serve(engine_args, host=host, port=port)
+
+
 def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
+    _select_scheduler_ext(raw_argv)
+    runtime = _announce_runtime(raw_argv)
+
+    if not getattr(args, "headless", False):
+        if runtime in ("embed", "rerank"):
+            _serve_pooling(raw_argv)
+            return
+        if runtime == "asr":
+            _serve_asr(raw_argv)
+            return
+
     from tokenspeed.cli.serve_smg import run_smg_from_args
 
     run_smg_from_args(args, raw_argv)

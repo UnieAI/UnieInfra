@@ -1,0 +1,94 @@
+UnieInfra
+Copyright (c) 2026 UnieInfra contributors
+
+================================================================================
+Fork attribution
+================================================================================
+
+UnieInfra is a fork of, and includes source code from, TokenSpeed
+(https://github.com/lightseekorg/tokenspeed), Copyright (c) 2026 LightSeek
+Foundation <contact@lightseek.org>, licensed under the MIT License. The MIT
+License text is retained in the LICENSE file, and the original TokenSpeed
+README is preserved as README.tokenspeed.md.
+
+UnieInfra is an independent, community-driven project. It is NOT affiliated
+with, sponsored by, or endorsed by the LightSeek Foundation.
+
+The vendored packages at the repository root — python/ (the engine), plus
+tokenspeed-kernel/, tokenspeed-kernel-amd/, tokenspeed-mla/, and
+tokenspeed-scheduler/ — originate from TokenSpeed and retain their per-file
+copyright headers and per-package LICENSE files. (Internal package/module names
+such as `tokenspeed` and `tokenspeed_kernel` are retained for now and will be
+renamed in a later, deliberate pass; see docs/design/.)
+
+================================================================================
+Absorbed engine source (vendored, owned, NOT synced upstream)
+================================================================================
+
+UnieInfra is an agent-oriented inference engine that absorbs valuable components
+from other inference engines as *owned in-tree source*, not as library
+dependencies. Absorbed source is hard-forked: we do not merge, rebase or pull
+from upstream. Each absorbed component records its own provenance and license
+below; per-component detail lives next to the code.
+
+  unieinfra-vllm/    vLLM (https://github.com/vllm-project/vllm)
+                     Apache License 2.0.
+                     Hard fork at commit d02df748bf9efd99022f1a062597dc3cb3808485
+                     (v0.13.0rc1-6959), snapshot dated 2026-07-24, vendored
+                     2026-07-25. The upstream LICENSE is retained unmodified at
+                     unieinfra-vllm/LICENSE and every upstream file keeps its
+                     "SPDX-FileCopyrightText: Copyright contributors to the vLLM
+                     project" header. Files UnieInfra changed are listed
+                     individually in unieinfra-vllm/PROVENANCE.md, satisfying
+                     Apache-2.0 section 4(b). The upstream README is preserved
+                     as unieinfra-vllm/UPSTREAM_README.md. The Python import
+                     package is still named `vllm`; this is a deliberate,
+                     documented deferral of the rename, not a claim of identity
+                     with upstream.
+
+UnieInfra is NOT affiliated with, sponsored by, or endorsed by the vLLM project
+or its contributors.
+
+Components under evaluation for absorption are tracked as git submodules under
+third_party/ (see below) until they are actually vendored. A submodule is a
+reference, not a dependency and not redistributed; a directory at the repository
+root is absorbed source that we own.
+
+================================================================================
+Vendored third-party components
+================================================================================
+
+TokenSpeed vendors third-party source under
+tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/. Each retains its own
+upstream copyright and license; refer to the headers within these directories
+and to the corresponding upstream projects for terms:
+
+  - cuda/       hand-written CUDA kernels, incl. FlashInfer-derived headers
+  - cute_dsl/   NVIDIA CuTe DSL kernels
+  - deep_gemm/  DeepGEMM
+  - msa/        MiniMax sparse attention (CUTLASS-derived)
+  - triton/     Triton kernels
+  - trtllm/     TensorRT-LLM-derived kernels
+
+================================================================================
+Reference-only dependencies (NOT vendored, NOT redistributed)
+================================================================================
+
+The following live as git submodules under third_party/ for reference and
+interoperability work only. They are not part of the UnieInfra distribution and
+retain their own licenses:
+
+  - third_party/vllm     — vLLM            (Apache-2.0) — kept at the pin
+                           d02df748 that unieinfra-vllm/ was vendored from, so
+                           the fork's provenance stays verifiable
+  - third_party/sglang   — SGLang           (Apache-2.0)
+  - third_party/FastVideo — FastVideo       (Apache-2.0)
+  - third_party/JetSpec  — JetSpec          (MIT)
+  - third_party/lmdeploy — LMDeploy         (Apache-2.0)
+  - third_party/TensorRT-LLM — TensorRT-LLM (Apache-2.0)
+  - third_party/modular  — Modular/Mojo/MAX (Apache-2.0 with LLVM exceptions)
+  - third_party/tilert   — TileRT           (see third_party/tilert/LICENSE)
+
+If any of these is later absorbed as source, it moves out of third_party/, gains
+its own PROVENANCE record, and is listed in the "Absorbed engine source" section
+above with its commit and license — not merely acknowledged here.

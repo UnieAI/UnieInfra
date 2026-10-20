@@ -1,0 +1,3381 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/_triton.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/_triton.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/_triton.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/_triton.py	2026-08-01 20:17:59.001447129 +0000
+@@ -30,13 +30,29 @@
+ 
+ import tokenspeed_triton as triton
+ import tokenspeed_triton.experimental.gluon.language as gl
+-import tokenspeed_triton.profiler as proton
+ from tokenspeed_triton import language as tl
+ from tokenspeed_triton.experimental import gluon
+ from tokenspeed_triton.language.core import _aggregate as aggregate
+ from tokenspeed_triton.language.extra import libdevice
+ from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+ 
++# Proton is optional and some tokenspeed-triton builds ship without it.
++# ``profiling.py`` already expects that -- it does
++# ``_HAS_PROTON = proton is not None`` -- but the import here was unconditional,
++# so a build lacking the submodule raised ModuleNotFoundError at import time
++# instead of yielding the None the downstream code is written for.
++#
++# The effect was invisible in serving, where the UnieInfra layer takes the
++# ``standalone`` backend and never reaches this module, and fatal in any
++# standalone use: importing a kernel module directly pulls
++# unieinfra_kernel.boundary -> tokenspeed_kernel -> here. That is why
++# benchmark/scripts/bench_decode_gemv.py could not run against a container whose
++# vLLM was happily executing the very kernel it wanted to benchmark.
++try:
++    import tokenspeed_triton.profiler as proton
++except ModuleNotFoundError:
++    proton = None
++
+ __all__ = [
+     "aggregate",
+     "TensorDescriptor",
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/artifact.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/artifact.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/artifact.py	1970-01-01 00:00:00.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/artifact.py	2026-07-25 17:22:05.135922174 +0000
+@@ -0,0 +1,373 @@
++# SPDX-License-Identifier: MIT
++# Copyright (c) 2026 UnieInfra contributors
++"""Build/artifact capability tier — "is there *code* for this device?".
++
++:class:`~tokenspeed_kernel.platform.CapabilityRequirement` answers two
++questions well: *what silicon is this* (``min_arch_version`` /
++``max_arch_version`` / ``vendors``) and *what can the silicon do*
++(``required_features``). It cannot answer a third question that decides just as
++many selections in practice:
++
++    **Does the binary that is actually installed contain code for this device?**
++
++A kernel can be perfectly expressible on the hardware and still be unreachable
++because the wheel on this machine was compiled without that architecture, the
++optional dependency is missing, the symbol was never bound, or the JIT toolchain
++in this container cannot target the part. ``min_arch_version`` says nothing
++about any of that, which is why E30 had to leave ``deep_gemm_*`` and
++``cuda_attn_merge_state`` unresolved: their gates were *arch* statements
++standing in for *artifact* questions.
++
++Three probe shapes were already scattered through the tree, each hand-rolled:
++
++1. an ``inspect.signature`` probe (``"sfq" in signature(flash_attn_varlen_func)``)
++   — does the installed build ship this entry point at all;
++2. ``try/except ImportError`` plus an ``is error_fn`` sentinel test — did the
++   optional dependency bind;
++3. a :func:`~tokenspeed_kernel.selection.select_kernel` /registry query
++   — did some other kernel actually register.
++
++This module generalizes all three into one mechanism —
++:func:`register_build_capability` — plus a fourth probe that none of them could
++express: :func:`binary_targets_device`, which asks the *object file* whether it
++contains SASS or forward-compatible PTX for the running device.
++
++Contract
++--------
++
++* A build capability is a feature name in the ``build:`` namespace. It goes in
++  ``required_features`` exactly like a hardware feature.
++* Probes are **lazy and cached**: nothing here runs during platform detection,
++  so declaring one costs nothing until a selection actually needs the answer.
++* A probe that raises falls back to its declared ``default``.
++* A ``build:`` feature with **no registered probe resolves to available**, with
++  a one-time warning. This is deliberate and is the E28 rule: when a capability
++  cannot be queried we fall back to the previously-validated behaviour, so a
++  detection gap can never *narrow* what already worked on hardware we cannot
++  test. A missing probe must not silently delete a datacenter kernel.
++"""
++
++from __future__ import annotations
++
++import logging
++import shutil
++import subprocess
++from dataclasses import dataclass
++from typing import Callable
++
++logger = logging.getLogger(__name__)
++
++__all__ = [
++    "BUILD_NAMESPACE",
++    "BuildCapability",
++    "binary_targets_device",
++    "build_capability_available",
++    "build_capabilities",
++    "clear_build_capability_cache",
++    "has_signature_parameter",
++    "kernel_is_registered",
++    "register_build_capability",
++    "symbol_is_bound",
++]
++
++#: Namespace prefix that marks a feature name as a build/artifact capability
++#: rather than a hardware capability.
++BUILD_NAMESPACE = "build:"
++
++
++@dataclass(frozen=True)
++class BuildCapability:
++    """A registered build/artifact capability and the probe that answers it.
++
++    Attributes:
++        name: Feature name, always in the ``build:`` namespace.
++        probe: Zero-argument callable returning a truthy value when the
++            capability is present. Called at most once per process (per cache
++            generation) and never during platform detection.
++        default: Value used when ``probe`` raises. Set this to ``True`` for a
++            capability that is known-good on the hardware we cannot test, so a
++            probe failure degrades to the previously-validated behaviour rather
++            than silently removing the kernel.
++        doc: Human-readable description, surfaced by :func:`build_capabilities`.
++    """
++
++    name: str
++    probe: Callable[[], object]
++    default: bool
++    doc: str = ""
++
++
++_REGISTRY: dict[str, BuildCapability] = {}
++_CACHE: dict[str, bool] = {}
++_WARNED: set[str] = set()
++
++
++def register_build_capability(
++    name: str,
++    probe: Callable[[], object],
++    *,
++    default: bool,
++    doc: str = "",
++) -> str:
++    """Register a build/artifact capability probe.
++
++    Args:
++        name: Feature name. Must start with ``build:``. Re-registering the same
++            name replaces the previous probe and drops its cached answer, which
++            is what lets a test swap a probe out.
++        probe: Zero-argument callable returning a truthy value when the
++            installed artifact provides the capability. Evaluated lazily on the
++            first selection that needs it, then cached.
++        default: The answer used when ``probe`` raises. Choose ``True`` when the
++            capability is validated on hardware this process cannot query, so a
++            probe failure never narrows a working path (the E28 rule).
++        doc: Optional description for diagnostics.
++
++    Returns:
++        ``name``, so a registration can be inlined straight into a
++        ``required_features`` set::
++
++            required_features=frozenset({
++                "memory:tma",
++                register_build_capability(
++                    "build:deep_gemm_device_code",
++                    _probe, default=True,
++                ),
++            })
++
++    Raises:
++        ValueError: If ``name`` is not in the ``build:`` namespace.
++    """
++    if not name.startswith(BUILD_NAMESPACE):
++        raise ValueError(
++            f"build capability name must start with {BUILD_NAMESPACE!r}, got {name!r}. "
++            "The prefix is what tells CapabilityRequirement to resolve the feature "
++            "through the artifact-probe registry instead of the device feature set."
++        )
++    _REGISTRY[name] = BuildCapability(name=name, probe=probe, default=default, doc=doc)
++    _CACHE.pop(name, None)
++    _WARNED.discard(name)
++    return name
++
++
++def build_capability_available(name: str) -> bool:
++    """Resolve a ``build:`` feature, evaluating and caching its probe.
++
++    Args:
++        name: Feature name in the ``build:`` namespace.
++
++    Returns:
++        The probe's answer; its ``default`` when the probe raised; or ``True``
++        when no probe is registered for ``name``. The unregistered case warns
++        once and answers ``True`` on purpose: an unqueryable capability must
++        never narrow a path that is already validated on hardware we cannot
++        reach (E28).
++    """
++    cached = _CACHE.get(name)
++    if cached is not None:
++        return cached
++
++    capability = _REGISTRY.get(name)
++    if capability is None:
++        if name not in _WARNED:
++            _WARNED.add(name)
++            logger.warning(
++                "Build capability %r has no registered probe; treating it as "
++                "AVAILABLE so an undetectable artifact cannot narrow a "
++                "previously-validated path. Register a probe with "
++                "register_build_capability(%r, ...) to make this decidable.",
++                name,
++                name,
++            )
++        return True
++
++    try:
++        answer = bool(capability.probe())
++    except Exception as exc:  # noqa: BLE001 - a probe must never break selection
++        logger.warning(
++            "Build capability probe %r raised %s; falling back to default=%s.",
++            name,
++            exc,
++            capability.default,
++        )
++        answer = capability.default
++
++    _CACHE[name] = answer
++    return answer
++
++
++def build_capabilities() -> dict[str, BuildCapability]:
++    """Return every registered build capability, keyed by feature name."""
++    return dict(_REGISTRY)
++
++
++def clear_build_capability_cache() -> None:
++    """Drop cached probe answers so the next query re-evaluates them."""
++    _CACHE.clear()
++    _WARNED.clear()
++
++
++# ---------------------------------------------------------------------------
++# Probe constructors -- the three in-tree patterns, generalized
++# ---------------------------------------------------------------------------
++
++
++def has_signature_parameter(load: Callable[[], object], parameter: str):
++    """Probe: does the installed entry point accept ``parameter``?
++
++    Generalizes the ``"sfq" in inspect.signature(flash_attn_varlen_func)`` and
++    ``"aux_tensors" in signature(AttentionMask.apply_mask_sm100)`` checks.
++
++    Args:
++        load: Zero-argument callable returning the function to inspect. Taking a
++            loader rather than the function keeps the import lazy, so a probe on
++            an optional dependency costs nothing until it is queried.
++        parameter: Parameter name the installed build must expose.
++
++    Returns:
++        A zero-argument probe suitable for :func:`register_build_capability`.
++    """
++
++    def probe() -> bool:
++        import inspect
++
++        return parameter in inspect.signature(load()).parameters
++
++    return probe
++
++
++def symbol_is_bound(load: Callable[[], object], *, sentinels: tuple = ()):
++    """Probe: did the optional dependency actually bind this symbol?
++
++    Generalizes the ``try/except ImportError`` plus ``x is not error_fn``
++    pattern used across ``ops/**``.
++
++    Args:
++        load: Zero-argument callable returning the symbol. Raising (typically
++            ``ImportError``) counts as unbound.
++        sentinels: Placeholder objects that mean "not bound" — pass
++            ``(error_fn,)`` to reuse the registry's own sentinel. ``None`` is
++            always treated as unbound.
++
++    Returns:
++        A zero-argument probe suitable for :func:`register_build_capability`.
++    """
++
++    def probe() -> bool:
++        try:
++            symbol = load()
++        except Exception:  # noqa: BLE001 - an unimportable symbol is simply absent
++            return False
++        if symbol is None:
++            return False
++        return not any(symbol is sentinel for sentinel in sentinels)
++
++    return probe
++
++
++def kernel_is_registered(kernel_name: str):
++    """Probe: did some other kernel register under ``kernel_name``?
++
++    Generalizes the ``select_kernel`` / registry-query pattern, which several
++    ``ops/**`` entry points use to decide whether a specialized path exists.
++
++    Args:
++        kernel_name: The registered kernel's unique name.
++
++    Returns:
++        A zero-argument probe suitable for :func:`register_build_capability`.
++    """
++
++    def probe() -> bool:
++        from tokenspeed_kernel.registry import KernelRegistry
++
++        return KernelRegistry.get().get_by_name(kernel_name) is not None
++
++    return probe
++
++
++def binary_targets_device(
++    locate: Callable[[], str],
++    *,
++    arch: Callable[[], tuple[int, int]] | None = None,
++):
++    """Probe: does this object file contain code for the running device?
++
++    This is the question ``min_arch_version`` structurally cannot ask. A
++    prebuilt ``.so`` carries a fatbinary whose architectures were fixed at
++    compile time; a device newer than every embedded target is unreachable no
++    matter how capable it is. ``cuobjdump`` reports both the embedded SASS
++    (exact ``sm_XY`` match required) and the embedded PTX (any target ``<=`` the
++    device JITs forward, so it counts).
++
++    Args:
++        locate: Zero-argument callable returning the path of the object file to
++            inspect. Lazy so a missing optional artifact is not an import error.
++        arch: Zero-argument callable returning ``(major, minor)`` for the device
++            to test. Defaults to the detected platform's arch version.
++
++    Returns:
++        A zero-argument probe suitable for :func:`register_build_capability`.
++        The probe **raises** when ``cuobjdump`` is unavailable or the file
++        cannot be read, so registration's ``default`` decides the answer — keep
++        that ``True`` for artifacts validated on datacenter parts.
++    """
++
++    def probe() -> bool:
++        if arch is None:
++            from tokenspeed_kernel.platform import current_platform
++
++            platform = current_platform()
++            major, minor = platform.arch_version.major, platform.arch_version.minor
++        else:
++            major, minor = arch()
++
++        cuobjdump = shutil.which("cuobjdump")
++        if cuobjdump is None:
++            raise RuntimeError("cuobjdump not on PATH; cannot inspect device code")
++
++        path = locate()
++        target = major * 10 + minor
++        result = subprocess.run(  # noqa: S603 - fixed argv, no shell
++            [cuobjdump, "--list-elf", "--list-ptx", path],
++            capture_output=True,
++            text=True,
++            timeout=60,
++        )
++        if result.returncode != 0:
++            raise RuntimeError(
++                f"cuobjdump failed on {path}: {result.stderr.strip() or 'unknown error'}"
++            )
++        return _fatbin_covers(result.stdout, target)
++
++    return probe
++
++
++def _fatbin_covers(listing: str, target: int) -> bool:
++    """Whether a ``cuobjdump`` listing covers compute capability ``target``.
++
++    Args:
++        listing: Combined ``--list-elf --list-ptx`` output.
++        target: Device compute capability as ``major * 10 + minor``.
++
++    Returns:
++        ``True`` when the listing names an ELF image for exactly ``target`` (an
++        exact SASS match) or a PTX image for ``target`` or lower (JIT-forward
++        compatible within the same major family).
++    """
++    import re
++
++    elf_archs: set[int] = set()
++    ptx_archs: set[int] = set()
++    for line in listing.splitlines():
++        for match in re.finditer(r"sm_(\d+)", line):
++            value = int(match.group(1))
++            if ".ptx" in line:
++                ptx_archs.add(value)
++            else:
++                elf_archs.add(value)
++    if target in elf_archs:
++        return True
++    # PTX JITs forward only within a major family: sm_90 PTX does not run on
++    # sm_100, but sm_100 PTX runs on sm_103.
++    return any(ptx <= target and ptx // 10 == target // 10 for ptx in ptx_archs)
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/cuda/__init__.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/cuda/__init__.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/cuda/__init__.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/cuda/__init__.py	2026-07-25 17:09:54.490110242 +0000
+@@ -1,6 +1,9 @@
+ from __future__ import annotations
+ 
+ import torch
++from tokenspeed_kernel.ops.build_capabilities import (
++    MERGE_STATE_DEVICE_CODE as _MERGE_STATE_DEVICE_CODE,
++)
+ from tokenspeed_kernel.platform import (
+     ArchVersion,
+     CapabilityRequirement,
+@@ -21,6 +24,7 @@
+         solution="cuda",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _MERGE_STATE_DEVICE_CODE}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/deep_gemm/__init__.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/deep_gemm/__init__.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/deep_gemm/__init__.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/deep_gemm/__init__.py	2026-07-25 17:18:27.914782016 +0000
+@@ -18,6 +18,9 @@
+     combine_topk_weights,
+     local_topk_to_global_slots,
+ )
++from tokenspeed_kernel.ops.build_capabilities import (
++    DEEP_GEMM_DEVICE_CODE as _DEEP_GEMM_DEVICE_CODE,
++)
+ from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+ from tokenspeed_kernel.platform import (
+     ArchVersion,
+@@ -110,6 +113,7 @@
+         solution="deep_gemm",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _DEEP_GEMM_DEVICE_CODE}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=frozenset({format_signature()}),
+@@ -159,6 +163,7 @@
+         solution="deep_gemm",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _DEEP_GEMM_DEVICE_CODE}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=frozenset(
+@@ -316,6 +321,7 @@
+         solution="deep_gemm",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _DEEP_GEMM_DEVICE_CODE}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=frozenset(
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_attn/__init__.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_attn/__init__.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_attn/__init__.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_attn/__init__.py	2026-07-25 17:07:36.203546893 +0000
+@@ -48,7 +48,12 @@
+ # ------------------------------------------------------------------------------
+ 
+ 
+-if platform.is_blackwell_plus:
++# Must match the registration guard below: `is_blackwell_plus` is an
++# open-ended version comparison that sm_120 also satisfies, so on sm_120 this
++# imported the sm_100-only FA4 CuTe wheel that nothing below can then use --
++# pure import cost, and a hard import failure waiting to happen if that wheel
++# ever arch-checks at import time. Byte-identical on sm_90/sm_100/sm_103.
++if platform.is_nvidia and platform.is_blackwell:
+     from flash_attn.cute import (
+         flash_attn_func,
+         flash_attn_varlen_func,
+@@ -600,6 +605,7 @@
+         solution="fa4",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"compute:tcgen05"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+@@ -690,6 +696,7 @@
+         solution="fa4",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"compute:tcgen05"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+@@ -789,6 +796,7 @@
+         solution="fa4",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"compute:tcgen05"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+@@ -922,6 +930,7 @@
+         solution="fa4",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"compute:tcgen05"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=_MXFP8_ATTENTION_SIGNATURES,
+@@ -999,6 +1008,7 @@
+         solution="fa4",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"compute:tcgen05"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=_MXFP8_ATTENTION_SIGNATURES,
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_mla/__init__.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_mla/__init__.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_mla/__init__.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flash_mla/__init__.py	2026-07-25 17:09:54.489938471 +0000
+@@ -21,6 +21,9 @@
+ from __future__ import annotations
+ 
+ import torch
++from tokenspeed_kernel.ops.build_capabilities import (
++    FLASHMLA_DEVICE_CODE as _FLASHMLA_DEVICE_CODE,
++)
+ from tokenspeed_kernel.platform import (
+     ArchVersion,
+     CapabilityRequirement,
+@@ -189,6 +192,7 @@
+         solution="flashmla",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _FLASHMLA_DEVICE_CODE}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+@@ -278,6 +282,7 @@
+         solution="flashmla",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _FLASHMLA_DEVICE_CODE}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/__init__.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/__init__.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/__init__.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/__init__.py	2026-07-25 09:20:34.780378337 +0000
+@@ -22,6 +22,7 @@
+ 
+ import math
+ 
++import tokenspeed_kernel.ops.attention.flashinfer.fa2  # noqa: F401
+ import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
+ import torch
+ from tokenspeed_kernel.platform import (
+@@ -134,6 +135,10 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            # TRT-LLM-gen FMHA supports only sm_100/sm_103 (fmhaRunner.cuh hard
++            # errors otherwise). Cap the arch so it is not selected on sm_120,
++            # where flashinfer_fa2_* takes over.
++            max_arch_version=ArchVersion(10, 3),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+@@ -213,6 +218,10 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            # TRT-LLM-gen FMHA supports only sm_100/sm_103 (fmhaRunner.cuh hard
++            # errors otherwise). Cap the arch so it is not selected on sm_120,
++            # where flashinfer_fa2_* takes over.
++            max_arch_version=ArchVersion(10, 3),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+@@ -284,6 +293,13 @@
+         solution="flashinfer_trtllm",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            # Same TRT-LLM-gen runner the MHA registrations above cap at
++            # sm_103; the cap was simply never applied here, so sm_120 (arch
++            # 12.0) satisfied the open-ended min and this SPECIALIZED kernel
++            # out-ranked triton_dsa_decode before hard-failing. Stated as the
++            # capability it actually needs rather than as a version fence, so
++            # it stays correct for sm_103 and for future parts.
++            required_features=frozenset({"compute:tcgen05"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=frozenset(
+@@ -373,6 +389,9 @@
+         solution="flashinfer_trtllm",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            # Delegates to flashinfer_trtllm_dsa_decode below, so it needs the
++            # same tcgen05 capability. See the note there.
++            required_features=frozenset({"compute:tcgen05"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=frozenset(
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/fa2.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/fa2.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/fa2.py	1970-01-01 00:00:00.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/fa2.py	2026-08-02 16:20:40.155984596 +0000
+@@ -0,0 +1,532 @@
++# Copyright (c) 2026 LightSeek Foundation
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in
++# all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""FlashInfer FA2 paged attention for MHA extend/decode.
++
++The ``flashinfer_trtllm_*`` kernels in this package use the TRT-LLM-gen fused
++MHA runner, which only supports datacenter Blackwell (sm_100 / sm_103) and hard
++errors on other architectures (notably sm_120 / RTX PRO 6000). This module wires
++the same ``mha_extend_with_kvcache`` / ``mha_decode_with_kvcache`` operators to
++FlashInfer's FA2 paged wrappers, which JIT-compile for the running architecture
++(sm_80+, including sm_120) and therefore provide a working FlashInfer attention
++path on consumer / workstation Blackwell.
++
++Both kernels share the same paged-KV contract as the rest of the attention
++family:
++
++* ``k_cache`` / ``v_cache``: ``[num_pages, page_size, num_kv_heads, head_dim]``
++  (this is exactly FlashInfer's ``NHD`` paged layout).
++* ``page_table``: ``[batch, max_pages_per_seq]`` of physical page ids.
++* ``cache_seqlens``: ``[batch]`` total visible KV length per request.
++
++FlashInfer's wrappers instead take the CSR-style ``(paged_kv_indptr,
++paged_kv_indices, paged_kv_last_page_len)`` description, which we derive from
++``page_table`` + ``cache_seqlens`` on each call.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++
++import torch
++from tokenspeed_kernel.platform import (
++    ArchVersion,
++    CapabilityRequirement,
++    current_platform,
++)
++from tokenspeed_kernel.registry import Priority, register_kernel
++from tokenspeed_kernel.selection import select_kernel
++from tokenspeed_kernel.signature import format_signatures
++
++platform = current_platform()
++
++if platform.is_nvidia:
++    from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
++    from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
++
++    # FlashInfer sub-allocates its prefill temporaries out of this buffer via an
++    # AlignedAllocator. At 128 MiB, Qwen3-scale prefill asked for 136,052,736 B
++    # against 134,217,728 B available -- short by 1.75 MiB -- and aborted startup
++    # with "Increase the workspace buffer size". That made the flashinfer
++    # attention backend look unsupported on sm_120 when it was merely
++    # unconfigured; raising it lets the backend serve. This is the sm_120 path
++    # specifically: these fa2 kernels register with min_arch_version=(8, 0) and
++    # are the only solution="flashinfer" MHA kernels sm_120 can reach, since the
++    # trtllm-gen ones are capped at 10.3.
++    #
++    # 512 MiB matches the siblings in this package (see __init__.py, which uses
++    # 512 MiB for its own wrappers). The env var mirrors
++    # tokenspeed.runtime.utils.flashinfer_config, but is read directly rather
++    # than imported: tokenspeed-kernel is the kernel-package boundary and must
++    # not depend back on tokenspeed.runtime (AGENTS.md, "Dependency boundaries").
++    _FA2_WORKSPACE_BYTES = int(
++        os.environ.get("FLASHINFER_WORKSPACE_SIZE", 512 * 1024 * 1024)
++    )
++
++    # Keyed by (device, window_left), not device alone.
++    #
++    # A FlashInfer wrapper records ``window_left`` at plan() time and asserts the
++    # value passed to run() matches:
++    #
++    #   File flashinfer/decode.py, in run
++    #     assert window_left == self._window_left
++    #   AssertionError
++    #
++    # One wrapper per device is fine while every layer shares a window. gemma-4
++    # does not: 50 sliding layers at 1024 and 10 global layers with no window, so
++    # whichever planned last loses. Each distinct window needs its own wrapper,
++    # and its own workspace with it, since the wrapper keeps plan state there.
++    # Cost is 128 MiB per (device, window) rather than per device.
++    #
++    # NOT SUFFICIENT ON ITS OWN, and gemma-4 still fails with that assertion.
++    # These factories only serve the eager path. Under CUDA graphs the wrapper is
++    # created and owned by the caller -- see
++    # runtime/layers/attention/backends/mha.py, `_fa2_decode_wrappers`, which is
++    # keyed by batch size and shared across every layer.
++    #
++    # The machinery to fix it already exists there: the "flat" path builds one
++    # wrapper per attention group (`_fa2_flat_decode_wrappers[(bs, gid)]`), which
++    # is exactly the right shape for heterogeneous layers. gemma-4 simply does
++    # not reach it -- `_fa2_flat_enabled` is only set when `att_gids` is
++    # non-empty. Routing gemma-4 through the flat path, or keying the non-flat
++    # wrapper by window as well, is where the real fix belongs.
++    #
++    # Left in place because it is independently correct for the eager path, but
++    # it fixes nothing observable today. gemma-4 is not blocked by this: it runs
++    # correctly on vLLM's TRITON_ATTN backend.
++    _WrapperKey = tuple[torch.device, int]
++
++    _prefill_workspace: dict[_WrapperKey, torch.Tensor] = {}
++    _decode_workspace: dict[_WrapperKey, torch.Tensor] = {}
++    _prefill_wrappers: dict[_WrapperKey, BatchPrefillWithPagedKVCacheWrapper] = {}
++    _decode_wrappers: dict[_WrapperKey, BatchDecodeWithPagedKVCacheWrapper] = {}
++
++    def _workspace(cache: dict, key: _WrapperKey) -> torch.Tensor:
++        ws = cache.get(key)
++        if ws is None:
++            ws = torch.empty(
++                _FA2_WORKSPACE_BYTES, dtype=torch.uint8, device=key[0]
++            )
++            cache[key] = ws
++        return ws
++
++    def _prefill_wrapper(
++        device: torch.device, window_left: int = -1
++    ) -> BatchPrefillWithPagedKVCacheWrapper:
++        key = (device, window_left)
++        wrapper = _prefill_wrappers.get(key)
++        if wrapper is None:
++            wrapper = BatchPrefillWithPagedKVCacheWrapper(
++                _workspace(_prefill_workspace, key),
++                kv_layout="NHD",
++                backend="fa2",
++            )
++            _prefill_wrappers[key] = wrapper
++        return wrapper
++
++    def _decode_wrapper(
++        device: torch.device, window_left: int = -1
++    ) -> BatchDecodeWithPagedKVCacheWrapper:
++        key = (device, window_left)
++        wrapper = _decode_wrappers.get(key)
++        if wrapper is None:
++            try:
++                wrapper = BatchDecodeWithPagedKVCacheWrapper(
++                    _workspace(_decode_workspace, key),
++                    kv_layout="NHD",
++                    use_tensor_cores=True,
++                    backend="fa2",
++                )
++            except (TypeError, ValueError):
++                # Older/newer signatures may not accept ``backend`` for decode;
++                # "auto" resolves to the FA2 decode kernel on sm_120.
++                wrapper = BatchDecodeWithPagedKVCacheWrapper(
++                    _workspace(_decode_workspace, key),
++                    kv_layout="NHD",
++                    use_tensor_cores=True,
++                )
++            _decode_wrappers[key] = wrapper
++        return wrapper
++
++    def _paged_kv_csr(
++        page_table: torch.Tensor,
++        cache_seqlens: torch.Tensor,
++        page_size: int,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Convert (page_table, cache_seqlens) to FlashInfer CSR paged layout.
++
++        Returns ``(indptr, indices, last_page_len)`` where ``indptr`` has shape
++        ``[batch + 1]``, ``indices`` is the flattened list of physical page ids
++        (concatenated per request), and ``last_page_len`` is the number of valid
++        tokens in each request's final page, in ``[1, page_size]``.
++        """
++        cache_seqlens = cache_seqlens.to(torch.int32)
++        num_pages = (cache_seqlens + (page_size - 1)) // page_size
++        # Build indptr = [0, cumsum(num_pages)...] entirely on-device via a pad,
++        # avoiding the scalar `indptr[0] = 0` host->device copy that is illegal
++        # under CUDA-graph capture. This function still uses a data-dependent
++        # boolean gather below, so it must only be called OUTSIDE a captured
++        # region (from the plan/replay hooks); the device-native indptr keeps it
++        # from failing on the specific scalar-copy op if it is ever reached.
++        indptr = torch.nn.functional.pad(
++            torch.cumsum(num_pages, dim=0, dtype=torch.int32), (1, 0)
++        )
++        batch, max_pages = page_table.shape
++        cols = torch.arange(max_pages, device=page_table.device).unsqueeze(0)
++        mask = cols < num_pages.unsqueeze(1)
++        indices = page_table[mask].to(torch.int32)
++        last_page_len = (cache_seqlens - (num_pages - 1) * page_size).to(torch.int32)
++        return indptr, indices, last_page_len
++
++    @register_kernel(
++        "attention",
++        "mha_extend_with_kvcache",
++        name="flashinfer_fa2_mha_extend_with_kvcache",
++        solution="flashinfer",
++        capability=CapabilityRequirement(
++            min_arch_version=ArchVersion(8, 0),
++            required_features=frozenset({"memory:async_copy"}),
++            vendors=frozenset({"nvidia"}),
++        ),
++        signatures=format_signatures(
++            ("q", "k_cache", "v_cache"),
++            "dense",
++            {torch.float16, torch.bfloat16},
++        ),
++        # Below trtllm-gen (SPECIALIZED) so datacenter Blackwell keeps trtllm,
++        # above Triton (PORTABLE) so this wins on sm_120 where trtllm is gated out.
++        priority=Priority.PERFORMANT,
++        traits={
++            "is_causal": frozenset({False, True}),
++            "sliding_window": frozenset({False, True}),
++            "support_sinks": frozenset({False, True}),
++            "support_logit_cap": frozenset({False, True}),
++            "return_lse": frozenset({False, True}),
++        },
++    )
++    def flashinfer_fa2_mha_extend_with_kvcache(
++        q: torch.Tensor,
++        cu_seqlens_q: torch.Tensor,
++        cu_seqlens_kv: torch.Tensor,
++        k_cache: torch.Tensor,
++        v_cache: torch.Tensor,
++        page_table: torch.Tensor,
++        cache_seqlens: torch.Tensor,
++        max_seqlen_q: int,
++        max_seqlen_k: int,
++        is_causal: bool = False,
++        window_left: int = -1,
++        logit_cap: float = 0.0,
++        sinks: torch.Tensor | None = None,
++        return_lse: bool = False,
++        softmax_scale: float | None = None,
++        q_scale: torch.Tensor | None = None,
++        k_scale: torch.Tensor | None = None,
++        v_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        if softmax_scale is None:
++            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
++        page_size = k_cache.shape[1]
++        num_qo_heads = q.shape[1]
++        num_kv_heads = k_cache.shape[2]
++        head_dim = q.shape[-1]
++
++        indptr, indices, last_page_len = _paged_kv_csr(
++            page_table, cache_seqlens, page_size
++        )
++        cu_seqlens_q = cu_seqlens_q.to(torch.int32)
++        # Under graph mode the caller pads q with tail rows beyond the real
++        # token count (cu_seqlens_q[-1]); Triton/trtllm bound work by cu_seqlens
++        # and ignore them, but FlashInfer's prefill wrapper requires
++        # q.shape[0] == qo_indptr[-1]. Extend is never cuda-graph captured
++        # (the capture hook rejects extend/mixed), so slicing off the padding
++        # with a host sync here is safe, and we scatter the result back.
++        total_real = int(cu_seqlens_q[-1].item())
++        q_run = q[:total_real] if total_real != q.shape[0] else q
++        wrapper = _prefill_wrapper(q.device, window_left)
++        wrapper.plan(
++            qo_indptr=cu_seqlens_q,
++            paged_kv_indptr=indptr,
++            paged_kv_indices=indices,
++            paged_kv_last_page_len=last_page_len,
++            num_qo_heads=num_qo_heads,
++            num_kv_heads=num_kv_heads,
++            head_dim_qk=head_dim,
++            page_size=page_size,
++            causal=is_causal,
++            sm_scale=softmax_scale,
++            window_left=window_left,
++            logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
++            q_data_type=q.dtype,
++            kv_data_type=k_cache.dtype,
++        )
++        out_run = wrapper.run(
++            q_run,
++            (k_cache, v_cache),
++            sinks=sinks,
++            return_lse=return_lse,
++        )
++        if q_run is q:
++            return out_run
++        # Scatter back into a full-length (padded) output; tail rows are
++        # discarded downstream but are zeroed to avoid propagating NaNs.
++        if return_lse:
++            out_run, lse_run = out_run
++        out = q.new_zeros((q.shape[0], out_run.shape[1], out_run.shape[2]))
++        out[:total_real] = out_run
++        if return_lse:
++            lse = q.new_zeros((q.shape[0], lse_run.shape[1]), dtype=lse_run.dtype)
++            lse[:total_real] = lse_run
++            return out, lse
++        return out
++
++    @register_kernel(
++        "attention",
++        "mha_decode_with_kvcache",
++        name="flashinfer_fa2_mha_decode_with_kvcache",
++        solution="flashinfer",
++        capability=CapabilityRequirement(
++            min_arch_version=ArchVersion(8, 0),
++            required_features=frozenset({"memory:async_copy"}),
++            vendors=frozenset({"nvidia"}),
++        ),
++        signatures=format_signatures(
++            ("q", "k_cache", "v_cache"),
++            "dense",
++            {torch.float16, torch.bfloat16},
++        ),
++        priority=Priority.PERFORMANT,
++        traits={
++            "sliding_window": frozenset({False, True}),
++            "support_sinks": frozenset({False, True}),
++            "support_logit_cap": frozenset({False, True}),
++            "return_lse": frozenset({False, True}),
++        },
++    )
++    def flashinfer_fa2_mha_decode_with_kvcache(
++        q: torch.Tensor,
++        k_cache: torch.Tensor,
++        v_cache: torch.Tensor,
++        page_table: torch.Tensor,
++        cache_seqlens: torch.Tensor,
++        max_seqlen_k: int,
++        max_seqlen_q: int = 1,
++        window_left: int = -1,
++        logit_cap: float = 0.0,
++        sinks: torch.Tensor | None = None,
++        return_lse: bool = False,
++        softmax_scale: float | None = None,
++        q_scale: torch.Tensor | None = None,
++        k_scale: torch.Tensor | None = None,
++        v_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        if softmax_scale is None:
++            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
++        page_size = k_cache.shape[1]
++        num_qo_heads = q.shape[1]
++        num_kv_heads = k_cache.shape[2]
++        head_dim = q.shape[-1]
++
++        indptr, indices, last_page_len = _paged_kv_csr(
++            page_table, cache_seqlens, page_size
++        )
++
++        if max_seqlen_q > 1:
++            # Speculative-decode / MTP verify: several uniformly packed query
++            # tokens per request, causal among themselves. The dedicated decode
++            # wrapper's q_len_per_req path uses different masking semantics than
++            # this operator, so route multi-token decode through the prefill
++            # wrapper with a uniform qo_indptr, which matches exactly.
++            batch = cache_seqlens.shape[0]
++            qo_indptr = torch.arange(
++                0,
++                (batch + 1) * max_seqlen_q,
++                max_seqlen_q,
++                dtype=torch.int32,
++                device=q.device,
++            )
++            wrapper = _prefill_wrapper(q.device, window_left)
++            wrapper.plan(
++                qo_indptr=qo_indptr,
++                paged_kv_indptr=indptr,
++                paged_kv_indices=indices,
++                paged_kv_last_page_len=last_page_len,
++                num_qo_heads=num_qo_heads,
++                num_kv_heads=num_kv_heads,
++                head_dim_qk=head_dim,
++                page_size=page_size,
++                causal=True,
++                sm_scale=softmax_scale,
++                window_left=window_left,
++                logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
++                q_data_type=q.dtype,
++                kv_data_type=k_cache.dtype,
++            )
++            return wrapper.run(
++                q,
++                (k_cache, v_cache),
++                sinks=sinks,
++                return_lse=return_lse,
++            )
++
++        wrapper = _decode_wrapper(q.device, window_left)
++        wrapper.plan(
++            indptr,
++            indices,
++            last_page_len,
++            num_qo_heads,
++            num_kv_heads,
++            head_dim,
++            page_size,
++            q_data_type=q.dtype,
++            kv_data_type=k_cache.dtype,
++            sm_scale=softmax_scale,
++            window_left=window_left,
++            logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
++        )
++        return wrapper.run(
++            q,
++            (k_cache, v_cache),
++            sinks=sinks,
++            return_lse=return_lse,
++        )
++
++    # ------------------------------------------------------------------
++    # CUDA-graph plan/run split for FA2 decode.
++    #
++    # FlashInfer's wrappers require plan() (host-side split-KV scheduling +
++    # data-dependent CSR index building) to run OUTSIDE the captured region,
++    # once per capture and once per replay, with run() captured inside the
++    # graph reading pre-planned fixed buffers. These helpers let the MHA
++    # attention backend drive that lifecycle for the decode-graph hot path
++    # without pulling FlashInfer specifics into the backend. They are only
++    # engaged when FA2 is the selected flashinfer decode kernel (i.e. sm_120);
++    # on sm_100/sm_103 the trtllm-gen decode kernel is monolithic and stays on
++    # the normal single-call op path, so nothing here touches it.
++    # ------------------------------------------------------------------
++
++    def fa2_decode_is_selected(dtype: torch.dtype) -> bool:
++        """Whether flashinfer_fa2_mha_decode_with_kvcache wins selection for
++        the flashinfer backend at this platform + dtype (True on sm_120,
++        False on sm_100/sm_103 where trtllm-gen wins)."""
++        if dtype not in (torch.float16, torch.bfloat16):
++            return False
++        try:
++            sig = next(
++                iter(format_signatures(("q", "k_cache", "v_cache"), "dense", {dtype}))
++            )
++            kernel = select_kernel(
++                "attention",
++                "mha_decode_with_kvcache",
++                sig,
++                traits={
++                    "sliding_window": False,
++                    "support_logit_cap": False,
++                    "support_sinks": False,
++                    "return_lse": False,
++                },
++                solution="flashinfer",
++            )
++            return kernel.name == "flashinfer_fa2_mha_decode_with_kvcache"
++        except Exception:
++            return False
++
++    def make_fa2_decode_cuda_graph_wrapper(
++        workspace: torch.Tensor,
++        indptr_buffer: torch.Tensor,
++        indices_buffer: torch.Tensor,
++        last_page_len_buffer: torch.Tensor,
++        use_tensor_cores: bool = True,
++    ) -> BatchDecodeWithPagedKVCacheWrapper:
++        """Construct a cuda-graph-capturable FA2 decode wrapper bound to fixed
++        (graph-stable) CSR buffers."""
++        kwargs = dict(
++            kv_layout="NHD",
++            use_cuda_graph=True,
++            use_tensor_cores=use_tensor_cores,
++            paged_kv_indptr_buffer=indptr_buffer,
++            paged_kv_indices_buffer=indices_buffer,
++            paged_kv_last_page_len_buffer=last_page_len_buffer,
++        )
++        try:
++            return BatchDecodeWithPagedKVCacheWrapper(
++                workspace, backend="fa2", **kwargs
++            )
++        except (TypeError, ValueError):
++            return BatchDecodeWithPagedKVCacheWrapper(workspace, **kwargs)
++
++    def fa2_decode_cuda_graph_plan(
++        wrapper: BatchDecodeWithPagedKVCacheWrapper,
++        page_table: torch.Tensor,
++        cache_seqlens: torch.Tensor,
++        page_size: int,
++        num_qo_heads: int,
++        num_kv_heads: int,
++        head_dim: int,
++        q_dtype: torch.dtype,
++        kv_dtype: torch.dtype,
++        indptr_buffer: torch.Tensor,
++        indices_buffer: torch.Tensor,
++        last_page_len_buffer: torch.Tensor,
++        window_left: int = -1,
++        logit_cap: float = 0.0,
++    ) -> None:
++        """Build CSR from (page_table, cache_seqlens), copy it into the fixed
++        buffers, and (re)plan. Runs OUTSIDE the captured region."""
++        bs = cache_seqlens.shape[0]
++        indptr, indices, last_page_len = _paged_kv_csr(
++            page_table, cache_seqlens.clamp_min(1), page_size
++        )
++        n = indices.shape[0]
++        indptr_buffer[: bs + 1].copy_(indptr)
++        indices_buffer[:n].copy_(indices)
++        last_page_len_buffer[:bs].copy_(last_page_len)
++        wrapper.plan(
++            indptr_buffer[: bs + 1],
++            indices_buffer[:n],
++            last_page_len_buffer[:bs],
++            num_qo_heads,
++            num_kv_heads,
++            head_dim,
++            page_size,
++            q_data_type=q_dtype,
++            kv_data_type=kv_dtype,
++            window_left=window_left,
++            logits_soft_cap=(logit_cap if logit_cap != 0.0 else None),
++        )
++
++    def fa2_decode_cuda_graph_run(
++        wrapper: BatchDecodeWithPagedKVCacheWrapper,
++        q: torch.Tensor,
++        k_cache: torch.Tensor,
++        v_cache: torch.Tensor,
++        sinks: torch.Tensor | None = None,
++        window_left: int = -1,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Captured inside the graph; reads the pre-planned fixed buffers."""
++        return wrapper.run(
++            q,
++            (k_cache, v_cache),
++            sinks=sinks,
++            window_left=(window_left if window_left >= 0 else None),
++            out=out,
++        )
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/gated_delta_rule.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/gated_delta_rule.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/gated_delta_rule.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/flashinfer/gated_delta_rule.py	2026-07-25 17:09:54.490054138 +0000
+@@ -48,6 +48,9 @@
+     GdnChunkPrefillResult,
+ )
+ from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
++from tokenspeed_kernel.ops.build_capabilities import (
++    FLASHINFER_GDN_DECODE as _GDN_DECODE_BUILD,
++)
+ from tokenspeed_kernel.platform import (
+     ArchVersion,
+     CapabilityRequirement,
+@@ -315,6 +318,7 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _GDN_DECODE_BUILD}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+@@ -383,6 +387,7 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _GDN_DECODE_BUILD}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures(
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/triton/mha_prefill.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/triton/mha_prefill.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/triton/mha_prefill.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/triton/mha_prefill.py	2026-08-02 16:33:50.727373587 +0000
+@@ -89,6 +89,16 @@
+ 
+     cur_seq_extend_start_idx = tl.load(cu_seqlens_q + cur_seq)
+     cur_seq_len_extend = tl.load(cu_seqlens_q + cur_seq + 1) - cur_seq_extend_start_idx
++    # The grid's M dimension is sized from the batch's LONGEST query segment, so
++    # a shorter row gets blocks whose every query index is out of range. Their
++    # `mask_m` is all-false, so they store nothing -- but without this exit they
++    # still walk the whole KV loop below (a full tl.dot per BLOCK_N tile) before
++    # discovering that. Harmless padding waste when query lengths are uniform;
++    # quadratic waste on a mixed prefill+decode batch, where every seqlen_q == 1
++    # decode row would otherwise re-scan its entire cache
++    # ceil(max_seqlen_q / BLOCK_M) times.
++    if cur_block_m * BLOCK_M >= cur_seq_len_extend:
++        return
+     if HAS_KV_CACHE:
+         cur_seq_len = tl.load(cache_seqlens + cur_seq)
+     else:
+@@ -300,6 +310,28 @@
+         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
+ 
+ 
++# Datacenter NVIDIA parts (sm_90, sm_100) expose ~228 KB of opt-in shared
++# memory per block; sm_86/sm_89 and sm_120 (RTX PRO / workstation Blackwell)
++# expose only ~100 KB. The prefill tiles below are sized off this split.
++_LARGE_SHARED_MEMORY_BYTES = 128 * 1024
++
++
++def _has_large_shared_memory(platform) -> bool:
++    """Whether the device has a datacenter-sized shared-memory budget per block.
++
++    Args:
++        platform: The active ``PlatformInfo``.
++
++    Returns:
++        ``True`` when the device can opt into at least
++        ``_LARGE_SHARED_MEMORY_BYTES`` of shared memory per block. An unknown
++        budget (``0``) also returns ``True`` so a detection gap never narrows
++        the tiles already validated on datacenter GPUs.
++    """
++    budget = platform.max_shared_memory_per_sm
++    return budget == 0 or budget >= _LARGE_SHARED_MEMORY_BYTES
++
++
+ def prefill_attention_fwd(
+     q_extend,
+     k_extend,
+@@ -360,6 +392,14 @@
+                 BLOCK_M, BLOCK_N = (128, 64)
+             else:
+                 BLOCK_M, BLOCK_N = (32, 64)
++            if Lq > 128 and not _has_large_shared_memory(platform):
++                # sm_120 (RTX PRO / workstation Blackwell) is hopper_plus by arch
++                # version but carries the sm_89-sized ~100 KB shared-memory budget
++                # rather than the ~228 KB of sm_90/sm_100. From head_dim 256 up,
++                # the datacenter tile above needs 112 KB and the launch aborts with
++                # `OutOfResources: shared memory`. Halve the tile so it fits.
++                # head_dim <= 128 already fits and is deliberately left untouched.
++                BLOCK_M, BLOCK_N = (64, 64) if Lq <= 256 else (32, 32)
+         elif platform.is_ampere_plus:
+             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
+             if platform.arch_version.minor == 9 or platform.arch_version.minor == 6:
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/build_capabilities.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/build_capabilities.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/build_capabilities.py	1970-01-01 00:00:00.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/build_capabilities.py	2026-07-25 17:22:04.861582724 +0000
+@@ -0,0 +1,202 @@
++# Copyright (c) 2026 LightSeek Foundation
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in
++# all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""Concrete ``build:`` capabilities for the in-tree kernels that need them.
++
++These are the gates E30 had to leave open because ``min_arch_version`` cannot
++express them. Each one answers "does the artifact installed *on this box*
++contain code for *this* device", which is a property of the wheel/``.so``/JIT
++toolchain, not of the silicon. See
++:mod:`tokenspeed_kernel.artifact` for the mechanism.
++
++Every probe here is **lazy** — nothing is imported or shelled out until a
++selection actually needs the answer — and every registration declares
++``default=True``, so if the probe itself cannot run we keep the
++previously-validated behaviour instead of silently deleting a kernel on
++hardware we cannot test (the E28 rule).
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from tokenspeed_kernel.artifact import (
++    binary_targets_device,
++    register_build_capability,
++    symbol_is_bound,
++)
++
++__all__ = [
++    "DEEP_GEMM_DEVICE_CODE",
++    "FLASHINFER_CUTLASS_MOE",
++    "FLASHINFER_GEMM_FP8_BLOCKSCALE",
++    "FLASHINFER_GDN_DECODE",
++    "FLASHMLA_DEVICE_CODE",
++    "MERGE_STATE_DEVICE_CODE",
++]
++
++
++def _sentinels() -> tuple:
++    from tokenspeed_kernel.registry import error_fn
++
++    return (error_fn,)
++
++
++# ---------------------------------------------------------------------------
++# DeepGEMM: JIT-compiled, ships per-arch-family implementation headers
++# ---------------------------------------------------------------------------
++
++
++def _probe_deep_gemm_device_code() -> bool:
++    """Does the installed DeepGEMM have an implementation for this device?
++
++    DeepGEMM JIT-compiles from headers named by architecture family
++    (``sm90_*.cuh`` / ``sm100_*.cuh`` / ``sm120_*.cuh``), so the artifact
++    question has three parts and none of them is an arch comparison: the package
++    must bind, the header family for this device must be shipped, and the JIT's
++    compiler must be reachable.
++
++    E30 left ``deep_gemm_*`` unresolved precisely here. It recorded that
++    DeepGEMM *does* ship ``sm120_fp8_fp4_gemm_1d1d.cuh``, so the sm_120 failure
++    seen in that container was an NVCC/cccl **toolchain** failure and not a
++    capability gap -- which is exactly the distinction this probe draws and an
++    arch bound cannot.
++    """
++    import shutil
++
++    import deep_gemm  # noqa: F401 - binding is part of the answer
++    from tokenspeed_kernel.platform import current_platform
++
++    if shutil.which("nvcc") is None:
++        import os
++
++        cuda_home = os.environ.get("CUDA_HOME")
++        if not (cuda_home and (Path(cuda_home) / "bin" / "nvcc").exists()):
++            return False
++
++    impls = Path(deep_gemm.__file__).parent / "include" / "deep_gemm" / "impls"
++    if not impls.is_dir():
++        # Older layouts do not expose the headers; fall back to "it imported",
++        # which is what the registration guard already relied on.
++        return True
++
++    arch = current_platform().arch_version
++    families = {f"sm{arch.major}{arch.minor}", f"sm{arch.major}0"}
++    return any(
++        header.name.split("_", 1)[0] in families for header in impls.glob("sm*.cuh")
++    )
++
++
++DEEP_GEMM_DEVICE_CODE = register_build_capability(
++    "build:deep_gemm_device_code",
++    _probe_deep_gemm_device_code,
++    default=True,
++    doc="DeepGEMM binds, ships impl headers for this device's arch family, and "
++    "has a reachable nvcc.",
++)
++
++
++# ---------------------------------------------------------------------------
++# Prebuilt CUDA extension: ask the fatbinary directly
++# ---------------------------------------------------------------------------
++
++
++def _merge_state_object() -> str:
++    from tokenspeed_kernel.thirdparty.cuda import merge_state as _merge_state_module
++
++    return str(
++        Path(_merge_state_module.__file__).parent
++        / "objs"
++        / "merge_state"
++        / "merge_state.so"
++    )
++
++
++MERGE_STATE_DEVICE_CODE = register_build_capability(
++    "build:merge_state_device_code",
++    binary_targets_device(_merge_state_object),
++    default=True,
++    doc="The prebuilt merge_state.so fatbinary contains SASS (or "
++    "forward-compatible PTX) for this device.",
++)
++
++
++# ---------------------------------------------------------------------------
++# Optional third-party entry points: did the symbol actually bind?
++# ---------------------------------------------------------------------------
++
++
++def _load_flashinfer_gemm_fp8_blockscale():
++    from tokenspeed_kernel.ops.gemm.flashinfer import gemm_fp8_nt_groupwise
++
++    return gemm_fp8_nt_groupwise
++
++
++FLASHINFER_GEMM_FP8_BLOCKSCALE = register_build_capability(
++    "build:flashinfer_gemm_fp8_blockscale",
++    symbol_is_bound(_load_flashinfer_gemm_fp8_blockscale, sentinels=_sentinels()),
++    default=True,
++    doc="FlashInfer's block-scaled fp8 GEMM entry point bound in this install.",
++)
++
++
++def _load_flashinfer_cutlass_fused_moe():
++    from flashinfer import cutlass_fused_moe
++
++    return cutlass_fused_moe
++
++
++FLASHINFER_CUTLASS_MOE = register_build_capability(
++    "build:flashinfer_cutlass_fused_moe",
++    symbol_is_bound(_load_flashinfer_cutlass_fused_moe),
++    default=True,
++    doc="FlashInfer's CUTLASS fused-MoE entry point bound in this install.",
++)
++
++
++def _load_flashmla_with_kvcache():
++    from tokenspeed_kernel.ops.attention.flash_mla import flash_mla_with_kvcache
++
++    return flash_mla_with_kvcache
++
++
++FLASHMLA_DEVICE_CODE = register_build_capability(
++    "build:flashmla_with_kvcache",
++    symbol_is_bound(_load_flashmla_with_kvcache, sentinels=_sentinels()),
++    default=True,
++    doc="FlashMLA's paged-KV decode entry point bound in this install.",
++)
++
++
++def _probe_flashinfer_gdn_decode() -> bool:
++    from tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule import (
++        is_decode_available,
++    )
++
++    return bool(is_decode_available())
++
++
++FLASHINFER_GDN_DECODE = register_build_capability(
++    "build:flashinfer_gdn_decode",
++    _probe_flashinfer_gdn_decode,
++    default=True,
++    doc="FlashInfer's gated-delta-rule decode/MTP kernels are present in this "
++    "install.",
++)
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py	2026-07-25 09:39:05.051961699 +0000
+@@ -56,6 +56,7 @@
+         "torch_bmm",
+         "torch_mm",
+         "triton_mm_fp8_scaled",
++        "unieinfra_decode_gemv_triton",
+     }
+ )
+ 
+@@ -365,6 +366,18 @@
+         )
+ 
+     traits: dict[str, object] = {
++        # Upper-bound shape buckets. These let a decode-shaped kernel (skinny M,
++        # narrow N) declare the slice it is specialized for and be filtered out
++        # everywhere else. They are coarse booleans on purpose: the selection
++        # cache is keyed on the trait tuple, so a continuous value here would
++        # make every distinct shape a cache miss.
++        #
++        # Additive by construction: a kernel that does not declare a trait is
++        # never filtered on it (see ``selection.spec_matches_traits``), and no
++        # pre-existing kernel declares these, so the current corpus is
++        # unaffected.
++        "m_le_8": M <= 8,
++        "n_le_16384": N <= 16384,
+         "n_align_16": N % 16 == 0,
+         "k_align_16": K % 16 == 0,
+         "k_align_32": K % 32 == 0,
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/deep_gemm.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/deep_gemm.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/deep_gemm.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/deep_gemm.py	2026-07-25 17:09:54.489550072 +0000
+@@ -21,6 +21,9 @@
+ from __future__ import annotations
+ 
+ import torch
++from tokenspeed_kernel.ops.build_capabilities import (
++    DEEP_GEMM_DEVICE_CODE as _DEEP_GEMM_DEVICE_CODE,
++)
+ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
+ from tokenspeed_kernel.registry import Priority, register_kernel
+ from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+@@ -61,6 +64,7 @@
+         solution="deep_gemm",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _DEEP_GEMM_DEVICE_CODE}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=_MXFP8_FORMAT_SIGNATURES,
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py	2026-07-25 17:18:30.210874489 +0000
+@@ -21,6 +21,9 @@
+ from __future__ import annotations
+ 
+ import torch
++from tokenspeed_kernel.ops.build_capabilities import (
++    FLASHINFER_GEMM_FP8_BLOCKSCALE as _FLASHINFER_FP8_BLOCKSCALE_BUILD,
++)
+ from tokenspeed_kernel.platform import (
+     ArchVersion,
+     CapabilityRequirement,
+@@ -95,6 +98,9 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset(
++                {"tensor_core:block_scale", _FLASHINFER_FP8_BLOCKSCALE_BUILD}
++            ),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=_MXFP8_FORMAT_SIGNATURES,
+@@ -284,7 +290,11 @@
+ 
+ mm_fp4 = error_fn
+ 
+-if platform.is_nvidia and platform.is_blackwell:
++# Capability gate, not an arch-version gate: ``is_blackwell`` is ``major == 10``
++# exactly and so excluded sm_120, which does have FP4 tensor cores. The kernel
++# below pins ``backend="cutlass"``, which flashinfer supports on sm_120 (its
++# ``trtllm`` backend does not). Unchanged on sm_89/sm_90/sm_100/sm_103.
++if platform.is_nvidia and platform.has_fp4_tensor_cores:
+     try:
+         from flashinfer import mm_fp4
+     except ImportError:
+@@ -299,6 +309,7 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"tensor_core:f4"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=_NVFP4_FORMAT_SIGNATURES,
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py	2026-07-25 05:51:19.788455435 +0000
+@@ -439,10 +439,16 @@
+ 
+     if (
+         _is_nvidia
++        and group_size == 128
+         and not column_major_scales
+         and not scale_tma_aligned
+         and not scale_ue8m0
+     ):
++        # The TRT-LLM fp8_quantize_1x128 kernel ONLY supports group_size=128.
++        # Any other group size (e.g. a full-row per-channel weight/activation
++        # quant that passes group_size = hidden_dim) must use the portable
++        # Triton path below, otherwise the kernel asserts. This also keeps the
++        # datacenter group-128 block-quant path on the fast TRT-LLM kernel.
+         return _trtllm_per_token_group_quant_fp8(x, group_size)
+ 
+     return _per_token_group_quant_8bit_raw(
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/triton.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/triton.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/triton.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/triton.py	2026-07-25 17:07:36.185649760 +0000
+@@ -965,6 +965,7 @@
+     solution="triton",
+     capability=CapabilityRequirement(
+         min_arch_version=ArchVersion(10, 0),
++        required_features=frozenset({"tensor_core:block_scale"}),
+         vendors=frozenset({"nvidia"}),
+     ),
+     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/trtllm.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/trtllm.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/trtllm.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/trtllm.py	2026-07-25 17:07:36.177586568 +0000
+@@ -82,6 +82,7 @@
+     solution="cublas",
+     capability=CapabilityRequirement(
+         min_arch_version=ArchVersion(10, 0),
++        required_features=frozenset({"tensor_core:f4"}),
+         vendors=frozenset({"nvidia"}),
+     ),
+     signatures=_NVFP4_FORMAT_SIGNATURES,
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutedsl_deepep_nvfp4.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutedsl_deepep_nvfp4.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutedsl_deepep_nvfp4.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutedsl_deepep_nvfp4.py	2026-07-25 09:17:40.203600589 +0000
+@@ -113,6 +113,10 @@
+         capability=CapabilityRequirement(
+             vendors=frozenset({"nvidia"}),
+             min_arch_version=ArchVersion(10, 0),
++            # CuTe DSL sm100 blockscaled grouped GEMM -- tcgen05/TMEM. The
++            # open-ended min admitted sm_120, which has FP4 tensor cores but
++            # no TMEM.
++            required_features=frozenset({"compute:tcgen05"}),
+         ),
+         signatures=format_signatures(
+             "x",
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_fp8.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_fp8.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_fp8.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_fp8.py	2026-07-25 17:09:54.489643856 +0000
+@@ -21,6 +21,9 @@
+ from __future__ import annotations
+ 
+ import torch
++from tokenspeed_kernel.ops.build_capabilities import (
++    FLASHINFER_CUTLASS_MOE as _FLASHINFER_CUTLASS_MOE_BUILD,
++)
+ from tokenspeed_kernel.platform import (
+     ArchVersion,
+     CapabilityRequirement,
+@@ -61,6 +64,7 @@
+         capability=CapabilityRequirement(
+             vendors=frozenset({"nvidia"}),
+             min_arch_version=ArchVersion(9, 0),
++            required_features=frozenset({"memory:tma", _FLASHINFER_CUTLASS_MOE_BUILD}),
+         ),
+         signatures=format_signatures(
+             "x",
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_nvfp4.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_nvfp4.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_nvfp4.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_nvfp4.py	2026-07-25 17:07:36.189332419 +0000
+@@ -140,6 +140,7 @@
+         capability=CapabilityRequirement(
+             vendors=frozenset({"nvidia"}),
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"tensor_core:f4"}),
+         ),
+         signatures=format_signatures(
+             "x",
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_unquant.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_unquant.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_unquant.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/cutlass_unquant.py	2026-07-25 17:07:36.190185273 +0000
+@@ -56,6 +56,7 @@
+         capability=CapabilityRequirement(
+             vendors=frozenset({"nvidia"}),
+             min_arch_version=ArchVersion(8, 9),
++            required_features=frozenset({"tensor_core:f8"}),
+         ),
+         signatures=format_signatures(
+             "x",
+@@ -93,7 +94,11 @@
+                 scores, k=getattr(w, "top_k"), dim=-1, sorted=False
+             )
+             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+-            topk_weights = topk_weights.to(x.dtype)
++            # `token_final_scales` must stay float32: the cutlass fused-MoE
++            # kernel rejects a half/bfloat16 scale tensor. The engine's
++            # precomputed-topk path already hands us float32; this branch only
++            # runs for direct callers that let the kernel do its own routing.
++            topk_weights = topk_weights.to(torch.float32)
+         # Tune new shapes during startup only, frozen once serving (see ops.tuning).
+         with nullcontext() if autotune_frozen() else flashinfer_autotune():
+             return cutlass_fused_moe(
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/trtllm_fp8.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/trtllm_fp8.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/trtllm_fp8.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/flashinfer/trtllm_fp8.py	2026-07-25 09:17:37.171604169 +0000
+@@ -79,6 +79,11 @@
+         capability=CapabilityRequirement(
+             vendors=frozenset({"nvidia"}),
+             min_arch_version=ArchVersion(10, 0),
++            # TRT-LLM-gen ships tcgen05 cubins; every sibling trtllm_* MoE
++            # registration bounds itself to sm_103, but this one did not, so
++            # sm_120 (arch 12.0) satisfied the open-ended min. Stated as the
++            # required capability so sm_103 and future parts stay correct.
++            required_features=frozenset({"compute:tcgen05"}),
+         ),
+         signatures=format_signatures(
+             "x",
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/quantization/flashinfer.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/quantization/flashinfer.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/quantization/flashinfer.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/quantization/flashinfer.py	2026-07-25 17:07:36.174909350 +0000
+@@ -52,6 +52,7 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"tensor_core:block_scale"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+@@ -65,7 +66,14 @@
+         return mxfp8_quantize(x, False)
+ 
+ 
+-if platform.is_nvidia and platform.is_blackwell:
++# Gate on the FP4 tensor-core capability, not on an arch-version predicate.
++# ``is_blackwell`` tests ``major == 10`` exactly, so it excluded sm_120 (RTX PRO
++# Blackwell) even though sm_120 has FP4 tensor cores -- ``fp4_quantize`` stayed
++# bound to ``error_fn`` and the first nvfp4 forward raised, while the matching
++# nvfp4 GEMMs (``cublaslt_mm_nvfp4``, ``flashinfer_mm_nvfp4``) had already
++# passed their own gates. ``has_fp4_tensor_cores`` is unchanged on sm_89/sm_90
++# (no ``tensor_core:f4``) and on sm_100/sm_103 (has it, as ``is_blackwell`` did).
++if platform.is_nvidia and platform.has_fp4_tensor_cores:
+     from flashinfer import (
+         fp4_quantize,
+         nvfp4_block_scale_interleave,
+@@ -78,6 +86,7 @@
+         solution="flashinfer",
+         capability=CapabilityRequirement(
+             min_arch_version=ArchVersion(10, 0),
++            required_features=frozenset({"tensor_core:f4"}),
+             vendors=frozenset({"nvidia"}),
+         ),
+         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/sampling/cute_dsl.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/sampling/cute_dsl.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/ops/sampling/cute_dsl.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/ops/sampling/cute_dsl.py	2026-07-25 17:10:26.661282504 +0000
+@@ -105,33 +105,29 @@
+ 
+ 
+ def _has_cluster_launch_support() -> bool:
+-    """Check if the GPU supports TMA cluster launches required by the kernel.
++    """Whether the GPU supports the TMA cluster launches this kernel needs.
+ 
+-    The CUTLASS DSL ArgmaxKernel uses cluster dimensions > 1 via TMA, which
+-    requires hardware cluster launch support. NVIDIA H20 GPUs report sm_90
+-    (Hopper architecture) but lack the cluster launch capability, causing
+-    CUDA_ERROR_INVALID_CLUSTER_SIZE (error 912) at kernel launch time.
++    Returns:
++        ``True`` when the platform advertises ``compute:cluster``.
+ 
+-    This function uses a device-name heuristic to detect H20 SKUs and route
+-    them through the torch.argmax fallback instead.
++    The CUTLASS DSL ArgmaxKernel uses cluster dimensions > 1 via TMA, which
++    requires hardware cluster-launch support. This used to be answered by a
++    device-name regex for ``H20`` -- an sm_90 SKU that cannot launch clusters
++    and so raised ``CUDA_ERROR_INVALID_CLUSTER_SIZE`` (error 912) at launch --
++    layered on top of a ``major > 9`` version comparison.
++
++    Both halves are gone. ``compute:cluster`` is now sourced from the driver
++    (``CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH``) in
++    :mod:`tokenspeed_kernel.platform`, which classifies the H20 correctly
++    without knowing its name -- and classifies a part we have never seen
++    correctly for the same reason. The device-name table survives in the
++    platform layer *only* as the fallback for when the driver cannot be queried
++    at all, so H20 behaviour is preserved rather than regressed.
+     """
+     try:
+-        p = current_platform()
++        return current_platform().has_cluster_launch
+     except Exception:
+         return False
+-    if not p.is_nvidia:
+-        return False
+-
+-    # Only Hopper (sm_90) SKUs are affected -- Blackwell always supports
+-    # cluster launches.
+-    if p.arch_version.major > 9:
+-        return True
+-
+-    # Device-name heuristic: H20 is the only sm_90 SKU known to lack cluster
+-    # launch support. Other Hopper SKUs (H100, H200, H800) all support it.
+-    import re
+-
+-    return not re.search(r"\bH20\b", p.device_name, re.IGNORECASE)
+ 
+ 
+ _ARCH_SUPPORTED = _ts_supported_arch()
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/platform.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/platform.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/platform.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/platform.py	2026-07-25 17:11:16.852034843 +0000
+@@ -49,6 +49,13 @@
+     "current_platform",
+ ]
+ 
++# Every vendor string the platform layer can report. A CapabilityRequirement
++# that carries an arch bound must name a subset of these explicitly: AMD
++# gfx950 is ArchVersion(9, 5) and CDNA5 is ArchVersion(12, 5) -- the very same
++# numbers NVIDIA uses for Hopper-minor and workstation Blackwell -- so an arch
++# bound without a vendor is latently cross-vendor and means nothing.
++KNOWN_VENDORS = frozenset({"nvidia", "amd"})
++
+ 
+ # ---------------------------------------------------------------------------
+ # Core data structures
+@@ -177,6 +184,55 @@
+         return self.is_nvidia and self.arch_version >= ArchVersion(10, 0)
+ 
+     @property
++    def has_tcgen05(self) -> bool:
++        """Whether the device has tcgen05 tensor-core MMA and Tensor Memory.
++
++        Returns:
++            ``True`` when the detected SM feature set advertises
++            ``compute:tcgen05`` (datacenter Blackwell: sm_100/sm_101/sm_103).
++
++        Prefer this over ``is_blackwell_plus`` when gating a kernel that is
++        built on tcgen05/TMEM. ``is_blackwell_plus`` is an open-ended version
++        comparison that sm_120 also satisfies despite having no TMEM.
++        """
++        return "compute:tcgen05" in self.sm_features
++
++    @property
++    def has_cluster_launch(self) -> bool:
++        """Whether the device supports thread-block clusters and distributed smem.
++
++        Returns:
++            ``True`` when the detected SM feature set advertises
++            ``compute:cluster``.
++
++        Sourced from the driver (``CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH``), not
++        inferred from ``major >= 9``. The inference is wrong in *both*
++        directions: sm_120 has clusters and distributed shared memory (verified
++        with ``ptxas`` and the driver in E30) even though it is not a datacenter
++        part, while the H20 SKU reports sm_90 and does **not** support cluster
++        launch -- which used to need a device-name regex to work around.
++        """
++        return "compute:cluster" in self.sm_features
++
++    @property
++    def has_fp4_tensor_cores(self) -> bool:
++        """Whether the device has native FP4 (nvfp4/mxfp4) tensor cores.
++
++        Returns:
++            ``True`` when the detected SM feature set advertises
++            ``tensor_core:f4``.
++
++        Prefer this over ``is_blackwell``/``is_blackwell_plus`` when gating an
++        FP4 kernel. ``is_blackwell`` tests ``major == 10`` exactly, which
++        excludes sm_120 (RTX PRO / workstation Blackwell) even though sm_120
++        *does* have FP4 tensor cores; ``is_blackwell_plus`` is an open-ended
++        version comparison that says nothing about the capability it stands in
++        for. This property asks the detected capability set directly and is
++        vendor-neutral (AMD gfx950/gfx1250 also advertise ``tensor_core:f4``).
++        """
++        return "tensor_core:f4" in self.sm_features
++
++    @property
+     def is_cdna3_plus(self) -> bool:
+         return self.is_amd and self.arch_version >= ArchVersion(9, 4)
+ 
+@@ -251,15 +307,123 @@
+         return f"{self.vendor}:{arch_version[0]}.{arch_version[1]}"
+ 
+ 
++_OPEN_ENDED_HELP = """\
++A `min_arch_version` on its own is not a capability -- it is an open-ended
++version comparison, and every part newer than the one you tested satisfies it.
++That is exactly how four kernels won selection on sm_120 and then hard-failed at
++runtime (E30), and how upstream's `ll_bf16` CuteDSL GEMM killed EngineCore at
++warmup on sm_120 while gating on `has_device_capability(90)` (E37).
++
++Add ONE of:
++
++  * `required_features={...}` -- the capability the version number was standing
++    in for. Prefer this: it classifies a part we have never seen correctly by
++    construction. Hardware features come from the device
++    (`compute:tcgen05`, `compute:cluster`, `tensor_core:f4`,
++    `tensor_core:block_scale`, `memory:tma`, `memory:async_copy`, ...);
++    `build:*` features come from the artifact-probe registry in
++    `tokenspeed_kernel.artifact` and answer "does the installed binary
++    contain code for this device", which no version number can express.
++
++  * `max_arch_version=...` -- an explicit upper bound, when the kernel really is
++    restricted to a known range of parts and you accept that a newer part must
++    be re-qualified by hand.
++"""
++
++
+ @dataclass(frozen=True)
+ class CapabilityRequirement:
+-    """Requirements a kernel has on platform capabilities."""
++    """Requirements a kernel has on platform capabilities.
++
++    Args:
++        min_arch_version: Lowest architecture the kernel supports. May not be
++            given alone -- see below.
++        max_arch_version: Highest architecture the kernel supports (inclusive).
++        required_features: Capability names the device must advertise. Hardware
++            features are matched against ``PlatformInfo.sm_features`` and
++            ``runtime_features``; names in the ``build:`` namespace are resolved
++            through :mod:`tokenspeed_kernel.artifact`.
++        vendors: Vendors the kernel supports. ``None`` means *any vendor*, which
++            is only legal for a requirement that carries no arch bound.
++
++    Raises:
++        ValueError: If ``min_arch_version`` is supplied with neither a
++            ``max_arch_version`` nor ``required_features`` (the mis-gating bug
++            class this type exists to prevent); if an arch bound is supplied
++            without an explicit ``vendors``; if ``max_arch_version`` is below
++            ``min_arch_version``; or if ``vendors`` names an unknown vendor.
++    """
+ 
+     min_arch_version: ArchVersion | None = None
+     max_arch_version: ArchVersion | None = None
+     required_features: frozenset[str] = frozenset()
+     vendors: frozenset[str] | None = None  # None = any vendor
+ 
++    def __post_init__(self) -> None:
++        object.__setattr__(
++            self, "required_features", frozenset(self.required_features or ())
++        )
++        if self.vendors is not None:
++            object.__setattr__(self, "vendors", frozenset(self.vendors))
++
++        has_arch_bound = (
++            self.min_arch_version is not None or self.max_arch_version is not None
++        )
++
++        if self.vendors is not None:
++            unknown = self.vendors - KNOWN_VENDORS
++            if unknown:
++                raise ValueError(
++                    f"CapabilityRequirement: unknown vendor(s) {sorted(unknown)}. "
++                    f"Known vendors: {sorted(KNOWN_VENDORS)}."
++                )
++            if not self.vendors:
++                raise ValueError(
++                    "CapabilityRequirement: `vendors=frozenset()` can never be "
++                    "satisfied. Omit `vendors` for a vendor-neutral requirement, "
++                    "or name the vendors the kernel supports."
++                )
++
++        # Rule 1 (design principles P1): a min bound with no upper bound and no
++        # feature requirement is the mis-gating form. Make it unrepresentable.
++        if (
++            self.min_arch_version is not None
++            and self.max_arch_version is None
++            and not self.required_features
++        ):
++            raise ValueError(
++                f"CapabilityRequirement(min_arch_version={self.min_arch_version}) "
++                "needs either `required_features` or `max_arch_version`.\n\n"
++                + _OPEN_ENDED_HELP
++            )
++
++        # Rule 4: an arch bound is meaningless without a vendor, because the
++        # vendors share the numbers.
++        if has_arch_bound and self.vendors is None:
++            raise ValueError(
++                "CapabilityRequirement: an arch bound requires an explicit "
++                "`vendors=`.\n\n"
++                "ArchVersion numbers are NOT vendor-unique: AMD gfx950 (CDNA4) is "
++                "ArchVersion(9, 5) and CDNA5 is ArchVersion(12, 5) -- the same "
++                "numbers NVIDIA uses for Hopper-minor and workstation Blackwell. "
++                "A bound such as `min_arch_version=ArchVersion(9, 0)` therefore "
++                "admits every CDNA part as well. Pass "
++                "`vendors=frozenset({'nvidia'})` (or the vendors you actually "
++                "support). A requirement with no arch bound at all may stay "
++                "vendor-neutral."
++            )
++
++        if (
++            self.min_arch_version is not None
++            and self.max_arch_version is not None
++            and self.max_arch_version < self.min_arch_version
++        ):
++            raise ValueError(
++                "CapabilityRequirement: max_arch_version "
++                f"{self.max_arch_version} is below min_arch_version "
++                f"{self.min_arch_version}; nothing can satisfy it."
++            )
++
+     def satisfied_by(self, platform: PlatformInfo) -> bool:
+         """Check if platform satisfies these requirements."""
+         if self.vendors and platform.vendor not in self.vendors:
+@@ -273,16 +437,32 @@
+             if platform.arch_version > self.max_arch_version:
+                 return False
+ 
+-        all_features = platform.sm_features | platform.runtime_features
+-        if not self.required_features.issubset(all_features):
+-            return False
+-
+-        return True
++        return not self.missing_features(platform)
+ 
+     def missing_features(self, platform: PlatformInfo) -> set[str]:
+-        """Return features required but not available."""
++        """Return features required but not available.
++
++        Hardware features are looked up in the platform's detected feature sets.
++        Features in the ``build:`` namespace describe the *installed artifact*
++        rather than the silicon, so they are resolved through
++        :func:`tokenspeed_kernel.artifact.build_capability_available`,
++        which probes lazily and caches.
++        """
++        from tokenspeed_kernel.artifact import (
++            BUILD_NAMESPACE,
++            build_capability_available,
++        )
++
+         all_features = platform.sm_features | platform.runtime_features
+-        return self.required_features - all_features
++        missing = self.required_features - all_features
++        return {
++            feature
++            for feature in missing
++            if not (
++                feature.startswith(BUILD_NAMESPACE)
++                and build_capability_available(feature)
++            )
++        }
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -355,9 +535,14 @@
+     """Detect NVIDIA CUDA platform."""
+     import torch
+ 
+-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
++    device_index = torch.cuda.current_device()
++    props = torch.cuda.get_device_properties(device_index)
+     arch_version = ArchVersion(props.major, props.minor)
+-    sm_features = _get_cuda_sm_features(arch_version)
++    sm_features = _get_cuda_sm_features(
++        arch_version,
++        cluster_launch=_detect_cuda_cluster_launch(device_index),
++        device_name=props.name,
++    )
+     runtime_features = _get_cuda_runtime_features()
+     interconnect = _detect_cuda_interconnect()
+     numa_cpu_affinity = _detect_cuda_numa_cpu_affinity()
+@@ -371,7 +556,7 @@
+         memory_bandwidth=_estimate_bandwidth(props),
+         sm_count=props.multi_processor_count,
+         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
+-        max_shared_memory_per_sm=getattr(props, "max_shared_memory_per_block", 0),
++        max_shared_memory_per_sm=_cuda_shared_memory_per_block(props),
+         sm_features=sm_features,
+         runtime_features=runtime_features,
+         interconnect=interconnect,
+@@ -379,8 +564,112 @@
+     )
+ 
+ 
+-def _get_cuda_sm_features(arch_version: ArchVersion) -> frozenset[str]:
+-    """Determine CUDA SM features from arch version."""
++def _cuda_shared_memory_per_block(props: object) -> int:
++    """Largest shared-memory allocation a single CUDA block can opt into.
++
++    Args:
++        props: The ``torch.cuda.get_device_properties()`` record for the device.
++
++    Returns:
++        Opt-in shared memory per block, in bytes, or ``0`` when the running
++        torch build exposes none of the known attributes.
++
++    ``torch.cuda`` has never exposed ``max_shared_memory_per_block``, so the
++    previous lookup silently reported ``0`` on every NVIDIA device. Kernels that
++    size their tiles from this budget need the real number: datacenter parts
++    (sm_90/sm_100) offer ~228 KB per block while sm_86/sm_89 and sm_120
++    (RTX PRO / workstation Blackwell) offer only ~100 KB.
++    """
++    for attr in (
++        "max_shared_memory_per_block",
++        "shared_memory_per_block_optin",
++        "shared_memory_per_multiprocessor",
++        "shared_memory_per_block",
++    ):
++        value = getattr(props, attr, 0) or 0
++        if value:
++            return int(value)
++    return 0
++
++
++#: ``CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH`` from ``cuda.h``. Reported as 1 on
++#: sm_90 (H100/H200), sm_100/sm_103 and sm_120; 0 on the H20 SKU, which is an
++#: sm_90 part that cannot launch clusters.
++_CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH = 120
++
++#: Device-name patterns for SKUs that report an architecture whose generation has
++#: cluster launch but that do not themselves support it. Consulted ONLY when the
++#: driver could not be queried at all, so the pre-driver-query behaviour is
++#: preserved exactly rather than regressing to the plain version inference.
++#: Matched on word boundaries -- "H20" must not match "H200".
++_NO_CLUSTER_LAUNCH_SKUS = (r"\bH20\b",)
++
++
++def _detect_cuda_cluster_launch(device_index: int) -> bool | None:
++    """Ask the driver whether this device supports thread-block cluster launch.
++
++    Args:
++        device_index: Ordinal of the CUDA device to query.
++
++    Returns:
++        ``True``/``False`` from ``cuDeviceGetAttribute`` with
++        ``CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH``, or ``None`` when the driver
++        cannot be loaded or the query fails -- in which case the caller falls
++        back to the previously-validated inference rather than narrowing.
++    """
++    for lib_name in ("libcuda.so.1", "libcuda.so"):
++        try:
++            lib = ctypes.CDLL(lib_name)
++            break
++        except OSError:
++            continue
++    else:
++        return None
++
++    try:
++        # cuInit is idempotent and cheap; torch has normally already run it.
++        if lib.cuInit(0) != 0:
++            return None
++        device = ctypes.c_int()
++        if lib.cuDeviceGet(ctypes.byref(device), ctypes.c_int(device_index)) != 0:
++            return None
++        value = ctypes.c_int()
++        status = lib.cuDeviceGetAttribute(
++            ctypes.byref(value),
++            ctypes.c_int(_CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH),
++            device,
++        )
++        if status != 0:
++            return None
++        return bool(value.value)
++    except Exception as exc:  # noqa: BLE001 - detection must never be fatal
++        logger.warning("Driver query for cluster-launch support failed: %s", exc)
++        return None
++
++
++def _get_cuda_sm_features(
++    arch_version: ArchVersion,
++    *,
++    cluster_launch: bool | None = None,
++    device_name: str = "",
++) -> frozenset[str]:
++    """Determine CUDA SM features for a device.
++
++    Args:
++        arch_version: The device's compute capability.
++        cluster_launch: Driver-reported cluster-launch support, from
++            :func:`_detect_cuda_cluster_launch`. ``None`` means the driver could
++            not be asked, and the previously-validated inference is used
++            instead so a detection gap never narrows a working path (E28).
++        device_name: Device name, consulted only on the ``None`` path to keep
++            the known-bad-SKU behaviour that predates the driver query.
++
++    Returns:
++        The device's hardware feature set. Everything except ``compute:cluster``
++        comes from an explicit arch -> feature table; ``compute:cluster`` comes
++        from the driver, because the version inference is wrong in both
++        directions (sm_120 *has* clusters; H20 reports sm_90 and does not).
++    """
+     features: set[str] = set()
+ 
+     if arch_version >= ArchVersion(7, 0):
+@@ -393,10 +682,39 @@
+         features |= {"tensor_core:f8"}
+ 
+     if arch_version >= ArchVersion(9, 0):
+-        features |= {"memory:tma", "compute:cluster"}
++        features |= {"memory:tma"}
++
++    if cluster_launch is None:
++        import re
++
++        cluster_launch = arch_version >= ArchVersion(9, 0) and not any(
++            re.search(pattern, device_name, re.IGNORECASE)
++            for pattern in _NO_CLUSTER_LAUNCH_SKUS
++        )
++    if cluster_launch:
++        features |= {"compute:cluster"}
+ 
+     if arch_version >= ArchVersion(10, 0):
+-        features |= {"tensor_core:f4"}
++        # Blackwell adds native FP4 tensor cores and, with them, block-scaled
++        # MMA (a scale-factor operand per K block: nvfp4, mxfp8, mxfp4). Both
++        # are present on datacenter Blackwell AND on sm_120 -- unlike tcgen05.
++        features |= {"tensor_core:f4", "tensor_core:block_scale"}
++
++    # tcgen05 -- the 5th-generation tensor-core MMA family plus its Tensor
++    # Memory (TMEM) -- exists only on *datacenter* Blackwell (sm_100/sm_101/
++    # sm_103). It is deliberately NOT an open-ended ">= (10, 0)" comparison:
++    # sm_120 (RTX PRO / workstation Blackwell) is arch 12.0 and would satisfy
++    # such a check, yet it has no TMEM at all.
++    #
++    # VERIFIED with ptxas (CUDA 12.9): `tcgen05.alloc` assembles for
++    # `sm_100a` and is rejected for both `sm_90a` and `sm_120a`
++    # ("Instruction 'tcgen05.alloc' not supported on .target 'sm_120a'").
++    #
++    # Kernels built on tcgen05/TMEM (trtllm-gen FMHA and MoE, CUTLASS sm100,
++    # the CuTe DSL sm100 kernels) should require this feature instead of
++    # writing `min_arch_version=(10, 0)` with no upper bound.
++    if ArchVersion(10, 0) <= arch_version < ArchVersion(11, 0):
++        features |= {"compute:tcgen05"}
+ 
+     return frozenset(features)
+ 
+@@ -459,7 +777,10 @@
+         features |= {"tensor_core:f16", "tensor_core:f8"}
+ 
+     if arch in ("gfx950", "gfx1250"):
+-        features |= {"tensor_core:f4", "memory:async_copy"}
++        # CDNA4/CDNA5 MFMA takes per-block scale factors (mxfp4/mxfp8), the same
++        # capability NVIDIA gained at sm_100 -- so the feature name is shared and
++        # a `vendors=` gate, not the feature, is what keeps kernels apart.
++        features |= {"tensor_core:f4", "tensor_core:block_scale", "memory:async_copy"}
+ 
+     return frozenset(features)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/registry.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/registry.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/registry.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/registry.py	2026-07-25 07:29:22.448811089 +0000
+@@ -180,6 +180,14 @@
+     tags: frozenset[str] = (
+         frozenset()
+     )  # Standard tags: "throughput", "latency", "determinism", "portability"
++    # Provenance of the implementation. This is an *informational* axis that also
++    # acts as the lowest-weight selection tiebreaker (see
++    # ``tokenspeed_kernel.selection``). The default ``"vendor"`` keeps every
++    # in-tree / upstream kernel on a single rank, so the tiebreaker can never
++    # reorder the existing corpus; out-of-tree packages (e.g. ``unieinfra-kernel``)
++    # set ``"first_party"``, ``"kda"``, or ``"contrib"`` to break exact ties in
++    # their favour without touching priority. Priority remains the primary lever.
++    origin: str = "vendor"
+     weight_preprocessor: Callable | None = None
+ 
+     def __post_init__(self) -> None:
+@@ -384,6 +392,7 @@
+     traits: dict[str, frozenset[Any]] | None = None,
+     priority: Priority | int = Priority.PERFORMANT + 2,
+     tags: set[str] | None = None,
++    origin: str = "vendor",
+     weight_preprocessor: Callable | None = None,
+ ) -> Callable:
+     """Decorator to register a kernel function.
+@@ -393,6 +402,13 @@
+     e.g. ``Priority.SPECIALIZED + 2``. See :class:`Priority` for the meaning of
+     each band and how to choose between them.
+ 
++    ``origin`` records provenance (``"vendor"`` default for in-tree/upstream
++    kernels, plus ``"first_party"``, ``"kda"``, ``"contrib"`` for out-of-tree
++    packages). It is the lowest-weight selection tiebreaker: it only decides an
++    exact ``(oracle, objective, priority)`` tie and, because every existing
++    kernel shares the ``"vendor"`` default, it can never reorder the current
++    corpus. Use ``priority`` — not ``origin`` — to actually change a winner.
++
+     Example::
+ 
+         from tokenspeed_kernel.signature import format_signatures
+@@ -432,6 +448,7 @@
+             traits=traits or {},
+             priority=priority_int,
+             tags=frozenset(tags or set()),
++            origin=origin,
+             weight_preprocessor=normalized_weight_preprocessor,
+         )
+ 
+@@ -456,6 +473,7 @@
+         f"  Operator: {spec.family}.{spec.mode}",
+         f"  Solution: {spec.solution}",
+         f"  Priority: {spec.priority} ({band_str})",
++        f"  Origin: {spec.origin}",
+         "  Format signatures: "
+         + ("; ".join(str(p) for p in spec.format_signatures) or "none"),
+         f"  Platform: {spec.capability}",
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/selection.py legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/selection.py
+--- /tmp/fp/tokenspeed-kernel/python/tokenspeed_kernel/selection.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/python/tokenspeed_kernel/selection.py	2026-07-25 09:39:12.846951893 +0000
+@@ -101,21 +101,30 @@
+ class ScoreBreakdown:
+     """Per-kernel scoring breakdown across all dimensions.
+ 
+-    Ranking is lexicographic on ``(oracle, objective, priority)`` — the oracle's
+-    per-family knowledge wins first, then objective alignment, with the kernel's
+-    declared priority band as the final tiebreaker.
++    Ranking is lexicographic on ``(oracle, objective, priority, origin)`` — the
++    oracle's per-family knowledge wins first, then objective alignment, then the
++    kernel's declared priority band, and finally ``origin`` as a stable,
++    lowest-weight tiebreaker. ``origin`` only ever decides an otherwise-exact tie
++    and, because every in-tree kernel shares ``origin="vendor"`` (rank 0), it
++    cannot reorder the existing corpus — it only lets an out-of-tree kernel
++    (``first_party``/``kda``/``contrib``) win a tie it would previously have lost
++    to registration order.
+     """
+ 
+     priority: int  # [0, 20) — from KernelSpec.priority
+     objective: int  # 0 or 1 — 1 if the kernel matches the requested objective
+     oracle: int  # [0, 20) — per-family oracle adjustment
++    origin: int = 0  # provenance rank; final tiebreaker (see _ORIGIN_RANK)
+ 
+-    def sort_key(self) -> tuple[int, int, int]:
++    def sort_key(self) -> tuple[int, int, int, int]:
+         """Lex sort key (descending — higher is better)."""
+-        return (self.oracle, self.objective, self.priority)
++        return (self.oracle, self.objective, self.priority, self.origin)
+ 
+     def __str__(self) -> str:
+-        return f"ora={self.oracle} obj={self.objective} pri={self.priority}"
++        return (
++            f"ora={self.oracle} obj={self.objective} "
++            f"pri={self.priority} org={self.origin}"
++        )
+ 
+ 
+ class SelectionOracle:
+@@ -340,6 +349,31 @@
+     return max(0, min(19, spec.priority))
+ 
+ 
++# Provenance ranks for the lowest-weight selection tiebreaker. Every in-tree /
++# upstream kernel keeps the default ``"vendor"`` (rank 0), so this dimension is
++# constant across the existing corpus and can never reorder two existing
++# kernels. Out-of-tree packages set a non-vendor origin to win an exact tie:
++# first-party and KDA-generated kernels outrank community contributions, which
++# in turn outrank the vendor baseline.
++_ORIGIN_RANK: dict[str, int] = {
++    "vendor": 0,
++    "contrib": 1,
++    "kda": 2,
++    "first_party": 3,
++}
++
++
++def _score_origin(spec: KernelSpec) -> int:
++    """Origin dimension: provenance-based final tiebreaker.
++
++    Returns 0 for the ``"vendor"`` default (and any unknown origin), which keeps
++    the entire existing corpus on a single rank. Only used to break an exact
++    ``(oracle, objective, priority)`` tie, so it never changes a selection whose
++    winner was decided on any earlier dimension.
++    """
++    return _ORIGIN_RANK.get(getattr(spec, "origin", "vendor"), 0)
++
++
+ _OBJECTIVE_TAG: dict[SelectionObjective, str] = {
+     SelectionObjective.LATENCY: "latency",
+     SelectionObjective.THROUGHPUT: "throughput",
+@@ -383,6 +417,7 @@
+         priority=_score_priority(spec),
+         objective=_score_objective(spec, objective),
+         oracle=_score_oracle(spec, platform, traits),
++        origin=_score_origin(spec),
+     )
+ 
+ 
+@@ -392,11 +427,12 @@
+     platform: PlatformInfo,
+     traits: dict[str, Any] | None,
+ ) -> list[tuple[KernelSpec, ScoreBreakdown]]:
+-    """Rank kernels lexicographically by (oracle, objective, priority).
++    """Rank kernels lexicographically by (oracle, objective, priority, origin).
+ 
+     Higher is better. Oracle wins first because per-family oracles encode the
+     most domain knowledge; objective alignment breaks ties next; the kernel's
+-    declared priority band is the final tiebreaker.
++    declared priority band comes after; and ``origin`` (provenance) is the
++    lowest-weight tiebreaker, constant across the vendor corpus.
+     """
+     scored = [(spec, _score(spec, objective, platform, traits)) for spec in specs]
+     scored.sort(key=lambda x: x[1].sort_key(), reverse=True)
+@@ -510,6 +546,21 @@
+         if isinstance(dim, int) and dim < minimum:
+             return False
+ 
++    # Upper-bound buckets, used by decode-shaped kernels that are only valid for
++    # a skinny M / narrow N slice of an operator.
++    maximum_traits: dict[str, tuple[str, int]] = {
++        "m_le_8": ("M", 8),
++        "n_le_16384": ("N", 16384),
++    }
++    for trait_name, (dim_name, maximum) in maximum_traits.items():
++        values = spec.traits.get(trait_name)
++        if values is None or True not in values:
++            continue
++
++        dim = shape.get(dim_name)
++        if isinstance(dim, int) and dim > maximum:
++            return False
++
+     return True
+ 
+ 
+@@ -784,7 +835,7 @@
+         Op: attention.decode (bfloat16)
+         Platform: NVIDIA H100 (sm_90)
+         Objective: default
+-        Ranking: lex (oracle, objective, priority); higher wins
++        Ranking: lex (oracle, objective, priority, origin); higher wins
+ 
+         Candidates (3 matched, 5 registered):
+           1. flashinfer_decode  [SELECTED]
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/test/conftest.py legacy/experiment/legacy/tokenspeed-kernel/test/conftest.py
+--- /tmp/fp/tokenspeed-kernel/test/conftest.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/test/conftest.py	2026-07-25 09:24:52.761974873 +0000
+@@ -34,6 +34,7 @@
+     ArchVersion,
+     InterconnectInfo,
+     PlatformInfo,
++    _get_cuda_sm_features,
+ )
+ from tokenspeed_kernel.registry import KernelRegistry
+ from tokenspeed_kernel.selection import (
+@@ -83,16 +84,10 @@
+         sm_count=132,
+         max_threads_per_sm=2048,
+         max_shared_memory_per_sm=232448,
+-        sm_features=frozenset(
+-            {
+-                "tensor_core:f16",
+-                "tensor_core:int8",
+-                "tensor_core:f8",
+-                "memory:async_copy",
+-                "memory:tma",
+-                "compute:cluster",
+-            }
+-        ),
++        # Derived from the real detector, never hand-copied: a literal
++        # feature set silently goes stale the moment a new capability is
++        # added (this fixture was missing `compute:tcgen05`).
++        sm_features=_get_cuda_sm_features(ArchVersion(9, 0)),
+         runtime_features=frozenset({"runtime:cuda_graph"}),
+         interconnect=InterconnectInfo(topology="nvlink_full"),
+     )
+@@ -110,13 +105,10 @@
+         sm_count=108,
+         max_threads_per_sm=2048,
+         max_shared_memory_per_sm=167936,
+-        sm_features=frozenset(
+-            {
+-                "tensor_core:f16",
+-                "tensor_core:int8",
+-                "memory:async_copy",
+-            }
+-        ),
++        # Derived from the real detector, never hand-copied: a literal
++        # feature set silently goes stale the moment a new capability is
++        # added (this fixture was missing `compute:tcgen05`).
++        sm_features=_get_cuda_sm_features(ArchVersion(8, 0)),
+         runtime_features=frozenset({"runtime:cuda_graph"}),
+         interconnect=InterconnectInfo(topology="nvlink_full"),
+     )
+@@ -181,17 +173,10 @@
+         sm_count=160,
+         max_threads_per_sm=2048,
+         max_shared_memory_per_sm=262144,
+-        sm_features=frozenset(
+-            {
+-                "tensor_core:f16",
+-                "tensor_core:int8",
+-                "tensor_core:f8",
+-                "tensor_core:f4",
+-                "memory:async_copy",
+-                "memory:tma",
+-                "compute:cluster",
+-            }
+-        ),
++        # Derived from the real detector, never hand-copied: a literal
++        # feature set silently goes stale the moment a new capability is
++        # added (this fixture was missing `compute:tcgen05`).
++        sm_features=_get_cuda_sm_features(ArchVersion(10, 0)),
+         runtime_features=frozenset({"runtime:cuda_graph"}),
+         interconnect=InterconnectInfo(topology="nvlink_full"),
+     )
+@@ -209,17 +194,10 @@
+         sm_count=160,
+         max_threads_per_sm=2048,
+         max_shared_memory_per_sm=262144,
+-        sm_features=frozenset(
+-            {
+-                "tensor_core:f16",
+-                "tensor_core:int8",
+-                "tensor_core:f8",
+-                "tensor_core:f4",
+-                "memory:async_copy",
+-                "memory:tma",
+-                "compute:cluster",
+-            }
+-        ),
++        # Derived from the real detector, never hand-copied: a literal
++        # feature set silently goes stale the moment a new capability is
++        # added (this fixture was missing `compute:tcgen05`).
++        sm_features=_get_cuda_sm_features(ArchVersion(10, 3)),
+         runtime_features=frozenset({"runtime:cuda_graph"}),
+         interconnect=InterconnectInfo(topology="nvlink_full"),
+     )
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/test/ops/test_attention.py legacy/experiment/legacy/tokenspeed-kernel/test/ops/test_attention.py
+--- /tmp/fp/tokenspeed-kernel/test/ops/test_attention.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/test/ops/test_attention.py	2026-07-25 09:00:00.370911925 +0000
+@@ -180,6 +180,11 @@
+     [
+         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
+         pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
++        # head_dim 256 is what Qwen3.6-MoE's full-attention layers use. It is the
++        # smallest head_dim whose prefill tile overflows the ~100 KB shared-memory
++        # budget of sm_120 when the datacenter (128, 64) tile is picked, so keep it
++        # covered here — nothing below 256 exercises that path.
++        pytest.param(torch.bfloat16, 256, 8, 2, id="bf16-d256"),
+         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
+         pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8-d128"),
+         pytest.param(torch.float8_e5m2, 64, 8, 2, id="fp8-e5m2"),
+@@ -558,3 +563,51 @@
+     assert lse.shape == lse_a.shape
+     torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+     torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)
++
++
++# --- shared-memory budget used to size the triton prefill tile -----------------
++#
++# sm_120 (RTX PRO 6000) reports as hopper_plus but only offers the sm_89-sized
++# ~100 KB opt-in shared memory per block. Picking the datacenter tile there
++# aborts the launch with `OutOfResources: shared memory` from head_dim 256 up
++# (see test_mha_extend_with_kvcache[triton-bf16-d256]).
++
++
++class _Props:
++    """Stand-in for a `torch.cuda.get_device_properties()` record."""
++
++    def __init__(self, **attrs: int) -> None:
++        self.__dict__.update(attrs)
++
++
++def test_cuda_shared_memory_per_block_prefers_the_optin_budget() -> None:
++    from tokenspeed_kernel.platform import _cuda_shared_memory_per_block
++
++    # torch exposes `shared_memory_per_block_optin`, never
++    # `max_shared_memory_per_block`; the smaller static limit must not win.
++    props = _Props(
++        shared_memory_per_block=49152,
++        shared_memory_per_block_optin=101376,
++        shared_memory_per_multiprocessor=102400,
++    )
++    assert _cuda_shared_memory_per_block(props) == 101376
++
++    # Nothing recognisable -> 0, which callers treat as "unknown".
++    assert _cuda_shared_memory_per_block(_Props()) == 0
++
++
++@pytest.mark.parametrize(
++    "budget,expected",
++    [
++        pytest.param(0, True, id="unknown-assumes-datacenter"),
++        pytest.param(101376, False, id="sm120-and-sm89"),
++        pytest.param(232448, True, id="h100"),
++        pytest.param(232448, True, id="b200"),
++    ],
++)
++def test_has_large_shared_memory(budget: int, expected: bool) -> None:
++    from tokenspeed_kernel.ops.attention.triton.mha_prefill import (
++        _has_large_shared_memory,
++    )
++
++    assert _has_large_shared_memory(_Props(max_shared_memory_per_sm=budget)) is expected
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/test/test_arch_gating.py legacy/experiment/legacy/tokenspeed-kernel/test/test_arch_gating.py
+--- /tmp/fp/tokenspeed-kernel/test/test_arch_gating.py	1970-01-01 00:00:00.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/test/test_arch_gating.py	2026-07-25 17:10:54.235260803 +0000
+@@ -0,0 +1,272 @@
++# Copyright (c) 2026 LightSeek Foundation
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in
++# all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""Architecture gating: capability predicates must not be version comparisons.
++
++``ArchVersion`` only compares version numbers, so an open-ended
++``min_arch_version`` such as ``(9, 0)`` or ``(10, 0)`` is satisfied by *every*
++newer part -- including sm_120 (RTX PRO / workstation Blackwell, arch 12.0),
++which lacks capabilities that every datacenter part from sm_100 on has. These
++tests pin the capability semantics so a version predicate cannot silently be
++substituted back in.
++
++Ground truth used here, verified with ``ptxas`` from CUDA 12.9:
++
++* ``tcgen05.alloc`` assembles for ``sm_100a`` and is rejected for both
++  ``sm_90a`` and ``sm_120a`` -> tcgen05/TMEM is datacenter-Blackwell only.
++* ``mapa.shared::cluster`` assembles for ``sm_90a``, ``sm_100a`` **and**
++  ``sm_120a``, and the driver reports
++  ``CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH == 1`` on sm_120 -> clusters and
++  distributed shared memory are *not* what sm_120 is missing.
++"""
++
++from __future__ import annotations
++
++import pytest
++from tokenspeed_kernel.platform import (
++    ArchVersion,
++    CapabilityRequirement,
++    InterconnectInfo,
++    PlatformInfo,
++    _get_cuda_sm_features,
++    current_platform,
++)
++from tokenspeed_kernel.registry import KernelRegistry
++
++# --- synthetic platforms ------------------------------------------------------
++#
++# Built through the real `_get_cuda_sm_features` so the feature set under test is
++# the one the detector actually produces, not a hand-copied duplicate of it.
++
++
++def _nvidia_platform(major: int, minor: int, smem: int, name: str) -> PlatformInfo:
++    arch_version = ArchVersion(major, minor)
++    return PlatformInfo(
++        vendor="nvidia",
++        arch_version=arch_version,
++        device_name=name,
++        device_count=1,
++        total_memory=80 * (1024**3),
++        memory_bandwidth=3350.0,
++        sm_count=132,
++        max_threads_per_sm=2048,
++        max_shared_memory_per_sm=smem,
++        sm_features=_get_cuda_sm_features(arch_version),
++        runtime_features=frozenset({"runtime:cuda_graph"}),
++        interconnect=InterconnectInfo(topology="single_gpu"),
++    )
++
++
++# sm_86 / sm_89 are the workstation Ampere+Ada parts in the compat matrix;
++# sm_90 is H100/H200; sm_100 is B200; sm_103 is B300 -- NEWER than the sm_100
++# most gates were written against; sm_120 is the RTX PRO 6000.
++SM86 = _nvidia_platform(8, 6, 101376, "NVIDIA RTX A6000")
++SM89 = _nvidia_platform(8, 9, 101376, "NVIDIA L40S")
++SM90 = _nvidia_platform(9, 0, 232448, "NVIDIA H200")
++SM100 = _nvidia_platform(10, 0, 232448, "NVIDIA B200")
++SM103 = _nvidia_platform(10, 3, 232448, "NVIDIA B300")
++SM120 = _nvidia_platform(12, 0, 101376, "NVIDIA RTX PRO 6000 Blackwell")
++
++ALL_PLATFORMS = {
++    "sm_86": SM86,
++    "sm_89": SM89,
++    "sm_90": SM90,
++    "sm_100": SM100,
++    "sm_103": SM103,
++    "sm_120": SM120,
++}
++
++
++# --- capability features ------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "platform,expected",
++    [
++        pytest.param(SM86, False, id="sm_86"),
++        pytest.param(SM89, False, id="sm_89"),
++        pytest.param(SM90, False, id="sm_90"),
++        pytest.param(SM100, True, id="sm_100"),
++        pytest.param(SM103, True, id="sm_103-b300"),
++        # The whole point: sm_120 is arch 12.0, so it satisfies every
++        # `>= (10, 0)` comparison, yet it has no TMEM.
++        pytest.param(SM120, False, id="sm_120"),
++    ],
++)
++def test_tcgen05_is_datacenter_blackwell_only(
++    platform: PlatformInfo, expected: bool
++) -> None:
++    assert platform.has_tcgen05 is expected
++    assert ("compute:tcgen05" in platform.sm_features) is expected
++
++
++@pytest.mark.parametrize(
++    "platform,expected",
++    [
++        pytest.param(SM86, False, id="sm_86"),
++        pytest.param(SM89, False, id="sm_89"),
++        pytest.param(SM90, False, id="sm_90"),
++        pytest.param(SM100, True, id="sm_100"),
++        pytest.param(SM103, True, id="sm_103-b300"),
++        # sm_120 *does* have FP4 tensor cores. `is_blackwell` (major == 10)
++        # said otherwise, which is what kept the nvfp4 quantizer unbound.
++        pytest.param(SM120, True, id="sm_120"),
++    ],
++)
++def test_fp4_tensor_cores_include_sm120(platform: PlatformInfo, expected: bool) -> None:
++    assert platform.has_fp4_tensor_cores is expected
++
++
++def test_fp4_capability_disagrees_with_is_blackwell_only_on_sm120() -> None:
++    """`has_fp4_tensor_cores` must be a strict superset of `is_blackwell`.
++
++    This is the safety property behind the nvfp4 gate change: swapping
++    ``is_blackwell`` for ``has_fp4_tensor_cores`` may only *add* sm_120, never
++    change any datacenter or Ampere-class answer.
++    """
++    for name, platform in ALL_PLATFORMS.items():
++        if name == "sm_120":
++            assert platform.is_blackwell is False
++            assert platform.has_fp4_tensor_cores is True
++        else:
++            assert platform.has_fp4_tensor_cores is platform.is_blackwell, name
++
++
++def test_cluster_support_is_not_what_sm120_lacks() -> None:
++    """sm_120 has thread-block clusters and DSMEM (ptxas + driver verified).
++
++    Recorded so nobody "fixes" sm_120 by taking ``compute:cluster`` away from
++    it -- that would exclude kernels which genuinely do run there.
++    """
++    assert "compute:cluster" in SM120.sm_features
++    assert "memory:tma" in SM120.sm_features
++    assert "compute:cluster" not in SM89.sm_features
++
++
++# --- the gates that were wrong ------------------------------------------------
++#
++# Each op below is registered with an open-ended `min_arch_version` that sm_120
++# satisfied. Reverting the fix (dropping `required_features`) makes the sm_120
++# assertion fail while leaving the datacenter assertions passing -- which is
++# exactly the bug shape being guarded against.
++
++TCGEN05_GATED_OPS = [
++    ("attention", "dsa_decode", "flashinfer_trtllm_dsa_decode"),
++    ("attention", "dsa_prefill", "flashinfer_trtllm_dsa_prefill"),
++    ("moe", "apply", "flashinfer_trtllm_fp8_moe_apply"),
++    ("moe", "apply", "flashinfer_cutedsl_deepep_nvfp4_moe_apply"),
++]
++
++
++def _spec(family: str, mode: str, name: str):
++    for spec in KernelRegistry.get().list_kernels(family=family, mode=mode):
++        if spec.name == name:
++            return spec
++    pytest.skip(f"{name} is not registered on this build/platform")
++
++
++@pytest.mark.parametrize(
++    "family,mode,name", TCGEN05_GATED_OPS, ids=[o[2] for o in TCGEN05_GATED_OPS]
++)
++def test_tcgen05_kernels_are_excluded_on_sm120_and_kept_on_datacenter(
++    family: str, mode: str, name: str
++) -> None:
++    capability = _spec(family, mode, name).capability
++
++    # sm_120 must be filtered out: these wrap tcgen05 cubins (TRT-LLM-gen /
++    # CuTe DSL sm100). Every one of them has a portable Triton sibling for the
++    # same op, so excluding them leaves a working path rather than a
++    # NoKernelFoundError.
++    assert capability.satisfied_by(SM120) is False
++    assert "compute:tcgen05" in capability.missing_features(SM120)
++
++    # ... and datacenter behaviour is unchanged. B300 (sm_103) matters as much
++    # as B200 here: it is newer than the sm_100 these gates were written for.
++    assert capability.satisfied_by(SM100) is True
++    assert capability.satisfied_by(SM103) is True
++
++    # Pre-Blackwell parts were already excluded by min_arch_version and stay so.
++    assert capability.satisfied_by(SM90) is False
++    assert capability.satisfied_by(SM86) is False
++
++
++def test_open_ended_min_arch_alone_is_now_unrepresentable() -> None:
++    """The bug shape can no longer be written at all.
++
++    `min_arch_version=(10, 0)` with no upper bound is what every mis-gated
++    registration used to carry: it admits sm_120 *and* would admit any future
++    arch. E30 fixed the instances; this pins the *form*, so the class cannot
++    come back.
++    """
++    with pytest.raises(ValueError) as excinfo:
++        CapabilityRequirement(
++            min_arch_version=ArchVersion(10, 0),
++            vendors=frozenset({"nvidia"}),
++        )
++    message = str(excinfo.value)
++    # The message must say what to add, not merely that something is wrong.
++    assert "required_features" in message
++    assert "max_arch_version" in message
++
++    # Restating it as the capability it stands for fixes sm_120 without
++    # touching sm_100/sm_103.
++    capability_gated = CapabilityRequirement(
++        min_arch_version=ArchVersion(10, 0),
++        required_features=frozenset({"compute:tcgen05"}),
++        vendors=frozenset({"nvidia"}),
++    )
++    assert capability_gated.satisfied_by(SM120) is False
++    assert capability_gated.satisfied_by(SM100) is True
++    assert capability_gated.satisfied_by(SM103) is True
++
++
++# --- nvfp4 unblock ------------------------------------------------------------
++
++
++def test_nvfp4_quantizer_is_registered_wherever_fp4_tensor_cores_exist() -> None:
++    """The nvfp4 quantizer and the nvfp4 GEMM must agree about the device.
++
++    ``fp4_quantize`` used to hide behind ``is_blackwell`` (``major == 10``
++    exactly) while ``cublaslt_mm_nvfp4`` gated on ``min_arch_version=(10, 0)``.
++    On sm_120 that left the registry with an nvfp4 *GEMM* and no nvfp4
++    *quantizer*, so the first nvfp4 forward raised.
++    """
++    platform = current_platform()
++    if not (platform.is_nvidia and platform.has_fp4_tensor_cores):
++        pytest.skip("device has no FP4 tensor cores")
++
++    from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
++    from tokenspeed_kernel.registry import error_fn
++
++    assert fp4_quantize is not error_fn
++
++    quantizers = {
++        spec.name
++        for spec in KernelRegistry.get().list_kernels(
++            family="quantization", mode="nvfp4"
++        )
++    }
++    assert "flashinfer_quantize_nvfp4" in quantizers
++
++    gemms = {
++        spec.name
++        for spec in KernelRegistry.get().list_kernels(family="gemm", mode="mm")
++    }
++    assert gemms & {"cublaslt_mm_nvfp4", "flashinfer_mm_nvfp4"}
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/test/test_capability_model.py legacy/experiment/legacy/tokenspeed-kernel/test/test_capability_model.py
+--- /tmp/fp/tokenspeed-kernel/test/test_capability_model.py	1970-01-01 00:00:00.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/test/test_capability_model.py	2026-07-25 17:22:05.219490151 +0000
+@@ -0,0 +1,504 @@
++# Copyright (c) 2026 LightSeek Foundation
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in
++# all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""The capability model itself: the mis-gating bug class must be unwritable.
++
++E30 (our tree), E28 (our tree) and E37 (upstream vLLM, now vendored) are three
++measured instances of one bug: an **open-ended architecture comparison** used as
++a stand-in for a capability. This suite pins the model that makes that form
++impossible to write rather than merely discouraged.
++
++Every test here runs on CPU -- platforms are synthesized through the real
++detector, so no GPU is touched and no fixture can drift from the code under
++test.
++
++Each test is written to FAIL if the corresponding fix is reverted:
++
++* the ``pytest.raises`` tests fail (nothing raised) without the ``__post_init__``
++  validation;
++* the ``compute:cluster`` tests fail without the driver-sourced feature, because
++  the pure ``major >= 9`` inference cannot report an H20 or a cluster-less part;
++* the ``build:`` tests fail with ``AttributeError``/``ImportError`` without the
++  artifact tier;
++* ``test_no_registered_kernel_carries_an_open_ended_gate`` fails against the
++  pre-E40 corpus, which had 25 such registrations.
++"""
++
++from __future__ import annotations
++
++import pytest
++from tokenspeed_kernel.artifact import (
++    _fatbin_covers,
++    build_capability_available,
++    clear_build_capability_cache,
++    has_signature_parameter,
++    kernel_is_registered,
++    register_build_capability,
++    symbol_is_bound,
++)
++from tokenspeed_kernel.platform import (
++    ArchVersion,
++    CapabilityRequirement,
++    InterconnectInfo,
++    PlatformInfo,
++    _get_cuda_sm_features,
++)
++
++# ---------------------------------------------------------------------------
++# Synthetic platforms, derived from the real detector (never hand-copied).
++# ---------------------------------------------------------------------------
++
++
++def _nvidia(
++    major: int,
++    minor: int,
++    name: str,
++    *,
++    cluster_launch: bool | None = None,
++) -> PlatformInfo:
++    arch_version = ArchVersion(major, minor)
++    return PlatformInfo(
++        vendor="nvidia",
++        arch_version=arch_version,
++        device_name=name,
++        device_count=1,
++        total_memory=80 * (1024**3),
++        memory_bandwidth=3350.0,
++        sm_count=132,
++        max_threads_per_sm=2048,
++        max_shared_memory_per_sm=232448,
++        sm_features=_get_cuda_sm_features(
++            arch_version, cluster_launch=cluster_launch, device_name=name
++        ),
++        runtime_features=frozenset({"runtime:cuda_graph"}),
++        interconnect=InterconnectInfo(topology="single_gpu"),
++    )
++
++
++SM86 = _nvidia(8, 6, "NVIDIA RTX A6000")
++SM89 = _nvidia(8, 9, "NVIDIA L40S")
++SM90 = _nvidia(9, 0, "NVIDIA H200")
++SM100 = _nvidia(10, 0, "NVIDIA B200")
++SM103 = _nvidia(10, 3, "NVIDIA B300")
++SM120 = _nvidia(12, 0, "NVIDIA RTX PRO 6000 Blackwell")
++
++DATACENTER = {"sm_90": SM90, "sm_100": SM100, "sm_103": SM103}
++
++
++# ---------------------------------------------------------------------------
++# Rule 1: an open-ended min_arch_version is unrepresentable
++# ---------------------------------------------------------------------------
++
++
++def test_min_arch_alone_is_rejected_at_construction() -> None:
++    with pytest.raises(ValueError) as excinfo:
++        CapabilityRequirement(
++            min_arch_version=ArchVersion(9, 0),
++            vendors=frozenset({"nvidia"}),
++        )
++    message = str(excinfo.value)
++    # The message must say what to ADD and why -- an author hitting this needs
++    # the remedy, not just a rejection.
++    assert "required_features" in message
++    assert "max_arch_version" in message
++    assert "sm_120" in message
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        pytest.param(
++            {
++                "min_arch_version": ArchVersion(10, 0),
++                "max_arch_version": ArchVersion(10, 9),
++            },
++            id="explicit-upper-bound",
++        ),
++        pytest.param(
++            {
++                "min_arch_version": ArchVersion(10, 0),
++                "required_features": frozenset({"compute:tcgen05"}),
++            },
++            id="capability-requirement",
++        ),
++    ],
++)
++def test_either_remedy_is_accepted(kwargs: dict) -> None:
++    requirement = CapabilityRequirement(vendors=frozenset({"nvidia"}), **kwargs)
++    # Both remedies exclude sm_120 and leave datacenter Blackwell untouched.
++    assert requirement.satisfied_by(SM120) is False
++    assert requirement.satisfied_by(SM100) is True
++    assert requirement.satisfied_by(SM103) is True
++
++
++def test_max_arch_alone_is_allowed() -> None:
++    """An upper bound with no lower bound is not the bug shape."""
++    requirement = CapabilityRequirement(
++        max_arch_version=ArchVersion(9, 9),
++        vendors=frozenset({"nvidia"}),
++    )
++    assert requirement.satisfied_by(SM90) is True
++    assert requirement.satisfied_by(SM100) is False
++
++
++def test_features_only_requirement_is_allowed_and_vendor_neutral() -> None:
++    """A pure capability statement needs no arch bound and no vendor."""
++    requirement = CapabilityRequirement(required_features=frozenset({"tensor_core:f4"}))
++    assert requirement.satisfied_by(SM100) is True
++    assert requirement.satisfied_by(SM120) is True
++    assert requirement.satisfied_by(SM90) is False
++
++
++def test_empty_requirement_is_allowed() -> None:
++    """The default (portable, everywhere) requirement must stay constructible."""
++    assert CapabilityRequirement().satisfied_by(SM86) is True
++
++
++# ---------------------------------------------------------------------------
++# Rule 4: vendor must be explicit whenever an arch bound is present
++# ---------------------------------------------------------------------------
++
++
++def test_arch_bound_without_vendor_is_rejected() -> None:
++    with pytest.raises(ValueError) as excinfo:
++        CapabilityRequirement(
++            min_arch_version=ArchVersion(9, 5),
++            max_arch_version=ArchVersion(9, 5),
++        )
++    message = str(excinfo.value)
++    assert "vendors" in message
++    # The reason must be stated: the numbers are shared between vendors.
++    assert "gfx950" in message or "CDNA" in message
++
++
++def test_the_collision_that_makes_rule_4_necessary() -> None:
++    """AMD gfx950 is ArchVersion(9, 5) -- the same number space NVIDIA uses.
++
++    Without ``vendors``, a Hopper-era gate silently admits CDNA4, and a sm_12x
++    gate silently admits CDNA5 (12, 5). With it, they cannot.
++    """
++    amd_cdna4 = PlatformInfo(
++        vendor="amd",
++        arch_version=ArchVersion(9, 5),
++        device_name="AMD Instinct MI350X",
++        device_count=1,
++        total_memory=0,
++        memory_bandwidth=0.0,
++        sm_count=256,
++        max_threads_per_sm=0,
++        max_shared_memory_per_sm=160 * 1024,
++        sm_features=frozenset({"tensor_core:f16", "tensor_core:f8", "tensor_core:f4"}),
++    )
++    nvidia_only = CapabilityRequirement(
++        min_arch_version=ArchVersion(9, 0),
++        required_features=frozenset({"memory:tma"}),
++        vendors=frozenset({"nvidia"}),
++    )
++    assert nvidia_only.satisfied_by(amd_cdna4) is False
++    assert nvidia_only.satisfied_by(SM90) is True
++
++
++def test_unknown_and_empty_vendors_are_rejected() -> None:
++    with pytest.raises(ValueError, match="unknown vendor"):
++        CapabilityRequirement(vendors=frozenset({"intel"}))
++    with pytest.raises(ValueError, match="never be satisfied"):
++        CapabilityRequirement(vendors=frozenset())
++
++
++def test_inverted_arch_range_is_rejected() -> None:
++    with pytest.raises(ValueError, match="below min_arch_version"):
++        CapabilityRequirement(
++            min_arch_version=ArchVersion(10, 0),
++            max_arch_version=ArchVersion(9, 0),
++            vendors=frozenset({"nvidia"}),
++        )
++
++
++# ---------------------------------------------------------------------------
++# Rule 2: capabilities come from measured device properties
++# ---------------------------------------------------------------------------
++
++
++def test_cluster_launch_comes_from_the_driver_not_the_version() -> None:
++    """The driver answer wins over the arch inference, in both directions."""
++    # An sm_90-class part the driver says cannot launch clusters (H20).
++    h20 = _nvidia(9, 0, "NVIDIA H20", cluster_launch=False)
++    assert h20.has_cluster_launch is False
++    assert "compute:cluster" not in h20.sm_features
++    # ... while it keeps every other Hopper capability, so this narrows exactly
++    # one feature and not the whole generation.
++    assert "memory:tma" in h20.sm_features
++
++    # sm_120 genuinely HAS clusters (ptxas + driver, E30) -- an inference that
++    # tied clusters to "datacenter" would get this wrong in the other direction.
++    sm120 = _nvidia(12, 0, "NVIDIA RTX PRO 6000 Blackwell", cluster_launch=True)
++    assert sm120.has_cluster_launch is True
++
++
++def test_cluster_launch_falls_back_to_validated_behaviour_when_undetectable() -> None:
++    """No driver answer must never narrow what already worked (the E28 rule)."""
++    for platform in DATACENTER.values():
++        # Built with cluster_launch=None, i.e. the driver could not be asked.
++        assert platform.has_cluster_launch is True
++
++    # And the pre-driver-query H20 workaround is preserved on that same path,
++    # without an H200 being caught by it.
++    h20 = _nvidia(9, 0, "NVIDIA H20")
++    h200 = _nvidia(9, 0, "NVIDIA H200")
++    assert h20.has_cluster_launch is False
++    assert h200.has_cluster_launch is True
++
++
++def test_datacenter_feature_sets_are_unchanged() -> None:
++    """Byte-identical on sm_90 / sm_100 / sm_103 -- the hardware we cannot test.
++
++    Spelled out as literals on purpose: this is the assertion that a future
++    edit to the arch -> feature table cannot silently move datacenter parts.
++    ``tensor_core:block_scale`` is the one addition, and it is purely additive
++    (it names a capability those parts always had).
++    """
++    assert SM90.sm_features == frozenset(
++        {
++            "tensor_core:f16",
++            "tensor_core:int8",
++            "tensor_core:f8",
++            "memory:async_copy",
++            "memory:tma",
++            "compute:cluster",
++        }
++    )
++    blackwell = frozenset(
++        {
++            "tensor_core:f16",
++            "tensor_core:int8",
++            "tensor_core:f8",
++            "tensor_core:f4",
++            "tensor_core:block_scale",
++            "memory:async_copy",
++            "memory:tma",
++            "compute:cluster",
++            "compute:tcgen05",
++        }
++    )
++    assert SM100.sm_features == blackwell
++    assert SM103.sm_features == blackwell
++
++
++def test_sm120_is_not_datacenter_blackwell() -> None:
++    """The distinction the whole model exists to draw."""
++    assert SM120.has_fp4_tensor_cores is True  # it does have FP4 tensor cores
++    assert SM120.has_cluster_launch is True  # and clusters + distributed smem
++    assert SM120.has_tcgen05 is False  # but no tcgen05 / TMEM
++    assert "tensor_core:block_scale" in SM120.sm_features
++
++
++# ---------------------------------------------------------------------------
++# Rule 5: a part we have never seen must be classified correctly by
++# construction -- no code change required.
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "major,minor,expect_tcgen05,expect_fp4",
++    [
++        # B300 is already newer than the sm_100 most gates were written for.
++        pytest.param(10, 3, True, True, id="sm_103-b300"),
++        # A hypothetical datacenter Blackwell refresh.
++        pytest.param(10, 9, True, True, id="sm_109-unseen-datacenter"),
++        # A hypothetical workstation part in the sm_12x family.
++        pytest.param(12, 1, False, True, id="sm_121-unseen-workstation"),
++        # A whole generation beyond anything in the table: it must NOT inherit
++        # tcgen05, because tcgen05 is bounded, not open-ended.
++        pytest.param(13, 0, False, True, id="sm_130-unseen-generation"),
++    ],
++)
++def test_unseen_parts_are_classified_without_a_code_change(
++    major: int, minor: int, expect_tcgen05: bool, expect_fp4: bool
++) -> None:
++    platform = _nvidia(major, minor, f"NVIDIA UNSEEN sm_{major}{minor}")
++    assert platform.has_tcgen05 is expect_tcgen05
++    assert platform.has_fp4_tensor_cores is expect_fp4
++
++    tcgen05_kernel = CapabilityRequirement(
++        min_arch_version=ArchVersion(10, 0),
++        required_features=frozenset({"compute:tcgen05"}),
++        vendors=frozenset({"nvidia"}),
++    )
++    assert tcgen05_kernel.satisfied_by(platform) is expect_tcgen05
++
++
++# ---------------------------------------------------------------------------
++# Rule 3: the build/artifact capability tier
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture(autouse=True)
++def _clean_build_cache():
++    clear_build_capability_cache()
++    yield
++    clear_build_capability_cache()
++
++
++def test_build_capability_gates_a_requirement() -> None:
++    name = "build:_test_present"
++    register_build_capability(name, lambda: True, default=False)
++    requirement = CapabilityRequirement(
++        min_arch_version=ArchVersion(9, 0),
++        required_features=frozenset({name}),
++        vendors=frozenset({"nvidia"}),
++    )
++    assert requirement.satisfied_by(SM100) is True
++
++    register_build_capability(name, lambda: False, default=True)
++    assert requirement.satisfied_by(SM100) is False
++    assert requirement.missing_features(SM100) == {name}
++
++
++def test_failing_probe_falls_back_to_its_declared_default() -> None:
++    """A probe that cannot run must not decide the answer by accident."""
++
++    def _boom() -> bool:
++        raise RuntimeError("toolchain missing")
++
++    register_build_capability("build:_test_boom_open", _boom, default=True)
++    register_build_capability("build:_test_boom_closed", _boom, default=False)
++    assert build_capability_available("build:_test_boom_open") is True
++    assert build_capability_available("build:_test_boom_closed") is False
++
++
++def test_unprobed_build_feature_never_narrows() -> None:
++    """The E28 rule, encoded: unknown must not mean unavailable.
++
++    A ``build:`` feature nobody registered a probe for resolves to AVAILABLE, so
++    a detection gap can never delete a kernel that is validated on hardware this
++    process cannot query.
++    """
++    requirement = CapabilityRequirement(
++        required_features=frozenset({"build:_test_never_registered"})
++    )
++    assert requirement.satisfied_by(SM100) is True
++
++
++def test_build_namespace_is_enforced() -> None:
++    with pytest.raises(ValueError, match="must start with"):
++        register_build_capability("not_a_build_feature", lambda: True, default=True)
++
++
++def test_probe_constructors_cover_the_three_in_tree_patterns() -> None:
++    """The three hand-rolled shapes, now one mechanism."""
++
++    # 1. inspect.signature probe.
++    def _with_sfq(q, k, v, sfq=None):
++        return None
++
++    def _without_sfq(q, k, v):
++        return None
++
++    assert has_signature_parameter(lambda: _with_sfq, "sfq")() is True
++    assert has_signature_parameter(lambda: _without_sfq, "sfq")() is False
++
++    # 2. try/except + `is error_fn` sentinel probe.
++    sentinel = object()
++
++    def _boom():
++        raise ImportError("optional dependency absent")
++
++    assert symbol_is_bound(lambda: _with_sfq, sentinels=(sentinel,))() is True
++    assert symbol_is_bound(lambda: sentinel, sentinels=(sentinel,))() is False
++    assert symbol_is_bound(lambda: None)() is False
++    assert symbol_is_bound(_boom)() is False
++
++    # 3. registry query probe.
++    assert kernel_is_registered("no_such_kernel_anywhere")() is False
++
++
++@pytest.mark.parametrize(
++    "listing,target,expected",
++    [
++        # The real answer for this tree's prebuilt merge_state.so, measured with
++        # cuobjdump: SASS for sm_120a only. A datacenter part is NOT covered --
++        # which is exactly the question `min_arch_version=(9, 0)` could not ask.
++        pytest.param(
++            "ELF file    1: merge_state.1.sm_120a.cubin", 120, True, id="sm120-elf-hit"
++        ),
++        pytest.param(
++            "ELF file    1: merge_state.1.sm_120a.cubin",
++            100,
++            False,
++            id="sm100-elf-miss",
++        ),
++        pytest.param(
++            "ELF file    1: k.1.sm_100a.cubin", 103, False, id="sass-is-exact-match"
++        ),
++        # PTX JITs forward, but only inside the same major family.
++        pytest.param(
++            "PTX file    1: k.1.sm_100.ptx", 103, True, id="ptx-jits-forward-in-family"
++        ),
++        pytest.param(
++            "PTX file    1: k.1.sm_90.ptx", 100, False, id="ptx-does-not-cross-family"
++        ),
++        pytest.param("", 100, False, id="empty-listing"),
++    ],
++)
++def test_fatbin_coverage(listing: str, target: int, expected: bool) -> None:
++    assert _fatbin_covers(listing, target) is expected
++
++
++# ---------------------------------------------------------------------------
++# Corpus-level guard
++# ---------------------------------------------------------------------------
++
++
++def test_no_registered_kernel_carries_an_open_ended_gate() -> None:
++    """Nothing in the live registry may carry the mis-gating form.
++
++    Construction now rejects it, so this can only fail if some path builds a
++    ``CapabilityRequirement`` around the validation -- which is precisely what a
++    regression would look like.
++    """
++    from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
++
++    load_builtin_kernels()
++
++    offenders = [
++        spec.name
++        for spec in KernelRegistry.get().list_kernels()
++        if spec.capability.min_arch_version is not None
++        and spec.capability.max_arch_version is None
++        and not spec.capability.required_features
++    ]
++    assert offenders == []
++
++
++def test_no_registered_kernel_has_an_implicit_vendor() -> None:
++    from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
++
++    load_builtin_kernels()
++
++    offenders = [
++        spec.name
++        for spec in KernelRegistry.get().list_kernels()
++        if spec.capability.vendors is None
++        and (
++            spec.capability.min_arch_version is not None
++            or spec.capability.max_arch_version is not None
++        )
++    ]
++    assert offenders == []
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/test/test_registry.py legacy/experiment/legacy/tokenspeed-kernel/test/test_registry.py
+--- /tmp/fp/tokenspeed-kernel/test/test_registry.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/test/test_registry.py	2026-07-25 17:10:45.741267523 +0000
+@@ -451,6 +451,8 @@
+             solution="triton",
+             capability=CapabilityRequirement(
+                 min_arch_version=ArchVersion(8, 0),
++                required_features=frozenset({"memory:async_copy"}),
++                vendors=frozenset({"nvidia"}),
+             ),
+             signatures=format_signatures(
+                 ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+diff -ruN '--exclude=__pycache__' '--exclude=.cache' '--exclude=*.so' '--exclude=*.a' /tmp/fp/tokenspeed-kernel/test/utils.py legacy/experiment/legacy/tokenspeed-kernel/test/utils.py
+--- /tmp/fp/tokenspeed-kernel/test/utils.py	2026-07-25 02:47:41.000000000 +0000
++++ legacy/experiment/legacy/tokenspeed-kernel/test/utils.py	2026-07-25 17:10:40.374390236 +0000
+@@ -80,6 +80,7 @@
+             capability=CapabilityRequirement(
+                 vendors=frozenset({"nvidia"}),
+                 min_arch_version=ArchVersion(8, 0),
++                required_features=frozenset({"memory:async_copy"}),
+             ),
+             priority=18,
+             tags=frozenset({"latency"}),
+@@ -107,6 +108,7 @@
+             capability=CapabilityRequirement(
+                 vendors=frozenset({"nvidia"}),
+                 min_arch_version=ArchVersion(9, 0),
++                required_features=frozenset({"memory:tma"}),
+             ),
+             priority=16,
+             tags=frozenset({"throughput"}),
+@@ -148,6 +150,7 @@
+             capability=CapabilityRequirement(
+                 vendors=frozenset({"nvidia"}),
+                 min_arch_version=ArchVersion(8, 0),
++                required_features=frozenset({"memory:async_copy"}),
+             ),
+             priority=15,
+             tags=frozenset({"throughput", "latency"}),
+@@ -170,6 +173,7 @@
+             capability=CapabilityRequirement(
+                 vendors=frozenset({"nvidia"}),
+                 min_arch_version=ArchVersion(9, 0),
++                required_features=frozenset({"memory:tma"}),
+             ),
+             priority=16,
+             tags=frozenset({"throughput"}),
+@@ -205,6 +209,7 @@
+             capability=CapabilityRequirement(
+                 vendors=frozenset({"nvidia"}),
+                 min_arch_version=ArchVersion(9, 0),
++                required_features=frozenset({"memory:tma"}),
+             ),
+             priority=15,
+             tags=frozenset({"latency", "throughput"}),
+@@ -227,6 +232,7 @@
+             capability=CapabilityRequirement(
+                 vendors=frozenset({"nvidia"}),
+                 min_arch_version=ArchVersion(8, 0),
++                required_features=frozenset({"memory:async_copy"}),
+             ),
+             priority=14,
+             tags=frozenset({"throughput"}),

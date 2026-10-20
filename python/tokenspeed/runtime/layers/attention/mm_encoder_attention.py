@@ -54,6 +54,11 @@ from tokenspeed.runtime.utils import add_prefix, round_up
 
 logger = logging.getLogger(__name__)
 
+# One-shot guard for the cross-attention dtype normalization diagnostic. A
+# module flag is used instead of a function attribute so it survives the
+# torch.compile wrapper in the prewarm path.
+_cross_attn_warned_dtype = False
+
 _platform = current_platform()
 _is_nvidia = _platform.is_nvidia
 _is_amd = _platform.is_amd
@@ -184,6 +189,114 @@ def vision_attn_fa3(
     )
 
 
+def vision_attn_fa_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    bsz: int,
+    seq_len: int,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
+    window_size: tuple[int, int] | None = None,
+    **_: Any,
+) -> torch.Tensor:
+    """Non-causal varlen attention with an optional symmetric local window.
+
+    Separate from ``fa3``/``fa4``, which ``_resolve_backend`` restricts by
+    architecture, because this one has to run wherever the model does:
+    ModernBERT makes two of every three layers local, so a backend that
+    refuses on this card would leave the model with no correct path at all.
+    The underlying ``flash_attn_varlen_func`` dispatches its own per-arch
+    kernel (``flash_fwd_sm120`` here) and honours ``window_size`` there --
+    verified against a banded-mask reference rather than assumed, since
+    several of this kernel's options are silently closed on sm_120
+    (``unieinfra/xref/15-encoder-embedding.md`` §6.1).
+
+    ``window_size`` is ``(left, right)`` in the kernel's terms. A
+    bidirectional encoder wants it symmetric: ModernBERT's ``local_attention``
+    is the *total* width, so each side is half of it.
+    """
+    cu_seqlens, _, max_seqlen = _varlen_metadata(
+        cu_seqlens, bsz, seq_len, device=q.device, max_seqlen=max_seqlen
+    )
+    result = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        softmax_scale=softmax_scale,
+        causal=False,
+        **({} if window_size is None else {"window_size": window_size}),
+    )
+    return result[0] if isinstance(result, tuple) else result
+
+
+def vision_attn_sdpa_window(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    bsz: int,
+    seq_len: int,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
+    window_size: tuple[int, int] | None = None,
+    **_: Any,
+) -> torch.Tensor:
+    """Non-causal varlen attention with a band mask, one sequence at a time.
+
+    The slow, correct local-attention path. ``fa_varlen`` is the fast one and
+    honours ``window_size`` on this card, but it raises
+    ``cudaErrorIllegalAddress`` intermittently once several attention modules
+    with different weights run in one process -- ModernBERT's shape exactly.
+    The fault is not reproducible on demand: the same 22-layer configuration
+    faulted at layer 2 on three runs and completed on the next two, which is
+    what an out-of-bounds access looks like when whether it faults depends on
+    what happens to be mapped next to the buffer. A path that passes for that
+    reason is not a path to serve on. Measured 2026-08-21; see
+    ``unieinfra/xref/15-encoder-embedding.md`` §6.8 before switching back.
+
+    The triton backend is stable but has no window parameter, so this fills
+    the gap with ``scaled_dot_product_attention`` under an explicit band
+    mask. Cost is the usual quadratic one: the mask is
+    ``[heads, L, L]`` per sequence, so it is fine for the few-hundred-token
+    prompts an embedding server sees and would need revisiting for
+    ModernBERT's full 8192-token context.
+    """
+    cu_seqlens, seq_lens, max_seqlen = _varlen_metadata(
+        cu_seqlens, bsz, seq_len, device=q.device, max_seqlen=max_seqlen
+    )
+    bounds = cu_seqlens.tolist()
+    output = torch.empty_like(q)
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        length = end - start
+        if length <= 0:
+            continue
+        # [heads, L, head_dim]
+        qs = q[start:end].transpose(0, 1)
+        ks = k[start:end].transpose(0, 1)
+        vs = v[start:end].transpose(0, 1)
+        mask = None
+        if window_size is not None:
+            left, right = window_size
+            idx = torch.arange(length, device=q.device)
+            offset = idx[:, None] - idx[None, :]
+            mask = (offset <= left) & (-offset <= right)
+        attended = torch.nn.functional.scaled_dot_product_attention(
+            qs, ks, vs, attn_mask=mask, scale=scale
+        )
+        output[start:end] = attended.transpose(0, 1)
+    return output
+
+
 def vision_attn_fa4(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -211,6 +324,66 @@ def vision_attn_fa4(
     )
     # FA4 CUTE returns (output, lse) in newer builds and bare output in older
     # ones; downstream callers only consume the tensor.
+    return result[0] if isinstance(result, tuple) else result
+
+
+def cross_attn_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Encoder-decoder cross-attention: q and kv have different lengths.
+
+    The three ``vision_attn_*`` backends above are self-attention shaped --
+    they pass one ``cu_seqlens`` for both sides because q_len == kv_len. A
+    Whisper decoder step has one query row per request against a fixed
+    encoder output, so the two sides differ and need separate cumulative
+    lengths. ``flash_attn_varlen_func`` already takes both.
+
+    ``k``/``v`` must be contiguous and in batch order. On sm_120 there is no
+    alternative: every indexed KV read this kernel offers is closed there --
+    ``page_table`` is refused outright ("Paged KV not supported on SM 12.0"),
+    ``gather_kv_indices`` needs ``qv``, and ``flash_attn_with_kvcache`` is an
+    unregistered placeholder. Measured 2026-08-21; see
+    ``unieinfra/xref/15-encoder-embedding.md`` §6.1 before assuming the caller
+    still has to materialise the gather.
+    """
+    # ``flash_attn_varlen_func`` requires q/k/v in one dtype. The decoder's
+    # query projection and the encoder's key/value projection can land on
+    # different precisions (Whisper: fp16 decoder vs an encoder that keeps the
+    # checkpoint's fp32 conv weights), and flash-attn then aborts with "query
+    # and key must have the same dtype". Normalize to the model-side query
+    # dtype; a fp32/bf16 encoder key is downcast to fp16 rather than aborting.
+    if q.dtype != k.dtype or k.dtype != v.dtype:
+        global _cross_attn_warned_dtype
+        target = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else k.dtype
+        if not _cross_attn_warned_dtype:
+            _cross_attn_warned_dtype = True
+            logger.info(
+                "cross_attn_varlen normalized q=%s k=%s v=%s -> %s",
+                q.dtype,
+                k.dtype,
+                v.dtype,
+                target,
+            )
+        q, k, v = (t.to(target) for t in (q, k, v))
+    result = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
     return result[0] if isinstance(result, tuple) else result
 
 
@@ -295,6 +468,8 @@ _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
     "triton_attn": vision_attn_triton,
     "fa3": vision_attn_fa3,
     "fa4": vision_attn_fa4,
+    "fa_varlen": vision_attn_fa_varlen,
+    "sdpa_window": vision_attn_sdpa_window,
     "flashinfer_cudnn": vision_attn_flashinfer_cudnn,
 }
 
@@ -440,6 +615,7 @@ class MultimodalEncoderAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         rotary_pos_emb_cos: torch.Tensor | None = None,
         rotary_pos_emb_sin: torch.Tensor | None = None,
+        window_size: tuple[int, int] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -560,6 +736,7 @@ class MultimodalEncoderAttention(nn.Module):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
             workspace_buffer=self._workspace_buffer,
+            window_size=window_size,
         )
 
         output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)

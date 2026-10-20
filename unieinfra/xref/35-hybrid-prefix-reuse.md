@@ -1,0 +1,657 @@
+# 35 — Hybrid 前綴重用：四家怎麼做，我們要怎麼做
+
+一句話問題：**共用文件 + 不同問題（RAG／agent 的形狀），在 Qwen3.5-27B 上我們重用 0。**
+
+量到的（`unieinfra/bench/`，`reuse_probe`，2690-token 文件 + ~130-token 尾巴）：
+
+| 情況 | 我們 | vLLM（**快取關閉，見下方更正**）|
+|---|---|---|
+| 冷（第一次） | 510 ms, cached=0 | 582 ms, cached=0 |
+| 完全重複 | **60 ms, cached=2752** | 412 ms, cached=0 |
+| 換尾巴（RAG） | 437 ms, cached=0 | 431 ms, cached=0 |
+
+> **更正（2026-08-10）：這一欄的 vLLM 不是 vLLM。**
+>
+> 這些數字是用 vLLM 的預設值量的，而 `Qwen3_5ForConditionalGeneration` 宣告 `IsHybrid`
+> 卻沒宣告 `MambaPrefixCaching`，所以 vLLM 把 `enable_prefix_caching` 解析成 **False，
+> 且不發任何警告**。上表量到的是一個**前綴快取被關掉的 vLLM**，那個 cached=0 是設定造成的，
+> 不是能力上限。
+>
+> 明確傳 `enable_prefix_caching=True` 之後，同一台卡、同一個模型、同一支 harness 的
+> RAG e2e（Qwen3.5-27B，conc=1/4/16 的 TTFT p50）：
+> **447.87 / 1620.73 / 4134.22 ms → 112.76 / 358.40 / 1160.97 ms。**
+> vLLM 在 RAG 形狀上**確實會重用**，它只是預設不重用。
+>
+> 因此「RAG 兩邊都是 0」這句話是錯的，`bf156ad4` commit message 裡的
+> 「vLLM reuses nothing in either case」同樣是錯的。本次改動仍然成立
+> （我們從 437 ms 降到 89.7 ms），但**它不是「補上一個 vLLM 也沒有的能力」，
+> 而是「補上一個 vLLM 打開開關就有的能力」**，而且領先幅度遠比原本記載的小。
+> 對照表見 `unieinfra/REPORT-commits.md` §12。
+>
+> 一般化的教訓已寫進 `AGENTS.local.md` 的量測紀律：**參照引擎的預設值要查，不能假設。**
+
+---
+
+## 為什麼是 0：一個 chunk 只發佈一個快照
+
+Full attention 的 KV 是可切片的：匹配到第 n 頁就用前 n 頁。線性注意力不是 ——
+它是遞迴狀態，要從第 n 個 token 接續，就必須有「處理完前 n 個 token 之後」的那個
+狀態本身。所以 hybrid 的前綴重用等於 `min(KV 匹配深度, 最深可用快照深度)`。
+
+我們每個 chunk 只發佈一個快照，位置在
+`csrc/fsm/forward_events.cpp:130 MambaCheckpointPublishDepth`：
+
+```cpp
+const std::int32_t publish_depth = (final_len / page_size) * page_size - page_size;
+```
+
+也就是**緊貼請求自己的結尾**。`augmentMatch`
+（`csrc/resource/hybrid_prefix_cache/hybrid_prefix_cache.cpp:132`）從 KV 匹配終點
+**往上**找帶快照的祖先 —— 而一個發在 2768 的快照，對於在 2690 分岔、匹配終點 2688 的
+請求來說是**子孫不是祖先**，看不見。找不到就把整個 KV 匹配丟掉，不是截斷，是丟掉。
+
+完全重複之所以能過，是因為它的匹配終點就在自己的快照之後。
+
+### 兩個已經試過並回退的修法
+
+1. **把快照往回退 256 token**（讓它落在分岔點之前）。結果**連完全重複也壞了**：
+   `AlignMambaCacheSeqlen(track_len) != track_len` 直接回 -1，等於什麼都沒發佈。
+   退讓量不是自由參數，只能是 GPU chunk 網格（`FLA_CHUNK_SIZE = 64`）的倍數。
+2. **調 `--mamba-track-interval`**（64 與 256）。RAG 仍是 0，完全重複仍是 2752 ——
+   那個旋鈕控制的是 flat 路徑上狀態群組的頁面網格，不是這條發佈路徑。
+
+---
+
+## 四家的策略
+
+| 引擎 | 每序列保留幾個遞迴快照 | 存在哪 | RAG 重用 |
+|---|---|---|---|
+| **SGLang** | 多個，掛在 radix 節點上 | 獨立的 `MambaCheckpointPool`，SSM 存 **int8** | 有 |
+| **vLLM** | `mamba_cache_mode="align"` 的對齊邊界 | KV block 池同一套管理 | **有，但預設關閉**（見開頭更正） |
+| **TRT-LLM** | 多個，但用途不同（replay 重算） | 雙緩衝 + `MIN_REPLAY_HISTORY_SIZE=16` | 不走前綴樹 |
+| **TurboMind** | 無此機制 | `kernels/linear_attn/` 只有前向 kernel | 無 |
+| **我們** | **一個** | working slot 旁的單一 `checkpoint_` | **無** |
+
+### SGLang：把檢查折進 descent，快照放獨立池
+
+`srt/mem_cache/mamba_radix_cache.py:1068 _match_prefix_helper` —— 下降時**沿路記錄**
+最深的帶快照節點，回傳的是那個節點：
+
+```python
+while len(key) > 0 and child_key in node.children.keys():
+    child = node.children[child_key]
+    if node.mamba_value is not None:      # 下降前先記
+        best_value_len = len(value)
+        best_last_node = node
+    ...
+if node.mamba_value is not None:          # 收尾再記一次
+    best_value_len = len(value)
+    best_last_node = node
+return value, best_last_node, best_value_len
+```
+
+**重用長度是 `min(KV, 快照)`，永遠不會因為終點沒快照就歸零。** 這是結構差異：
+我們先挑 KV 終點、再事後往上找；它是一邊下降一邊挑「兩者都有」的最深點。
+
+`srt/mem_cache/mamba_checkpoint_pool.py:186 MambaCheckpointPool` 解掉「多份快照很貴」：
+
+- **獨立於 working 池**，容量自己設，不和活躍請求搶
+- SSM 狀態存 **int8**（`Int8CheckpointStore`），scale 是 per-(layer, slot, head, k-channel)，
+  縮減軸取 `d_v`，對齊 `diag(alpha)` 的 per-k-channel 衰減
+- conv 窗口保持原 dtype（本來就小）
+- `store_from_active` / `load_to_active` 在兩池之間搬
+
+我們 `mamba_ssm_dtype='float32'`，換 int8 就是 **4x** 容量。
+
+### TRT-LLM：不是前綴樹，是 replay
+
+`_torch/pyexecutor/mamba_cache_manager.py` 走另一條路：保留一個歷史窗口，需要時
+**重算**而不是查表。`MIN_REPLAY_HISTORY_SIZE = 16` 是因為 replay kernel 會把 token 維
+補到 tensor-core tile，小於 16 不會更快、卻要更頻繁地寫 checkpoint。
+
+值得記的是它的取捨方向和我們相反：它用「重算」換「不存」。對 RAG 那種
+「一份文件被幾十個問題共用」的形狀，存一次給多次用顯然划算，所以我們不走這條。
+
+### TurboMind：沒有
+
+`src/turbomind/kernels/linear_attn/` 只有 `delta_rule.cu` 和前向 kernel，沒有任何
+前綴／重用機制。sm_120 的 `tma_desc_prepare.cu` 在，值得之後看它的 kernel 寫法，但
+在這一題上沒有可參考的結構。
+
+---
+
+## 設計：把 K 個中間狀態搬出來
+
+### 已經確認可用的東西
+
+**kernel 完全不用改。** `gdn_chunk_prefill(output_h=True)` 已經回傳每一段：
+
+```
+fi_checkpoints        [total_ckpts, H, V, K] float32，K-last
+                      checkpoint k = 處理完 chunk k 之後的狀態
+                      每序列數量 = L_i // FLA_CHUNK_SIZE（64）
+checkpoint_cu_starts  [N+1] int64，每序列在緩衝區的起點
+```
+
+2690-token 的前綴就有 **42 個**中間狀態躺在裡面。而複製那一步是純 gather/scatter
+（`runtime/layers/attention/backends/hybrid_linear_attn.py:2763`）：
+
+```python
+ssm_states[track_ssm_h_dst]  = fi_h_checkpoints[h_src]
+conv_states[track_ssm_h_dst] = mixed_qkv_t[:, track_conv_indices].transpose(0, 1)
+```
+
+**索引張量拉長 K 倍就直接能用。**
+
+### 瓶頸在傳遞與儲存
+
+`csrc/resource/allocator/local_mamba_allocator.h:56` 每請求持有恰好一個：
+
+```cpp
+std::unique_ptr<MambaSlot> checkpoint_{};
+```
+
+一路到 `mamba_checkpoint_dst_idx`（單一 int）→ `FlatForwardOperation` →
+bindings（`bindings/python_module.cpp:396`）→ `input_buffer.py` → 索引計算。
+
+### 改動清單
+
+| 檔案 | 改什麼 |
+|---|---|
+| `local_mamba_allocator.{h,cpp}` | `checkpoint_` → vector；`AllocateCheckpoints(n)` / `DetachCheckpoints()` |
+| `scheduler/operations/forward.{h,cpp}` | `mamba_checkpoint_dst_idx` → 攤平的 indices + 每請求 count（CSR 形式） |
+| `fsm/forward_events.cpp` | `MambaCheckpointPublishDepth` 回傳深度**列表**；逐一 `SplitAt` + `InsertMamba` |
+| `bindings/python_module.cpp` | 暴露攤平形式 |
+| `runtime/execution/input_buffer.py` | 帶上攤平的 dst 與 count |
+| `hybrid_linear_attn.py` | `_compute_track_ssm_indices` / `_compute_track_conv_indices` 每請求發 K 個 |
+| 新增 | checkpoint 池的配額與 LRU 淘汰 |
+
+### K 取多少
+
+不必搬 42 個。快照間隔 G 決定「分岔時最多損失多少重用」：
+
+| G | 2690-token 前綴的快照數 | 最差重用 |
+|---|---|---|
+| 64（全搬） | 42 | 2688 |
+| 512 | 5 | 2048 |
+| 1024 | 2 | 2048 |
+
+**建議 G = 512**（`K = ceil(prefix_len / 512)`）：每請求 5 個快照，最差仍重用 2048／2690。
+配合 int8 存放（4x），實際 slot 成本約等於現在的 1.25 倍。
+
+### 不變式（兩次失敗換來的）
+
+1. 發佈深度必須滿足 `AlignMambaCacheSeqlen(d - chunk_begin) == d - chunk_begin`。
+   GPU 只在自己的 chunk 網格上留中間狀態；不在網格上的深度會被靜靜丟掉（回 -1）。
+2. Python 的 `publish_lens` 與 C++ 的 `MambaCheckpointPublishDepth` **必須逐位一致** ——
+   C++ 用它把 slot 掛到 radix 節點，Python 用它決定搬哪一個索引。兩邊算不一樣，
+   狀態會被歸檔在一個它並不描述的深度上，之後的命中會從錯誤的遞迴狀態接續。
+   靜默且錯誤。這條在 `runtime/layers/attention/backends/hybrid_linear_attn.py:1508` 已有註解，改動時最容易破壞。
+3. `augmentMatch` 必須改成「回傳 min(KV, 快照) 的截斷」而不是「找不到就丟棄」——
+   否則就算發了 K 個，只要最深的那個比 KV 終點深，仍會歸零。
+
+---
+
+## 結果（已實作）
+
+`reuse_probe`，同一組 prompt，改動前後：
+
+| 情況 | 之前 | **之後** |
+|---|---|---|
+| 冷（第一次） | 510 ms, cached=0 | 543 ms, cached=0 |
+| 完全重複 | 60 ms, cached=2752 | **58 ms, cached=2752** |
+| **換尾巴（RAG）** | **437 ms, cached=0** | **89.7 ms, cached=2560** |
+
+RAG **快 4.9x**，重用 0 → 2560（stride 512 向下取整），而完全重複沒有退步 —— 這是設計時
+的硬條件，不能為了 RAG 犧牲它。
+
+**正確性**：重用 2560 個 token 的回答與同一問題在冷引擎上算出的**逐字相同**（`rag_correct.py`，
+3 個問題）。錯的遞迴狀態不會當掉，只會產生流暢而錯誤的文字，所以這一項比時間更重要。
+
+端到端（`e2e_concurrency.py --shape rag`，Qwen3.5-27B，700 字文件）：
+
+| conc | TTFT p50 | TTFT p99 | ITL p50 | TPS |
+|---|---|---|---|---|
+| 1 | 93.61 | 99.42 | 37.03 | 26.3 |
+| 4 | 262.99 | 264.29 | 39.77 | 92.4 |
+| 16 | 736.74 | 742.30 | 44.36 | 289.3 |
+
+改動前 RAG 的行為與冷 prefill 相同（`cached=0`），也就是 conc=1/4/16 分別是
+420.7 / 1624.7 / 4611.7 ms、TPS 23.4 / 62.1 / 110.2。對照之下 **TTFT 降 4.5–6.3x、
+TPS 升 12%–162%**，且 conc=16 的 TTFT p99 從 6.4 s 降到 742 ms —— 落回 1 秒 SLA 之內。
+
+### 實作與設計的兩處差異
+
+1. **額外的 slot 在發佈點補配，不在四個分配點。** 只有發佈點知道 chunk 範圍，因而知道
+   要幾個；在分配點預留上限會讓一份長文件餓死整批。配置是 best-effort，池子不夠只會
+   少留幾個快照，不會讓請求失敗。
+2. **發佈的 slot index 必須由發佈點記下來交給 forward operation。** 掛上樹時所有權就
+   轉移了，allocator 不再知道自己給了哪些 slot —— 而 operation 正是告訴 GPU 往哪寫的
+   東西。少了這一步，節點會持有永遠沒被寫入的 slot，之後的命中從未初始化的記憶體接續。
+   這是實作時唯一一個會靜默出錯的地方。
+
+## 驗收
+
+`unieinfra/bench/` 的 `reuse_probe` 三列都要動：
+
+- **換尾巴（RAG）**：`cached=0` → `≥ 2048`，437 ms → 應接近完全重複的 60 ms 量級
+- **完全重複**：維持 `cached=2752`、60 ms（不能為了 RAG 犧牲它）
+- **冷**：不變
+
+再跑 `e2e_concurrency.py --shape shared`（注意：那個形狀量的是完全重複，RAG 要用
+`reuse_probe` 或新增一個 shape），確認 TTFT 下降、TPS 上升。
+
+---
+
+## 文獻對照（讀於 2026-08-11）：我們實作的東西在論文裡叫 `Balanced`
+
+三篇，一篇有 code。它們把上面「為什麼是 0」與「K 取多少」兩節從工程判斷變成有名字的
+已知問題，並指出我們選的那個點不是最佳解。
+
+### 1. 我們的 0 是一個退化解，不是 bug
+
+*Sparse Prefix Caching for Hybrid and Recurrent LLM Serving*（arXiv 2605.05219，
+Shirokikh & Nikolenko，2026-05）把這題形式化。給定快照集合 `C = {c_1 < … < c_M}`，
+一個重疊深度為 `t` 的請求能接續的最深快照是：
+
+```
+ℓ(t; C) = max({0} ∪ {c ∈ C : c ≤ t})
+```
+
+需要重算 `r(t; C) = t − ℓ(t; C)` 個 token 的遞迴工作。
+
+那個 `∪ {0}` 就是本文件開頭那件事的數學版：**只有一個快照、而且它坐在比 `t` 深的位置
+時，集合是空的，`ℓ = 0`，整段重算。** `MambaCheckpointPublishDepth` 把唯一的快照發在
+`final_len` 附近，對任何在中途分岔的請求都是子孫節點 —— 所以 RAG 形狀必然是 0，
+而完全重複必然是滿的。兩個極端是同一個式子的兩端，不是兩個 bug。
+
+論文另外證明（Remark 1）**從快照重放是輸出精確的**：遞迴更新是決定性的，從 `c` 重放
+`c+1…t` 得到的狀態與從 0 全跑相同，他們跨資料集驗過 bit-exact。這與本文件
+`rag_correct.py` 的逐字相同是同一個保證，可以互相佐證。
+
+### 2. `G = 512` 等距 = 論文的 `Balanced`，而它只在重疊均勻時最佳
+
+論文比較五種配置策略。對照本文件「K 取多少」那節：
+
+| 論文策略 | 快照位置 | 我們 |
+|---|---|---|
+| No cache | — | 修改前 |
+| **Balanced** | `⌊i(L+1)/(M+1)⌋` 等距 | **現在（G = 512）** |
+| Block | `B, 2B, …, ⌊L/B⌋B` | — |
+| Sqrt | `⌊√L⌋` 間隔 | — |
+| DP-optimal | 依重疊分布解 Thm 2 | — |
+
+**Theorem 1**：balanced 在**均勻重疊**與**最差情況**下最佳，最差重算
+`⌈(L+1)/(M+1)⌉ − 1` —— 這正是本文件表格裡「G=512 → 最差重用 2048」那一欄，我們當時
+是手算出來的。
+
+**但 Fig 1 顯示真實重疊分布離均勻很遠**：QuALITY（單文件多問題，**就是我們的 RAG 形狀**）
+在文件全長附近有一個尖峰；System Prompts 的質量集中在短前綴。分布集中時，把 5 個快照
+均勻鋪開是在浪費預算 —— 該把它們堆在分岔點附近。
+
+**Theorem 2** 給出精確的 O(NM) DP（convex hull trick），用歷史重疊直方圖估分布，
+每 10 個請求重解一次，離線算完不上服務路徑。Thm 3/4 給了用經驗直方圖取代真分布的
+plug-in 保證與漂移界。
+
+**結果**：NarrativeQA 上 DP 版在整個 budget 範圍壓過 Balanced/Block/Sqrt/Logarithmic，
+recurrent-work reduction 最高 ~3.2x，而且**預算越低差距越大**。我們 K=5 正是低預算端。
+
+> **評測強度要打折**：RTX 2080 Super 8GB + HuggingFace Transformers（不是 serving
+> engine），wall-clock 只量「代表性層組」= Qwen-3.5-0.8B 的 1 個 full attention + 3 個
+> GDN 層。作者自己寫明這不能當完整模型的 serving benchmark。快照擷取還是在另一次
+> **不計時**的 run 裡做的，因為 FLA 沒有暴露非最後位置的擷取 API —— 而我們的
+> `gdn_chunk_prefill(output_h=True)` 已經有（見「已經確認可用的東西」），
+> **這一項我們領先論文的原型。** 沒有 code release。
+
+### 3. Marconi：我們 TODO 裡「快取池配額與 LRU 淘汰」那一格的答案
+
+*Marconi: Prefix Caching for the Era of Hybrid LLMs*（MLSys'25 Outstanding Paper
+佳作，Princeton + AWS，<https://github.com/ruipeterpan/marconi>）與上一篇**正交**：
+上一篇決定「一個 entry 內部快照放哪」，Marconi 決定「**哪些 entry 值得留**」。
+
+它量化了本文件開頭那個現象（7B 模型，Fig 3a）：
+
+| block size | KV block 重用率 | 遞迴狀態重用率 | 差距 |
+|---|---|---|---|
+| 32 | 25.0% | **0.4%** | **65.3x** |
+| 64 | — | — | 27.9x |
+| 128 | — | 3.3% | 11.1x |
+
+記憶體側：block size 16 時單一 SSM 層的狀態是同 block 內 Attention 層 KV 的 4 倍；
+7B 模型單一 10K token 序列吃 **17.4 GB**，是同尺寸 Transformer 的 3.3 倍。
+**細粒度快照會把池子打爆**，這是我們把 G 訂在 512 而不是 64 的獨立佐證。
+
+兩個機制：
+
+- **Admission（推測性插入）**：把前綴重用分成「純輸入」（system prompt、few-shot —— 跨
+  請求共享、會分岔）與「輸入+輸出」（對話歷史 —— 只往後接、不分岔）。prefill 前先把
+  輸入 token 試插進 radix tree，**只有會產生中間節點（分岔點）的位置才值得下錨**。
+  最後一個 decoded token 無論如何都存。
+- **Eviction（FLOP-aware）**：不只看 recency，看重用時能省多少計算、再除以佔用空間。
+  刻意犧牲短序列命中率換長序列。
+
+**結果**：token hit rate 比擴充過 hybrid 支援的 vLLM/SGLang 高 **4.5–34.4x**，
+P95 TTFT 低 **36.1–71.1%**（103.3–617.0 ms）。
+
+Marconi 明講**當時沒有任何既有系統支援 hybrid 的 prefix caching**，vLLM/SGLang 的對照組
+是他們自己擴充的 —— 這與本文件開頭那則更正（vLLM 在 Qwen3.5 上 `enable_prefix_caching`
+靜默解析成 False）是同一件事的兩個來源。
+
+### 4. 第三條路：不要存狀態
+
+*KVBuffer: IO-aware Serving for Linear Attention*（arXiv 2605.19049，Yale，2026-05）
+的 §6 提出另一個位置：**遞迴狀態可以從緩衝的 K/V 重建**。所以與其快取狀態，不如快取
+選定前綴的 K/V，命中時再把狀態算出來。狀態太大導致快照只能粗粒度、難以在任意位置切分
+—— 那個限制在這條路上不存在。
+
+代價是命中時要付重建的計算，而且它要求引擎有 chunkwise 的 KV 緩衝機制（該論文的主體）。
+
+### 5. 三個位置
+
+| | 主張 | 我們的狀態 |
+|---|---|---|
+| **Sparse**（2605.05219） | 存狀態，選好 entry **內部**的位置 | 已實作 `Balanced`；DP 版未試 |
+| **Marconi**（MLSys'25） | 存狀態，選好留**哪些 entry** | 未實作（= TODO 的池配額／淘汰） |
+| **KVBuffer** §6（2605.19049） | **不存狀態**，存 K/V 現場重建 | 未評估 |
+
+三者不互斥。Sparse 與 Marconi 作者互相確認正交，可直接疊。
+
+### 6. 可測候選
+
+| 候選 | 量什麼 | 為什麼值得 |
+|---|---|---|
+| P1 分岔點對齊 | 把快照從等距改成「靠近實際分岔深度」，同樣 K=5 | `reuse_probe` 現在拿 2560/2690，損失 130 是 stride 向下取整；分岔深度會變時損失更大 |
+| P2 重疊深度直方圖 | 在 RAG／shared 形狀上記錄實際重疊深度分布 | Thm 2 的輸入。分布若真的是尖峰，DP 相對 Balanced 的增益就是論文說的低預算大增益 |
+| P3 Marconi admission | 只在會產生 radix 分岔的節點下錨，取代固定 G | 直接減少快照數；池壓力是我們把 G 訂大的唯一理由 |
+| P4 FLOP-aware 淘汰 | 對照 LRU | TODO 那一格，有現成參考實作 |
+
+### 7. 未解格
+
+- 本文件「四家的策略」表裡我們那列仍寫「保留幾個：**一個**／RAG 重用：**無**」，
+  那是修改前的狀態，與「結果（已實作）」矛盾。表要更新，但要先確認 G=512 在
+  當前 build 上仍成立（見下）。
+- **上面所有量測數字的時間戳是 2026-07-25 前後，而本分支此後有 41 個 commit**，
+  其中包含 scheduler 優先權重排（`d1018671`，commit message 自陳未量測）。
+  引用本文件任何 ms 數之前先重跑。
+
+
+---
+
+## 8. checkpoint 密度在高併發下是「重用 vs 常駐」，不是純粹的重用（實測，2026-08-17）
+
+出貨的間距是從 `max_model_len` 推導的固定值（`_MAX_STATE_CHECKPOINTS = 2`，
+`qwen35.py`）。它在 RAG c=64/128 上讓 goodput 從 0.75x 掉到 0.66x，重用從 75.5%
+掉到 69.5%，所以看起來像是「短 prompt 拿不到 checkpoint」的 bug ——
+MML=16384 → 間距 64 blocks，而 RAG 的 prompt 只有約 32 頁，落在一個間距之內。
+
+**把間距改成從請求自己的長度推導（固定 K 個快照）之後，RAG 更差。** 實測：
+
+| RAG c=64 | per-request K=2 | 固定間距（出貨值） |
+|---|---|---|
+| goodput | **2.49** req/s | 4.26 / 4.37 |
+| P99 TTFT | **8,955 ms** | 4,681 / 4,525（SLO 5,000） |
+| TPOT p50 | 30.1 ms | 39.0 ms |
+| reuse | 71.0% | 69.5% |
+
+重用確實升了 1.5 個百分點，TPOT 也更好，但 **P99 TTFT 幾乎翻倍**，跨過 SLO 的請求
+變多，goodput 掉 42%。原因是 charge：固定間距給一個 32 頁的 RAG 請求 **1** 個
+backed page（只有 chunk 尾），per-request K=2 給它 **2** 個。RAG 在 c=64 是
+arena-bound 的，多那一個 checkpoint 換到的重用補不回常駐數。
+
+**結構上的結論**：固定間距按「prompt 相對於 `max_model_len` 的長度」分配 checkpoint
+—— 短 prompt 少、長 prompt 多 —— 而 arena 壓力正好隨「併發 × 短 prompt」上升。
+per-request 的 K 讓長短 prompt 都拿到 K 個，分不開這兩者。**在這一題上固定間距是對的
+抽象，per-request 不是。** agent 26k c=16 兩者持平（1.00 vs 0.99），所以這個改動是
+純粹的退步，已還原。
+
+RAG c=64/128 的 LOSS 因此不是 checkpoint 密度能解的。下一格要看的是容量本身
+（`fp8 KV` 有 2x），或 vLLM 在這個形狀上到底快在哪 —— 我們 1,089 tok/s 對它 1,647，
+而兩邊 TTFT p50 都在 1 秒級，差距不在准入。
+
+## 9. vLLM 側的同一題：命中率是被容量吃掉的，不是被粒度（原始碼 + 既有日誌，2026-08-17）
+
+在 `github.com/unieai/vllm` 分支 `roy/mamba-checkpoint-reuse` 上把 §8 的想法移植過去
+（新旗標 `--mamba-align-retained-states`，讓 align 模式在 stride 邊界上不釋放狀態
+block），實測只有 +2.8%。這一節是「為什麼只有 +2.8%」的歸因，全部不需要 GPU：
+只讀原始碼和已經跑完的日誌。
+
+### 9.1 目標模型的頁大小是算得出來的
+
+Qwen3.6-35B-A3B(`config.json`)：40 層、`full_attention_interval 4` →
+**10 層 full attention + 30 層 GDN**。
+
+| | 每層每 block 的位元組 |
+|---|---|
+| full attention | `1056 tokens × 2(K,V) × 2 kv heads × 256 head_dim × 2 B` = **2,162,688** |
+| GDN | ssm `32×128×128 × 4 B(fp32)` = 2,097,152 + conv `8192×4 × 2 B` = 65,536 = **2,162,688** |
+
+兩者精確相等，這就是引擎日誌那兩行的來源：
+
+    Setting attention block size to 1056 tokens to ensure that attention page
+    size is >= mamba page size.
+    Padding mamba page size by 0.76% to ensure that mamba page size and
+    attention page size are exactly equal.
+
+vLLM 是**把 attention 的 block 撐大到 mamba 頁**，不是把 mamba 頁縮小。1056 tokens
+的 attention block 因此是被 GDN 狀態尺寸決定的，不是自由參數。
+
+### 9.2 群組結構：attention 和 mamba 共用一個可互換的池
+
+用手算的 spec 直接跑 vLLM 自己的 `get_kv_cache_groups` /
+`get_kv_cache_config_from_groups`（純 Python，無 GPU，探針見附註）：
+
+    4 groups, sizes [10, 10, 10, 10]
+      FullAttentionSpec  10 layers
+      MambaSpec          10 layers   ×3
+
+10 個 tensor，每個由 4 層共享（每 group 一層）；block id 全域唯一，所以同一個 id
+不會同時被兩個 group 佔用。**這就是我們的 LCM arena：一個池，attention 和 mamba
+可互換。** 原本以為這是我們相對 vLLM 的結構優勢，不是——vLLM 已經是這樣了，這條
+移植路線是空的。
+
+### 9.3 `max_memory_usage_bytes` 只是諮詢用的
+
+    num_blocks = 380      # retained=0
+    num_blocks = 380      # retained=4
+
+`retained` 完全不改變池子大小。追 `max_memory_usage_bytes` 的所有呼叫端：啟動可行
+性檢查、`_estimate_max_model_len_from_groups`、以及日誌那行 `Maximum concurrency`。
+**沒有一個是執行期的閘門**——`max_admission_blocks_per_request` 只掛在
+`SlidingWindowSpec` 和 `ChunkedLocalAttentionSpec` 上，mamba 和 full attention 都
+沒有。
+
+所以「retained=4 砍掉 18.5% 容量」是錯的推論，我一度這樣寫。它只砍掉**回報的**併發
+數（7.18x → 5.85x），而 5.85x 正是日誌裡印的值——這反過來獨立證實了那次跑的旗標
+確實生效。
+
+即便如此這仍是記帳錯誤，已修：retained 快照是**共享前綴快取**，共用同一段前綴的請
+求資源命中的是同一批 block，而且隨時可被淘汰；按每請求私有計費會低估併發，並可能
+拒絕一個其實跑得動的啟動組態。請求私有的只有「當前 + 前一個」狀態 block。
+
+### 9.4 真正的成本是 pinning，真正的限制是容量
+
+修掉記帳後，`--mamba-align-retained-states` 的執行期效果只剩一個：讓
+`remove_skipped_blocks` 不要釋放 stride 邊界上的 block。被釘住的 block 保證在，代
+價是池子變小；被釋放的 block 進 free queue 後**仍然是 hashed、仍然可命中**，直到被
+淘汰。所以這筆交易是「保證命中 vs 池子大小」。
+
+C=16 時 16 請求 × 4 = 64 個 block 被釘死，佔 380 的 **17%**。而池子本來就在飽和：
+
+| 時間 | KV 使用率 | 命中率(累計) |
+|---|---|---|
+| 11:23:44 | 24.5% | **93.9%** |
+| 11:23:54 | 70.7% | 70.2% |
+| 11:24:14 | 92.3% | 51.2% |
+| 11:24:34 | 99.2% | 38.5% |
+| 11:24:44 | 96.0% | **35.1%** |
+
+`CachingMetrics` 的窗口是 `max_recent_requests`（預設 1000），這次只有 64 個請求，
+**窗口從未滑動**，所以上表是累計值——末段的邊際命中率遠低於 35.1%。
+
+**命中率是被容量吃掉的。** 26k 提示需要 25 個 attention block + ~6 個 mamba
+block-slot ≈ 31 個 id；380/31 = 12.2 併發，C=16 就已經超訂。在這個體制下，任何
+「重新分配池子」的改動都會打平——和 §8 在我們自己引擎上得到的結論完全一致，兩邊
+獨立撞到同一面牆。
+
+### 9.5 每 step 每請求只有一個真實 block
+
+順帶確認一個原本以為是瓶頸的東西不是。align 模式的 `allocate_new_blocks` 會把
+`[prev_block_len, num_skipped_blocks)` 一次填成 `_null_block`，而且上游自己寫了
+
+    assert num_new_blocks <= 1
+
+所以快照粒度 = **每個 scheduler step 每個請求處理的 token 數**，不是 `block_size`。
+高併發下每步每請求的 chunk 很小，粒度自然很細——粒度不是限制。
+
+`find_longest_cache_hit` 的對齊過濾 `(i+1)*block_size % alignment_tokens != 0` 也不
+會再砍一刀：`alignment_tokens = scheduler_block_size`，而 hybrid 上它等於
+`block_size`，該分支直接短路。
+
+### 9.6 剩下的槓桿
+
+診斷指向容量，而 vLLM 的結構本身沒有可撿的東西（9.2）。唯一能動的是**縮小每請求
+的位元組**，而最大的一項是 GDN 的 ssm 狀態：`mamba_ssm_dtype: float32`，
+`32×128×128×4 B` = 2 MiB/層，佔了整個 mamba 頁的 97%。改成 bf16 後頁縮到
+1,114,112 B，attention block 隨之降到 544 tokens，同樣記憶體下 block 數
+380 → ~737，**約 1.9x 容量**。
+
+這正是 SGLang 的 `--enable-int8-mamba-checkpoint` 在做的事：**量化存下來的
+checkpoint，活躍狀態維持高精度**。我們自己則因為它和 hierarchical cache 會把 int8
+checkpoint slot 當 bf16 active slot 讀而拒絕這個組合（見 `AGENTS.md` 的設計習慣一
+節）。vLLM 沒有這個東西。
+
+這是量化，落在「先不做任何量化」的範圍內，需要先確認才動。
+
+> 附註：探針 `kv_split_probe.py` 手工建 `FullAttentionSpec` / `MambaSpec` 再跑
+> vLLM 自己的群組與配置函式，不需要 GPU 也不需要權重。它先斷言兩邊頁大小相等，
+> 這一點和引擎日誌對得上，才有資格談後面的數字。
+
+## 10. 一個 parent 只能放一個 checkpoint，而 16 是 2 的冪的巧合（原始碼，2026-08-17）
+
+§8 量到「每請求第二個 backed page」在 RAG c=64 上要 42% 的 goodput
+（4.26 → 2.49 req/s）。這一節是那個代價的機制，以及它是不是必然。
+
+### 10.1 parent 是可互換單位，不是共享容器
+
+引擎自己印的：
+
+    parent_bytes=41943040, P=128, parents=222, token_capacity=454656, layers=40,
+    groups={'full_attention': 16, 'linear_attention_0': 1,
+            'linear_attention_1': 1, 'linear_attention_2': 1}
+
+`qwen_gdn_cache_fields` 把 plane 命名成 `unit.{unit}.a` / `unit.{unit}.b`，而
+`unit` 是**每群組各自的計數器**，所以不同群組共用同一組 plane id；
+`solve_cache_layout` 對 plane 取 `max` over groups。**因此一個 parent 同時只服務
+一個群組**，`usable_pages = num_lcm_blocks × cache_blocks_per_lcm_block` 是「所有
+parent 都給這個群組時」的上限，不是同時可得的量。
+
+### 10.2 那 48.8% 的浪費是什麼，以及它不是可回收的
+
+| plane | attention 放什麼 | state 放什麼 | 大小 |
+|---|---|---|---|
+| `unit.j.a` ×10 | K：16 頁 × 131,072 | ssm **2,097,152** | 2,097,152 |
+| `unit.j.b` ×10 | V：16 頁 × 131,072 | conv **49,152** | 2,097,152 |
+
+合計 41,943,040 = parent，逐位元吻合；state raw = 10×2,097,152 + 10×49,152 =
+21,463,040，同樣吻合。K/ssm 那半邊是**精確相等**的設計（16 個 attention 頁 ≡ 1 個
+ssm）；浪費全在 `.b`：**conv 只有 49,152 B 卻佔著一個 V 尺寸的 plane，使用率 2.34%。**
+
+**但把 conv 搬到自己的 plane 是輸的。** 那些位元組不是全域浪費，它們只在該 parent
+拿去放 state 時閒置，而 parent 拿去放 attention 時就需要它們——這是可互換性的代價。
+搬走只是多一個 attention 付錢卻用不到的 plane。用「每位元組買到幾個 block」來比：
+
+| 方案 | parent | attn/parent | state/parent | attn 每位元組 | state 每位元組 |
+|---|---|---|---|---|---|
+| 出貨 | 41,943,040 | 16 | 1 | 3.8147e-7 | 2.3842e-8 |
+| conv 獨立 plane | 84,869,120 | 32 | 2 | 3.7705e-7（−1.2%） | 2.3566e-8（−1.2%） |
+| **parent = 17 個 attn block** | **44,564,480** | **17** | **2** | **3.8147e-7（持平）** | **4.4880e-8（+88%）** |
+
+真正的槓桿是 **16 是 2 的冪的巧合**：
+
+    44,564,480 / 17 = 2,621,440   ← 與現行 attention stride 逐位元相同，零 padding
+    44,564,480 /  2 = 22,282,240  ≥ 21,463,040，state padding 3.8%
+
+**attention 每位元組一點不虧，state 容量 +88%。**
+
+### 10.3 但 packing=2 只在同一群組有 ≥2 個 checkpoint 時才有用
+
+parent 綁群組，而 state 有 **3 個**群組。一個請求在每組各放 1 個 block，就得佔 3 個
+parent，每個只用一半——packing 提高完全幫不上。
+
+| 每組 checkpoint 數 | 出貨（packing 1） | packing 2 |
+|---|---|---|
+| K=1 | 3 parents | 3 parents |
+| **K=2** | **6 parents** | **3 parents** |
+
+**所以 packing=2 的效果精確地是「讓第二個 checkpoint 免費」**，而 §8 量到的正是
+K=2：多出來的 3 個 parent 就是那 42% goodput 的去向。§8 的失敗實驗因此是這個改動的
+現成對照組。
+
+### 10.4 卡在一個 ABI，而且它寫在程式裡
+
+    # hybrid_mha.py:109
+    if ssm.stride(0) != int(np.prod(ssm.shape[1:])):
+        raise ValueError("... the GDN decode ABI requires contiguous state page rows")
+
+一個 parent 放兩個 state block，等於 ssm 的 page stride 不再等於 payload，所以 ssm
+必須從 `exact_page_stride=True` 改成 `False`（planner 用來標「kernel 吃 tensor 的
+runtime stride」）。`conv` 早就是 `False`，所以機制存在；`fla_kda_recurrent.py` 也
+早就在傳 `stride_state_page=h_pool.stride(0)`——但那是 KDA 不是 GDN，而 GDN 的
+FlashInfer 後端大概跟不上。
+
+`base.py:202` 的欄位 view 本來就是 `as_strided(page_stride_bytes // element_size)`，
+所以**框架層不需要改**，要改的只有宣告自己走隱含 stride 的那些 kernel。
+
+### 10.5 四家怎麼做（調查，2026-08-17）
+
+| 引擎 | conv / ssm 配置 |
+|---|---|
+| SGLang | 兩個獨立 tensor，`(num_layers, size+1) + shape`，按 slot 索引 |
+| TRT-LLM | 兩個獨立 `torch.zeros`；`intermediate_*_states` 是 MTP 用的，不是前綴 checkpoint |
+| lmdeploy | `conv_state` 與 `recurrent_state` 分開載入 |
+| vLLM | 同一頁但 `page_size = conv + ssm`，沒有 V 尺寸的 plane 逼它變大 |
+
+**四家一致：沒有任何一家把 conv 的 page stride 綁在 attention 的 V 上。** 這個耦合
+是 LCM arena 獨有的，也是這一節整個問題的來源。
+
+### 10.6 實測：每一次准入拒絕都由 state 群組造成（2026-08-17）
+
+`AdmissionPlanner::Plan()` 在 `/workspace/roy/.plan_trace.on` 存在時，會把每次拒絕
+的每群組需求寫進 `.fits_trace.txt`。這個儀表**已經編譯在出貨的 .so 裡**，不需要重建。
+
+Qwen3.5-27B、RAG c=64、n=64、MML=16384、GPU 0
+（`parent_bytes=100663296, parents=366, groups={'full_attention': 12,
+'linear_attention_0/1/2': 1}`）。
+
+**82 次拒絕，82 次完全相同：**
+
+    parents_needed=3  empty_parents=1
+    g0(need=1 free=0 slots=1)   linear_attention_0
+    g1(need=1 free=0 slots=1)   linear_attention_1
+    g2(need=1 free=0 slots=1)   linear_attention_2
+    g3(need=1 free=7 slots=12)  full_attention
+
+扣掉 `free` 之後每群組實際要求的 parent 數：state 三組各 **1**，attention **0**，
+82/82 皆然。**注意力從來不是拒絕的原因。**
+
+而且原因是結構性的而非壓力性的：**`slots=1` 讓 state parent 從綁定的那一刻起
+`free` 恆為 0**，所以 state 永遠無法重用已綁定的 parent，每一個 state block 都必須
+要一塊**全空**的 parent。一個總共只要 4 個 block 的請求，在 7 個 attention slot 空
+著的情況下被拒絕，而 `empty_parents=1` —— 每一次都差兩塊。
+
+**這修正了 §10.3 的框架。** 共用是**跨請求**的，不是請求內的：parent 綁的是群組
+（`block_pool.h:94` 的 `BoundGroup` 回傳單一 optional group，所以三個 state 群組
+永遠不可能共用一個 parent 的不同 slot），而同一群組的兩個 block 來自兩個不同請求。
+
+| | packing 1（出貨） | packing 2 |
+|---|---|---|
+| 單一請求孤立來看 | 3 parents | **3**（不變） |
+| 64 請求 × 3 群組 × 1 block | **192 parents，每一個都必須是空的** | **96** |
+
+所以 packing=2 **在 K=1 就已經是純贏**，不必等到多 checkpoint 才划算：它把「需要全空
+parent」變成「可以擠進已綁定的 parent」，直接打在這 82 次拒絕上。
+
+> **同一次跑的端到端數字已作廢。** 另一個 session 的 gemma arm 從 21:14:11 起在
+> GPU 1 上跑，我的 benchmark 視窗落在其中。不同卡，但同一個容器與主機 CPU。trace
+> 不受影響——它是 allocator 對 GPU 0 arena 的自有記帳，且 82 筆逐筆相同而非平均值。
+> 乾淨窗口的 35B 覆核另記。

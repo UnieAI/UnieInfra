@@ -1,0 +1,582 @@
+[
+ {
+  "range": 0,
+  "action": 0,
+  "name": "vectorized_elementwise_kernel",
+  "name_demangled": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase &, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 3)]::operator ()() const::[lambda(int) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 0.249455732946299,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.016873146387524254,
+  "lts__t_sector_hit_rate.pct": 77.66345834716229,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 8.288438807055828,
+  "gpu__time_duration.sum": 3584.0,
+  "dram__bytes.sum.per_second": 3928571428.5714283,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 2,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 36,
+  "launch__waves_per_multiprocessor": 0.0008865248226950354,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 1,
+  "name": "vectorized_gather_kernel",
+  "name_demangled": "void at::native::vectorized_gather_kernel<(int)16, int>(char *, char *, T2 *, int, long, long, long, long, bool)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 1.1922074774283464,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 13.678571818410049,
+  "lts__t_sector_hit_rate.pct": 43.088387588023,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 76.13512026315989,
+  "gpu__time_duration.sum": 10656.0,
+  "dram__bytes.sum.per_second": 18906906906.906906,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 3820,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 24,
+  "launch__waves_per_multiprocessor": 3.3865248226950353,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 2,
+  "name": "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign16o40961_tensorptrbf16gmemalign128oi64409640961___T_0",
+  "name_demangled": "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign16o40961_tensorptrbf16gmemalign128oi64409640961___T_0",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 48.77215068842427,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 9.590671551579847,
+  "lts__t_sector_hit_rate.pct": 6.181507866119847,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 36.93066548182734,
+  "gpu__time_duration.sum": 20192.0,
+  "dram__bytes.sum.per_second": 776050713153.7242,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 955,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 56,
+  "launch__waves_per_multiprocessor": 1.0159574468085106,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 3,
+  "name": "Kernel2",
+  "name_demangled": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Params)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 13.270576834447114,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 89.71523701215925,
+  "lts__t_sector_hit_rate.pct": 92.46483136541539,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.65388472998485,
+  "gpu__time_duration.sum": 311872.0,
+  "dram__bytes.sum.per_second": 211776728914.42642,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 360,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 232,
+  "launch__waves_per_multiprocessor": 1.9148936170212767,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 4,
+  "name": "_fused_qk_rmsnorm_kernel",
+  "name_demangled": "_fused_qk_rmsnorm_kernel",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 21.651178603807796,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 40.79300333455694,
+  "lts__t_sector_hit_rate.pct": 8.95235966847071,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 48.347146397620165,
+  "gpu__time_duration.sum": 56672.0,
+  "dram__bytes.sum.per_second": 345206098249.5765,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 76400,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 17,
+  "launch__waves_per_multiprocessor": 33.86524822695036,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 5,
+  "name": "BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel",
+  "name_demangled": "void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<(bool)0, (unsigned int)128, (unsigned int)8, (unsigned int)16, __nv_bfloat16, long>(T5 *, T5 *, T5 *, T5 *, float *, T6 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 63.76583333333333,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 20.809506512065063,
+  "lts__t_sector_hit_rate.pct": 53.69664271303244,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 78.28389872572161,
+  "gpu__time_duration.sum": 19424.0,
+  "dram__bytes.sum.per_second": 1008487644151.5651,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 9560,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 40,
+  "launch__waves_per_multiprocessor": 4.23758865248227,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 6,
+  "name": "_store_kv_cache_kernel",
+  "name_demangled": "_store_kv_cache_kernel",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 45.60883299558946,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.3631190271408,
+  "lts__t_sector_hit_rate.pct": 2.193525172665394,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 71.82697809891692,
+  "gpu__time_duration.sum": 10880.0,
+  "dram__bytes.sum.per_second": 720211764705.8824,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 3820,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 18,
+  "launch__waves_per_multiprocessor": 1.6932624113475176,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 7,
+  "name": "_fwd_kernel",
+  "name_demangled": "_fwd_kernel",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 10.642223953117465,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 34.50275036801729,
+  "lts__t_sector_hit_rate.pct": 38.17063694489706,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.62997786461819,
+  "gpu__time_duration.sum": 138432.0,
+  "dram__bytes.sum.per_second": 169793804900.601,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 4032,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 200,
+  "launch__waves_per_multiprocessor": 21.4468085106383,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 8,
+  "name": "Kernel2",
+  "name_demangled": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Params)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 9.964089267371351,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 60.26796580844063,
+  "lts__t_sector_hit_rate.pct": 91.83518887281691,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.653348180717863,
+  "gpu__time_duration.sum": 309856.0,
+  "dram__bytes.sum.per_second": 159001962201.79697,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 240,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 232,
+  "launch__waves_per_multiprocessor": 1.2765957446808511,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 9,
+  "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "name_demangled": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 63.07797805642633,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 7.250014043139412,
+  "lts__t_sector_hit_rate.pct": 53.70040923458886,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 22.493463113944294,
+  "gpu__time_duration.sum": 31136.0,
+  "dram__bytes.sum.per_second": 1005886947584.7894,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 955,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 124,
+  "launch__waves_per_multiprocessor": 1.6932624113475176,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 10,
+  "name": "Kernel2",
+  "name_demangled": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Params)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 14.563247615309797,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 90.84307701074829,
+  "lts__t_sector_hit_rate.pct": 93.40262301287278,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.6557737980651,
+  "gpu__time_duration.sum": 1203136.0,
+  "dram__bytes.sum.per_second": 232441300069.15262,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 1440,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 232,
+  "launch__waves_per_multiprocessor": 7.659574468085107,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 11,
+  "name": "act_and_mul_kernel",
+  "name_demangled": "void flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, &silu>(T1 *, const T1 *, int)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 87.79486212839294,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 20.58334732993424,
+  "lts__t_sector_hit_rate.pct": 11.457892373543697,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 62.15317467606846,
+  "gpu__time_duration.sum": 71520.0,
+  "dram__bytes.sum.per_second": 1400418791946.3088,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 1910,
+  "launch__block_size": 1024,
+  "launch__registers_per_thread": 39,
+  "launch__waves_per_multiprocessor": 10.159574468085106,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 12,
+  "name": "Kernel2",
+  "name_demangled": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_tn_align8>(T1::Params)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 13.763554848826168,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 84.1968428288373,
+  "lts__t_sector_hit_rate.pct": 93.4498322051482,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.59829887183607,
+  "gpu__time_duration.sum": 697248.0,
+  "dram__bytes.sum.per_second": 219660195511.4966,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 1024,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 222,
+  "launch__waves_per_multiprocessor": 5.446808510638298,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 13,
+  "name": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "name_demangled": "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gmemalign128oi64409640961_tensorptrbf16gme_0",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 63.88755431149733,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 7.32958225752764,
+  "lts__t_sector_hit_rate.pct": 53.91491526381732,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 22.817362860180854,
+  "gpu__time_duration.sum": 30752.0,
+  "dram__bytes.sum.per_second": 1018414151925.078,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 955,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 124,
+  "launch__waves_per_multiprocessor": 1.6932624113475176,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 14,
+  "name": "Kernel2",
+  "name_demangled": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Params)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 13.233341950627011,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 89.57510903471085,
+  "lts__t_sector_hit_rate.pct": 92.4746416775323,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.65107304336361,
+  "gpu__time_duration.sum": 312736.0,
+  "dram__bytes.sum.per_second": 211188376138.34033,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 360,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 232,
+  "launch__waves_per_multiprocessor": 1.9148936170212767,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 15,
+  "name": "_fused_qk_rmsnorm_kernel",
+  "name_demangled": "_fused_qk_rmsnorm_kernel",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 21.54180948944615,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 40.57973619902865,
+  "lts__t_sector_hit_rate.pct": 9.153534225287133,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 48.61898442715977,
+  "gpu__time_duration.sum": 56960.0,
+  "dram__bytes.sum.per_second": 343460674157.30334,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 76400,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 17,
+  "launch__waves_per_multiprocessor": 33.86524822695036,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 16,
+  "name": "BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel",
+  "name_demangled": "void flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<(bool)0, (unsigned int)128, (unsigned int)8, (unsigned int)16, __nv_bfloat16, long>(T5 *, T5 *, T5 *, T5 *, float *, T6 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 65.17802385008518,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 21.30212243477898,
+  "lts__t_sector_hit_rate.pct": 53.62268642810363,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 78.46905848257752,
+  "gpu__time_duration.sum": 19040.0,
+  "dram__bytes.sum.per_second": 1028826890756.3024,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 9560,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 40,
+  "launch__waves_per_multiprocessor": 4.23758865248227,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 17,
+  "name": "_store_kv_cache_kernel",
+  "name_demangled": "_store_kv_cache_kernel",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 45.98005047470256,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 4.397471922144454,
+  "lts__t_sector_hit_rate.pct": 2.1882677212535206,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 70.67734450302157,
+  "gpu__time_duration.sum": 10784.0,
+  "dram__bytes.sum.per_second": 726599406528.19,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 3820,
+  "launch__block_size": 128,
+  "launch__registers_per_thread": 18,
+  "launch__waves_per_multiprocessor": 1.6932624113475176,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 18,
+  "name": "_fwd_kernel",
+  "name_demangled": "_fwd_kernel",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 10.634335272969867,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 34.38132598546984,
+  "lts__t_sector_hit_rate.pct": 38.27028080630884,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.62986916361945,
+  "gpu__time_duration.sum": 138528.0,
+  "dram__bytes.sum.per_second": 169676137676.13766,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 4032,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 200,
+  "launch__waves_per_multiprocessor": 21.4468085106383,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ },
+ {
+  "range": 0,
+  "action": 19,
+  "name": "Kernel2",
+  "name_demangled": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Params)",
+  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 9.959077812184338,
+  "sm__throughput.avg.pct_of_peak_sustained_elapsed": 60.09757855548272,
+  "lts__t_sector_hit_rate.pct": 91.83484417974947,
+  "sm__warps_active.avg.pct_of_peak_sustained_active": 16.650343763706395,
+  "gpu__time_duration.sum": 310016.0,
+  "dram__bytes.sum.per_second": 158921552436.0033,
+  "dram__bytes_read.sum": null,
+  "dram__bytes_write.sum": null,
+  "launch__grid_size": 240,
+  "launch__block_size": 256,
+  "launch__registers_per_thread": 232,
+  "launch__waves_per_multiprocessor": 1.2765957446808511,
+  "nvtx_ranges": {
+   "<default domain>": [],
+   "NCCL": [
+    "ncclCommInitRankConfig"
+   ],
+   "tokenspeed": [
+    "forward_step ext=126 dec=0",
+    "target_forward"
+   ],
+   "CCCL": []
+  }
+ }
+]

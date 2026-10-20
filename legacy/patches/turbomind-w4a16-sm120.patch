@@ -1,0 +1,427 @@
+From 54571b39d25346901896b77425ddab68436a30ae Mon Sep 17 00:00:00 2001
+From: Roy Shih <royshih.cs11@nycu.edu.tw>
+Date: Tue, 4 Aug 2026 03:15:30 +0000
+Subject: [PATCH] turbomind: w4a16 for sm_120
+
+Registers the mma.m16n8k16 w4a16 kernels under an Sm120 tag. They were already
+being compiled for sm_120a; a half-open arch range (Sm80 = Arch<800,900>) made
+Registry::Add reject them host-side and compiled every body away device-side,
+so this card registered zero quantized GEMMs -- only the cuBLAS fallback.
+
+- kernel/sm120_16816_4.cu: 55 sm80 tiles re-tagged Sm120, plus dense and
+  grouped bf16 blocks (Qwen3.5-27B is bf16; upstream forces fp16 for AWQ).
+- arch/config_sm80_s16816.h: Config_U4_d takes Operand_A<T>/Tc = T rather than
+  hardcoded half, so the *dense* w4a16 path can serve bf16. No-op for the
+  T = half instantiations every other arch uses.
+- core/common.h + iterator_sm80.h: TURBOMIND_ARCH_HAS_L2_EVICT_POLICY. sm_12x
+  faults with an illegal instruction when the cp.async L2 evict-first hint is
+  applied to the packed-B operand. The hint is performance-only, so dropping
+  it there cannot change results.
+- core/mma.h: include <cuda_bf16.h>. CUDA 13 stopped pulling it in
+  transitively, breaking every sm70/75/80 kernel TU, not just this one.
+
+Verified on RTX PRO 6000 Blackwell: 2 -> 222 registered kernels, 28/28 numerics
+against a dequant reference, 2.3-3.3x on decode GEMMs.
+---
+ src/turbomind/kernels/core/common.h           |  17 ++
+ src/turbomind/kernels/core/mma.h              |   5 +
+ src/turbomind/kernels/gemm/CMakeLists.txt     |   9 +
+ .../kernels/gemm/arch/config_sm80_s16816.h    |   9 +-
+ src/turbomind/kernels/gemm/iterator_sm80.h    |   6 +-
+ .../kernels/gemm/kernel/sm120_16816_4.cu      | 225 ++++++++++++++++++
+ src/turbomind/kernels/gemm/registry.cu        |   6 +
+ src/turbomind/kernels/gemm/registry.h         |   4 +
+ 8 files changed, 277 insertions(+), 4 deletions(-)
+ create mode 100644 src/turbomind/kernels/gemm/kernel/sm120_16816_4.cu
+
+diff --git a/src/turbomind/kernels/core/common.h b/src/turbomind/kernels/core/common.h
+index 398f0ed4..7b2af7ba 100644
+--- a/src/turbomind/kernels/core/common.h
++++ b/src/turbomind/kernels/core/common.h
+@@ -30,6 +30,23 @@
+ 
+ #define TURBOMIND_ARCH_HAS_FP8 TURBOMIND_ARCH_SM90
+ 
++// L2 evict-first cache policy on `cp.async` (createpolicy + .L2::cache_hint).
++//
++// On sm_12x this faults with an illegal instruction when the hint is applied to
++// the packed-B (quantized weight) operand.  Measured on an RTX PRO 6000
++// Blackwell, holding the tile fixed and varying only the policy: `Stream` on A
++// runs, `Stream` on B faults, on every tile tried.  The emitted `LDGSTS` forms
++// are identical either way -- the difference is in the memory descriptor the
++// hint builds, not in the opcode -- and the same PTX in isolation runs fine, so
++// this is narrower than "sm_120 lacks L2 policies".
++//
++// The policy is a pure performance hint, so dropping it cannot change results.
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && (__CUDA_ARCH__ < 1300)
++#define TURBOMIND_ARCH_HAS_L2_EVICT_POLICY 0
++#else
++#define TURBOMIND_ARCH_HAS_L2_EVICT_POLICY TURBOMIND_ARCH_SM80
++#endif
++
+ #define TURBOMIND_ARCH_BF16_GUARD(type) (TURBOMIND_ARCH_HAS_BF16 || type != ::turbomind::kBfloat16)
+ 
+ #define TURBOMIND_ARCH_FP8_GUARD(type)                                                                                 \
+diff --git a/src/turbomind/kernels/core/mma.h b/src/turbomind/kernels/core/mma.h
+index 768cdcbe..fab08dec 100644
+--- a/src/turbomind/kernels/core/mma.h
++++ b/src/turbomind/kernels/core/mma.h
+@@ -5,6 +5,11 @@
+ #include "src/turbomind/kernels/core/array.h"
+ #include "src/turbomind/kernels/core/common.h"
+ #include <cassert>
++// `nv_bfloat16` is used by the m16n8k16/m16n8k8 bf16 overloads below.  Up to
++// CUDA 12.x it arrived transitively; CUDA 13's `cuda_runtime.h` no longer pulls
++// it in, so every kernel TU that includes this header first (sm70/75/80/120)
++// fails with "identifier nv_bfloat16 is undefined".
++#include <cuda_bf16.h>
+ 
+ namespace turbomind {
+ 
+diff --git a/src/turbomind/kernels/gemm/CMakeLists.txt b/src/turbomind/kernels/gemm/CMakeLists.txt
+index 7a1b2107..b0b65bf5 100644
+--- a/src/turbomind/kernels/gemm/CMakeLists.txt
++++ b/src/turbomind/kernels/gemm/CMakeLists.txt
+@@ -15,6 +15,14 @@ set(GEMM2_KERNELS_SM80
+     kernel/sm80_16816_8.cu
+     kernel/sm80_16816_16.cu
+ )
++# mma.m16n8k16 kernels re-tagged for sm_120; they use no instruction sm_120
++# lacks, so they build under whatever `CMAKE_CUDA_ARCHITECTURES` holds and are
++# filtered at registration, exactly like the SM70/75/80 sets above. They are
++# NOT in GEMM2_KERNELS_SM90, which CMake quarantines to arch 90 because that
++# set really does need wgmma/TMA.
++set(GEMM2_KERNELS_SM120
++    kernel/sm120_16816_4.cu
++)
+ set(GEMM2_KERNELS_SM90
+     tma.cu
+     kernel/sm90_16816_4.cu
+@@ -58,6 +66,7 @@ add_library(gemm2
+         ${GEMM2_KERNELS_SM70}
+         ${GEMM2_KERNELS_SM75}
+         ${GEMM2_KERNELS_SM80}
++        ${GEMM2_KERNELS_SM120}
+         cublas.cu
+         moe_utils_v2.cu
+         test/test_utils.cu
+diff --git a/src/turbomind/kernels/gemm/arch/config_sm80_s16816.h b/src/turbomind/kernels/gemm/arch/config_sm80_s16816.h
+index a449e2cc..9bf4f56f 100644
+--- a/src/turbomind/kernels/gemm/arch/config_sm80_s16816.h
++++ b/src/turbomind/kernels/gemm/arch/config_sm80_s16816.h
+@@ -105,18 +105,23 @@ struct Sm80_s16816 {
+     };
+ };
+ 
++// `A` and `Tc` follow `T` rather than being pinned to `half`.  They were pinned,
++// which made the *dense* w4a16 path fp16-only while the grouped one below was
++// already generic -- so a bf16 model got no dense w4a16 kernel at all and fell
++// back to unquantized cuBLAS.  Every existing instantiation passes `T = half`
++// explicitly (sm70/75/80/90), for which this is a no-op.
+ template<class Arch, class T, Order raster_order>  // kColMajor
+ using Config_U4_d = Sm80_s16816<Arch,
+                                 T,                                      // mma dtype
+                                 kColMajor,                              // mma iter order
+-                                Operand_A<half, kRowMajor>,             // A
++                                Operand_A<T, kRowMajor>,                // A
+                                 Transform_Default,                      // tarnsform A
+                                 VoidOperand,                            // U
+                                 Operand_B_Pack<uint4_t, kColMajor, 2>,  // B
+                                 Transform_HMMA_16816<1, 0>,             // transform B
+                                 Operand_UV_Pack<uint32_t, true>,        // V
+                                 kRowMajor,                              // order_C
+-                                half,                                   // Tc
++                                T,                                      // Tc
+                                 raster_order,                           // raster order
+                                 -1>;                                    // group axis
+ 
+diff --git a/src/turbomind/kernels/gemm/iterator_sm80.h b/src/turbomind/kernels/gemm/iterator_sm80.h
+index a625c68b..fc4db3bc 100644
+--- a/src/turbomind/kernels/gemm/iterator_sm80.h
++++ b/src/turbomind/kernels/gemm/iterator_sm80.h
+@@ -142,7 +142,7 @@ struct GmemIteratorSm80 {
+             src_data_     = reinterpret_cast<const char*>((T*)src_data) + src_offset_;
+         }
+ 
+-#if TURBOMIND_ARCH_SM80
++#if TURBOMIND_ARCH_HAS_L2_EVICT_POLICY
+         if constexpr (Policy::kEvictPolicy != EvictPolicy::kEvictNormal) {
+             asm volatile("createpolicy.fractional.L2::evict_first.b64 %0;\n" : "=l"(cache_policy_) :);
+         }
+@@ -231,7 +231,9 @@ struct GmemIteratorSm80 {
+ 
+         static constexpr auto cache_op = GetCacheOp<Policy::kCacheOp, size>::value;
+ 
+-        if constexpr (Policy::kEvictPolicy != EvictPolicy::kEvictNormal) {
++        // The `&& TURBOMIND_ARCH_HAS_L2_EVICT_POLICY` drops the hint (not the
++        // copy) on arches that fault on it; see core/common.h.
++        if constexpr (Policy::kEvictPolicy != EvictPolicy::kEvictNormal && TURBOMIND_ARCH_HAS_L2_EVICT_POLICY) {
+             CP_ASYNC<cache_op, size, prefetch_size>::apply(ptr, src, cache_policy_, mask);
+         }
+         else {
+diff --git a/src/turbomind/kernels/gemm/kernel/sm120_16816_4.cu b/src/turbomind/kernels/gemm/kernel/sm120_16816_4.cu
+new file mode 100644
+index 00000000..b31b504e
+--- /dev/null
++++ b/src/turbomind/kernels/gemm/kernel/sm120_16816_4.cu
+@@ -0,0 +1,225 @@
++// Copyright (c) OpenMMLab. All rights reserved.
++
++// w4a16 for sm_120 (consumer Blackwell, e.g. RTX PRO 6000).
++//
++// Nothing here is a new kernel.  `kernel/sm80_16816_4.cu` is already compiled
++// for sm_120a -- the top-level CMakeLists appends `120a-real` on CUDA >= 12.8,
++// and the `gemm2` target that holds these kernels inherits it.  What stopped
++// them running is a half-open arch range: `Sm80` is `Arch<800, 900>`
++// (gemm/arch.h), so on this device
++//
++//     __CUDA_ARCH__          == 1200
++//     Sm80::is_compatible(1200) == (800 <= 1200 && 1200 < 900) == false
++//
++// which makes `gemm_universal.h`'s `if constexpr (Kernel::Arch::is_compatible(
++// __CUDA_ARCH__))` compile every sm80 kernel body away to an empty __global__,
++// and makes `is_arch_compatible(800, 1200)` reject each one host-side in
++// `Registry::Add`.  The result is that TurboMind registers **zero** w4a16
++// kernels on this card.
++//
++// This is a gate, not a hardware limit.  Every instruction the sm80 U4 path
++// uses exists on sm_120: `mma.sync.aligned.m16n8k16` (core/mma.h),
++// `ldmatrix.sync.aligned.m8n8.x4` (core/smem.h), `cp.async.cg` (gemm/cp_async.h)
++// and the `lop3.b32` u4->f16 unpack (attention/quantization.h).  None of
++// `wgmma`, TMA or `tcgen05` -- which sm_120 lacks -- appear on it; those are
++// confined to the sm90 fp8 path, which CMake already quarantines to arch 90.
++//
++// Shared memory also fits: the widest registered tile here is ~99.8 KB against
++// this card's 101,376 B optin limit, and decode-shaped tiles (CTA_M 16/32/48)
++// sit at 33-51 KB, so >= 2 CTAs stay resident per SM.  `Registry::Add` drops
++// anything over `sharedMemPerBlockOptin` anyway, so a tile that does not fit
++// is skipped rather than fatal.
++//
++// The `Sm120` tag itself already existed in gemm/arch.h; it just had no kernel
++// instantiated against it.  This file is that instantiation.
++
++#include "src/turbomind/kernels/gemm/arch.h"
++#include "src/turbomind/kernels/gemm/arch/config_sm80_s16816.h"
++#include "src/turbomind/kernels/gemm/registry.h"
++#include "src/turbomind/kernels/gemm/types.h"
++#include <type_traits>
++
++namespace turbomind::gemm {
++
++using namespace sm80_s16816;
++using namespace cache_policy;
++using S = cache_policy::Stream;
++using D = cache_policy::Default;
++
++void Registry::sm120_16816_4()
++{
++    auto register_u4_d = [this](auto group_size_tag) {
++        constexpr int kGroupSize = decltype(group_size_tag)::value;
++        // clang-format off
++        using C = Config_U4_d<Sm120, half, kColMajor>;
++        // Add<C::Type<128, 256,  64, 1, 8, 1, D, S, 3, true, 1, kGroupSize>>(); // 0/0
++        Add<C::Type<128, 256,  32, 1, 8, 1, D, D, 3, true, 1, kGroupSize, 128, 128>>(); // 30/3
++        Add<C::Type<128, 256,  32, 1, 8, 1, D, D, 4, true, 1, kGroupSize, 128, 128>>(); // --/20
++        Add<C::Type<128, 128,  32, 1, 4, 1, D, D, 3, true, 1, kGroupSize, 64, 128>>();  // --/13
++        Add<C::Type<128, 128,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize, 64, 128>>();  // 21/13
++        Add<C::Type<128, 128,  64, 1, 4, 2, D, S, 3, true, 1, kGroupSize, 64, 128>>();  // 6/6
++
++        Add<C::Type<96, 256,  32, 1, 8, 1, D, D, 4, true, 1, kGroupSize>>();  // --/3
++        Add<C::Type<96, 256,  32, 1, 8, 1, D, S, 3, true, 1, kGroupSize>>();  // 13/13
++        Add<C::Type<96, 128,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();  // 14/10
++        Add<C::Type<96, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();  // 2/2
++
++        Add<C::Type<64, 256,  32, 1, 4, 1, D, D, 3, true, 1, kGroupSize, 64, 128>>(); // --/21
++        Add<C::Type<64, 256,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize, 64, 128>>(); // 27/13
++        Add<C::Type<64, 128,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();  // 8/5
++        Add<C::Type<64, 128,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();  // 7/5
++        Add<C::Type<64, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();  // 6/7
++        Add<C::Type<64,  64,  64, 1, 2, 2, D, S, 6, true, 1, kGroupSize>>();
++
++        Add<C::Type<48, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize, 48, 128>>(); // 1/1
++        Add<C::Type<48, 128,  64, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();  // 1/1
++        Add<C::Type<48, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();  // 4/4
++        Add<C::Type<48,  64, 128, 1, 2, 2, D, S, 4, true, 1, kGroupSize>>();
++
++        Add<C::Type<32, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<32, 128,  64, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<32, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<32,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<32,  64, 128, 1, 2, 2, D, S, 4, true, 1, kGroupSize>>();
++
++        Add<C::Type<16, 128,  64, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<16, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<16, 128, 128, 1, 4, 2, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<16,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<16,  64, 128, 1, 2, 2, D, S, 4, true, 1, kGroupSize>>();
++        // clang-format on
++    };
++
++    register_u4_d(std::integral_constant<int, 128>{});
++    register_u4_d(std::integral_constant<int, 32>{});
++
++    auto register_u4_g = [this](auto group_size_tag) {
++        constexpr int kGroupSize = decltype(group_size_tag)::value;
++        // clang-format off
++        using C = Config_U4_g<Sm120, half, kColMajor>;
++        Add<C::Type<128, 256,  32, 2, 4, 1, D, D, 3,   0 , 1, kGroupSize>>();  // 10 + 5 + 4 + 10 + 10, 37
++        Add<C::Type<128, 128,  32, 1, 4, 1, D, D, 3, true, 1, kGroupSize>>();  // 1 + 6 + 4 + 4 + 2, 3
++        Add<C::Type< 64, 128,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();  // 7 + 4 + 6 + 2 + 4, 26
++        Add<C::Type< 64, 256,  32, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();  // 18
++        Add<C::Type< 32,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();  // 2
++        Add<C::Type< 32, 128,  64, 1, 4, 1, D, S, 5, true, 1, kGroupSize>>();  // 1 + 2 + 2 + 2 + 2, 2
++        Add<C::Type< 32, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();  // 9
++        Add<C::Type< 16, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();  // 22
++        Add<C::Type< 16, 256,  32, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();  // 8
++        Add<C::Type< 16, 128,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();  // 1 + 13 + 9 + 13 + 7, 7
++        Add<C::Type< 16,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();  // 12 + 2 + 6 + 2 + 8, 42
++        // clang-format on
++    };
++
++    register_u4_g(std::integral_constant<int, 128>{});
++    register_u4_g(std::integral_constant<int, 32>{});
++
++    // bf16 activations.  `Transform_HMMA_16816` already has the bf16 dequant
++    // overload (transform.h) backed by `ConvertKvCache<uint4_t, nv_bfloat16>`
++    // (attention/quantization.h), so bf16 w4a16 needs no new kernel -- only
++    // these instantiations.  `Config_U4_d` had `Operand_A<half>` / `Tc = half`
++    // hardcoded; that is now `T` (config_sm80_s16816.h), a no-op for the
++    // `T = half` instantiations every other arch uses.
++    //
++    // It matters for Qwen3.5-27B, which is bf16: upstream forces fp16 for AWQ
++    // (turbomind/converter.py sets dtype=float16 when model_format=='awq'), and
++    // running fp16 activations under a bf16-trained model is a numerical change
++    // nobody here has priced.  Tile lists are the same as the fp16 sets -- same
++    // instruction family, same smem footprint, and retuning during a port would
++    // confound the port with the tuning.
++    //
++    // `_d` is **dense** and `_g` is **grouped (MoE)**; they are not two spellings
++    // of group-wise quantization.  A linear layer dispatches against
++    // `group_axis = -1` and `ttt_fff` striding, which only the `_d` set answers,
++    // so registering `_g` alone leaves an ordinary bf16 model with no kernel.
++    auto register_u4_d_bf16 = [this](auto group_size_tag) {
++        constexpr int kGroupSize = decltype(group_size_tag)::value;
++        // clang-format off
++        using C = Config_U4_d<Sm120, bfloat16_t, kColMajor>;
++        Add<C::Type<128, 256,  32, 1, 8, 1, D, D, 3, true, 1, kGroupSize, 128, 128>>();
++        Add<C::Type<128, 256,  32, 1, 8, 1, D, D, 4, true, 1, kGroupSize, 128, 128>>();
++        Add<C::Type<128, 128,  32, 1, 4, 1, D, D, 3, true, 1, kGroupSize, 64, 128>>();
++        Add<C::Type<128, 128,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize, 64, 128>>();
++        Add<C::Type<128, 128,  64, 1, 4, 2, D, S, 3, true, 1, kGroupSize, 64, 128>>();
++
++        Add<C::Type<96, 256,  32, 1, 8, 1, D, D, 4, true, 1, kGroupSize>>();
++        Add<C::Type<96, 256,  32, 1, 8, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<96, 128,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<96, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();
++
++        Add<C::Type<64, 256,  32, 1, 4, 1, D, D, 3, true, 1, kGroupSize, 64, 128>>();
++        Add<C::Type<64, 256,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize, 64, 128>>();
++        Add<C::Type<64, 128,  32, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<64, 128,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<64, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<64,  64,  64, 1, 2, 2, D, S, 6, true, 1, kGroupSize>>();
++
++        Add<C::Type<48, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize, 48, 128>>();
++        Add<C::Type<48, 128,  64, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<48, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<48,  64, 128, 1, 2, 2, D, S, 4, true, 1, kGroupSize>>();
++
++        Add<C::Type<32, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<32, 128,  64, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<32, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<32,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<32,  64, 128, 1, 2, 2, D, S, 4, true, 1, kGroupSize>>();
++
++        Add<C::Type<16, 128,  64, 1, 4, 1, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<16, 128, 128, 1, 4, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<16, 128, 128, 1, 4, 2, D, S, 4, true, 1, kGroupSize>>();
++        Add<C::Type<16,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type<16,  64, 128, 1, 2, 2, D, S, 4, true, 1, kGroupSize>>();
++        // clang-format on
++    };
++
++    register_u4_d_bf16(std::integral_constant<int, 128>{});
++    register_u4_d_bf16(std::integral_constant<int, 32>{});
++
++    auto register_u4_g_bf16 = [this](auto group_size_tag) {
++        constexpr int kGroupSize = decltype(group_size_tag)::value;
++        // clang-format off
++        using C = Config_U4_g<Sm120, bfloat16_t, kColMajor>;
++        Add<C::Type<128, 256,  32, 2, 4, 1, D, D, 3,   0 , 1, kGroupSize>>();
++        Add<C::Type<128, 128,  32, 1, 4, 1, D, D, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 64, 128,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 64, 256,  32, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 32,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 32, 128,  64, 1, 4, 1, D, S, 5, true, 1, kGroupSize>>();
++        Add<C::Type< 32, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 16, 256,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 16, 256,  32, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 16, 128,  64, 1, 4, 1, D, S, 3, true, 1, kGroupSize>>();
++        Add<C::Type< 16,  64, 128, 1, 2, 2, D, S, 3, true, 1, kGroupSize>>();
++        // clang-format on
++    };
++
++    register_u4_g_bf16(std::integral_constant<int, 128>{});
++    register_u4_g_bf16(std::integral_constant<int, 32>{});
++
++    if constexpr (1) {
++        // clang-format off
++        using Cd = Config_MXF4<Sm120, bfloat16_t, 16, kColMajor>;
++        // Add<Cd::Type<256, 128, 32, 8, 1, 1, D, D, 3, true, 32, 1, 128, 128>>();
++
++        using Cg = Config_MXF4<Sm120, bfloat16_t, 16, kColMajor, 1>;
++        Add<Cg::Type<256, 128, 32, 8, 1, 1, D, D, 3, true, 32, 1, 128, 128>>();
++        Add<Cg::Type<256,  64, 32, 4, 1, 1, D, D, 3, true, 32, 1, 128,  64>>();
++        Add<Cg::Type<256,  32, 32, 4, 1, 1, S, D, 5, true, 32, 1>>();
++        Add<Cg::Type<128, 128, 32, 4, 1, 1, D, D, 3, true, 32, 1, 128,  64>>();
++        Add<Cg::Type<128,  96, 32, 4, 1, 1, D, D, 3, true, 32, 1>>();
++        Add<Cg::Type<128,  64, 32, 4, 1, 1, S, D, 3, true, 32, 1>>();
++        Add<Cg::Type<128,  32, 32, 4, 1, 1, S, D, 3, true, 32, 1>>();
++        Add<Cg::Type<128,  16, 32, 4, 1, 1, S, D, 5, true, 32, 1>>();
++        Add<Cg::Type<128,  16, 64, 4, 1, 1, S, D, 3, true, 32, 1>>();
++
++        using C8 = Config_MXF4<Sm120, bfloat16_t, 8, kColMajor, 1>;
++        Add<C8::Type<256, 8,  32, 4, 1, 1, S, D, 5, true, 32, 1>>();
++        Add<C8::Type<128, 8,  32, 4, 1, 1, S, D, 5, true, 32, 1>>();
++        Add<C8::Type<128, 8,  64, 4, 1, 1, S, D, 3, true, 32, 1>>();
++        Add<C8::Type< 64, 8,  64, 4, 1, 1, S, D, 5, true, 32, 1>>();
++        // clang-format on
++    }
++}
++
++}  // namespace turbomind::gemm
+diff --git a/src/turbomind/kernels/gemm/registry.cu b/src/turbomind/kernels/gemm/registry.cu
+index 55937a4d..f249c681 100644
+--- a/src/turbomind/kernels/gemm/registry.cu
++++ b/src/turbomind/kernels/gemm/registry.cu
+@@ -15,6 +15,12 @@ Registry::Registry(std::shared_ptr<cudaDeviceProp> device_prop):
+     sm90_64n32_8();
+ #endif
+ 
++    // Registering is unconditional; `Add` filters on arch and on shared memory,
++    // so on a non-sm_120 device every kernel here is rejected and this costs
++    // only the construction. Guarding it on `arch_` instead would put the same
++    // decision in two places.
++    sm120_16816_4();
++
+     sm80_16816_4();
+     sm80_16816_8();
+     sm80_16816_16();
+diff --git a/src/turbomind/kernels/gemm/registry.h b/src/turbomind/kernels/gemm/registry.h
+index f5cac6c8..7b7b95d2 100644
+--- a/src/turbomind/kernels/gemm/registry.h
++++ b/src/turbomind/kernels/gemm/registry.h
+@@ -30,6 +30,10 @@ private:
+     void sm90_16816_8();
+     void sm90_16816_16();
+ 
++    // sm_120 re-registers the sm80 (mma.m16n8k16) kernels under the Sm120 tag;
++    // see kernel/sm120_16816_4.cu for why the sm80 ones cannot serve this arch.
++    void sm120_16816_4();
++
+     void sm80_16816_4();
+     void sm80_16816_8();
+     void sm80_16816_16();
+-- 
+2.43.0
+

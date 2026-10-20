@@ -29,6 +29,8 @@
 #include <variant>
 #include <vector>
 
+#include "resource/allocator/checkpoint_slot_allocator.h"
+
 namespace tokenspeed {
 
 struct ForwardOperationBase {
@@ -37,15 +39,29 @@ struct ForwardOperationBase {
     std::int32_t input_length{0};
     std::int32_t prefill_length{0};
 
-    // Per-group block tables. Rows use absolute logical-page indexing; null
-    // holes are page 0 and rows are not compacted.
+    // Per-group block tables. A History group's row uses absolute
+    // logical-page indexing; null holes are page 0 and rows are not
+    // compacted. A State group's row is its two slots [input, live]: a
+    // prefill row reads slot 0 (0 = the zero state) and writes slot 1; a
+    // decode row reads slot 0 when it is set, else slot 1, and writes slot 1.
     std::map<std::string, std::vector<std::int32_t>> block_tables;
+
+    // Destination slot in the recurrent-state checkpoint pool for this step's
+    // snapshot, or -1 for "no slot to give" -- which the runtime already drops
+    // in `store_from_active_indexed`. This is `CheckpointSlotAllocator`'s index
+    // space, NOT an arena page id; the two are unrelated numbers.
+    std::int32_t mamba_checkpoint_dst_idx{CheckpointSlot::kNoSlot};
 };
 
 struct PrefillOperation : public ForwardOperationBase {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
+    // The prompt positions already cached: the hit boundary, any token count.
     std::int32_t extend_prefix_len{0};
+    // The D role's remote admission only: every State group's checkpoint at
+    // exactly the prompt end was found locally and sits in slot 0, so the
+    // peer omits the latest-snapshot transfer. False everywhere else.
+    bool state_prefix_cached{false};
     // Leading input rows that re-feed already computed prompt tokens
     // (bounded replay). Positions [extend_prefix_len, extend_prefix_len +
     // extend_replay_len) regenerate replayable cache groups only; every
@@ -74,10 +90,17 @@ struct ForwardBatch {
     std::vector<std::int32_t> extend_prefix_lens;
     // Parallel to extend_prefix_lens: PrefillOperation::extend_replay_len.
     std::vector<std::int32_t> extend_replay_lens;
+    // Parallel to extend_prefix_lens: PrefillOperation::state_prefix_cached.
+    std::vector<bool> state_prefix_cached;
     std::vector<std::int32_t> decode_input_ids;
     // Parallel to decode_input_ids (one entry per decode row); rows without
     // candidates hold an empty vector.
     std::vector<std::vector<std::int32_t>> spec_candidate_ids;
+
+    // One entry per request, aligned with `request_ids`. Exposed to the
+    // runtime as `mamba_track_pool_indices`, the name its snapshot path
+    // already uses.
+    std::vector<std::int32_t> mamba_checkpoint_dst_indices;
 
     // Per-group block tables: dict[group_id] =
     // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
@@ -97,6 +120,7 @@ struct ForwardBatch {
                     request_pool_indices.push_back(inner.request_pool_index);
                     input_lengths.push_back(inner.input_length);
                     prefill_lengths.push_back(inner.prefill_length);
+                    mamba_checkpoint_dst_indices.push_back(inner.mamba_checkpoint_dst_idx);
                     for (auto& [gid, pages] : inner.block_tables) {
                         block_tables[gid];
                     }
@@ -108,6 +132,7 @@ struct ForwardBatch {
                                          prefill->shifted_input_ids.end());
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
                 extend_replay_lens.push_back(prefill->extend_replay_len);
+                state_prefix_cached.push_back(prefill->state_prefix_cached);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
                 spec_candidate_ids.push_back(std::move(decode->spec_candidate_ids));

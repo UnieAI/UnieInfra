@@ -22,8 +22,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# ruff: noqa: F821
-
 import logging
 from collections.abc import Callable
 
@@ -47,6 +45,18 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.scalar_type impor
 )
 from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
+)
+from tokenspeed.runtime.layers.quantization.marlin_utils import (
+    MarlinLinearLayerConfig,
+    apply_gptq_marlin_linear,
+    check_marlin_supports_shape,
+    marlin_is_k_full,
+    marlin_make_empty_g_idx,
+    marlin_make_workspace,
+    marlin_permute_scales,
+    marlin_repeat_scales_on_all_ranks,
+    marlin_sort_g_idx,
+    marlin_zero_points,
 )
 from tokenspeed.runtime.layers.quantization.utils import replace_parameter, unpack_cols
 

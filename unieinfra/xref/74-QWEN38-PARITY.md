@@ -113,6 +113,93 @@ sequence slots (64 of 80).
 What is left is per-step efficiency: 95.4 ms of wall time for 852 tokens, of
 which ~64 are decode rows. At c1 the same model decodes a token every 15 ms, so
 a c64 step costs 6x per token what a c1 step does -- and the workload is ~94%
-prefill, so this step is prefill plus decode executed one after the other, with
-the device idling between them. That is exactly what mixed batching removes, and
-it is why the fix above comes before any other c64 work.
+prefill, so this step is prefill plus decode executed one after the other. That
+is what mixed batching removes, and it is why the fix above comes before any
+other c64 work.
+
+## The profile of that cell: the device was not idling
+
+The counters above say what the step cost but not what the device did with it, so
+the same cell was profiled (`trace-q38-ours-c64/20261020-030130-TP0.trace.json.gz`,
+425 MB compressed, 17.4M complete events). `trace_stats.py --list-hosts` picks the
+step function by covered time: the forward is wrapped by
+`tokenspeed/runtime/execution/device.py(567): _forward`, which is 1141 instances
+in the window (the auto-detected candidate list cannot name it because the profiler
+records the file's line number in the frame name).
+
+| quantity | measured over the traced window |
+|----------|---------------------------------|
+| steps | 1141 |
+| ms/step | mean 105.51, p50 4.54, p90 492.35, p99 822.27 |
+| kernels/step | mean 361.5, p50 121, p90 1181, p99 2302 |
+| us/kernel | 289.4 |
+| device busy | 104.56 ms/step, **99% of step wall** |
+| host/other | 0.96 ms/step |
+
+**The device is saturated.** Per-step wall times cannot be compared across steps
+under asynchronous submission -- a decode step returns in 4.5 ms while the GPU is
+still chewing the previous prefill step's kernels; the wait lands in
+`_commit_forward_results` (138 ms/call mean, of which 116 ms is
+`stream.synchronize`). The aggregate is trustworthy where the histogram is not:
+of the window's step wall, 99% is covered by running kernels. There is no idle gap
+between prefill and decode for mixed batching to reclaim.
+
+Where the device time goes:
+
+| kernel group | device time | share |
+|--------------|-------------|-------|
+| GEMM (cuBLASLt `nvjet_sm90_*`) | 95.0 s | 80% |
+| FlashAttention (16 full-attention layers) | 5.7 s | 4.8% |
+| GDN delta rule | 3.0 s | 2.5% |
+| `act_and_mul`, `causal_conv1d`, `rmsnorm`, `masked_fill`, split/gating | 7.3 s | 6% |
+
+One GEMM alone -- `nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT`, 34,066
+launches at 2101 us -- is 71.6 s, 60% of all device time.
+
+That fixes the arithmetic of the c64 gap, and it is not what this document
+previously assumed. The corpus is 256 prompts of 8,321 tokens mean (2.13M prompt
+tokens), but the requests continue each other's sessions, so most of every prompt
+is an L3 prefix hit: the cell's own counters say only 852 tokens per iteration
+were actually scheduled, 501k over the measured phase, of which 32.8k are the
+generated tokens. The work is therefore ~94% prefill of ~470k tokens, and the
+three engines run the same corpus through comparable radix/prefix caches, so they
+deliver comparable token counts over the measured phase:
+
+| engine | measured phase | delivered |
+|--------|----------------|-----------|
+| ours (no mix) | 56.35 s | 526 TFLOP/s (53% of H200 bf16 peak) |
+| sglang | 40.7 s | 727 TFLOP/s |
+| vLLM | 39.8 s | 744 TFLOP/s |
+
+At 55.6 GB of bf16 weights the checkpoint is 27.8B dense parameters, so a token
+costs 5.6e10 FLOPs and 533k tokens are 3.0e16. **The c64 gap is 1.38x of prefill
+GEMM efficiency, not lost overlap.** Folding the decode rounds into the prefill
+rounds saves at most the few percent of device time those rounds occupy, which is
+why the mixed arm is still worth measuring -- and why it cannot be the whole
+591 -> 805.
+
+Read the kernel shares as indicative, not as a budget: `PREFILL_ISOLATION.md`
+section 7.1 re-measured a comparable profiler table and found it had inflated one
+op's per-step time by 16x. The wall-clock arithmetic above is what to trust; the
+table only says the step is GEMM-dominated and that the small unfused kernels are
+6% of it -- unlike the DeepSeek-V4 analysis in that document, where they were 20%,
+so for this checkpoint fusion is not the lever it was there.
+
+The same arithmetic per round, using the counters: ~470k prefill tokens arrive in
+~62 chunks of ~7.6k tokens, so a prefill round costs ~870 ms and a decode round
+~4.5 ms (526 of the 588 iterations, ~4% of the phase). A 7.6k-token chunk is
+4.2e14 FLOPs, i.e. 486 TFLOP/s for that round; the 2.1 ms GEMM above works out to
+~645 TFLOP/s on the shape the layer should have issued ([7.6k, 5120] x [5120,
+17408]). Both sit inside the 49-53% overall, which leaves two levers, in order:
+the ~20% of device time that is not GEMM, and the GEMM tactics themselves.
+
+Padding is not one of them: the breakable prefill graph's ladder spaces rungs at
+the largest power of two below `size/8`, capped at 512 tokens
+(`prefill_graph.py:113-190`), so a 7.6k-token chunk pads by at most 2%.
+
+The next profile must be taken with `record_shapes` (the profiler accepts it:
+`request_handler.py:989`) so the GEMM can be named by its M and N instead of by
+its tile shape, and checked against the shape the layer should have issued -- a
+second row for the same weights at a smaller M is a chunking defect, and a
+correct M with a poor tactic is a tuning defect. The two call for opposite fixes,
+which is why the shape has to be read before either is touched.

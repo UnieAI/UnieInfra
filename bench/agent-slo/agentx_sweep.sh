@@ -93,13 +93,19 @@ case "$KIND" in
         # No tool-call/reasoning parser and no expert parallel: this checkpoint
         # is dense, its own chat template is unused because the cells drive
         # /v1/completions, and TP=1 leaves EP nothing to shard.
+        # --enable-mixed-batch: both reference arms pack prefill and decode into
+        # one step by default, and this tree's MHA leaf now serves that round.
+        # It used to assert it away, which is why every earlier qwen38 cell
+        # measured the no-mix configuration -- an arm running a different
+        # mechanism than the arms it is compared against.
         RUN_ARGS=(python3 -m tokenspeed.cli serve \
           --model-path "$MODEL" --tp "$TP" --port 8015 --host 0.0.0.0 --trust-remote-code \
           --disable-kvstore \
           --gpu-memory-utilization 0.90 --max-num-seqs 80 --max-model-len 32768 \
           --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
           --block-size 64 \
-          --prefill-graph-max-tokens 8192)
+          --prefill-graph-max-tokens 8192 \
+          --enable-mixed-batch)
         ;;
       *)
         RUN_ARGS=(python3 -m tokenspeed.cli serve \
@@ -113,6 +119,17 @@ case "$KIND" in
           --ep-size "$TP")
         ;;
     esac
+    # The scheduler already exports what an admission investigation needs:
+    # num_requests_running, num_requests_waiting, the KV cache usage ratio and
+    # the tokens-per-iteration histogram, updated once per scheduler iteration.
+    # Off by default in the engine, so a cell that wants a time series opts in
+    # with METRICS_PORT=<host port>; the port is then published and scraped.
+    if [ -n "${METRICS_PORT:-}" ]; then
+      # --metrics-host is separate from --host on purpose: the orchestrator
+      # rewrites the serving --host to loopback inside the container, so a
+      # metrics endpoint inheriting it is unreachable from the published port.
+      RUN_ARGS+=(--enable-metrics --metrics-port "$METRICS_PORT" --metrics-host 0.0.0.0)
+    fi
     # Engram rows go to host memory at every degree, because that is what the
     # reference cell does at TP=4 too: its log reads "engram host table: dropped
     # the page cache of 48 checkpoint files (475 GiB) before pre-faulting the
@@ -174,11 +191,12 @@ case "$KIND" in
     # max_num_seqs=80) the same cell ran 59.8 s at 547 tok/s and 82 ms TPOT,
     # with graph=True at bs=59/64/69/71/73. get_batch_sizes_to_capture() now
     # warns when the cap is the binding constraint.
-    # Mixed batch is ON by default (ServerArgs.enable_mixed_batch=True) and is
-    # the prefill/decode-overlap mechanism that vLLM/sglang use; the dsv4 mixed
-    # path is correctness-guarded (deepseek_v4.py token-count check), so do NOT
-    # disable it in the A/B. A previous baseline replayed the nospec-nomix
-    # config (--disable-mixed-batch --prefill-defer-window 32) via extra args.
+    # Mixed batch is the prefill/decode-overlap mechanism that vLLM/sglang use,
+    # and it is OFF by default (ServerArgs.enable_mixed_batch=False), so an arm
+    # that wants it must ask. The dsv4 mixed path is correctness-guarded
+    # (deepseek_v4.py token-count check), so do NOT disable it in the A/B. A
+    # previous baseline replayed the nospec-nomix config
+    # (--disable-mixed-batch --prefill-defer-window 32) via extra args.
     INT_PORT=8015
     MN="$MODEL"
     ;;
@@ -267,15 +285,18 @@ case "$KIND" in
       echo "cannot determine site-packages inside $IMG_ENG" >&2
       exit 1
     fi
+    PUBLISH_ARGS=(-p "$PORT:$INT_PORT")
+    if [ -n "${METRICS_PORT:-}" ]; then
+      PUBLISH_ARGS+=(-p "$METRICS_PORT:$METRICS_PORT")
+    fi
     docker run -d --name "$NAME" --gpus \"device=$GPU\" --shm-size 32g \
-      -p "$PORT:$INT_PORT" -v /models:/models -v /workspace:/workspace \
+      "${PUBLISH_ARGS[@]}" -v /models:/models -v /workspace:/workspace \
       -v "$HERE/UnieInfra/tokenspeed-scheduler/python/tokenspeed_scheduler:$SCHED_SITE/tokenspeed_scheduler:ro" \
       -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
       -e FLASHINFER_WORKSPACE_BASE=/workspace/roy/.fiws \
       -e PYTHONPATH=/workspace/roy/UnieInfra/python:/workspace/roy/UnieInfra/tokenspeed-kernel/python \
       -e TOKENSPEED_DSV4_FP8_INDEXER_FUSED_VERIFY="${DSV4_FP8_VERIFY:-0}" \
       -e TOKENSPEED_DSV4_FP8_INDEXER_FUSED="${DSV4_FP8_FUSED:-0}" \
-      -e TOKENSPEED_SCHED_LOOP_TIMING="${SCHED_TIMING:-0}" \
       -e TORCH_EXTENSIONS_DIR="${TORCH_EXT_DIR:-/workspace/roy/.torch_ext}" \
       -e TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR=/workspace/roy/.autotune \
       "$IMG_ENG" bash -lc "${RUN_ARGS[*]}"

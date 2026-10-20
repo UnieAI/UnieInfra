@@ -30,6 +30,7 @@ printed so a wrong pick is visible rather than silent.
 """
 
 import argparse
+import bisect
 import gzip
 import json
 import statistics
@@ -51,11 +52,49 @@ HOST_CATS = ("python_function", "cpu_op")
 
 
 def load_events(path):
+    """Complete events from a chrome trace, decoded as the file streams.
+
+    A serving-scale trace is hundreds of megabytes before decompression, and
+    ``json.load`` on one expands every annotation it carries: the first attempt
+    at the c64 Qwen3.8 profile reached 11.8 GiB of resident memory and had to be
+    killed. The events are decoded one at a time instead, and only the fields
+    the summary reads are kept.
+    """
     opener = gzip.open if path.endswith(".gz") else open
+    decoder = json.JSONDecoder()
+    events = []
+    buf = ""
     with opener(path, "rt") as f:
-        doc = json.load(f)
-    events = doc["traceEvents"] if isinstance(doc, dict) else doc
-    return [e for e in events if e.get("ph") == "X" and "ts" in e and "dur" in e]
+        while True:
+            chunk = f.read(1 << 22)
+            if not chunk:
+                break
+            buf += chunk
+            pos = 0
+            while True:
+                # Skip separators; a partial value at the end of the buffer is
+                # completed by the next chunk.
+                while pos < len(buf) and buf[pos] in " \t\r\n,[]":
+                    pos += 1
+                if pos >= len(buf):
+                    break
+                try:
+                    value, end = decoder.raw_decode(buf, pos)
+                except json.JSONDecodeError:
+                    break
+                pos = end
+                if isinstance(value, dict) and value.get("ph") == "X":
+                    if "ts" in value and "dur" in value:
+                        events.append(
+                            {
+                                "name": value.get("name"),
+                                "cat": value.get("cat"),
+                                "ts": value["ts"],
+                                "dur": value["dur"],
+                            }
+                        )
+            buf = buf[pos:]
+    return events
 
 
 def pct(values, q):
@@ -135,12 +174,20 @@ def summarize(events, step_fn, top, kernel_filter):
             f"no host instances of {step_fn!r} found; nothing to summarize"
         )
     kernels = [e for e in events if e.get("cat") == "kernel"]
+    # Steps and kernels are both in trace-time order, so each step's kernels are
+    # a contiguous range: bisect into it instead of scanning every kernel once
+    # per step. The scan was steps x kernels -- minutes of CPU on a serving-scale
+    # trace that holds millions of launches.
+    kernels.sort(key=lambda e: e["ts"])
+    kernel_ts = [k["ts"] for k in kernels]
 
     per_step = []
     attributed = []
     for step in steps:
         start, end = step["ts"], step["ts"] + step["dur"]
-        inside = [k for k in kernels if start <= k["ts"] < end]
+        lo = bisect.bisect_left(kernel_ts, start)
+        hi = bisect.bisect_left(kernel_ts, end)
+        inside = kernels[lo:hi]
         if not inside:
             continue
         attributed.extend(inside)

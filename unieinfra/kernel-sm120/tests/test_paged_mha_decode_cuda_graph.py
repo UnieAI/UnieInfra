@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import mha_decode_with_kvcache
+from tokenspeed_kernel.ops.attention.mha import mha_decode_with_kvcache
 from tokenspeed_kernel.plugins import discover_plugins
 from unieinfra_kernel_sm120 import flashinfer_mha as fim
 

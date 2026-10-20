@@ -1155,8 +1155,29 @@ The sanctioned per-leaf residue, all kernel-imposed: `verify_floor` /
 `block_decode_expansion` (whether block decode materializes one metadata
 entry per block position, or the leaf repeats one per request at forward
 time — FlashMLA, TRT-LLM MLA), FlashMLA's `for_graph_replay` tile-schedule
-swap, and the MLA family's `num_extends` decode-request slicing
-(`override_num_extends`).
+swap, and the `num_extends` request slicing a MIXED round needs to keep its
+decode suffix off its extend span (MLA's `override_num_extends`, the MHA
+family's split in `forward_extend`).
+
+### A MIXED round is one packed batch, one metadata, two kernels
+
+A MIXED round is not a second path: the router packs the extend requests
+first and the decode requests after them exactly as an extend batch packs its
+requests, and the prologue writes every row's KV through one write window
+(`_append_decode_rows` after the extend span, so `padded_write_locations`
+covers both halves). The split lives in the leaf, because only the leaf knows
+its kernels:
+
+* `init_forward_metadata` builds the extend metadata over the leading
+  `num_extends` rows and then refreshes the decode window for the same round
+  with `num_extends` set, so the decode read skips the extend rows;
+* the leaf's extend forward runs the extend kernel over the prefill span and
+  the decode kernel over the trailing rows (one row per request, or one
+  request's verify width). Row counts come from the live batch, never from the
+  activation width, which a prefill-graph replay pads past the real rows.
+
+The state groups (Mamba/GDN/KDA) read the same layout: extend rows at their
+cached prefix, decode rows `spec_num_tokens` before `seq_lens`.
 
 One side channel exists beyond the table: `set_request_slots(req_pool_indices)`,
 a no-op by default, which the router calls on every leaf after each

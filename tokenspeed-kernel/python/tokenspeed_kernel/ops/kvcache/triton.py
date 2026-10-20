@@ -761,15 +761,14 @@ def copy_state_rows(
     )
 
 
-@triton.jit(do_not_specialize=["num_rows", "state_width"])
+@triton.jit(do_not_specialize=["state_dim_2", "state_dim_3", "tiles_3"])
 def _store_state_rows_kernel(
     states,
     slab,
     blocks,
-    num_rows,
-    state_width,
     state_dim_2,
     state_dim_3,
+    tiles_3,
     state_stride_0,
     state_stride_1,
     state_stride_2,
@@ -778,32 +777,46 @@ def _store_state_rows_kernel(
     slab_stride_1,
     slab_stride_2,
     slab_stride_3,
-    BLOCK: tl.constexpr,
+    BLOCK_2: tl.constexpr,
+    BLOCK_3: tl.constexpr,
 ):
-    offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
-    row = offsets // state_width
-    feature = offsets % state_width
-    live = row < num_rows
-    destination = tl.load(blocks + row, mask=live, other=-1).to(tl.int64)
-    live = live & (destination >= 0)
-    # int64 element offsets: a slab block id times its stride, or a late row of
-    # a wide state, exceeds int32 on large pools.
-    dim_1_index = feature // (state_dim_2 * state_dim_3)
-    remainder = feature % (state_dim_2 * state_dim_3)
-    dim_2_index = remainder // state_dim_3
-    dim_3_index = remainder % state_dim_3
-    state_offset = (
-        row * state_stride_0
-        + dim_1_index * state_stride_1
-        + dim_2_index * state_stride_2
-        + dim_3_index * state_stride_3
+    """Copy one (key, value) tile of one request's state into its slab block.
+
+    Grid is (plane tiles, rows, heads), so an element's coordinates come from
+    ``program_id`` and two ``arange``s rather than from dividing a flat index:
+    int64 division is a software sequence on GPU, and four of them per element
+    cost more than moving the megabyte that a state row is.
+
+    The tile is two-dimensional because the copy is a transpose in the common
+    case -- the scan hands back a value-major state while the slab is key-major,
+    so one side runs at the other's inner stride. A flat element index made
+    every lane of a warp touch a different 512-byte sector on that side.
+    """
+    tile = tl.program_id(0)
+    row = tl.program_id(1)
+    dim_1_index = tl.program_id(2)
+    destination = tl.load(blocks + row).to(tl.int64)
+    index_2 = (tile // tiles_3) * BLOCK_2 + tl.arange(0, BLOCK_2)
+    index_3 = (tile % tiles_3) * BLOCK_3 + tl.arange(0, BLOCK_3)
+    live = (
+        (index_2[:, None] < state_dim_2)
+        & (index_3[None, :] < state_dim_3)
+        & (destination >= 0)
     )
-    slab_offset = (
-        destination * slab_stride_0
-        + dim_1_index * slab_stride_1
-        + dim_2_index * slab_stride_2
-        + dim_3_index * slab_stride_3
+    state_inner = (
+        dim_1_index * state_stride_1
+        + index_2[:, None] * state_stride_2
+        + index_3[None, :] * state_stride_3
     )
+    slab_inner = (
+        dim_1_index * slab_stride_1
+        + index_2[:, None] * slab_stride_2
+        + index_3[None, :] * slab_stride_3
+    )
+    # int64 row bases: a slab block id times its stride, or a late row of a wide
+    # state, exceeds int32 on large pools.
+    state_offset = row.to(tl.int64) * state_stride_0 + state_inner
+    slab_offset = destination * slab_stride_0 + slab_inner
     value = tl.load(states + state_offset, mask=live)
     tl.store(slab + slab_offset, value.to(slab.dtype.element_ty), mask=live)
 
@@ -842,19 +855,22 @@ def store_state_rows(
         live = blocks >= 0
         slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
         return
-    state_width = states[0].numel()
-    block = 256
-    _store_state_rows_kernel[(triton.cdiv(blocks.numel() * state_width, block),)](
+    state_dim_2, state_dim_3 = states.shape[2], states.shape[3]
+    block_2, block_3 = 32, min(triton.next_power_of_2(state_dim_3), 128)
+    tiles_3 = triton.cdiv(state_dim_3, block_3)
+    _store_state_rows_kernel[
+        (triton.cdiv(state_dim_2, block_2) * tiles_3, blocks.numel(), states.shape[1])
+    ](
         states,
         slab,
         blocks,
-        blocks.numel(),
-        state_width,
-        states.shape[2],
-        states.shape[3],
+        state_dim_2,
+        state_dim_3,
+        tiles_3,
         *states.stride(),
         *slab.stride(),
-        BLOCK=block,
+        BLOCK_2=block_2,
+        BLOCK_3=block_3,
     )
 
 

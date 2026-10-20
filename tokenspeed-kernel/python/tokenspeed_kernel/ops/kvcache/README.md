@@ -15,6 +15,24 @@ This scheduler/lifecycle operation consumes a CPU range list outside CUDA graph
 capture. Capturing it fails explicitly rather than retaining a temporary pinned
 metadata pointer in a graph. Model forward graph replay is unchanged.
 
+## Recurrent state rows
+
+`store_state_rows` scatters one request's recurrent state per row into its
+slab block, honouring both tensors' strides, so a transposed scan output and a
+page-interleaved arena view need no staging copy. The grid is
+(plane tiles, rows, heads) and the tile is two-dimensional over the last two
+dimensions: an element's coordinates come from `program_id` and two `arange`s
+instead of a flat index divided by a runtime width. Both matter because the copy
+is a transpose in serving -- the scan returns a value-major state while the slab
+is key-major -- and because capacity-shaped prefill metadata pads the request
+dimension with `-1` blocks, so most programs of a mixed step move nothing and
+must not cost a division per element. A negative block skips its row.
+
+The destination block per row is device-resident: the host never reads it, so
+the launch grid covers the padded request count and the masked rows retire
+immediately. `copy_state_rows` is the multi-layer sibling used when one
+call carries several layers through per-layer address tables.
+
 ## Sparse KV offloading
 
 `offload.py` is the runtime boundary. NVIDIA uses the registered

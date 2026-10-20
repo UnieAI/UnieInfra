@@ -37,7 +37,7 @@ Every task declares one `workflow_stage`:
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
 
-The NVIDIA B200 Tests and AMD Tests workflows run unit tests before model
+The NVIDIA Tests and AMD Tests workflows run unit tests before model
 tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
 concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks

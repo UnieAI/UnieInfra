@@ -39,39 +39,40 @@ on:
         type: choice
         options:
           - "off"
-          - test/ci/eval/deepseek-v4.1-flash-dspark-evalscope-gsm8k.yaml
-          - test/ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml
-          - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
-          - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
-          - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
-          - test/ci/eval/inkling-nvfp4-mtp-evalscope-aime25.yaml
-          - test/ci/eval/kimi-k2.5-nvfp4-dflash-evalscope-aime25.yaml
-          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml
-          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gpqa-diamond.yaml
-          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gsm8k.yaml
-          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
-          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
-          - test/ci/eval/kimi-k3-mxfp4-tp16-four-node-evalscope-aime26-slurm.yaml
-          - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml
-          - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml
-          - test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
-          - test/ci/eval/kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
-          - test/ci/eval/kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml
-          - test/ci/eval/kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
-          - test/ci/eval/kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
-          - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
-          - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
-          - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
-          - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
-          - test/ci/eval/qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-evalscope-gsm8k.yaml
-          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
-          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
-          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
-          - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
-          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
-          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
-          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
-          - test/ci/perf/qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml
+          # Model validation is temporarily disabled. Re-enable only
+          # Qwen3.8-27B and Qwen3.6-35B-A3B entries after support lands.
+          # - test/ci/eval/deepseek-v4.1-flash-dspark-evalscope-gsm8k.yaml
+          # - test/ci/eval/deepseek-v4.1-flash-pd-1p1d-dspark-evalscope-gsm8k-gb300-slurm.yaml
+          # - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
+          # - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
+          # - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
+          # - test/ci/eval/inkling-nvfp4-mtp-evalscope-aime25.yaml
+          # - test/ci/eval/kimi-k2.5-nvfp4-dflash-evalscope-aime25.yaml
+          # - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml
+          # - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gpqa-diamond.yaml
+          # - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gsm8k.yaml
+          # - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
+          # - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
+          # - test/ci/eval/kimi-k3-mxfp4-tp16-four-node-evalscope-aime26-slurm.yaml
+          # - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml
+          # - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml
+          # - test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          # - test/ci/eval/kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          # - test/ci/eval/kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml
+          # - test/ci/eval/kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          # - test/ci/eval/kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
+          # - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
+          # - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
+          # - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
+          # - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
+          # - test/ci/eval/qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-evalscope-gsm8k.yaml
+          # - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
+          # - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
+          # - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
+          # - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
+          # - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
+          # - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
+          # - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
           - test/ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml
           - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
           - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
@@ -118,6 +119,7 @@ concurrency:
 
 jobs:
   dispatch:
+    if: false
     runs-on: ${{ inputs.cluster == 'gb300' && 'slurm-dispatch-gb300' || 'slurm-dispatch' }}
     timeout-minutes: 720
     permissions:
@@ -152,6 +154,10 @@ jobs:
           TRIGGER: ${{ inputs.trigger }}
         run: |
           set -euo pipefail
+          if [ "$YAML_SELECTION" = off ] && [[ ",$TASK_TYPES," == *",eval,"* || ",$TASK_TYPES," == *",perf,"* ]]; then
+            echo "Model validation is temporarily disabled; only Qwen3.8-27B and Qwen3.6-35B-A3B may be re-enabled later." >&2
+            exit 2
+          fi
           if [ -n "$CONTAINER_IMAGE" ]; then
             [[ "$CONTAINER_IMAGE" =~ ^ghcr\.io/lightseekorg/tokenspeed-runner:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}@sha256:[0-9a-f]{64}$ ]] || {
               echo "container_image must be an immutable ghcr.io/lightseekorg/tokenspeed-runner image" >&2

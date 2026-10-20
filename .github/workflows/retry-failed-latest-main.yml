@@ -25,7 +25,6 @@ jobs:
         with:
           script: |
             const workflows = [
-              "nvidia-b200-tests.yml",
               "amd-tests.yml",
               "amd-kernel-benchmark.yml",
               "pr-test-nvidia-arm.yml",

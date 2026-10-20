@@ -313,6 +313,25 @@ def test_cuda_include_dirs_fall_back_from_partial_toolkit(
 
 
 @pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("sm121", "121"),
+        ("sm121a", "121a"),
+        ("100", "100a"),
+        ("103a", "103a"),
+        ("10.0", "100a"),
+    ],
+)
+def test_cuda_arch_normalization_accepts_sm_prefix(arch, expected, monkeypatch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+
+    assert builder._normalize_cuda_arch(arch) == expected
+
+
+@pytest.mark.parametrize(
     ("launcher", "expected_prefix"),
     [
         (None, []),

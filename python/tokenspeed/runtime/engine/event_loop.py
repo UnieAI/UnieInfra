@@ -372,6 +372,22 @@ class EventLoop:
             and attn_tp_rank == 0
         )
 
+        # A MIXED round scans its decode rows with the extend kernels, so a
+        # recurrent layer folds every verify token into the committed state,
+        # rejected drafts included. Measured on Qwen3.8-27B MTP: staggered
+        # greedy replies drop words ("Let's for a file named"). Refuse it
+        # rather than serve corrupt text.
+        if (
+            server_args.enable_mixed_batch
+            and specs.spec_num_tokens > 1
+            and specs.cache_state_group_ids
+        ):
+            raise RuntimeError(
+                "--enable-mixed-batch with speculative decoding is not supported "
+                "on a model with recurrent state: a MIXED round would commit the "
+                "state past rejected draft tokens. Drop one of the two."
+            )
+
         # Encode nodes never build an EventLoop (they run the LM-free encode
         # loop), so here "disaggregation is on" means the cache-transfer PD
         # protocol: this engine is a P or D role.

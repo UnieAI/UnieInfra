@@ -97,7 +97,11 @@ case "$KIND" in
         # one step by default, and this tree's MHA leaf now serves that round.
         # It used to assert it away, which is why every earlier qwen38 cell
         # measured the no-mix configuration -- an arm running a different
-        # mechanism than the arms it is compared against.
+        # mechanism than the arms it is compared against. There is no
+        # --disable-mixed-batch to undo it, so the two arms differ by this flag
+        # alone and Q38_MIXED=0 is how the control is run.
+        MIXED_ARGS=()
+        if [ "${Q38_MIXED:-1}" = "1" ]; then MIXED_ARGS=(--enable-mixed-batch); fi
         RUN_ARGS=(python3 -m tokenspeed.cli serve \
           --model-path "$MODEL" --tp "$TP" --port 8015 --host 0.0.0.0 --trust-remote-code \
           --disable-kvstore \
@@ -105,7 +109,7 @@ case "$KIND" in
           --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
           --block-size 64 \
           --prefill-graph-max-tokens 8192 \
-          --enable-mixed-batch)
+          "${MIXED_ARGS[@]}")
         ;;
       *)
         RUN_ARGS=(python3 -m tokenspeed.cli serve \

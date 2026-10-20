@@ -113,9 +113,9 @@ def test_padded_slot_rows_are_defined_and_zero():
     assert torch.isfinite(out).all(), "a padded row reached the caller as a NaN"
 
     pad_rows = slice(int(query_start_loc[1]), int(query_start_loc[2]))
-    assert out[:, pad_rows].abs().max().item() == 0.0, (
-        "a padded slot must report zeros, not the allocation's leftovers"
-    )
+    assert (
+        out[:, pad_rows].abs().max().item() == 0.0
+    ), "a padded slot must report zeros, not the allocation's leftovers"
     # Two real chunks of four, plus one chunk for each single-token row.
     assert metadata.batch_indices.numel() == 2 + 1 + 1
     # The pad slot is never a write target.

@@ -49,8 +49,10 @@ CONCURRENCY="${GB10_CONCURRENCY:-1 4 16 64}"
 # 27B dense decode is ~5 tok/s per stream here, so c=1 sets the run time.
 BENCH_MIN_PROMPTS="${GB10_BENCH_MIN_PROMPTS:-8}"
 # Benchmark shapes, each at every concurrency: unique 1024-token prompts, a
-# shared 1024-token prefix plus 256 new tokens, and unique 6144-token prompts
-# (where the KV cache is a real share of each decode step's reads).
+# shared 1024-token prefix plus 256 new tokens, unique 6144-token prompts
+# (where the KV cache is a real share of each decode step's reads), and
+# `longshared`: a shared 6144-token prefix plus 256 new -- the decode context
+# of `long` with almost none of its prefill, which separates the two costs.
 BENCH_SHAPES="${GB10_BENCH_SHAPES:-unique shared long}"
 # gsm8k questions to score after the benchmark (0 skips it). Generation config
 # as the GB10 CI eval; a subset, since the full set takes hours on one GB10.
@@ -263,7 +265,7 @@ bench() {
     --random-input-len "$inlen" --random-output-len "$outlen" --ignore-eos \
     --num-prompts "$n" --max-concurrency "$conc" \
     --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
-    --save-result --result-dir /logs --result-filename "bench-$name-c$conc.json" \
+    --save-result --save-detailed --result-dir /logs --result-filename "bench-$name-c$conc.json" \
     >"$LOGDIR/bench-$name-c$conc.txt" 2>&1 ||
     { log "WARNING: bench $name c=$conc failed (bench-$name-c$conc.txt)"; return 0; }
   python3 - "$LOGDIR/bench-$name-c$conc.json" "$name" "$conc" <<'PY'
@@ -396,6 +398,7 @@ cmd_window() {
         unique) bench unique "$c" 0 1024 128 ;;
         shared) bench shared "$c" 1024 256 128 ;;
         long) bench long "$c" 0 6144 128 ;;
+        longshared) bench longshared "$c" 6144 256 128 ;;
         *) die "unknown bench shape: $shape" ;;
       esac
     done

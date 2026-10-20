@@ -14,6 +14,33 @@ closely, adding UnieAI's model support, scheduling and kernel work on top.
 - **Entrypoint**: an OpenAI-compatible server with low-overhead request
   handling.
 
+## What we are working on
+
+**DeepSeek-V4.1-Flash on 4x H200 for agent serving.** The target is twice the
+throughput of vLLM 0.31 on AgentX agent traces at the same hardware, without
+giving up accuracy. It is reached at concurrency 32 (2.15x); concurrency 16 is
+at 1.95x.
+
+What got it there, in order (c16 wall time, vLLM 0.31 takes 47.3 s):
+
+| step | c16 (s) |
+|---|---|
+| upstream TokenSpeed with DeepSeek-V4.1 support | 51.4 |
+| batch prefill attention, fuse the Hopper index top-k glue | 45.3 |
+| capture the attention projections in prefill CUDA graphs | 36.5 |
+| prefill graphs up to 4096 tokens, W4A8 MoE (FP8 activations) | 32.8 |
+| capture the CED narrowing layer around its row selection | 29.8 |
+| DSpark speculative decoding with 5 draft steps | 28.7 |
+| memoize kernel selection across eager calls | 27.4 |
+| 8192-token prefill chunks and graphs, ratio-1 compressor in graph | 26.0 |
+| prefill coalescing (`--prefill-coalesce-ms 100`) | **24.2** |
+
+![Optimization steps at concurrency 16](assets/perf/unieinfra-dsv41-h200-steps.png)
+
+Both decode and prefill are now bound by streaming the routed-expert weights,
+so the remaining lever is scheduling: letting more tokens share each pass over
+those weights. Next is closing the last 2% at concurrency 16.
+
 ## Performance
 
 ### DeepSeek-V4.1-Flash on 4x H200, against vLLM 0.31
@@ -22,6 +49,8 @@ AgentX agent traces: 256 requests per cell, about 9.7k input tokens each
 (most of it a prefix shared within a session) and exactly 128 output tokens.
 The prefix cache is flushed before every cell. Each value is the wall time for
 the cell, median over repeated arms run in swapped orders; lower is better.
+
+![Output throughput against vLLM 0.31](assets/perf/unieinfra-dsv41-h200-throughput.png)
 
 | concurrency | 1 | 8 | 16 | 32 | 64 | 128 |
 |---|---|---|---|---|---|---|
@@ -32,6 +61,11 @@ the cell, median over repeated arms run in swapped orders; lower is better.
 At concurrency 16, UnieInfra serves 634 requests per minute at a mean TTFT of
 354 ms; vLLM serves 325 at 576 ms. GSM8K accuracy is 0.9356 on the same
 deployment.
+
+![Throughput against time to first token](assets/perf/unieinfra-dsv41-h200-ttft.png)
+
+Both engines saturate around concurrency 64. At concurrency 1 decode speed is
+at parity, and the lead comes from time to first token (84 ms against 186 ms).
 
 Serving recipe (TP4 with expert parallelism, DSpark speculative decoding):
 

@@ -28,7 +28,9 @@ def _body(iteration_buckets, extra=""):
     """An exposition body in the shape the server publishes."""
     lines = []
     for bound, count in iteration_buckets:
-        lines.append(f'tokenspeed:iteration_tokens_total_bucket{{le="{bound}"}} {count}')
+        lines.append(
+            f'tokenspeed:iteration_tokens_total_bucket{{le="{bound}"}} {count}'
+        )
     lines += [
         "tokenspeed:iteration_tokens_total_sum 9000.0",
         "tokenspeed:iteration_tokens_total_count 12.0",
@@ -90,7 +92,9 @@ def _write_csv(tmp_path, rows):
     ]
     path = tmp_path / "metrics.csv"
     path.write_text(
-        ",".join(columns) + "\n" + "".join(",".join(str(v) for v in row) + "\n" for row in rows)
+        ",".join(columns)
+        + "\n"
+        + "".join(",".join(str(v) for v in row) + "\n" for row in rows)
     )
     return str(path)
 
@@ -123,9 +127,13 @@ def test_report_slices_to_the_measured_window(tmp_path, capsys):
     ]
     csv_path = _write_csv(tmp_path, rows)
     result = tmp_path / "measured.json"
-    result.write_text(json.dumps({"started_at": 1009.0, "finished_at": 1013.0, "rows": []}))
+    result.write_text(
+        json.dumps({"started_at": 1009.0, "finished_at": 1013.0, "rows": []})
+    )
 
-    step_report.main(["step_report.py", csv_path, "--json", str(result), "--label", "cell"])
+    step_report.main(
+        ["step_report.py", csv_path, "--json", str(result), "--label", "cell"]
+    )
 
     out = capsys.readouterr().out
     # Measured window covers t=3..5: 100 iterations over 2 s, 124000 tokens,

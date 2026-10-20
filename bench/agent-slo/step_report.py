@@ -30,7 +30,9 @@ import sys
 def bucket_columns(row):
     return sorted(
         (k for k in row if k.startswith("iteration_tokens_total_le")),
-        key=lambda k: float(k[len("iteration_tokens_total_le") :].replace("+Inf", "inf")),
+        key=lambda k: float(
+            k[len("iteration_tokens_total_le") :].replace("+Inf", "inf")
+        ),
     )
 
 
@@ -45,32 +47,44 @@ def main(argv):
     path = argv[1]
     label = argv[argv.index("--label") + 1] if "--label" in argv else path
     rows = list(csv.DictReader(open(path)))
-    window = measured_window(argv[argv.index("--json") + 1]) if "--json" in argv else None
+    window = (
+        measured_window(argv[argv.index("--json") + 1]) if "--json" in argv else None
+    )
     if window is not None:
         lo, hi = window
         rows = [r for r in rows if "wall" in r and lo <= float(r["wall"]) <= hi]
     live = [r for r in rows if float(r["num_requests_running"]) > 0]
     where = "measured phase" if window else "whole sample file"
-    print(f"== step accounting: {label} ({len(rows)} samples in the {where}, {len(live)} with a non-empty batch)")
+    print(
+        f"== step accounting: {label} ({len(rows)} samples in the {where}, {len(live)} with a non-empty batch)"
+    )
     if len(live) < 2:
         print("   no non-empty batch sampled; nothing to account for")
         return
     first, last = live[0], live[-1]
     seconds = float(last["t"]) - float(first["t"])
-    iterations = float(last["iteration_tokens_total_count"]) - float(first["iteration_tokens_total_count"])
-    tokens = float(last["iteration_tokens_total_sum"]) - float(first["iteration_tokens_total_sum"])
+    iterations = float(last["iteration_tokens_total_count"]) - float(
+        first["iteration_tokens_total_count"]
+    )
+    tokens = float(last["iteration_tokens_total_sum"]) - float(
+        first["iteration_tokens_total_sum"]
+    )
     if iterations <= 0:
         print("   no iterations sampled")
         return
     running = [float(r["num_requests_running"]) for r in live]
     waiting = [float(r["num_requests_waiting"]) for r in live]
     cache = [float(r["kv_cache_usage_perc"]) for r in live]
-    print(f"   {seconds:.1f}s  {iterations:.0f} iterations  "
-          f"{iterations / seconds:.2f} iter/s  {1000 * seconds / iterations:.1f} ms/iter")
+    print(
+        f"   {seconds:.1f}s  {iterations:.0f} iterations  "
+        f"{iterations / seconds:.2f} iter/s  {1000 * seconds / iterations:.1f} ms/iter"
+    )
     print(f"   {tokens / iterations:.0f} tokens/iter")
-    print(f"   running p50 {statistics.median(running):.0f} max {max(running):.0f}"
-          f" | waiting p50 {statistics.median(waiting):.0f} max {max(waiting):.0f}"
-          f" | cache p50 {statistics.median(cache):.2f} max {max(cache):.2f}")
+    print(
+        f"   running p50 {statistics.median(running):.0f} max {max(running):.0f}"
+        f" | waiting p50 {statistics.median(waiting):.0f} max {max(waiting):.0f}"
+        f" | cache p50 {statistics.median(cache):.2f} max {max(cache):.2f}"
+    )
     buckets = bucket_columns(rows[0])
     if not buckets:
         print("   (this CSV predates the bucket columns; no step-size split)")
@@ -84,8 +98,14 @@ def main(argv):
         bound = float(column[len("iteration_tokens_total_le") :].replace("+Inf", "inf"))
         cumulative = float(last[column]) - float(first[column])
         count = cumulative - below
-        span = f"({low:.0f}, inf)" if bound == float("inf") else f"({low:.0f}, {bound:.0f}]"
-        print(f"     {span:>16} {count:7.0f}  {100 * count / total if total else 0:5.1f}%")
+        span = (
+            f"({low:.0f}, inf)"
+            if bound == float("inf")
+            else f"({low:.0f}, {bound:.0f}]"
+        )
+        print(
+            f"     {span:>16} {count:7.0f}  {100 * count / total if total else 0:5.1f}%"
+        )
         low, below = bound, cumulative
 
 

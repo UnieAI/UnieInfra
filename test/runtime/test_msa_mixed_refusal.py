@@ -67,7 +67,9 @@ def test_msa_refuses_a_mixed_round_before_touching_state():
     # to survive refactors of the entry point.
     backend = MSAAttnBackend.__new__(MSAAttnBackend)
 
-    with pytest.raises(AssertionError, match="MSA backend does not support mixed batch") as caught:
+    with pytest.raises(
+        AssertionError, match="MSA backend does not support mixed batch"
+    ) as caught:
         _mixed_call(backend)
 
     # The message is the only thing an operator sees at the point of failure.

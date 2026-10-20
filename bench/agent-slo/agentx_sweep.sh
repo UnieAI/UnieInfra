@@ -367,9 +367,29 @@ if [ "$up" -ne 1 ]; then echo "[$TAG] FAILED to come up"; tail -120 "$LOG"; kill
 for CONC in $(echo "$CONCS" | tr ',' ' '); do
   OUT=$OUTDIR/agentx_${KIND}_${TAG}_c${CONC}.json
   echo "[$TAG] conc=$CONC -> $OUT"
+  # With a metrics port published, every cell also carries the scheduler's own
+  # counters: the sampler runs beside the load and the report slices the series
+  # to the window drive.py recorded, so the warmup the sampler necessarily also
+  # sees does not leak into the accounting. The sampler is killed rather than
+  # timed out -- it writes a line-buffered row per sample, so the file is
+  # complete when it stops.
+  CSV=$OUTDIR/metrics_${KIND}_${TAG}_c${CONC}.csv
+  SAMP=
+  if [ -n "${METRICS_PORT:-}" ]; then
+    "$HERE/UnieInfra/.venv/bin/python" "$HERE/UnieInfra/bench/agent-slo/step_metrics.py" \
+      "http://127.0.0.1:$METRICS_PORT/metrics" "$CSV" 86400 20 &
+    SAMP=$!
+  fi
   if ! "$HERE/UnieInfra/.venv/bin/python" "$HERE/UnieInfra/bench/agent-slo/drive.py" \
        "http://127.0.0.1:$PORT" "$MN" "$DATA" "$CONC" "$NREQ" "$OUT" "$WARM"; then
+    [ -n "$SAMP" ] && kill "$SAMP" 2>/dev/null
     echo "[$TAG] run failed at conc=$CONC"; kill "$LOGPID" 2>/dev/null; exit 1
+  fi
+  if [ -n "$SAMP" ]; then
+    kill "$SAMP" 2>/dev/null
+    wait "$SAMP" 2>/dev/null
+    "$HERE/UnieInfra/.venv/bin/python" "$HERE/UnieInfra/bench/agent-slo/step_report.py" \
+      "$CSV" --json "$OUT" --label "$KIND $TAG c$CONC"
   fi
 done
 

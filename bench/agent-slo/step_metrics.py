@@ -21,11 +21,15 @@ prefill and how many did decode -- without a trace. The bounds are the server's
 own (1-2-5 up to its largest step), so they are discovered from the first
 scrape rather than hardcoded. Other histograms keep only their sum and count.
 
+Kill it rather than waiting out SECONDS: a line-buffered row per sample means the
+file is complete whenever the sampler stops.
+
 Usage:
     python3 bench/agent-slo/step_metrics.py URL OUT.csv SECONDS [HZ]
 
-Writes one row per sample with a monotonic timestamp, so the series lines up with
-the driver's per-request timings.
+Writes one row per sample with both a monotonic timestamp (for the series) and a
+wall-clock one, so `step_report.py` can slice the file to the measured window a
+result JSON names, and drop the warmup it shares the process with.
 """
 
 import sys
@@ -110,18 +114,23 @@ def main(argv):
     hz = float(argv[4]) if len(argv) > 4 else 20.0
     period = 1.0 / hz
     keys = list(KEYS) + discover(scrape(url))
-    with open(path, "w") as f:
-        f.write("t," + ",".join(keys) + "\n")
+    with open(path, "w", buffering=1) as f:
+        f.write("t,wall," + ",".join(keys) + "\n")
         start = time.monotonic()
         while time.monotonic() - start < seconds:
             tick = time.monotonic() - start
+            wall = time.time()
             try:
                 sample = parse(scrape(url), keys)
             except Exception as exc:  # the server can be mid-shutdown
                 sys.stderr.write(f"scrape failed at {tick:.1f}s: {exc}\n")
                 time.sleep(period)
                 continue
-            f.write(f"{tick:.3f}," + ",".join(f"{sample[k]:.4f}" for k in keys) + "\n")
+            f.write(
+                f"{tick:.3f},{wall:.3f},"
+                + ",".join(f"{sample[k]:.4f}" for k in keys)
+                + "\n"
+            )
             time.sleep(max(0.0, period - (time.monotonic() - start - tick)))
 
 

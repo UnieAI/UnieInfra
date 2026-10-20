@@ -59,41 +59,79 @@ def load_events(path):
     at the c64 Qwen3.8 profile reached 11.8 GiB of resident memory and had to be
     killed. The events are decoded one at a time instead, and only the fields
     the summary reads are kept.
+
+    The file is one object whose ``traceEvents`` member holds the events, so the
+    stream is first advanced to the start of that array -- decoding the whole
+    document just to reach it would defeat the point -- and the trailing ``]``
+    ends the read.
     """
     opener = gzip.open if path.endswith(".gz") else open
     decoder = json.JSONDecoder()
     events = []
     buf = ""
     with opener(path, "rt") as f:
-        while True:
+        # Advance to the first event: an object keyed by traceEvents, or a bare
+        # array. Each refill keeps the tail that did not reach the array yet.
+        offset = None
+        while offset is None:
+            marked = buf.find('"traceEvents"')
+            if marked >= 0:
+                bracket = buf.find("[", marked)
+                if bracket >= 0:
+                    offset = bracket + 1
+                    break
+            else:
+                bare = buf.lstrip()[:1]
+                if bare == "[":
+                    offset = buf.index("[") + 1
+                    break
             chunk = f.read(1 << 22)
             if not chunk:
-                break
+                return events
             buf += chunk
-            pos = 0
-            while True:
-                # Skip separators; a partial value at the end of the buffer is
-                # completed by the next chunk.
-                while pos < len(buf) and buf[pos] in " \t\r\n,[]":
-                    pos += 1
-                if pos >= len(buf):
+        buf = buf[offset:]
+        pos = 0
+        while True:
+            # Skip separators; a partial value at the end of the buffer is
+            # completed by the next chunk.
+            while pos < len(buf) and buf[pos] in " \t\r\n,[":
+                pos += 1
+            if pos >= len(buf):
+                chunk = f.read(1 << 22)
+                if not chunk:
                     break
-                try:
-                    value, end = decoder.raw_decode(buf, pos)
-                except json.JSONDecodeError:
+                buf = buf[pos:] + chunk
+                pos = 0
+                continue
+            if buf[pos] == "]":
+                break
+            try:
+                value, end = decoder.raw_decode(buf, pos)
+            except json.JSONDecodeError:
+                chunk = f.read(1 << 22)
+                if not chunk:
                     break
-                pos = end
-                if isinstance(value, dict) and value.get("ph") == "X":
-                    if "ts" in value and "dur" in value:
-                        events.append(
-                            {
-                                "name": value.get("name"),
-                                "cat": value.get("cat"),
-                                "ts": value["ts"],
-                                "dur": value["dur"],
-                            }
-                        )
-            buf = buf[pos:]
+                buf = buf[pos:] + chunk
+                pos = 0
+                continue
+            pos = end
+            if (
+                isinstance(value, dict)
+                and value.get("ph") == "X"
+                and "ts" in value
+                and "dur" in value
+            ):
+                events.append(
+                    {
+                        "name": value.get("name"),
+                        "cat": value.get("cat"),
+                        "ts": value["ts"],
+                        "dur": value["dur"],
+                    }
+                )
+            if pos > (1 << 20):
+                buf = buf[pos:]
+                pos = 0
     return events
 
 
@@ -149,6 +187,38 @@ def pick_step_fn(events, requested):
         "could not auto-detect the step function; pass --step-fn. "
         f"Most frequent host names and counts: {best}"
     )
+
+
+def rank_hosts(events, top):
+    """Host functions ranked by the time they cover, for choosing --step-fn.
+
+    ``pick_step_fn`` names the step only when a candidate it knows appears. Our
+    own traces wrap the forward in ``device._forward``, which the candidate list
+    cannot spell because the recorded name carries the file's line number, so the
+    reader has to choose. Ranking by count offers builtins and per-element calls
+    (``list.append``, ``isinstance``); ranking by time offers the frames that
+    actually bound work.
+    """
+    agg = {}
+    for e in events:
+        if e.get("cat") in HOST_CATS:
+            entry = agg.setdefault(e["name"], [0, 0.0])
+            entry[0] += 1
+            entry[1] += e["dur"]
+    by_time = sorted(agg.items(), key=lambda kv: kv[1][1], reverse=True)[:top]
+    by_count = sorted(agg.items(), key=lambda kv: kv[1][0], reverse=True)[:top]
+    return by_time, by_count
+
+
+def report_hosts(by_time, by_count):
+    print("host functions by covered time:")
+    for name, (count, total_us) in by_time:
+        print(
+            f"  {total_us / 1e6:9.1f} s  {count:8d}x  {total_us / count / 1000:9.3f} ms  {name}"
+        )
+    print("\nhost functions by call count:")
+    for name, (count, total_us) in by_count:
+        print(f"  {count:9d}x  {total_us / 1e6:9.1f} s  {name}")
 
 
 def steps_from(events, step_fn):
@@ -310,12 +380,20 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("trace")
     ap.add_argument("--step-fn", default=None)
+    ap.add_argument(
+        "--list-hosts",
+        action="store_true",
+        help="rank host functions instead of summarizing, to choose --step-fn",
+    )
     ap.add_argument("--kernel", default=None, help="substring to report separately")
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
     events = load_events(args.trace)
+    if args.list_hosts:
+        report_hosts(*rank_hosts(events, args.top))
+        return 0
     step_fn = pick_step_fn(events, args.step_fn)
     summary = summarize(events, step_fn, args.top, args.kernel)
     report(summary, step_fn, args.kernel)

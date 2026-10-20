@@ -205,12 +205,21 @@ async def main():
     res = {}
     async with aiohttp.ClientSession() as s:
         await warmup(s)
+        started_at = time.time()
         t0 = time.perf_counter()
         await asyncio.gather(*[one(s, sem, i, p, res) for i, p in enumerate(prompts)])
         dur = time.perf_counter() - t0
+        finished_at = time.time()
     rows = [res[i] for i in sorted(res)]
     json.dump(
-        {"duration_s": round(dur, 2), "n": len(rows), "rows": rows}, open(out, "w")
+        {
+            "duration_s": round(dur, 2),
+            "started_at": round(started_at, 3),
+            "finished_at": round(finished_at, 3),
+            "n": len(rows),
+            "rows": rows,
+        },
+        open(out, "w"),
     )
     ok = sum(1 for r in rows if r["text"])
     print(f"{out}: n={len(rows)} ok={ok} duration={dur:.1f}s")

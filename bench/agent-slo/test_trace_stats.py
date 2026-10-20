@@ -143,3 +143,69 @@ def test_step_function_is_auto_detected_from_a_real_trace_file(tmp_path):
     assert trace_stats.pick_step_fn(loaded, None) == "forward_step"
     with pytest.raises(SystemExit):
         trace_stats.pick_step_fn(loaded, "not_in_trace")
+
+
+def test_events_are_loaded_across_chunk_boundaries(tmp_path):
+    # load_events reads 4 MiB at a time, so a serving-scale trace has events whose
+    # text straddles a refill. An event lost or duplicated at a boundary would
+    # shift the per-step kernel count, which is the number the method divides by.
+    filler = [
+        {"ph": "X", "cat": "kernel", "name": "fill", "ts": i, "dur": 1}
+        for i in range(120_000)
+    ]
+    last = {
+        "ph": "X",
+        "cat": "python_function",
+        "name": "forward_step",
+        "ts": 10**9,
+        "dur": 7_000,
+    }
+    path = _write(tmp_path, filler + [last])
+
+    loaded = trace_stats.load_events(path)
+
+    assert len(loaded) == len(filler) + 1
+    assert loaded[-1]["name"] == "forward_step"
+    assert sum(1 for e in loaded if e["name"] == "fill") == len(filler)
+
+
+def test_a_bare_array_trace_is_also_accepted(tmp_path):
+    # Some profilers write the event array without the object wrapper.
+    path = tmp_path / "bare.json"
+    path.write_text(json.dumps([_step(0, 1_000, [("k", 10, 100)])[0]]))
+    assert [e["name"] for e in trace_stats.load_events(str(path))] == ["forward_step"]
+
+
+def test_hosts_are_ranked_by_covered_time_not_call_count(tmp_path):
+    # Choosing --step-fn by call count offers builtins (list.append runs millions
+    # of times); the step is the frame that covers the work.
+    events = [
+        {"ph": "X", "cat": "python_function", "name": "list.append", "ts": i, "dur": 1}
+        for i in range(500)
+    ] + [
+        {
+            "ph": "X",
+            "cat": "python_function",
+            "name": "device(567): _forward",
+            "ts": 0,
+            "dur": 900_000,
+        },
+        {"ph": "X", "cat": "kernel", "name": "k", "ts": 10, "dur": 100},
+    ]
+
+    by_time, by_count = trace_stats.rank_hosts(events, top=2)
+
+    assert [name for name, _ in by_time] == ["device(567): _forward", "list.append"]
+    assert [name for name, _ in by_count] == ["list.append", "device(567): _forward"]
+    # Kernels are not host frames and must not be offered as a step function.
+    assert all(name != "k" for name, _ in by_time)
+
+
+def test_list_hosts_prints_without_needing_a_step_function(tmp_path, capsys):
+    path = _write(tmp_path, _step(0, 1_000, [("k", 10, 100)]))
+
+    assert trace_stats.main([path, "--list-hosts"]) == 0
+
+    out = capsys.readouterr().out
+    assert "host functions by covered time" in out
+    assert "forward_step" in out

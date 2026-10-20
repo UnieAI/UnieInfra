@@ -71,3 +71,48 @@ is not the next step.
    the defect is admission granularity, not kernel time.
 3. Only then a code change, verified at c64 against this table, with c1-c16
    re-measured to prove nothing regressed below the knee.
+
+## The arm definition was wrong before any of this was measured
+
+`ServerArgs.enable_mixed_batch` defaults to `False`, and the sweep never asked
+for it, so **every number in the tables above is the no-mix configuration**.
+Both reference engines pack prefill and decode into one step by default
+(sglang's `mixed_overlap`, vLLM's chunked-prefill scheduling), so the comparison
+was not "our scheduler against theirs" -- it was "our scheduler with
+prefill/decode overlap switched off against theirs with it on".
+
+The reason the arm never asked: the MHA leaf, which serves this checkpoint's
+full-attention layers, asserted a MIXED round away
+(`assert not forward_mode.is_mixed()`, `paged/mha.py`). A disable flag is a bug
+report (AGENTS.md): this one is now fixed by serving the packed batch the way
+the state groups and MLA already do -- extend kernel over the leading rows,
+decode kernel over the trailing rows, `num_extends` carried on the decode
+metadata. Until the c64 point is re-measured with `--enable-mixed-batch`, the
+c32/c64 rows above are a lower bound on this arm, not a parity result.
+
+## What the c64 cell's own counters say
+
+The metrics time series from the no-mix c64 cell (`--enable-metrics`,
+`ab_real/agentx-sweep/met-q38-c64/metrics.csv`, 20 Hz) already rules out the
+retraction hypothesis and fixes the step accounting:
+
+| quantity | measured |
+|----------|----------|
+| scheduler iterations over the measured phase | 588 (10.5 iter/s, 95.4 ms/step) |
+| tokens processed per iteration | 852 (of an 8192 prefill budget) |
+| `num_requests_running` | pinned at 64 (max_num_seqs 80, so slots are free) |
+| `num_requests_waiting` | p50 8, p90 38, max 59 |
+| `kv_cache_usage_perc` | p50 0.43, max 0.60 (KV is not the constraint) |
+| `iteration_tokens_total` across the whole cell | 1,224,803 |
+
+No retraction: the token counter matches the workload's own arithmetic
+(prompts + generated + warmup), so nothing was re-prefilled -- retraction would
+have inflated it. Admission is not refusing on KV (0.43 of the cache) or on
+sequence slots (64 of 80).
+
+What is left is per-step efficiency: 95.4 ms of wall time for 852 tokens, of
+which ~64 are decode rows. At c1 the same model decodes a token every 15 ms, so
+a c64 step costs 6x per token what a c1 step does -- and the workload is ~94%
+prefill, so this step is prefill plus decode executed one after the other, with
+the device idling between them. That is exactly what mixed batching removes, and
+it is why the fix above comes before any other c64 work.

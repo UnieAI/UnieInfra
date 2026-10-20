@@ -87,12 +87,16 @@ def main() -> int:
     dt, rt = load(args.test)
     sb, st = summary(db), summary(dt)
 
-    print(f"{'arm':<10}{'tok/s':>9}{'rpm':>8}{'tok/req':>9}{'ttft50':>9}"
-          f"{'ttft95':>9}{'tpot50':>8}{'tpot90':>8}{'err':>5}")
+    print(
+        f"{'arm':<10}{'tok/s':>9}{'rpm':>8}{'tok/req':>9}{'ttft50':>9}"
+        f"{'ttft95':>9}{'tpot50':>8}{'tpot90':>8}{'err':>5}"
+    )
     for name, s in (("base", sb), ("test", st)):
-        print(f"{name:<10}{s['tok_s']:>9.1f}{s['rpm']:>8.1f}"
-              f"{s['tok_per_req']:>9.1f}{s['ttft50']:>9.0f}{s['ttft95']:>9.0f}"
-              f"{s['tpot50']:>8.0f}{s['tpot90']:>8.0f}{s['err']:>5}")
+        print(
+            f"{name:<10}{s['tok_s']:>9.1f}{s['rpm']:>8.1f}"
+            f"{s['tok_per_req']:>9.1f}{s['ttft50']:>9.0f}{s['ttft95']:>9.0f}"
+            f"{s['tpot50']:>8.0f}{s['tpot90']:>8.0f}{s['err']:>5}"
+        )
     ratio = st["tok_s"] / sb["tok_s"] if sb["tok_s"] else float("nan")
     print(f"\ntest/base throughput: {ratio:.3f}x")
 
@@ -106,22 +110,25 @@ def main() -> int:
         else:
             diffs.append((i, a, b))
     rate = same / len(common) if common else float("nan")
-    print(f"greedy agreement: {same}/{len(common)} = {rate:.4f}"
-          f" (rows only in base: {len(set(rb) - set(rt))},"
-          f" only in test: {len(set(rt) - set(rb))})")
+    print(
+        f"greedy agreement: {same}/{len(common)} = {rate:.4f}"
+        f" (rows only in base: {len(set(rb) - set(rt))},"
+        f" only in test: {len(set(rt) - set(rb))})"
+    )
 
     for i, a, b in diffs[:5]:
         k = first_divergence(a, b)
-        print(f"\n  request {i} diverges at char {k}"
-              f" (base {len(a)} chars, test {len(b)} chars)")
+        print(
+            f"\n  request {i} diverges at char {k}"
+            f" (base {len(a)} chars, test {len(b)} chars)"
+        )
         print(f"    base: ...{a[max(0, k - 20):k + args.prefix_chars]!r}")
         print(f"    test: ...{b[max(0, k - 20):k + args.prefix_chars]!r}")
 
     lengths = [(rb[i]["ntok"], rt[i]["ntok"]) for i in common]
     short = [(i, x, y) for i, (x, y) in zip(common, lengths) if x != y]
     if short:
-        print(f"\ntoken counts differ on {len(short)} requests"
-              f" (first: {short[0]})")
+        print(f"\ntoken counts differ on {len(short)} requests" f" (first: {short[0]})")
 
     if rate < args.min_agreement:
         print(f"\nFAIL: agreement {rate:.4f} < {args.min_agreement}", file=sys.stderr)

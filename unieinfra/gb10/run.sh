@@ -318,15 +318,15 @@ for f in sorted(glob.glob(os.path.join(d, "bench-*.json"))):
         "completed": b["completed"], "output_tok_s": b["output_throughput"],
         "ttft_p50_ms": b["median_ttft_ms"], "ttft_p99_ms": b["p99_ttft_ms"],
         "tpot_p50_ms": b["median_tpot_ms"], "tpot_p99_ms": b["p99_tpot_ms"]})
-scores = []
-for f in glob.glob(os.path.join(d, "eval", "**", "reports", "**", "*.json"), recursive=True):
-    try:
-        rep = json.load(open(f))
-    except Exception:
-        continue
-    if isinstance(rep, dict) and "score" in rep:
-        scores.append(rep["score"])
-m["gsm8k"] = scores[0] if scores else None
+# evalscope's v2 report: the primary metric's score among `metrics`.
+m["gsm8k"] = None
+for f in glob.glob(os.path.join(d, "eval", "*", "reports", "*", "gsm8k.json")):
+    rep = json.load(open(f))
+    primary = rep.get("primary_metric_identity")
+    for metric in rep.get("metrics", []):
+        if metric.get("identity") == primary:
+            m["gsm8k"] = metric["score"]
+            m["gsm8k_n"] = metric["num"]
 json.dump(m, open(os.path.join(d, "metrics.json"), "w"), indent=2)
 print(f"metrics: ready {m['ready_s']} s, kv {m['kv_cache_gb']} GB, gsm8k {m['gsm8k']}, "
       f"{len(m['bench'])} bench points -> {d}/metrics.json")

@@ -34,10 +34,7 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
-from tokenspeed.runtime.configs.pooling_config import (
-    PoolingConfig,
-    resolve_pooling_config,
-)
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
     TRTLLM_MHA_PAGE_SIZE,
@@ -470,12 +467,18 @@ def beam_default_moe_backend(
 
 
 def _apply_beam_moe_default(model_config, server_args: ServerArgs) -> None:
-    """Fill ``--moe-backend`` for a Beam model the launch left ``auto`` (an
-    explicit backend is never asked; another model's launch is not read)."""
+    """Apply Beam's performance default to eligible ``auto`` launches.
+
+    Bitwise launches leave selection to the capability-constrained MoE planner.
+    """
     architectures = _model_architectures(
         model_config.hf_config, model_config.hf_text_config
     )
-    if "BeamForCausalLM" not in architectures or server_args.moe_backend != "auto":
+    if (
+        "BeamForCausalLM" not in architectures
+        or server_args.moe_backend != "auto"
+        or server_args.numerics in BITWISE_ENVELOPES
+    ):
         return
     fmt = _beam_checkpoint_format(model_config)
     backend = beam_default_moe_backend(
@@ -869,29 +872,8 @@ class ModelConfig:
             if hasattr(self.hf_config, "text_config"):
                 self.hf_config.text_config = self.hf_text_config
 
-        # Check model type. A pooling checkpoint is served as an embedding
-        # model: one prefill, one vector, no decode. Draft and auxiliary
-        # checkpoints are never pooled.
-        self.pooling_config: PoolingConfig | None = (
-            None
-            if is_draft_worker
-            else resolve_pooling_config(
-                model_path,
-                is_embedding=getattr(server_args, "is_embedding", None),
-                pooling_type=getattr(server_args, "pooling_type", None),
-                pooling_normalize=getattr(server_args, "pooling_normalize", None),
-            )
-        )
-        self.is_generation = self.pooling_config is None and is_generation_model(
-            self.hf_config.architectures
-        )
-        if self.pooling_config is not None:
-            # Model-facing gate, same idiom as ``hf_config.encoder_only``: the
-            # model class is constructed from the HF config alone, so the
-            # decision has to travel on it.
-            self.hf_config.pooling_config = self.pooling_config
-            if hasattr(self.hf_config, "text_config"):
-                self.hf_config.text_config.pooling_config = self.pooling_config
+        # Check model type
+        self.is_generation = is_generation_model(self.hf_config.architectures)
         self.is_multimodal = (
             self.model_profile.is_multimodal
             if self.model_profile is not None
@@ -976,11 +958,6 @@ class ModelConfig:
                 self.context_len = context_length
         else:
             self.context_len = derived_context_len
-
-        if self.pooling_config is not None:
-            # Here rather than where pooling_config is resolved: the prefill
-            # chunk check is stated against context_len, settled just above.
-            self._resolve_embedding_server_args(server_args)
 
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(
@@ -1102,63 +1079,6 @@ class ModelConfig:
         return (
             self.model_profile is not None and self.model_profile.request_token_history
         )
-
-    def _resolve_embedding_server_args(self, server_args: ServerArgs) -> None:
-        """Turn off the features a pooling forward cannot express.
-
-        Chunked prefill: a pooled vector reduces over the whole prompt, so a
-        partial chunk would reduce over part of it. Prefix caching: a pooling
-        request never reads its own KV back. Both are forced and logged
-        rather than refused, so the server does not fail on flag defaults the
-        operator never set.
-        """
-        if server_args.enable_prefix_caching:
-            logger.info(
-                "Embedding model: disabling prefix caching. A pooling request "
-                "computes one forward and never reads its own KV back."
-            )
-            server_args.enable_prefix_caching = False
-        # This tree has no "-1 disables chunked prefill" convention (the value
-        # sizes the input buffers), so the chunk budget is opened wide enough
-        # that no prompt this server accepts is ever split.
-        budget = int(server_args.max_prefill_tokens)
-        if budget < self.context_len:
-            raise ValueError(
-                "An embedding server cannot split a prompt across prefill "
-                f"chunks, but --max-prefill-tokens ({budget}) is smaller than "
-                f"the context length ({self.context_len}). Raise "
-                f"--max-prefill-tokens to at least {self.context_len}, or "
-                f"lower --max-model-len to at most {budget}."
-            )
-        if server_args.chunked_prefill_size != budget:
-            logger.info(
-                "Embedding model: opening the prefill chunk budget from "
-                f"{server_args.chunked_prefill_size} to {budget} so a pooled "
-                "prompt is never split across chunks."
-            )
-            server_args.chunked_prefill_size = budget
-        if server_args.speculative_algorithm:
-            raise ValueError(
-                "Speculative decoding has nothing to draft for an embedding "
-                "model. Drop --speculative-algorithm."
-            )
-        if not server_args.disable_overlap_schedule:
-            # The C++ scheduler stops a request only when a Finish event
-            # lands. Under the overlap schedule the next plan is built before
-            # the previous step commits, so a pooling request, which finishes
-            # on its only forward, would get a decode step scheduled against
-            # it. A pooling server has no second step to overlap with.
-            logger.info(
-                "Embedding model: disabling the overlap schedule. A pooling "
-                "request finishes on its first forward."
-            )
-            server_args.disable_overlap_schedule = True
-
-        # After this, `server_args.is_embedding` is the resolved answer, not
-        # the request.
-        server_args.is_embedding = True
-        server_args.pooling_type = self.pooling_config.pooling_type.value
-        server_args.pooling_normalize = self.pooling_config.normalize
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)

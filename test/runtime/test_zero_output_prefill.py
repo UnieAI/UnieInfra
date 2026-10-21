@@ -426,7 +426,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     )
     forward = load_symbol(
         RUNTIME + "models/deepseek_v41.py",
-        "forward",
+        "_layer_forward",
         owner="DeepseekV41Attention",
         _row_plan=lambda *args: plan,
         current_forward_ctx=lambda: None,
@@ -447,6 +447,36 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     assert output.shape == (0, 8)
     torch.testing.assert_close(writes[0], hidden)
     assert len(writes) == 1
+
+
+@pytest.mark.parametrize(
+    "capturing, extend, layer_id, expected",
+    [
+        (True, True, 19, "split"),
+        (True, True, 21, "split"),
+        (True, True, 20, "layer"),
+        (True, False, 19, "layer"),
+        (False, True, 19, "layer"),
+    ],
+)
+def test_captured_extend_splits_attention_except_at_the_narrowing_layer(
+    capturing, extend, layer_id, expected
+):
+    forward = load_symbol(
+        RUNTIME + "models/deepseek_v41.py",
+        "forward",
+        owner="DeepseekV41Attention",
+        is_breakable_capture_active=lambda: capturing,
+    )
+    attention = SimpleNamespace(
+        layer_id=layer_id,
+        ced_decoder_start=20,
+        _captured_extend_forward=lambda *args: "split",
+        _layer_forward=lambda *args: "layer",
+    )
+    mode = SimpleNamespace(is_extend=lambda: extend)
+    ctx = SimpleNamespace(forward_mode=mode)
+    assert forward(attention, None, None, ctx) == expected
 
 
 def test_zero_decoder_skips_layers_and_normalization():

@@ -51,7 +51,8 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import resolve_kernel_override, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -65,6 +66,7 @@ __all__ = [
     "cache_gather",
     "index_q_quantize",
     "selected_attention",
+    "prefill_indices",
     "new_attention_schedule",
     "index_score",
     "index_topk",
@@ -80,17 +82,52 @@ __all__ = [
 ]
 
 
-def _kernel(mode: str, x: torch.Tensor):
-    return select_kernel(
+# Selection key -> (registry, generation, kernel). These wrappers run once per
+# layer in eager prefill breaks, where building and hashing the signature for
+# the selection cache costs about as much as launching a small kernel.
+_SELECTED: dict[tuple, tuple] = {}
+
+
+def _select(
+    mode: str,
+    role: str,
+    dtype: torch.dtype,
+    traits: dict | None,
+    solution: str | None,
+):
+    """``select_kernel`` for ``dsv41_<mode>``, memoized until the registry changes.
+
+    An active override always selects afresh and is never memoized.
+    """
+    op = "dsv41_" + mode
+    registry = KernelRegistry.get()
+    key = (mode, role, dtype, tuple(sorted(traits.items())) if traits else (), solution)
+    hit = _SELECTED.get(key)
+    overridden = resolve_kernel_override("attention", op, None) is not None
+    if (
+        hit is not None
+        and not overridden
+        and hit[0] is registry
+        and hit[1] == registry.generation
+    ):
+        return hit[2]
+    kernel = select_kernel(
         "attention",
-        "dsv41_" + mode,
-        format_signature(x=dense_tensor_format(x.dtype)),
+        op,
+        format_signature(**{role: dense_tensor_format(dtype)}),
         features=None,
         platform=None,
-        traits=None,
-        solution=None,
+        traits=traits,
+        solution=solution,
         override=None,
     )
+    if not overridden:
+        _SELECTED[key] = (registry, registry.generation, kernel)
+    return kernel
+
+
+def _kernel(mode: str, x: torch.Tensor):
+    return _select(mode, "x", x.dtype, None, None)
 
 
 def cache_pack(
@@ -308,15 +345,8 @@ def selected_attention(
     native = (
         schedule is not None or prefill_kv is not None
     ) and is_flash_mla_v41_available()
-    kernel = select_kernel(
-        "attention",
-        "dsv41_selected_attention",
-        format_signature(x=dense_tensor_format(q.dtype)),
-        features=None,
-        platform=None,
-        traits={"flashmla_eligible": native},
-        solution=None,
-        override=None,
+    kernel = _select(
+        "selected_attention", "x", q.dtype, {"flashmla_eligible": native}, None
     )
     return kernel(
         q,
@@ -333,6 +363,60 @@ def selected_attention(
         schedule,
         prefill_kv,
         prefill_indices,
+    )
+
+
+def prefill_indices(
+    swa_indices: torch.Tensor,
+    logical_rows: torch.Tensor,
+    global_slots: torch.Tensor,
+    history_base: torch.Tensor,
+    rows: torch.Tensor | None,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Join SWA and selected global rows into compact prefill workspace indices.
+
+    The prefill workspace holds every query's SWA rows and a dequantized copy
+    of each request's global history; this builds the ``prefill_indices`` that
+    ``selected_attention`` reads it with, in one launch for a whole batch.
+
+    Args:
+        swa_indices: Int32 [T, W] workspace rows of each query's SWA keys, -1
+            for absent keys; W is a power of two (128 for V4.1).
+        logical_rows: Integer [T, K] request-local global row ids per query.
+        global_slots: Integer [T, K] physical slots of those rows; a negative
+            slot (non-causal, unselected or unmapped) drops the entry.
+        history_base: Integer [T] workspace row holding global row 0 of the
+            query's request, or -1 to drop all of the query's global entries.
+        rows: Optional contiguous integer [N] query rows to emit, in order;
+            None emits all T rows.
+        out: Contiguous-column int32 [N, W + K] destination, or None to allocate.
+
+    Returns:
+        Int32 [N, W + K]: the SWA indices, then ``history_base + logical_rows``
+        where the row id and slot are valid and -1 elsewhere.
+    """
+    if not swa_indices.is_cuda:
+        if rows is not None:
+            swa_indices, logical_rows, global_slots, history_base = (
+                t[rows] for t in (swa_indices, logical_rows, global_slots, history_base)
+            )
+        valid = (logical_rows >= 0) & (global_slots >= 0) & (history_base[:, None] >= 0)
+        joined = torch.cat(
+            (
+                swa_indices.to(torch.int32),
+                torch.where(valid, logical_rows + history_base[:, None], -1).to(
+                    torch.int32
+                ),
+            ),
+            dim=1,
+        )
+        if out is None:
+            return joined
+        out.copy_(joined)
+        return out
+    return _kernel("prefill_indices", swa_indices)(
+        swa_indices, logical_rows, global_slots, history_base, rows, out
     )
 
 
@@ -480,20 +564,17 @@ def index_topk(
     if process_group is not None:
         index_shards = torch.distributed.get_world_size(process_group)
         index_heads *= index_shards
-    kernel = select_kernel(
-        "attention",
-        "dsv41_index_topk",
-        format_signature(x=dense_tensor_format(index_q.dtype)),
-        features=None,
-        platform=None,
-        traits={
+    kernel = _select(
+        "index_topk",
+        "x",
+        index_q.dtype,
+        {
             "index_heads": index_heads,
             "index_k_format": index_k_format,
             "index_shards": index_shards,
             "native_indexer": native,
         },
-        solution=solution,
-        override=None,
+        solution,
     )
     return kernel(
         index_q,
@@ -570,13 +651,7 @@ def rope_inplace(
         raise ValueError(
             "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
         )
-    kernel = select_kernel(
-        "attention",
-        "dsv41_rope_inplace",
-        format_signature(values=dense_tensor_format(values.dtype)),
-        traits={},
-        solution=solution,
-    )
+    kernel = _select("rope_inplace", "values", values.dtype, None, solution)
     return kernel(values, positions, cos_sin_cache)
 
 
@@ -602,13 +677,7 @@ def rope_pad_query(
     _validate_rope(values, positions, cos_sin_cache)
     if values.ndim != 3 or values.shape[-1] != 512 or not 1 <= values.shape[1] <= 128:
         raise ValueError("Padded V4.1 queries require [tokens,1..128 heads,512]")
-    kernel = select_kernel(
-        "attention",
-        "dsv41_rope_pad_query",
-        format_signature(values=dense_tensor_format(values.dtype)),
-        traits={},
-        solution=solution,
-    )
+    kernel = _select("rope_pad_query", "values", values.dtype, None, solution)
     return kernel(values, positions, cos_sin_cache)
 
 

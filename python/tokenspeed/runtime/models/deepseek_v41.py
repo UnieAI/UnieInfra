@@ -70,7 +70,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from weakref import WeakValueDictionary
 
 import torch
@@ -97,6 +97,7 @@ from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
+    is_breakable_capture_active,
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import (
@@ -636,26 +637,35 @@ class DeepseekV41Compressor(nn.Module):
 
     def forward(self, x, owner, positions, requests, backend, mode):
         if self.ratio == 1:
+            return self.project(x), positions, requests
+        return self.pool(self.project(x), owner, backend, mode)
+
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """The token-local part of the compressor.
+
+        A ratio-1 owner's normalized latent rows, or a ratio-2 owner's FP32
+        ``[content | scores]`` projection that :meth:`pool` pairs up.
+        """
+        if self.ratio == 1:
             content, _ = self.wkv(x, block_scale=None, output_dtype=None)
-        else:
-            projected = (
-                dsv4_linear_fp32(
-                    x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
-                )
-                if x.is_cuda
-                else F.linear(x.float(), self.wkv_wgate.weight.float())
-            )
-            content, scores = projected.chunk(2, dim=-1)
-            content, positions, requests = backend.compress(
-                owner,
-                content,
-                scores,
-                mode,
-                self.norm.weight,
-                self.norm.variance_epsilon,
-            )
-            return content, positions, requests
-        return _attention_norm(content, self.norm), positions, requests
+            return _attention_norm(content, self.norm)
+        if not x.is_cuda:
+            return F.linear(x.float(), self.wkv_wgate.weight.float())
+        return dsv4_linear_fp32(
+            x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
+        )
+
+    def pool(self, projected, owner, backend, mode):
+        """Pool the projected rows of the canonical query window into pairs."""
+        content, scores = projected.chunk(2, dim=-1)
+        return backend.compress(
+            owner,
+            content,
+            scores,
+            mode,
+            self.norm.weight,
+            self.norm.variance_epsilon,
+        )
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -853,20 +863,252 @@ class DeepseekV41Attention(nn.Module):
             )
         return self._padded_attn_sink
 
-    def _write_global_kv(self, hidden_states, positions, requests, backend, mode):
+    def _global_kv_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """What :meth:`_write_global_kv` consumes, projected while still captured."""
+        if self.compressor is None:
+            return hidden_states
+        return self.compressor.project(hidden_states)
+
+    def _write_global_kv(
+        self, kv_input, positions, requests, backend, mode, projected=False
+    ):
+        """Write the owner's global rows from ``kv_input``.
+
+        ``kv_input`` is the hidden states, or with ``projected`` the output of
+        :meth:`_global_kv_input` (the compressor's token-local projection).
+        """
         if self.compressor is None:
             return
-        latent, row_positions, row_requests = self.compressor(
-            hidden_states, self.layer_id, positions, requests, backend, mode
-        )
+        if projected and self.compressor.ratio == 1:
+            latent, row_positions, row_requests = kv_input, positions, requests
+        elif projected:
+            latent, row_positions, row_requests = self.compressor.pool(
+                kv_input, self.layer_id, backend, mode
+            )
+        else:
+            latent, row_positions, row_requests = self.compressor(
+                kv_input, self.layer_id, positions, requests, backend, mode
+            )
         index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
         main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
         backend.write_global(
             self.layer_id, main_k, index_k, row_positions, row_requests, mode
         )
 
-    @break_point
     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        # Under a prefill capture only the cache writes, selection and attention
+        # stay an eager break; the token-local projections around them are
+        # captured into the graph segments. The narrowing layer changes the row
+        # count inside the layer and keeps the whole-layer break.
+        if (
+            is_breakable_capture_active()
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_extend()
+            and self.layer_id != self.ced_decoder_start
+        ):
+            return self._captured_extend_forward(positions, hidden_states, ctx)
+        return self._layer_forward(positions, hidden_states, ctx)
+
+    def _captured_extend_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """The extend path of ``_layer_forward`` split around a narrow break.
+
+        Runs on the bucket's padded rows. The replayed graph also serves mixed
+        extend+decode batches; those take the same projections and RoPE as a
+        pure extend in ``_layer_forward`` (the decode-only query padding and
+        aux-stream overlap apply to pure decode alone).
+        """
+        qr, swa = self._input_projection(hidden_states)
+        q, swa, index_q, index_weights = self._extend_queries(
+            positions, hidden_states, qr, swa
+        )
+        kv_input = self._global_kv_input(hidden_states)
+        out = self._extend_attention(kv_input, q, swa, index_q, index_weights, ctx)
+        return self._output_projection(out, positions)
+
+    def narrowing_projection(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The narrowing layer's attention up to its row selection, on every row.
+
+        Projects ``qr``/``swa`` and writes the decoder's global KV from every
+        live row; :meth:`narrowed_forward` finishes the attention on the rows
+        the decoder view keeps. The split lets the prefill graph capture both
+        halves (in the encoder and decoder graphs) around an eager selection.
+        """
+        qr, swa = self._input_projection(hidden_states)
+        self._narrowing_global_kv(self._global_kv_input(hidden_states), ctx)
+        return qr, swa
+
+    def narrowed_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        swa: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """The narrowing layer's attention on the decoder view's rows."""
+        q, swa, index_q, index_weights = self._extend_queries(
+            positions, hidden_states, qr, swa
+        )
+        out = self._narrowed_attention(q, swa, index_q, index_weights, ctx)
+        return self._output_projection(out, positions)
+
+    def _input_projection(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
+        qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
+        return _attention_norm(qr, self.q_norm), swa
+
+    def _extend_queries(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        swa: torch.Tensor,
+    ):
+        """Index queries, the roped query and the normalized SWA key (extend)."""
+        self.rotary_emb._prepare_cache(hidden_states.device)
+        index_q, index_weights = (
+            self.indexer(hidden_states, qr, positions, self.rotary_emb)
+            if self.indexer is not None
+            else (None, None)
+        )
+        q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
+        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        if q.is_cuda and self.head_dim == 512:
+            # As in decode: rotate straight into the FlashMLA head width, so the
+            # eager attention break does not pad the query again every layer.
+            q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
+        else:
+            q = self.rotary_emb.apply_owned(q, positions, False)
+        swa = _attention_norm(swa, self.kv_norm)
+        if not self._fused_swa_rope():
+            swa = self.rotary_emb.apply_owned(swa, positions, False)
+        return q, swa, index_q, index_weights
+
+    def _fused_swa_rope(self) -> bool:
+        return self.head_dim == 512 and self.rotary_emb.dim == 64
+
+    @break_point
+    def _extend_attention(
+        self,
+        kv_input: torch.Tensor,
+        q: torch.Tensor,
+        swa: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Cache writes, global selection and attention over the live rows.
+
+        ``kv_input`` comes from :meth:`_global_kv_input`, so a ratio-2 owner's
+        compressor projection is already captured in the graph segment.
+        """
+        backend, mode = ctx.attn_backend, ctx.forward_mode
+        meta = _row_plan(self.layer_id, self.ced_decoder_start, ctx).source
+        kv_input, q, swa, index_q, index_weights = slice_to_real_tokens(
+            meta.positions.numel(), kv_input, q, swa, index_q, index_weights
+        )
+        self._write_global_kv(
+            kv_input,
+            meta.positions,
+            meta.request_indices,
+            backend,
+            mode,
+            projected=True,
+        )
+        return self._attend(meta, q, swa, index_q, index_weights, ctx)
+
+    @break_point
+    def _narrowing_global_kv(
+        self, kv_input: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """The decoder's global KV from every live row of the narrowing layer.
+
+        ``kv_input`` comes from :meth:`_global_kv_input`, so the compressor's
+        token-local projection is captured in the graph segment. Returns an
+        empty tensor: a break hands one tensor to the next segment.
+        """
+        meta = _row_plan(self.layer_id, self.ced_decoder_start, ctx).source
+        (kv_input,) = slice_to_real_tokens(meta.positions.numel(), kv_input)
+        self._write_global_kv(
+            kv_input,
+            meta.positions,
+            meta.request_indices,
+            ctx.attn_backend,
+            ctx.forward_mode,
+            projected=True,
+        )
+        return meta.positions[:0]
+
+    @break_point
+    def _narrowed_attention(
+        self,
+        q: torch.Tensor,
+        swa: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Global selection and attention over the decoder view's live rows."""
+        meta = _row_plan(self.layer_id, self.ced_decoder_start, ctx).query
+        q, swa, index_q, index_weights = slice_to_real_tokens(
+            meta.positions.numel(), q, swa, index_q, index_weights
+        )
+        return self._attend(meta, q, swa, index_q, index_weights, ctx)
+
+    def _attend(self, meta, q, swa, index_q, index_weights, ctx) -> torch.Tensor:
+        self.rotary_emb._prepare_cache(q.device)
+        out = ctx.attn_backend.forward_v41(
+            q,
+            swa,
+            layer_id=self.layer_id,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ctx.forward_mode,
+            index_q=index_q,
+            index_weights=index_weights,
+            attn_sink=self._kernel_attn_sink(),
+            softmax_scale=self.head_dim**-0.5,
+            index_process_group=None,
+            swa_rope_cache=(
+                self.rotary_emb.cos_sin_cache if self._fused_swa_rope() else None
+            ),
+        )
+        return out[:, : self.n_local_heads]
+
+    def _output_projection(
+        self, out: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Inverse RoPE, grouped output LoRA and the TP reduction."""
+        out = self.rotary_emb.apply_owned(out, positions, True)
+        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
+        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+        out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+        out, _ = self.wo_b(out, scale=None)
+        if self.mapping.attn.has_tp:
+            out = all_reduce(
+                out,
+                group=self.mapping.attn.tp_group,
+                backend=None,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        return out
+
+    @break_point
+    def _layer_forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -983,19 +1225,7 @@ class DeepseekV41Attention(nn.Module):
             index_process_group=index_group,
             swa_rope_cache=swa_rope_cache,
         )
-        out = self.rotary_emb.apply_owned(out[:, : self.n_local_heads], positions, True)
-        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
-        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
-        out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
-        out, _ = self.wo_b(out, scale=None)
-        if self.mapping.attn.has_tp:
-            out = all_reduce(
-                out,
-                group=self.mapping.attn.tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        return out
+        return self._output_projection(out[:, : self.n_local_heads], positions)
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
@@ -1205,6 +1435,53 @@ class DeepseekV41DecoderLayer(nn.Module):
             x = self._forward_ffn(x, image_mask, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
 
+    def narrowing_head(
+        self, residual: torch.Tensor, pre_mix: torch.Tensor, ctx: ForwardContext
+    ) -> list[torch.Tensor]:
+        """This (narrowing) layer up to the decoder view's row selection.
+
+        Runs on every row, like ``forward`` before its ``keep_rows`` selection
+        (an extend has no HC overlap). Returns the row-shaped tensors
+        :meth:`narrowed_forward` consumes, ``[x, qr, swa, attn_pre, post, comb]``.
+        """
+        attn_pre, post, comb = v41_hc_mixes(
+            residual,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.norm_eps,
+            self.hc_eps,
+            self.hc_sinkhorn_iters,
+        )
+        x = _v41_hc_input(residual, pre_mix, self.attn_norm)
+        qr, swa = self.attn.narrowing_projection(x, ctx)
+        return [x, qr, swa, attn_pre, post, comb]
+
+    def narrowed_forward(
+        self,
+        residual: torch.Tensor,
+        head: list[torch.Tensor],
+        positions: torch.Tensor,
+        image_mask: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rest of this layer on the kept rows of ``residual`` and ``head``."""
+        x, qr, swa, attn_pre, post, comb = head
+        x = self.attn.narrowed_forward(positions, x, qr, swa, ctx)
+        residual = v41_hc_post(x, residual, post, comb)
+        ffn_pre, post, comb = v41_hc_mixes(
+            residual,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.norm_eps,
+            self.hc_eps,
+            self.hc_sinkhorn_iters,
+        )
+        x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
+        x = self._forward_ffn(x, image_mask, ctx)
+        return v41_hc_post(x, residual, post, comb), ffn_pre
+
     def _forward_ffn(self, x, image_mask, ctx):
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
@@ -1257,7 +1534,10 @@ class V41RowState:
     optional ``image_mask`` describe the same rows. ``hashes`` and
     ``engram_token_mask`` are present only while a later layer runs Engram.
     ``captured`` holds the DSpark taps taken so far, one ``[rows, hidden]``
-    tensor per tap layer. The prefill graph allocates a zero state of a fixed
+    tensor per tap layer. ``head`` is empty or, on an extend, the candidate
+    source layer's row-shaped outputs before its row selection
+    (``DeepseekV41DecoderLayer.narrowing_head``); ``hidden`` is then that
+    layer's input. The prefill graph allocates a zero state of a fixed
     row count as the decoder graph's input (``allocate_decoder_state``) and
     lands each forward's narrowed state into it (``land_into``).
     """
@@ -1269,6 +1549,7 @@ class V41RowState:
     hashes: torch.Tensor | None
     engram_token_mask: torch.Tensor | None
     captured: list[torch.Tensor]
+    head: list[torch.Tensor] = field(default_factory=list)
 
     @property
     def rows(self) -> int:
@@ -1282,13 +1563,28 @@ class V41RowState:
             self.image_mask,
             self.hashes,
             self.engram_token_mask,
+            *self.head,
             *self.captured,
         ]
 
     def _rebuilt(self, tensors: list[torch.Tensor | None]) -> V41RowState:
-        hidden, pre_mix, positions, image_mask, hashes, mask, *captured = tensors
+        hidden, pre_mix, positions, image_mask, hashes, mask, *rest = tensors
+        heads = len(self.head)
         return V41RowState(
-            hidden, pre_mix, positions, image_mask, hashes, mask, list(captured)
+            hidden,
+            pre_mix,
+            positions,
+            image_mask,
+            hashes,
+            mask,
+            list(rest[heads:]),
+            list(rest[:heads]),
+        )
+
+    def selected(self, rows: torch.Tensor) -> V41RowState:
+        """The rows ``rows`` indexes of every tensor."""
+        return self._rebuilt(
+            [t if t is None else t.index_select(0, rows) for t in self._tensors()]
         )
 
     def leading(self, rows: int) -> V41RowState:
@@ -1306,11 +1602,15 @@ class V41RowState:
             raise ValueError(
                 f"V4.1 row state of {rows} rows exceeds the {dst.rows}-row target"
             )
+        if len(self.head) != len(dst.head):
+            raise ValueError("V4.1 row states disagree on the narrowing head")
         for src, target in zip(self._tensors(), dst._tensors(), strict=True):
             if (src is None) != (target is None):
                 raise ValueError("V4.1 row states disagree on their optional tensors")
             if src is None:
                 continue
+            if src.dtype != target.dtype or src.shape[1:] != target.shape[1:]:
+                raise ValueError("V4.1 row states disagree on a tensor's layout")
             target[:rows].copy_(src)
             if rows < target.shape[0]:
                 target[rows:].zero_()
@@ -1492,6 +1792,16 @@ class DeepseekV41Model(nn.Module):
         Engram and the DSpark taps sit at the layer input; a tap is the
         unweighted HC mean the draft was trained on, appended to ``captured``.
         """
+        hidden = self._layer_input(layer, hidden, state, captured)
+        return layer(hidden, pre_mix, state.positions, state.image_mask, ctx)
+
+    def _layer_input(
+        self,
+        layer: DeepseekV41DecoderLayer,
+        hidden: torch.Tensor,
+        state: V41RowState,
+        captured: list[torch.Tensor],
+    ) -> torch.Tensor:
         if layer.engram is not None:
             hidden = layer.engram(
                 hidden,
@@ -1500,7 +1810,7 @@ class DeepseekV41Model(nn.Module):
             )
         if layer.layer_id in self.dspark_capture_layers:
             captured.append(hidden.mean(dim=1))
-        return layer(hidden, pre_mix, state.positions, state.image_mask, ctx)
+        return hidden
 
     def encoder_forward(
         self,
@@ -1552,8 +1862,23 @@ class DeepseekV41Model(nn.Module):
         )
         for layer in self.layers[: self.ced_decoder_start]:
             h, pre_mix = self._run_layer(layer, h, pre_mix, state, ctx, state.captured)
+        if self._splits_narrowing(ctx):
+            layer = self.layers[self.ced_decoder_start]
+            h = self._layer_input(layer, h, state, state.captured)
+            state.head = layer.narrowing_head(h, pre_mix, ctx)
         state.hidden, state.pre_mix = h, pre_mix
         return state
+
+    def _splits_narrowing(self, ctx: ForwardContext) -> bool:
+        """Whether this forward runs the candidate source split around its
+        row selection: the head with the encoder stage, the rest with the
+        decoder stage, so a prefill graph captures both. Extends without
+        attention DP only; decode keeps the whole layer and its HC overlap."""
+        return (
+            self._splits_narrowing_any()
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_extend_or_mixed()
+        )
 
     def narrowing_forward(self, state: V41RowState, ctx: ForwardContext) -> V41RowState:
         """Run the candidate source layer and narrow to the decoder view.
@@ -1563,6 +1888,9 @@ class DeepseekV41Model(nn.Module):
         far follow ``keep_rows``. ``state`` may carry a padded tail past the
         forward's real rows (an encoder graph output): only the real rows are
         used. A window-only stack has no candidate source and passes through.
+        When the encoder stage already ran the layer's head (an extend, see
+        ``_splits_narrowing``), only the row selection remains here and the
+        decoder stage runs the rest of the layer.
         """
         start = self.ced_decoder_start
         if start >= len(self.layers):
@@ -1585,6 +1913,23 @@ class DeepseekV41Model(nn.Module):
                 "V4.1 CED narrowing under attention data parallelism needs the "
                 "narrowed row counts exchanged across ranks"
             )
+        if state.head:
+            hashes, mask = (
+                (state.hashes, state.engram_token_mask)
+                if self.decoder_uses_engram
+                else (None, None)
+            )
+            state = V41RowState(
+                state.hidden,
+                state.pre_mix,
+                state.positions,
+                state.image_mask,
+                hashes,
+                mask,
+                list(state.captured),
+                list(state.head),
+            )
+            return state if view.keep_rows is None else state.selected(view.keep_rows)
         captured = list(state.captured)
         # Petit exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
@@ -1620,6 +1965,9 @@ class DeepseekV41Model(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Run the layers above the candidate source and the final norm.
 
+        A state carrying the candidate source's head (``narrowing_forward``)
+        first finishes that layer on its rows.
+
         Every row of ``state`` is computed and sized into the collectives: the
         prefill graph hands a fixed-row state whose tail is padding and slices
         the result. Returns the normalized rows and the DSpark taps.
@@ -1634,8 +1982,12 @@ class DeepseekV41Model(nn.Module):
             )
             return hidden, captured
         layers = self.layers[start + 1 :]
-        if layers:
+        if layers or state.head:
             with report_collective_sizing(ctx, state.rows, None):
+                if state.head:
+                    h, pre_mix = self.layers[start].narrowed_forward(
+                        h, state.head, state.positions, state.image_mask, ctx
+                    )
                 for layer in layers:
                     h, pre_mix = self._run_layer(
                         layer, h, pre_mix, state, ctx, captured
@@ -1714,7 +2066,31 @@ class DeepseekV41Model(nn.Module):
                 torch.zeros((rows, hidden_size), dtype=dtype, device=device)
                 for _ in range(taps)
             ],
+            self._allocate_narrowing_head(rows) if self._splits_narrowing_any() else [],
         )
+
+    def _splits_narrowing_any(self) -> bool:
+        """Whether some forward (an extend) carries the narrowing head."""
+        return (
+            self.ced_decoder_start < len(self.layers) and not self.mapping.attn.has_dp
+        )
+
+    def _allocate_narrowing_head(self, rows: int) -> list[torch.Tensor]:
+        """Zero statics laid out like ``narrowing_head``'s outputs."""
+        attn = self.layers[self.ced_decoder_start].attn
+        weight = self.embed_tokens.weight
+        device, dtype = weight.device, weight.dtype
+        hc = int(self.config.hc_mult)
+        return [
+            torch.zeros(
+                (rows, int(self.config.hidden_size)), dtype=dtype, device=device
+            ),
+            torch.zeros((rows, attn.q_norm.weight.numel()), dtype=dtype, device=device),
+            torch.zeros((rows, attn.head_dim), dtype=dtype, device=device),
+            torch.zeros((rows, hc), dtype=torch.float32, device=device),
+            torch.zeros((rows, hc), dtype=torch.float32, device=device),
+            torch.zeros((rows, hc, hc), dtype=torch.float32, device=device),
+        ]
 
 
 class DeepseekV41ForCausalLM(BaseCausalLM):
@@ -2192,6 +2568,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             )
         self.checkpoint_load_report = {"loaded": len(loaded), "skipped": dict(skipped)}
         logger.info(f"V4.1 checkpoint coverage: {self.checkpoint_load_report!s}")
+        # post_load_weights re-lays out the MoE experts into new Parameters. Any
+        # reference still held here to the loaded ones (the name->Parameter map
+        # and the MoE loader built over it) keeps every layer's original experts
+        # alive until this frame returns, so the re-layout peaks at twice the
+        # expert weights: ~63 GiB extra per rank at TP4, an OOM on 141 GB H200.
+        del params, moe_loader, pending
         self.post_load_weights()
 
     def _load_missing_engram_tables(self, loaded: set[str]) -> None:

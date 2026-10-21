@@ -405,8 +405,18 @@ def prefill_attention_fwd(
     lse_arg = lse_extend if lse_extend is not None else o_extend
     page_table_arg = page_table if page_table is not None else cache_seqlens
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
+    if platform.is_hopper and Lq > 256:
+        # Heads wider than FlashAttention-3 serves (Gemma 4's 512-wide global
+        # layers) land here. A 64-row tile over 32 keys, pipelined two deep,
+        # fits the 512-wide fp32 accumulator in 8 warps. Against the 32x64
+        # single-stage default on an H200: 46.0 -> 28.5 ms on a cold
+        # 8192-token causal prefill (32 heads over 4 KV heads), 7.0 -> 3.9 ms
+        # on 1024 new tokens over 7168 cached.
+        BLOCK_M, BLOCK_N = (64, 32)
+        num_warps = 8
+        num_stages = 2
+    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
 
     extra_kargs = {}
     if platform.is_amd:

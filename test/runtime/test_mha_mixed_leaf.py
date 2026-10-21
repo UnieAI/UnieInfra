@@ -57,6 +57,7 @@ class _Layer:
         self.tp_v_head_num = Q_HEADS
         self.sliding_window_size = -1
         self.logit_cap = 0.0
+        self.scaling = 1.0
 
 
 class _Pool:

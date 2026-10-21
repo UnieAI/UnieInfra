@@ -333,9 +333,7 @@ def _oracle_proportional_inv_freq(
     """
     rope_angles = rotary_dim // 2
     nope_angles = (head_size // 2) - rope_angles
-    freq_exponents = (
-        torch.arange(0, 2 * rope_angles, 2, dtype=torch.float) / head_size
-    )
+    freq_exponents = torch.arange(0, 2 * rope_angles, 2, dtype=torch.float) / head_size
     inv_freq = 1.0 / (base**freq_exponents)
     if nope_angles > 0:
         inv_freq = torch.cat([inv_freq, torch.zeros(nope_angles, dtype=torch.float)])
@@ -376,9 +374,7 @@ def test_full_rope_inv_freq_matches_the_hand_proportional_formula():
         _FULL_ROPE_THETA
         ** (torch.arange(0, _FULL_ROTARY_DIM, 2, dtype=torch.float) / _FULL_HEAD_DIM)
     )
-    hand = torch.cat(
-        [hand_nonzero, torch.zeros(_FULL_NOPE_ANGLES, dtype=torch.float)]
-    )
+    hand = torch.cat([hand_nonzero, torch.zeros(_FULL_NOPE_ANGLES, dtype=torch.float)])
     assert hand.shape == (_FULL_HEAD_DIM // 2,)
     assert hand_nonzero.shape == (_FULL_ROPE_ANGLES,)
 
@@ -428,8 +424,7 @@ def test_sliding_rope_inv_freq_matches_the_plain_hand_formula():
     hand = 1.0 / (
         _SLIDING_ROPE_THETA
         ** (
-            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float)
-            / _SLIDING_HEAD_DIM
+            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float) / _SLIDING_HEAD_DIM
         )
     )
     assert hand.shape == (_SLIDING_HEAD_DIM // 2,)
@@ -446,8 +441,7 @@ def test_sliding_rope_cos_sin_match_the_hand_computation():
     hand_inv_freq = 1.0 / (
         _SLIDING_ROPE_THETA
         ** (
-            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float)
-            / _SLIDING_HEAD_DIM
+            torch.arange(0, _SLIDING_HEAD_DIM, 2, dtype=torch.float) / _SLIDING_HEAD_DIM
         )
     )
     positions = torch.tensor(_SAMPLE_POSITIONS, dtype=torch.float32)
@@ -678,9 +672,7 @@ def test_v_norm_has_no_weight_while_qk_norms_each_have_one() -> None:
 
         # v_norm is weightless: no learnable Parameter at all.
         assert list(attn.v_norm.parameters()) == []
-        assert not any(
-            "v_norm" in name for name, _ in attn.named_parameters()
-        )
+        assert not any("v_norm" in name for name, _ in attn.named_parameters())
 
 
 def test_sliding_layer_window_is_hf_window_minus_one() -> None:
@@ -727,7 +719,7 @@ class _CaptureAttn(torch.nn.Module):
         self.k = None
         self.v = None
 
-    def forward(self, q, k, v, ctx):
+    def forward(self, q, k, v, positions, ctx):
         self.q = q.detach().clone()
         self.k = k.detach().clone()
         self.v = v.detach().clone()
@@ -842,6 +834,7 @@ def test_v_is_normalized_not_rotated() -> None:
     positions = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
     rotated_v, _ = attn.rotary_emb(positions, expected_v.clone(), expected_v.clone())
     assert not torch.allclose(rotated_v, capture.v, rtol=1e-3, atol=1e-3)
+
 
 # ---------------------------------------------------------------------------
 # Task-5 components: MLP guard, decoder layer_scalar, model embedding
@@ -1142,15 +1135,18 @@ def test_get_input_embeddings_returns_a_scaled_tensor_not_a_module() -> None:
     assert embeds.shape == (input_ids.shape[0], _TINY_HIDDEN_SIZE)
 
     scale = _TINY_HIDDEN_SIZE**0.5
-    expected = model.embed_tokens(input_ids) * scale
-    torch.testing.assert_close(embeds, expected, rtol=1e-6, atol=1e-6)
+    raw = torch.nn.functional.embedding(input_ids, model.embed_tokens.weight)
+    torch.testing.assert_close(embeds, raw * scale, rtol=1e-6, atol=1e-6)
+    # The prefill CUDA graph gathers through ``embed_tokens`` directly, so the
+    # module itself must already return the scaled rows.
+    torch.testing.assert_close(model.embed_tokens(input_ids), embeds)
 
 
 def test_embedding_normalizer_is_cached_per_dtype() -> None:
     """Property 4: the ``sqrt(hidden_size)`` normalizer is cached per compute
     dtype as a Python float ~= sqrt(hidden_size).
 
-    After a call the model's ``_normalizer_by_dtype`` holds the embedding's
+    After a call ``embed_tokens._normalizer_by_dtype`` holds the embedding's
     dtype key with a value close to ``sqrt(hidden_size)``; a second call does
     not change the cache (same key, same value).
     """
@@ -1159,13 +1155,15 @@ def test_embedding_normalizer_is_cached_per_dtype() -> None:
 
     first = model.get_input_embeddings(input_ids)
     dtype = first.dtype
-    assert dtype in model._normalizer_by_dtype
+    assert dtype in model.embed_tokens._normalizer_by_dtype
     expected_scale = _TINY_HIDDEN_SIZE**0.5
-    assert model._normalizer_by_dtype[dtype] == pytest.approx(expected_scale, rel=1e-6)
+    assert model.embed_tokens._normalizer_by_dtype[dtype] == pytest.approx(
+        expected_scale, rel=1e-6
+    )
 
-    cache_after_first = dict(model._normalizer_by_dtype)
+    cache_after_first = dict(model.embed_tokens._normalizer_by_dtype)
     model.get_input_embeddings(input_ids)
-    assert model._normalizer_by_dtype == cache_after_first
+    assert model.embed_tokens._normalizer_by_dtype == cache_after_first
 
 
 def test_model_rope_moduledict_has_exactly_the_present_layer_type_keys() -> None:

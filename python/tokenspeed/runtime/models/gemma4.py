@@ -606,6 +606,10 @@ class Gemma4Attention(nn.Module):
             layer_id=layer_id,
             logit_cap=logit_cap,
             sliding_window_size=sliding_window_size,
+            # q/k norm, the partial RoPE and v_norm run in forward(); the
+            # prologue only writes the cache.
+            rotary_emb=None,
+            qk_norm=None,
         )
 
     def forward(
@@ -664,9 +668,7 @@ class Gemma4Attention(nn.Module):
         # v norm comes AFTER RoPE and applies only to v (v is never rotated).
         v = self.v_norm(v.reshape(-1, self.head_dim)).view(num_tokens, self.kv_size)
 
-        # Stock TokenSpeed: PagedAttention reads write locations from ctx
-        # (cf. gemma3), not an explicit out_cache_loc argument.
-        attn_output = self.attn(q, k, v, ctx=ctx)
+        attn_output = self.attn(q, k, v, positions, ctx)
         if attn_output.dim() == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -822,9 +824,7 @@ class Gemma4DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
         self.post_attention_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
         self.pre_feedforward_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
-        self.post_feedforward_layernorm = RMSNorm(
-            int(text_config.hidden_size), eps=eps
-        )
+        self.post_feedforward_layernorm = RMSNorm(int(text_config.hidden_size), eps=eps)
         # Per-layer output scalar: a [1] buffer loaded from the checkpoint
         # (filled by the weight-load task) and applied to the layer output.
         # Initialised to ones so an unloaded layer is the identity scaling.
@@ -900,6 +900,32 @@ class Gemma4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
+class _ScaledEmbedding(VocabParallelEmbedding):
+    """Token embedding that applies Gemma's ``sqrt(hidden_size)`` normalizer.
+
+    The scale lives in the module rather than in ``get_input_embeddings``
+    because the prefill CUDA graph gathers embeddings eagerly through
+    ``inner_model.embed_tokens`` and feeds the captured region from a static
+    buffer: a scale applied anywhere else is skipped there, and every prompt
+    then enters the decoder ``sqrt(5376)`` = 73x too small (greedy replies of
+    one repeated token). The weight is unchanged, so the tied ``lm_head``
+    still reads the raw table. The normalizer is a Python float per dtype
+    (rounded through that dtype, as HF does), so capture copies nothing.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, **kwargs) -> None:
+        super().__init__(num_embeddings, embedding_dim, **kwargs)
+        self._normalizer_by_dtype: dict[torch.dtype, float] = {}
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        embeds = super().forward(input_ids)
+        scale = self._normalizer_by_dtype.get(embeds.dtype)
+        if scale is None:
+            scale = float(torch.tensor(self.embedding_dim**0.5, dtype=embeds.dtype))
+            self._normalizer_by_dtype[embeds.dtype] = scale
+        return embeds * scale
+
+
 class Gemma4Model(nn.Module):
     """Gemma 4 stacked text decoder: scaled embed -> N layers -> final norm.
 
@@ -947,7 +973,7 @@ class Gemma4Model(nn.Module):
         self.hidden_size = int(text_config.hidden_size)
         # Shared token embedding, sharded over the attention TP group (the
         # lm_head is tied to this by the LM-head task).
-        self.embed_tokens = VocabParallelEmbedding(
+        self.embed_tokens = _ScaledEmbedding(
             self.vocab_size,
             self.hidden_size,
             quant_config=quant_config,
@@ -983,35 +1009,11 @@ class Gemma4Model(nn.Module):
         # STANDARD x*weight RMSNorm (NOT Gemma 3's 1+weight GemmaRMSNorm); no
         # residual is folded into it (see forward / class docstring).
         self.norm = RMSNorm(self.hidden_size, eps=float(text_config.rms_norm_eps))
-        # Normalizer cache keyed by compute dtype; see get_input_embeddings.
-        self._normalizer_by_dtype: dict[torch.dtype, float] = {}
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Scaled token embeddings as a TENSOR: ``embed_tokens(ids) *
-        sqrt(hidden_size)``.
-
-        Gemma scales its token embeddings by ``sqrt(hidden_size)`` (HF's
-        ``embed_scale``). This MUST return a tensor (not an ``nn.Module``): the
-        landed ``prefill_graph.py`` fix prefers a tensor-returning
-        ``get_input_embeddings`` so the prefill CUDA graph consumes the SCALED
-        embedding rather than the raw one (the gemma-3 garbage bug). The
-        normalizer is built once per dtype on CPU and cached as a Python float
-        so the multiply folds into the embedding kernel and issues no CPU->GPU
-        copy during CUDA-graph capture.
-
-        Args:
-            input_ids: Token ids, shape ``[num_tokens]``.
-
-        Returns:
-            The scaled embeddings, shape ``[num_tokens, hidden_size]`` in the
-            embedding compute dtype.
-        """
-        embeds = self.embed_tokens(input_ids)
-        scale = self._normalizer_by_dtype.get(embeds.dtype)
-        if scale is None:
-            scale = float(torch.tensor(self.hidden_size**0.5, dtype=embeds.dtype))
-            self._normalizer_by_dtype[embeds.dtype] = scale
-        return embeds * scale
+        """Scaled token embeddings: ``embed_tokens`` applies Gemma's
+        ``sqrt(hidden_size)`` itself (see :class:`_ScaledEmbedding`)."""
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,

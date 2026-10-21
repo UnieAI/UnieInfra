@@ -562,6 +562,11 @@ def get_config(
         # selected entry architecture when returning the language config.
         if config is not text_config:
             text_config.architectures = list(config.architectures)
+    elif config is not text_config and not getattr(text_config, "architectures", None):
+        # An in-tree composite outside the allowlist above (Gemma 4) is built
+        # from its language config, which only the composite names the entry
+        # class for; without it the model config has no architecture at all.
+        text_config.architectures = list(config.architectures or [])
     return text_config
 
 

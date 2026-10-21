@@ -540,6 +540,10 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # Hopper FlashAttention-3 is built for these head sizes only; a
+            # wider head (gemma-4's 512-wide global layers) must select another
+            # kernel rather than fail inside this one.
+            "head_dim": frozenset({64, 96, 128, 192, 256}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -597,6 +601,10 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # Hopper FlashAttention-3 is built for these head sizes only; a
+            # wider head (gemma-4's 512-wide global layers) must select another
+            # kernel rather than fail inside this one.
+            "head_dim": frozenset({64, 96, 128, 192, 256}),
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
@@ -660,6 +668,10 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # Hopper FlashAttention-3 is built for these head sizes only; a
+            # wider head (gemma-4's 512-wide global layers) must select another
+            # kernel rather than fail inside this one.
+            "head_dim": frozenset({64, 96, 128, 192, 256}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),

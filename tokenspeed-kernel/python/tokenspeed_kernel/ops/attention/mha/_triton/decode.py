@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
 import math
 
 import torch
@@ -25,6 +26,35 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
+# Split-K for the paged decode: a split reads at least this many tokens, and a
+# request never takes more splits than this.
+_MIN_TOKENS_PER_KV_SPLIT = 1024
+_MAX_KV_SPLITS = 16
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _decode_kv_splits(
+    q: torch.Tensor, kv_heads: int, max_seqlen_k: int, window_left: int
+) -> int:
+    """KV splits per request for one decode launch.
+
+    One split per request leaves the grid at ``batch x head groups`` programs,
+    each walking the whole context serially: at batch 16 on Gemma 4's global
+    layers (32 query heads over 4 KV heads, head_dim 512) that is 64 programs
+    on a 132-SM H200, 0.68 ms a layer against 0.26 ms split four ways. Split
+    until the grid covers the device twice, never below
+    ``_MIN_TOKENS_PER_KV_SPLIT`` tokens a split; a full batch keeps one.
+    """
+    effective = max_seqlen_k if window_left < 0 else min(max_seqlen_k, window_left + 1)
+    by_length = triton.cdiv(max(effective, 1), _MIN_TOKENS_PER_KV_SPLIT)
+    group = max(1, q.shape[1] // max(kv_heads, 1))
+    programs = q.shape[0] * triton.cdiv(q.shape[1], min(16, group))
+    by_occupancy = triton.cdiv(2 * _num_sms(q.device.index or 0), max(programs, 1))
+    return max(1, min(_MAX_KV_SPLITS, by_length, by_occupancy))
 
 
 @triton.jit
@@ -858,7 +888,7 @@ def _triton_mha_decode_with_kvcache_impl(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    max_kv_splits = 4
+    max_kv_splits = _decode_kv_splits(q, k_cache.shape[2], max_seqlen_k, window_left)
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
@@ -874,8 +904,8 @@ def _triton_mha_decode_with_kvcache_impl(
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    num_kv_splits = torch.full(
+        (cache_seqlens.shape[0],), max_kv_splits, dtype=torch.int32, device=q.device
     )
     decode_attention_fwd(
         q,

@@ -2309,7 +2309,6 @@ class ModelExecutor:
             grammar_completion = None
 
             forward_logprobs = None
-            input_token_logprobs = None
             # Set only by a pooling forward; it then replaces the token outputs.
             output_embeddings = None
             if total_tokens == 0:

@@ -22,7 +22,8 @@
 
 import torch
 import triton
-from tokenspeed_kernel._triton import tl, triton as ts_triton
+from tokenspeed_kernel._triton import tl
+from tokenspeed_kernel._triton import triton as ts_triton
 from tokenspeed_kernel.ops.kvcache.triton import store_state_rows
 
 
@@ -107,7 +108,8 @@ def main() -> None:
     slab = torch.zeros((blocks, heads, key, value), dtype=torch.float32, device="cuda")
     # Page-interleaved arena view, as the pool hands out recurrent state.
     interleaved = slab.as_strided(
-        (blocks // 2, heads, key, value), (2 * heads * key * value, key * value, value, 1)
+        (blocks // 2, heads, key, value),
+        (2 * heads * key * value, key * value, value, 1),
     )
     # Capacity metadata pads the request dimension with -1 blocks, so in a mixed
     # step most rows carry no destination: their programs are still scheduled and
@@ -135,7 +137,11 @@ def main() -> None:
             for label, fn, source in (
                 ("old", old_store, scan),
                 ("new", store_state_rows, scan),
-                ("torch index_copy", lambda s, t, b: t.index_copy_(0, b.long(), s), scan),
+                (
+                    "torch index_copy",
+                    lambda s, t, b: t.index_copy_(0, b.long(), s),
+                    scan,
+                ),
                 ("old/contiguous", old_store, contiguous),
                 ("new/contiguous", store_state_rows, contiguous),
             ):

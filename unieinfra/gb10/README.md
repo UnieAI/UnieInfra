@@ -68,5 +68,17 @@ through it while the service is down.
 
 - `nvidia-smi` reports `memory.total` as `[N/A]` on GB10; the engine falls back
   to `torch.cuda.mem_get_info()`, which sees the whole unified pool.
-- The UnieAI sm_12x kernel plugin lives on the `unieai` branch
-  (`unieinfra/kernel-sm120`); this tree does not carry it.
+- The UnieAI sm_12x kernel plugin is in this tree at `unieinfra/kernel-sm120`
+  (imported from the `unieai` branch in 717e0b98, adapted to main's kernel
+  package in b7e86154). `build_wheels.sh` and `Dockerfile` build and install it;
+  level 1 runs its tests when it imports. Its gemm and moe families are
+  deliberately not registered on main (see its CHANGELOG).
+
+## Where the rest lives
+
+- `plan.md` -- the research plan for beating vLLM on GB10: roofline, measured
+  baseline, work packages, milestones, open questions.
+- `kernel_zoo.md` -- pitfalls hit on sm_12x and unified memory (symptom, root
+  cause, fix, how to catch it) and optimization candidates.
+- `results/` -- `metrics.json` summaries of every level 2 run, with a README
+  that tabulates them.

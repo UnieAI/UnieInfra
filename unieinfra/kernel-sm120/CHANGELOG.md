@@ -1,9 +1,45 @@
 # Changelog — unieinfra-kernel-sm120
 
-Out-of-tree `tokenspeed-kernel` plugins for NVIDIA sm_120 (RTX PRO 6000
-Blackwell Server Edition). Design provenance for each kernel — what it was
+Out-of-tree `tokenspeed-kernel` plugins for NVIDIA sm_12x: sm_120 (RTX PRO 6000
+Blackwell Server Edition) and, since 0.8.0, sm_121 (GB10 / DGX Spark). Design provenance for each kernel — what it was
 derived from, what it reuses, what it changes — is in
 [`docs/kernel-provenance.md`](docs/kernel-provenance.md).
+
+## 0.8.0 — 2026-10-19
+
+Ported from the `unieai` branch to `main` (commits 717e0b98, b7e86154,
+07696f3d). The entries below this one describe the plugin as it was on
+`unieai`; where they say a family is "not wired", this entry is current.
+
+### Changed
+
+- Registers on every sm_12x device (`arch_version.major == 12`), so GB10
+  (12.1) no longer falls out of an exact `(12, 0)` comparison.
+- `register()` now wires `flash_attn2`, `gdn` and `quant` after the
+  FlashInfer paged MHA decode. **gemm and moe stay unregistered on main**:
+  their ops select on traits (activation, EP, bias, routing, strides) the
+  kernels never declared, and an undeclared trait matches every value.
+- Adapted to main's kernel package: `register_kernel` lost `tags` (#1654);
+  GDN helpers moved to `ops/attention/gdn/`; MHA ops pass `enable_pdl`;
+  trait names are main's (`sinks`, `logit_cap`, `value_head_dim`,
+  `dequantize=False`), with `head_dim` and `skip_softmax` declared.
+- Dropped the removed `PlatformInfo.fp8e4m3fn`; the fused GDN prefill accepts
+  `h_dtype`.
+
+### Added
+
+- `tests/test_registration.py` asserts every expected kernel registered (a
+  failed family is otherwise silent); `tests/test_gdn_prefill.py` holds the
+  fused GDN prefill to the Triton result.
+
+### Known gaps on main
+
+- Nothing in main calls the decode kernel's `prepare_paged_mha_decode` hook,
+  so CUDA-graph capture with the plugin decode raises; `--attention-backend
+  triton` (the GB10 CI and runbook flags) keeps it from being selected anyway.
+- The fused GDN prefill is not in main's `_DEVICE_BOUNDS_CHUNK_PREFILL` list,
+  so prefill loses graph capture when it is selected.
+- FA2 needs an aarch64 `vllm_flash_attn` matching torch 2.14; none is known.
 
 ## 0.7.0 — 2026-08-02
 

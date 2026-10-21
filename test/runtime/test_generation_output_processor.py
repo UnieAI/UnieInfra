@@ -96,6 +96,7 @@ class _ExecutionResult:
     input_top_logprobs_idx = None
     output_top_logprobs_val = None
     output_top_logprobs_idx = None
+    output_embeddings = None
 
 
 def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
@@ -657,6 +658,7 @@ class _PrefillExecutionResult:
     input_top_logprobs_idx = None
     output_top_logprobs_val = None
     output_top_logprobs_idx = None
+    output_embeddings = None
 
 
 class _EmptyPrefillExecutionResult(_PrefillExecutionResult):

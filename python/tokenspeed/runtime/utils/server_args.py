@@ -353,6 +353,16 @@ class ServerArgs:
     revision: str | None = None
     language_model_only: bool = False
 
+    # Embedding (pooling) serving: one pooled vector per request and no token
+    # generation. A server is either generative or embedding, never both.
+    # Left None, the mode is inferred from the checkpoint's
+    # sentence-transformers pooling config (1_Pooling/config.json).
+    is_embedding: bool | None = None
+    # Override the pooling reduction / L2 normalization the checkpoint declares.
+    # Only needed for a checkpoint that ships no sentence-transformers config.
+    pooling_type: str | None = None
+    pooling_normalize: bool | None = None
+
     # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
     # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
     # output sockets) over the msgpack wire. Default OFF;
@@ -2374,6 +2384,28 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.skip_tokenizer_init,
             help="If set, skip init tokenizer and pass input_ids in generate request",
+        )
+        parser.add_argument(
+            "--is-embedding",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.is_embedding,
+            help="Serve this checkpoint as an embedding model: one pooled "
+            "vector per request, no token generation. Inferred from the "
+            "checkpoint's 1_Pooling/config.json when unset.",
+        )
+        parser.add_argument(
+            "--pooling-type",
+            type=str,
+            choices=["last", "cls", "mean"],
+            default=ServerArgs.pooling_type,
+            help="Override the pooling reduction. Needed only for an "
+            "embedding checkpoint that ships no sentence-transformers config.",
+        )
+        parser.add_argument(
+            "--pooling-normalize",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pooling_normalize,
+            help="Override whether pooled embeddings are L2-normalized.",
         )
         parser.add_argument(
             "--language-model-only",

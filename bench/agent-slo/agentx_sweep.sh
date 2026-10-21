@@ -60,8 +60,8 @@ export ENDPOINT
 PROFILE=${PROFILE:-dsv41}
 case "$PROFILE" in
   dsv41) SRV_NAME=DeepSeek-V4-Flash-Vision-Exp ;;
-  qwen38) SRV_NAME="$MODEL" ;;
-  *) echo "unknown PROFILE $PROFILE (dsv41|qwen38)" >&2; exit 1 ;;
+  qwen38|dense) SRV_NAME="$MODEL" ;;
+  *) echo "unknown PROFILE $PROFILE (dsv41|qwen38|dense)" >&2; exit 1 ;;
 esac
 # drive.py counts generated tokens with the checkpoint's own tokenizer when a
 # server sends no usage chunk, so token counts mean the same thing on every
@@ -91,7 +91,7 @@ RUN_ARGS=()
 case "$KIND" in
   ours)
     case "$PROFILE" in
-      qwen38)
+      qwen38|dense)
         # No tool-call/reasoning parser and no expert parallel: this checkpoint
         # is dense, its own chat template is unused because the cells drive
         # /v1/completions, and TP=1 leaves EP nothing to shard.
@@ -143,7 +143,7 @@ case "$KIND" in
     # ours on the device instead costs 22.9 GiB of HBM per rank and leaves no
     # room for the KV arena on a 140 GiB H200 (the probe reported -1.13 GiB),
     # so device placement was never the comparable configuration.
-    if [ "$PROFILE" != qwen38 ]; then
+    if [ "$PROFILE" = dsv41 ]; then
       RUN_ARGS+=(--engram-host-table --engram-host-table-dir "$HERE/.engram")
     fi
     # --ep-size == --tp: the reference cell runs ep-size==tp-size==4 so the MoE
@@ -216,7 +216,7 @@ case "$KIND" in
     MN="$SRV_NAME"
     ;;
   sglang)
-    if [ "$PROFILE" = qwen38 ]; then
+    if [ "$PROFILE" != dsv41 ]; then
       # Plain defaults: no speculative decoding, no hierarchical cache -- nothing
       # the other two arms do not also run. Only a plain cell separates scheduler
       # and kernel work from extra machinery.

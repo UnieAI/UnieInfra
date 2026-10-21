@@ -405,20 +405,19 @@ class MoELayer(torch.nn.Module):
                 or combine_order != "rank"
             ):
                 raise ValueError(
-                    "bf16_route_accum_fp32 requires BF16 unquantized SiLU experts "
-                    "without expert parallelism, all-to-all, bias or slot combine"
+                    f"{precision_policy} requires BF16 input and unquantized "
+                    "weights with SiLU, without expert parallelism, all-to-all, "
+                    "bias or slot combine"
                 )
             if moe_backend not in {None, "triton"}:
                 raise ValueError(
-                    "bf16_route_accum_fp32 is supported only by the Triton "
-                    f"BF16 MoE backend, not {moe_backend!r}"
+                    f"{precision_policy} requires --moe-backend triton for "
+                    f"unquantized weights, not {moe_backend!r}"
                 )
             if routing_mode not in {None, "precomputed_topk"}:
-                raise ValueError("bf16_route_accum_fp32 requires precomputed top-k")
+                raise ValueError(f"{precision_policy} requires precomputed top-k")
             if self._routed_scaling_factor != 1.0:
-                raise ValueError(
-                    "bf16_route_accum_fp32 requires unscaled route weights"
-                )
+                raise ValueError(f"{precision_policy} requires unscaled route weights")
             if not 0.0 < output_scale < float("inf"):
                 raise ValueError("MoE output_scale must be finite and positive")
             moe_backend = "triton"
@@ -498,6 +497,8 @@ class MoELayer(torch.nn.Module):
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
             hidden=hidden_size,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
             swiglu_form=self._swiglu_form(),
             activation_clamped=(
                 self.swiglu_arg is not None and self.swiglu_arg.limit is not None
@@ -512,6 +513,11 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
+            features=(
+                frozenset({"batch_invariant"})
+                if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+                else frozenset()
+            ),
             solution=moe_backend,
             # rl-bitwise promises one reduction order; fast-math epilogues
             # trade exactly that away.
@@ -608,7 +614,7 @@ class MoELayer(torch.nn.Module):
     @property
     def topk_weights_dtype(self) -> torch.dtype:
         """Preferred route-weight storage at the selected expert boundary."""
-        return self.plan.get("topk_weights_dtype", torch.float32)
+        return self.plan["topk_weights_dtype"]
 
     @property
     def topk_output_format(self):
@@ -619,6 +625,15 @@ class MoELayer(torch.nn.Module):
     @property
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
+
+    @property
+    def supports_deferred_cuda_finalize(self) -> bool:
+        """Whether callers can defer to ``moe_finalize_fuse_shared``.
+
+        That fused finalizer is a CUDA library, so other platforms keep the
+        kernel's own finalize even when the kernel can defer it.
+        """
+        return current_platform().is_nvidia and self.supports_deferred_finalize
 
     @property
     def supports_prequantized_input(self) -> bool:
@@ -671,6 +686,12 @@ class MoELayer(torch.nn.Module):
             routing_prepared: Routing metadata already populated from the
                 precomputed top-k, so the kernel skips its routing launch.
                 Only kernels advertising prepared routing accept it.
+
+        Returns:
+            Finalized ``[tokens, hidden]`` hidden states, or with
+            ``do_finalize=False`` ``(route_outputs, route_weights,
+            expanded_idx)`` for the caller's finalize. Precomputed routes
+            always come with their weights.
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
@@ -726,7 +747,7 @@ class MoELayer(torch.nn.Module):
             raise ValueError(
                 "selected MoE kernel does not support precomputed top-k routing"
             )
-        return kernel_moe_apply(
+        output = kernel_moe_apply(
             self.plan,
             hidden_states,
             self,
@@ -742,3 +763,8 @@ class MoELayer(torch.nn.Module):
             x_quantized=x_quantized,
             routing_prepared=routing_prepared,
         )
+        if not do_finalize and output[1] is None:
+            # Some precomputed-route kernels (Triton MXFP4) return no route
+            # weights; finalize with the ones they were given.
+            output = (output[0], topk_output.topk_weights, output[2])
+        return output

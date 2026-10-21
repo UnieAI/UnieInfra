@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -53,7 +54,7 @@ _SHAPES = [(2560, 320), (2560, 3072), (512, 2560), (6656, 2560), (1000, 1040), (
 
 
 def _reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    return (x.double() @ w.double().T).to(x.dtype)
+    return torch_mm(x.double(), w.double(), None, None, x.dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -176,7 +177,7 @@ def test_selection_takes_the_gemv_on_every_listed_bucket():
 
 @pytest.mark.parametrize("m", [1, 4, 16])
 def test_mm_routes_a_measured_shape_through_the_gemv(m):
-    n, k = 2560, 3072
+    n, k = 1280, 2560
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     expected = x.new_empty(m, n)

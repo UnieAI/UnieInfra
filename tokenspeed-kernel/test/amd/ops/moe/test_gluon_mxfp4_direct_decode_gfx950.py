@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -697,6 +697,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
         internal_activation_dtype="mxfp4",
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         solution="gluon",
     )
 

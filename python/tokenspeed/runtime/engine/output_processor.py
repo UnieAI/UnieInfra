@@ -140,6 +140,11 @@ class OutputProcessor:
             # already used where the collector is fed, further down).
             streaming = bool(getattr(state.obj, "stream", False))
             logprobs_info = state.logprobs_info if not streaming else {}
+            if streaming and "cumulative_logprob" in state.logprobs_info:
+                # Lists cover this frame; the scalar covers the whole request.
+                logprobs_info["cumulative_logprob"] = state.logprobs_info[
+                    "cumulative_logprob"
+                ]
 
             obj = state.obj
             sp = getattr(obj, "sampling_params", None) or {}
@@ -167,6 +172,7 @@ class OutputProcessor:
                         f"Failed to attach logprobs for rid={rid!s}: {exc!s}. Returning"
                         " response without logprobs.",
                     )
+            state.logprobs_info = logprobs_info
 
             if not isinstance(recv_obj, BatchEmbeddingOut):
                 meta_info.update(
@@ -186,12 +192,10 @@ class OutputProcessor:
                     )
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
-                    state.logprobs_info = logprobs_info
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
                 else:
-                    state.logprobs_info.update(logprobs_info)
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
 
@@ -236,12 +240,10 @@ class OutputProcessor:
                         )
                     state.text += incremental_emit
                     if state.obj.stream:
-                        state.logprobs_info = logprobs_info
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids[state.last_output_offset :]
                         state.last_output_offset = len(state.output_ids)
                     else:
-                        state.logprobs_info.update(logprobs_info)
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids.copy()
 

@@ -68,12 +68,22 @@ class GroupTableSpec:
             divide ``block_granularity``.
         max_num_pages: Kernel pages per request the leaf reads
             (``leaf.max_num_pages``).
+        page_spacing: Scheduler-block spans between consecutive blocks in
+            the leaf's row views (``CacheArena.page_spacing``): 1 for
+            contiguous pages, more when the group's pages sit on a flat plane
+            shared with other fields.
     """
 
     group_id: str
     block_granularity: int
     kernel_page_size: int
     max_num_pages: int
+    page_spacing: int = 1
+
+    @property
+    def block_stride(self) -> int:
+        """Kernel page ids one scheduler block advances by."""
+        return self.ratio * self.page_spacing
 
     @property
     def ratio(self) -> int:
@@ -96,6 +106,7 @@ def _unpack_group_kernel(
     num_blocks,  # scheduler blocks per request (the raw table's column count)
     src_stride_b,
     ratio,  # kernel pages per scheduler block
+    block_stride,  # kernel page ids one scheduler block advances by
     max_num_pages,  # kernel pages per request the leaf reads
     dst_stride_b,
     stack_max_num_pages,  # the stack's column count (widest group)
@@ -128,7 +139,7 @@ def _unpack_group_kernel(
         )
         # Holes and ragged padding (id <= 0) collapse onto the dummy page 0;
         # a real block expands to its ratio consecutive kernel pages.
-        page = tl.maximum(raw, 0).to(tl.int64) * ratio + col % ratio
+        page = tl.maximum(raw, 0).to(tl.int64) * block_stride + col % ratio
         page = tl.where(raw > 0, page, 0)
         vals = tl.where(in_table, page, 0)
         tl.store(
@@ -136,6 +147,18 @@ def _unpack_group_kernel(
             vals.to(tl.int32),
             mask=col < stack_max_num_pages,
         )
+
+
+def _expand_blocks(blocks: torch.Tensor, ratio: int, block_stride: int) -> torch.Tensor:
+    """Host/torch form of the unpack kernel's block -> kernel page math: block
+    ``b`` becomes pages ``b * block_stride + [0, ratio)``; block 0 (holes and
+    padding) stays the null page 0 across its ratio slots."""
+    if ratio == 1 and block_stride == 1:
+        return blocks
+    offsets = torch.arange(ratio, dtype=blocks.dtype, device=blocks.device)
+    pages = blocks.unsqueeze(-1) * block_stride + offsets
+    pages = torch.where(blocks.unsqueeze(-1) > 0, pages, torch.zeros_like(pages))
+    return pages.reshape(blocks.shape[0], -1)
 
 
 class GroupTableStacks:
@@ -168,6 +191,7 @@ class GroupTableStacks:
         self._specs = {spec.group_id: spec for spec in groups}
         self._index = {gid: i for i, gid in enumerate(self.group_ids)}
         self._ratios = tuple(spec.ratio for spec in groups)
+        self._block_strides = tuple(spec.block_stride for spec in groups)
         self._max_num_pages = tuple(spec.max_num_pages for spec in groups)
         self.max_bs = int(max_bs)
         self.max_tokens_per_req = max(int(max_tokens_per_req), 1)
@@ -223,14 +247,11 @@ class GroupTableStacks:
         leading rows (unpadded), the same block-to-page math as the device
         fill, for leaves that count page ownership on the host."""
         i = self._index[group_id]
-        ratio = self._ratios[i]
-        src = block_table_cpu[:num_requests].to(torch.int64).clamp_min(0)
-        if ratio != 1:
-            offsets = torch.arange(ratio, dtype=torch.int64)
-            src = (src.unsqueeze(-1) * ratio + offsets).reshape(num_requests, -1)
-            # Page 0 stays 0 across its ratio slots.
-            src = torch.where(src >= ratio, src, torch.zeros_like(src))
-        return src.to(torch.int32)
+        return _expand_blocks(
+            block_table_cpu[:num_requests].to(torch.int64).clamp_min(0),
+            self._ratios[i],
+            self._block_strides[i],
+        ).to(torch.int32)
 
     def decode_locations(
         self, group_id: str, bs: int, tokens_per_req: int
@@ -299,6 +320,7 @@ class GroupTableStacks:
                     src.shape[1],
                     src.stride(0),
                     self._ratios[i],
+                    self._block_strides[i],
                     self._max_num_pages[i],
                     self.tables.stride(1),
                     stack_max_num_pages,
@@ -320,13 +342,11 @@ class GroupTableStacks:
             # Only the scheduler blocks whose expansion lands inside the
             # leaf's max_num_pages are read.
             num_blocks = min(src.shape[1], -(-max_num_pages // ratio))
-            live = src[:actual_bs, :num_blocks].clamp_min(0)
-            if ratio != 1:
-                offsets = torch.arange(ratio, dtype=live.dtype, device=live.device)
-                live = (live.unsqueeze(-1) * ratio + offsets).reshape(actual_bs, -1)
-                live = torch.where(
-                    live >= ratio, live, torch.zeros_like(live)
-                )  # page 0 stays 0 across its ratio slots
+            live = _expand_blocks(
+                src[:actual_bs, :num_blocks].clamp_min(0),
+                ratio,
+                self._block_strides[i],
+            )
             num_pages = min(live.shape[1], max_num_pages)
             dst[:actual_bs, :num_pages].copy_(live[:, :num_pages])
             dst[:actual_bs, num_pages:].zero_()

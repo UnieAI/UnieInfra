@@ -162,6 +162,8 @@ class CacheArena:
                     pin_memory=host,
                 )
         self._field_bindings = {b.field_id: b for b in self.storage_plan.fields}
+        # Filled by ``_bind`` for the groups whose fields fold into rows.
+        self._group_page_spacing: dict[str, int] = {}
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
@@ -291,7 +293,47 @@ class CacheArena:
             token_rows = spec.rows_per_page
         if spec.attn_kind == "state" or field.shape[0] != token_rows:
             return pages
-        return pages.view(-1, *field.shape[1:])
+        spacing = self._page_spacing(field)
+        if self._group_page_spacing.setdefault(field.group_id, spacing) != spacing:
+            raise ValueError(
+                f"cache group {field.group_id!r} mixes page spacings; one page "
+                "table cannot address them all"
+            )
+        if spacing == 1:
+            return pages.view(-1, *field.shape[1:])
+        # Pages several payloads apart (fields sharing one flat plane): the
+        # rows run on from page 0 through the other fields' bytes, so page p
+        # starts at row p * spacing * token_rows -- the kernel page its
+        # group's table expands it to (``page_spacing``).
+        rows = ((group.page_count - 1) * spacing + 1) * token_rows
+        if rows > torch.iinfo(torch.int32).max:
+            raise ValueError(
+                f"cache field {field.field_id!r}: {rows} spaced rows overflow "
+                "the int32 write slots"
+            )
+        row_elements = stride // token_rows
+        start = offset // field.element_size
+        return buffer.view(dtype)[start : start + rows * row_elements].view(
+            rows, *field.shape[1:]
+        )
+
+    @staticmethod
+    def _page_spacing(field) -> int:
+        """Payloads one page stride of a token-row field spans."""
+        if field.page_stride_bytes % field.payload_bytes:
+            raise ValueError(
+                f"cache field {field.field_id!r}: page stride "
+                f"{field.page_stride_bytes} is not a whole number of "
+                f"{field.payload_bytes}-byte payloads, so its pages cannot be "
+                "addressed as rows"
+            )
+        return field.page_stride_bytes // field.payload_bytes
+
+    def page_spacing(self, group_id: str) -> int:
+        """Kernel pages one of the group's cache pages advances by in its
+        fields' row views: 1 for contiguous pages, more when the group shares
+        a flat plane whose page stride spans several payloads."""
+        return self._group_page_spacing.get(group_id, 1)
 
     def field(self, field_id: str) -> torch.Tensor:
         """Return one planned field's view into the arena.

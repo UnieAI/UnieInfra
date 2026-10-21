@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+    FLAT_KV_PLANE,
     _config_bytes_per_token,
     _config_kv_head_counts,
     _config_layer_fields,
@@ -117,14 +118,9 @@ def _mha_config(
 
 def _kv_shapes(config: AttnConfig, num_layers: int) -> list[tuple[int, ...]]:
     """The K page shape each layer's MHA fields resolve to."""
-    spec = config.component(SoftmaxAttnConfig)
-    layer_types = tuple(spec.cache_layer_types)
     shapes = []
     for layer_id in range(num_layers):
-        group_id = (
-            layer_types[layer_id] if layer_id < len(layer_types) else "full_attention"
-        )
-        fields = _mha_layer_fields(config, layer_id, layer_id, group_id, 0)
+        fields = _mha_layer_fields(config, layer_id, layer_id, 0)
         # fields[0] is the K page; .shape is (prefix_granularity, kv_heads, head_dim)
         shapes.append(tuple(fields[0].shape))
     return shapes
@@ -179,21 +175,22 @@ class PerLayerGeometryFieldTest(unittest.TestCase):
         self.assertEqual(_config_bytes_per_token(config, num_layers), expected)
 
 
-class PerLayerPlaneScopingTest(unittest.TestCase):
-    """Per-layer-geometry groups never share a K/V plane.
+class PerLayerPlaneTest(unittest.TestCase):
+    """Per-layer-geometry layers share one flat K/V plane.
 
-    Two cache groups whose layers differ in head_dim (gemma-4 full 4 x 512 vs
-    sliding 16 x 256) must land on distinct planes: ``pack``'s exact-page-stride
-    check rejects two different payload sizes sharing one plane. The uniform
-    default keeps the group-agnostic ``unit.{occurrence}`` plane every current
-    model relies on so byte-equal full/sliding layers still pair in one slab.
+    Gemma-4's full (4 x 512) and sliding (16 x 256) layers cannot pair
+    byte-equal planes the way a uniform hybrid model does, and planes of their
+    own would leave the other group's planes of every parent unused. Every
+    field instead lands on one flat plane, strided by whole payloads. The
+    uniform default keeps the group-agnostic ``unit.{occurrence}`` plane every
+    current model relies on so byte-equal full/sliding layers still pair in
+    one slab.
     """
 
-    def _plane_ids(self, config, layer_id, group_id, occurrence):
-        fields = _mha_layer_fields(config, layer_id, layer_id, group_id, occurrence)
-        return tuple(f.plane_id for f in fields)
+    def _fields(self, config, layer_id, occurrence):
+        return _mha_layer_fields(config, layer_id, layer_id, occurrence)
 
-    def test_distinct_groups_get_distinct_planes_when_per_layer(self):
+    def test_every_per_layer_field_shares_the_flat_plane(self):
         config = _mha_config(
             layer_kv_geometry=_GEMMA4_GEOMETRY,
             num_kv_heads=16,
@@ -201,28 +198,13 @@ class PerLayerPlaneScopingTest(unittest.TestCase):
             attn_tp_size=1,
             cache_layer_types=tuple(_LAYER_TYPES * 2),
         )
-        # Occurrence 0 of the sliding group and occurrence 0 of the full group:
-        # under the old group-agnostic naming both were 'unit.0.k' and collided.
-        sliding_planes = self._plane_ids(config, 0, "sliding_attention", 0)
-        full_planes = self._plane_ids(config, 5, "full_attention", 0)
-        self.assertNotEqual(set(sliding_planes), set(full_planes))
-        self.assertEqual(len(set(sliding_planes) & set(full_planes)), 0)
-
-    def test_same_group_shares_a_plane_namespace_across_occurrences(self):
-        config = _mha_config(
-            layer_kv_geometry=_GEMMA4_GEOMETRY,
-            num_kv_heads=16,
-            head_dim=256,
-            attn_tp_size=1,
-            cache_layer_types=tuple(_LAYER_TYPES * 2),
-        )
-        # Two layers of the SAME group with distinct occurrences get distinct
-        # planes within that group's namespace (occurrence separates them).
-        occ0 = self._plane_ids(config, 0, "sliding_attention", 0)
-        occ1 = self._plane_ids(config, 1, "sliding_attention", 1)
-        self.assertNotEqual(set(occ0), set(occ1))
-        for plane in occ0 + occ1:
-            self.assertTrue(plane.startswith("unit.sliding_attention."))
+        for layer_id, occurrence in ((0, 0), (1, 1), (5, 0), (11, 1)):
+            for field in self._fields(config, layer_id, occurrence):
+                self.assertEqual(field.plane_id, FLAT_KV_PLANE)
+                self.assertFalse(field.exact_page_stride)
+                # The stride is whole payloads, so a page starts on a kernel
+                # page of the field's row view.
+                self.assertEqual(field.page_stride_alignment_bytes, field.payload_bytes)
 
     def test_uniform_model_keeps_group_agnostic_unit_plane(self):
         config = _mha_config(
@@ -232,8 +214,9 @@ class PerLayerPlaneScopingTest(unittest.TestCase):
             attn_tp_size=1,
             cache_layer_types=("full_attention",) * 6,
         )
-        planes = self._plane_ids(config, 0, "full_attention", 0)
-        self.assertEqual(set(planes), {"unit.0.k", "unit.0.v"})
+        fields = self._fields(config, 0, 0)
+        self.assertEqual({f.plane_id for f in fields}, {"unit.0.k", "unit.0.v"})
+        self.assertTrue(all(f.exact_page_stride for f in fields))
 
 
 class UniformDefaultInvariantTest(unittest.TestCase):
@@ -456,7 +439,6 @@ def _pack_gemma4(config: AttnConfig):
             config,
             layer_id=layer_id,
             local_layer_id=layer_id,
-            group_id=group_id,
             occurrence=occurrence,
         )
 
@@ -494,8 +476,7 @@ class PerLayerGeometryPackingTest(unittest.TestCase):
         # the old shared-slab pin; the derived path packs cleanly.
         layout = _pack_gemma4(_gemma4_split_config(attn_tp_size=1))
         packing = dict(layout.group_packing)
-        # Two geometries -> two distinct planes per occurrence -> no plane is
-        # shared, so the derived packing is the byte-ratio one.
+        # The derived packing is the byte-ratio one.
         self.assertEqual(packing["full_attention"], 2)
         for k in range(5):
             self.assertEqual(packing[f"sliding_attention_{k}"], 1)
@@ -525,6 +506,146 @@ class PerLayerGeometryPackingTest(unittest.TestCase):
         self.assertEqual(packing["full_attention"], 2)
         for k in range(5):
             self.assertEqual(packing[f"sliding_attention_{k}"], 1)
+
+
+def _pack_gemma4_two_groups(config: AttnConfig):
+    """Pack the two cache groups the runtime serves gemma-4 with (one sliding,
+    one full) from the recipe's own fields."""
+    spec = config.component(SoftmaxAttnConfig)
+    layer_types = tuple(spec.cache_layer_types)
+    groups = group_declarations(
+        layer_types=layer_types,
+        group_ids=layer_types,
+        sliding_window_tokens=spec.sliding_window_tokens,
+        prefix_granularity=config.prefix_granularity,
+        fields_for_layer=lambda layer_id, group_id, occurrence: _config_layer_fields(
+            config, layer_id=layer_id, local_layer_id=layer_id, occurrence=occurrence
+        ),
+        pd_disaggregation_enabled=False,
+    )
+    return pack(
+        groups,
+        prefix_granularity=config.prefix_granularity,
+        cache_blocks_per_lcm_block=None,
+        alignment=1,
+        max_padding_fraction=1.0,
+    )
+
+
+class FlatPlaneTest(unittest.TestCase):
+    """Both groups fill whole parents, and the spaced row views address the
+    planned bytes.
+
+    Ten sliding layers (16 x 256) and two full layers (4 x 512): a sliding
+    page is 10 x 2 x 131072 B and a full page 2 x 2 x 65536 B, so a parent
+    holds one sliding page or ten full pages and no byte of it is idle.
+    """
+
+    def _config(self):
+        return _mha_config(
+            layer_kv_geometry=_GEMMA4_GEOMETRY,
+            num_kv_heads=16,
+            head_dim=256,
+            attn_tp_size=1,
+            cache_layer_types=tuple(_LAYER_TYPES * 2),
+        )
+
+    def test_a_parent_is_one_sliding_page_or_ten_full_pages(self):
+        layout = _pack_gemma4_two_groups(self._config())
+        packing = dict(layout.group_packing)
+        self.assertEqual(packing, {"full_attention": 10, "sliding_attention": 1})
+        sliding_page = 10 * 2 * _PREFIX_GRANULARITY * 16 * 256 * 2
+        self.assertEqual(layout.lcm_block_bytes, sliding_page)
+        full_fields = [f for f in layout.fields if f.group_id == "full_attention"]
+        self.assertTrue(
+            all(f.page_stride_bytes == sliding_page // 10 for f in full_fields)
+        )
+
+    def test_spaced_rows_land_in_the_planned_page_bytes(self):
+        if not torch.cuda.is_available():
+            self.skipTest("set_kv_buffer runs a CUDA triton scatter")
+        from cache_pool_test_utils import make_arena
+
+        from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+            MHATokenToKVPool,
+        )
+        from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+        plan = _pack_gemma4_two_groups(self._config()).bind(4)
+        arena = make_arena(plan, "cuda")
+        # Page stride over payload: 20 sliding payloads, 4 full payloads.
+        self.assertEqual(arena.page_spacing("sliding_attention"), 20)
+        self.assertEqual(arena.page_spacing("full_attention"), 4)
+        pool = MHATokenToKVPool(
+            arena=arena,
+            dtype=torch.bfloat16,
+            head_num=16,
+            head_dim=256,
+            layer_num=len(_GEMMA4_GEOMETRY),
+            rank=0,
+            layer_kv_head_counts=tuple(h for h, _ in _GEMMA4_GEOMETRY),
+            kv_alloc_head_count=16,
+            field_layer_offset=0,
+        )
+        n = _PREFIX_GRANULARITY
+        written = {}
+        # Write page 2 of every layer of both groups through its row view.
+        for layer_id, (kv_heads, head_dim) in enumerate(_GEMMA4_GEOMETRY):
+            gid = _LAYER_TYPES[layer_id % len(_LAYER_TYPES)]
+            first_row = 2 * arena.page_spacing(gid) * n
+            loc = torch.arange(first_row, first_row + n, device="cuda")
+            k = torch.randn(n, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+            v = torch.randn_like(k)
+            layer = PagedAttention(
+                num_heads=kv_heads,
+                head_dim=head_dim,
+                scaling=1.0,
+                num_kv_heads=kv_heads,
+                layer_id=layer_id,
+                logit_cap=0.0,
+                sliding_window_size=-1,
+                rotary_emb=None,
+                qk_norm=None,
+            )
+            pool.set_kv_buffer(layer, loc, k, v)
+            written[f"layer.{layer_id}.k"] = k
+            written[f"layer.{layer_id}.v"] = v
+        torch.cuda.synchronize()
+        raw = arena.buffer
+        for field_id, rows in written.items():
+            start = plan.field_page_byte_offset(field_id, 2)
+            payload = rows.numel() * rows.element_size()
+            stored = raw[start : start + payload].view(torch.bfloat16)
+            # Bit-exact at the planned offset, so no write overlapped another.
+            self.assertTrue(torch.equal(stored, rows.reshape(-1)), field_id)
+
+    def test_the_page_table_expands_blocks_by_their_spacing(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            GroupTableSpec,
+            GroupTableStacks,
+        )
+
+        stacks = GroupTableStacks(
+            [
+                GroupTableSpec("spaced", 16, 16, 4, page_spacing=20),
+                GroupTableSpec("split", 16, 8, 8, page_spacing=4),
+            ],
+            max_bs=1,
+            max_tokens_per_req=1,
+            max_extend_tokens=0,
+            device="cpu",
+        )
+        blocks = torch.tensor([[3, 0, 1]], dtype=torch.int32)
+        stacks.fill(1, 1, {"spaced": blocks, "split": blocks})
+        self.assertEqual(stacks.table("spaced", 1).tolist(), [[60, 0, 20, 0]])
+        # Two kernel pages per block, spaced by four blocks' worth of pages.
+        self.assertEqual(
+            stacks.table("split", 1).tolist(), [[24, 25, 0, 0, 8, 9, 0, 0]]
+        )
+        self.assertEqual(
+            stacks.host_table("split", blocks, 1).tolist(),
+            [[24, 25, 0, 0, 8, 9]],
+        )
 
 
 class PoolRowViewWidthTest(unittest.TestCase):

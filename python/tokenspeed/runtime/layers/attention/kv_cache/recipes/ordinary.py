@@ -27,6 +27,7 @@ MHA draft is just layers with two different geometries in one plan.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import cached_property
@@ -47,6 +48,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
+    cache_dtype_bytes,
     cache_dtype_name,
     mxfp8_kv_scale_fields,
     scatter_stored_dtype_name,
@@ -215,9 +217,9 @@ class OrdinaryRecipe(CacheRecipe):
         """How many of each group's CacheBlocks share one physical parent.
 
         A per-layer-geometry model (gemma-4) returns ``None`` so :func:`pack`
-        derives per-group packing from the groups' byte ratios plus the
-        exact-page-stride constraints their distinct-width planes impose --
-        the general path. Its two geometries are not byte-equal (full 4 x 512,
+        derives per-group packing from the groups' byte ratios -- the general
+        path: its groups share one flat plane, and a parent holds as many of a
+        group's pages as fit. Its two geometries are not byte-equal (full 4 x 512,
         sliding 16 x 256), so pinning every group to one CacheBlock per parent
         would size each group's stride at the whole LCM block while its payload
         fills only its own planes, blowing the padding fraction far past the
@@ -244,7 +246,6 @@ class OrdinaryRecipe(CacheRecipe):
             config,
             layer_id=layer_id,
             local_layer_id=local_layer_id,
-            group_id=group_id,
             occurrence=occurrence,
         )
 
@@ -354,7 +355,7 @@ def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
 
 
 def _config_layer_fields(
-    config, *, layer_id: int, local_layer_id: int, group_id: str, occurrence: int
+    config, *, layer_id: int, local_layer_id: int, occurrence: int
 ) -> tuple[CacheFieldSpec, ...]:
     """What one layer costs, dispatched on the config that owns the layer."""
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -368,16 +369,14 @@ def _config_layer_fields(
             _index_k_field(config, layer_id),
         )
     if isinstance(spec, MSAConfig):
-        fields = _mha_layer_fields(
-            config, layer_id, local_layer_id, group_id, occurrence
-        )
+        fields = _mha_layer_fields(config, layer_id, local_layer_id, occurrence)
         if local_layer_id in spec.sparse_layer_ids:
             fields += (_index_k_field(config, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, layer_id, occurrence)
     if isinstance(spec, MHAConfig):
-        return _mha_layer_fields(config, layer_id, local_layer_id, group_id, occurrence)
+        return _mha_layer_fields(config, layer_id, local_layer_id, occurrence)
     raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
@@ -397,27 +396,36 @@ def _mha_layer_geometry(spec, local_layer_id: int) -> tuple[int, int]:
     return max(kv_heads // spec.attn_tp_size, 1), head_dim
 
 
-def _mha_plane_prefix(spec, group_id: str) -> str:
-    """Plane namespace for an MHA layer's K/V planes.
+# The one plane every K/V field of a per-layer-geometry model shares.
+FLAT_KV_PLANE = "unit.flat"
 
-    A uniform model keeps the bare ``unit`` prefix every current model uses,
-    so its planes stay byte-for-byte ``unit.{occurrence}.k`` and the i-th
-    layer of each cache group deliberately shares one plane (full and sliding
-    layers are byte-equal, so the hybrid slab pairs them). A per-layer-geometry
-    model (gemma-4) cannot share a plane across groups: a 4 x 512 full layer
-    and a 16 x 256 sliding layer have different page strides, and
-    ``pack``'s exact-page-stride check rejects two payloads on one plane. Such
-    a model scopes the plane by its cache group so each geometry owns its own
-    plane namespace.
+
+def _mha_plane(spec, occurrence: int, name: str) -> tuple[str, bool]:
+    """Plane id of an MHA layer's K or V field, and whether its kernel needs
+    an exact page stride.
+
+    A uniform model keeps the bare ``unit.{occurrence}`` planes every current
+    model uses: the i-th layer of each cache group deliberately shares one
+    plane (full and sliding layers are byte-equal, so the hybrid slab pairs
+    them and a parent serves whichever group owns it with every byte).
+
+    A per-layer-geometry model (gemma-4) cannot pair layers that way: a
+    4 x 512 full layer and a 16 x 256 sliding layer have different payloads.
+    Giving each group its own planes leaves the other group's planes of every
+    parent unused -- half the arena for gemma-4. Instead every field lands on
+    one flat plane: a group's page is all of its fields back to back, a
+    parent holds one whole sliding page or ten whole full pages, and no byte
+    sits in a plane its owner does not use. The fields' page strides then
+    exceed their payloads; the arena serves each as a row view whose kernel
+    pages are spaced by ``stride / payload`` (see ``CacheArena.page_spacing``),
+    so the attention and store kernels keep their contiguous-row contract.
     """
     if getattr(spec, "layer_kv_geometry", None) is None:
-        return "unit"
-    return f"unit.{group_id}"
+        return f"unit.{occurrence}.{name}", True
+    return FLAT_KV_PLANE, False
 
 
-def _mha_layer_fields(
-    config, layer_id: int, local_layer_id: int, group_id: str, occurrence: int
-):
+def _mha_layer_fields(config, layer_id: int, local_layer_id: int, occurrence: int):
     """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
     spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)
@@ -438,15 +446,22 @@ def _mha_layer_fields(
         if mxfp8
         else scatter_stored_dtype_name(config.kv_cache_dtype)
     )
-    plane_prefix = _mha_plane_prefix(spec, group_id)
-    fields = (
-        CacheFieldSpec(
-            f"layer.{layer_id}.k", f"{plane_prefix}.{occurrence}.k", shape, kv_dtype
-        ),
-        CacheFieldSpec(
-            f"layer.{layer_id}.v", f"{plane_prefix}.{occurrence}.v", shape, kv_dtype
-        ),
-    )
+    payload_bytes = math.prod(shape) * cache_dtype_bytes(kv_dtype)
+    fields = ()
+    for name in ("k", "v"):
+        plane_id, exact_page_stride = _mha_plane(spec, occurrence, name)
+        fields += (
+            CacheFieldSpec(
+                f"layer.{layer_id}.{name}",
+                plane_id,
+                shape,
+                kv_dtype,
+                exact_page_stride=exact_page_stride,
+                # A spaced field's stride must be whole payloads, so its pages
+                # sit on the kernel-page grid of its row view.
+                page_stride_alignment_bytes=1 if exact_page_stride else payload_bytes,
+            ),
+        )
     if not mxfp8:
         return fields
     return fields + mxfp8_kv_scale_fields(

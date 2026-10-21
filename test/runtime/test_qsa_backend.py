@@ -158,6 +158,7 @@ def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
                 ]
             ),
             field=tensors.__getitem__,
+            page_spacing=lambda group_id: 1,
             cache_group_specs=tuple(
                 SimpleNamespace(
                     group_id=gid,

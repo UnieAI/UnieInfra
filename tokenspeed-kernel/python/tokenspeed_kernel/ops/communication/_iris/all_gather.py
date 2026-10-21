@@ -310,6 +310,7 @@ def iris_pull_allgather_columns(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        REMOTE_STORE_CACHE=".wt",
     )
     gl.atomic_add(epoch_ptr, 0, sem="acquire", scope="sys")
 
@@ -353,6 +354,7 @@ def iris_pull_allgather_columns(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        REMOTE_STORE_CACHE=".wt",
     )
 
 

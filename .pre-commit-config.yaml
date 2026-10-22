@@ -8,7 +8,9 @@ default_stages: [pre-commit, pre-push, manual]
 #     so a blank context line is a single space -- exactly what
 #     trailing-whitespace strips, silently corrupting the patch.
 #   - reformatting an archive destroys its fidelity to what was actually run.
-exclude: '^legacy/'
+# `vllm_fa4` is vendored verbatim from vLLM (see its README); keeping the hooks
+# off it keeps it diffable against the upstream copy.
+exclude: '^(legacy/|tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/vllm_fa4/)'
 
 default_language_version:
   python: python3.12

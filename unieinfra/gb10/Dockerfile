@@ -7,11 +7,13 @@
 #   docker build -f unieinfra/gb10/Dockerfile -t unieinfra:gb10-main .
 #
 # Same recipe as docker/Dockerfile.nvidia, but on the runner image whose
-# flashinfer-jit-cache matches the flashinfer-python pin (0.7.1rc2; the 0.6.18
-# image fails the kernel build on flashinfer's version check), and with native
+# flashinfer-jit-cache matches the flashinfer-python pin in
+# tokenspeed-kernel/python/requirements/cuda.txt (0.7.2 since upstream #2338;
+# a mismatched image fails the kernel build on flashinfer's version check),
+# and with native
 # kernels for sm_121a only: the default list (9.0a/10.0a) has no SASS a GB10
 # can run, and an `a` target is not forward compatible across minor versions.
-FROM lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.7.1rc2
+FROM lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.7.2
 
 USER root
 

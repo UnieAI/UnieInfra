@@ -92,6 +92,11 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+    // A new prompt whose next uncached pages another resident prompt is still
+    // computing waits a round for them to be published instead of computing
+    // them a second time, when at least this many such pages lead its
+    // uncached suffix. Zero disables the wait.
+    std::int32_t inflight_prefix_defer_pages{4};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

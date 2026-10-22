@@ -468,6 +468,22 @@ private:
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
+
+    // In-flight prefix dedup (SchedulerConfig::inflight_prefix_defer_pages).
+    // The prefix hashes of the full prompt pages each admitted prompt
+    // computes itself (past its hit), by request id, kept while the pages
+    // can still be unpublished: Prefilling, and PrefillDone until its first
+    // decode publishes the prompt end. The union is rebuilt every round.
+    std::unordered_map<std::string, std::vector<std::string>> inflight_prefix_pages_;
+    std::unordered_set<std::string> inflight_prefix_hashes_;
+    // The same hashes for every Submitted prompt, and how many of them carry
+    // each hash, kept incrementally (a prompt is hashed once, on first sight).
+    std::unordered_map<std::string, std::vector<std::string>> waiting_prefix_pages_;
+    std::unordered_map<std::string, std::int32_t> waiting_prefix_counts_;
+    void refreshInflightPrefixPages();
+    bool defersToInflightPrefix(std::span<const std::string> candidate_hashes, std::int32_t hit_pages) const;
+    std::int32_t pagesSharedWithWaiting(std::span<const std::string> candidate_hashes, std::int32_t hit_pages) const;
+    std::vector<std::string> candidatePrefixHashes(const Request& request) const;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).

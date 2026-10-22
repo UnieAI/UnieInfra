@@ -200,14 +200,27 @@ NVIDIA 的 compute capability 是兩條產品線，不是一條階梯：sm_100/1
 ### F2. main 新增 per-tensor scaled FP8 KV cache（upstream #2414）→ 跟 C1 的 Triton 路徑有縫
 - main 現在把「checkpoint 自帶 k_scale/v_scale ≠ 1 的 FP8 cache」當成另一個 signature
   （`scaled-fp8`，`ops/attention/mha/__init__.py::_blockscaled_signature_and_scales`），
-  只有 FlashInfer trtllm-gen 的 MHA kernel 宣告它；我們 C1 的 Triton「bf16 q × fp8 KV」只服務
-  unit-scale 的 dense fp8 signature。
-- 後果：GB10 上 `--kv-cache-dtype fp8_e4m3` 配 BF16 checkpoint（scale = 1）照常；**配自帶
-  KV scale 的 FP8 checkpoint 會在第一次 forward 才 `NoKernelFoundError`**，因為
-  `mha_fp8_cache_query_dtype` 啟動時只用 dense signature 探 registry，看不到這個缺口。
+  只有 FlashInfer trtllm-gen 的 MHA kernel 宣告它（sm_100 的 kernel）；我們 C1 的 Triton
+  「bf16 q × fp8 KV」只宣告 unit-scale 的 dense fp8 signature，讀出來也沒乘 scale。
+- **誰會碰到**（2026-10-22 追到底）：loader 把非 1 的 KV scale tensor 從權重裡抽出來，交給模型的
+  `load_kv_cache_scales`；**只有 Nemotron-H 實作了這個 hook**（`models/nemotron_h.py`）。Qwen
+  系列沒有 → 帶 KV scale 的 Qwen checkpoint 在 **載入時** 就 `ValueError: checkpoint KV-cache
+  scales …; only unit KV-cache scales are supported`，跟 kernel、跟 KV dtype 都無關。
+  所以：
+  1. 現在的 BF16 Qwen3.8-27B + fp8 KV：scale = 1，完全沒事。
+  2. Nemotron-H + fp8 KV 在 GB10：scaled signature 找不到 Triton → 第一次 forward
+     `NoKernelFoundError`；啟動檢查 `mha_fp8_cache_query_dtype` 只探 dense signature，看不到。
+  3. **WP2 的實際阻礙**：ModelOpt 出的 NVFP4 checkpoint 常帶 `kv_cache_quant_algo: FP8` 與
+     k_scale/v_scale；這種 Qwen checkpoint TS 根本載不進來（任何 GPU 都一樣），要先給 Qwen 模型
+     加 `load_kv_cache_scales`（upstream 層級的工作），加了之後 GB10 上才會輪到上面第 2 點的縫。
+     選 checkpoint 時先看 `hf_quant_config.json` 有沒有 `kv_cache_quant_algo`。
+- BF16 KV cache 不受影響：attention 層對非 FP8 cache 直接忽略 scale（`paged_attention.py` L165）。
+  GB10 上 fp8 KV 的收益實測只有 +0–7% 吞吐、2 倍槽位（results/），所以「先用 BF16 KV」是合理的
+  繞法。GB10 上 **沒有** Triton 以外的 attention kernel 可選：trtllm-gen 要 sm_100、FA2 沒有
+  aarch64 build、plugin 的 FlashInfer decode 只收 bf16/fp16。
 - 修法候選：Triton kernel 多宣告 scaled-fp8 signature 並在 upcast 後乘 descale（FlashInfer
   那邊是 `k_descale, v_descale = fp8_kv_scales`），或讓 `mha_fp8_cache_query_dtype` 也探
-  scaled signature 並在啟動時就報錯。**未修，先記著。**
+  scaled signature 在啟動時就報錯。**未修。**
 
 ### F3. FlashInfer pin 0.7.1rc2 → 0.7.2（upstream #2338）
 - `tokenspeed-kernel/python/requirements/cuda.txt` 現在是 `flashinfer-python==0.7.2`；runbook

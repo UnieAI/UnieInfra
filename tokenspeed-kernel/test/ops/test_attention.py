@@ -50,6 +50,8 @@ def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16-d64"),
         pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
+        # Qwen3.5/3.8 full attention; its tiles overflow ~100 KB smem parts.
+        pytest.param(torch.bfloat16, 256, 8, 2, id="bf16-d256"),
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="e4m3-d64"),
         pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="e4m3-d128"),
         pytest.param(torch.float8_e5m2, 64, 8, 2, id="e5m2-d64"),
@@ -71,6 +73,8 @@ def test_mha_prefill(
     require,
 ) -> None:
     require("attention", "mha_prefill", solution, dtype, "q")
+    if head_dim == 256 and solution != "triton":
+        pytest.skip("head_dim 256 is covered for the Triton kernel only")
     if solution == "fa4" and (has_sink or is_sliding):
         pytest.skip("FA4 MHA prefill does not support sinks or sliding window")
 
@@ -250,6 +254,7 @@ def test_mha_prefill_triton_window_bounds(
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
         pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
+        pytest.param(torch.bfloat16, 256, 8, 2, id="bf16-d256"),
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
         pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8-d128"),
         pytest.param(torch.float8_e5m2, 64, 8, 2, id="fp8-e5m2"),
@@ -267,6 +272,8 @@ def test_mha_extend_with_kvcache(
     require,
 ) -> None:
     require("attention", "mha_extend_with_kvcache", solution, dtype, "q")
+    if head_dim == 256 and solution != "triton":
+        pytest.skip("head_dim 256 is covered for the Triton kernel only")
 
     batch_size = 4
     page_size = 64

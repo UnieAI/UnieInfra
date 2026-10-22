@@ -213,7 +213,7 @@ Ready time：482–497 s。
   3. 混合精度策略：GDN / attention 層留 FP8（ai-muninn 的 hybrid 教訓），MLP 走 NVFP4；`modelopt_mixed` 已支援 per-layer 格式。
   4. MoE：`flashinfer_cutlass_nvfp4` 在 sm_121 admitted 但未測；備案 Marlin MXFP4。
 - **驗收**：WP0 圖上 TS NVFP4 c=1 與 vLLM NVFP4（無 MTP）持平；prefill ≥ vLLM 的 1,900 tok/s。
-- **風險**：PTX / 靜默錯誤（sm_120 kernel 在 sm_121 跑出垃圾但不報錯，有人踩過）→ 每個 kernel 先過 numerics 比對再上整模型；FlashInfer 版本漂移（runbook 已從 0.6.18 升到 0.7.1rc2）。
+- **風險**：PTX / 靜默錯誤（sm_120 kernel 在 sm_121 跑出垃圾但不報錯，有人踩過）→ 每個 kernel 先過 numerics 比對再上整模型；FlashInfer 版本漂移（runbook 已從 0.6.18 → 0.7.1rc2 → 0.7.2 跟著 main 的 pin 走，每次 rebase 都要對一次）。
 
 ### WP3 推測解碼：MTP → DSpark → tree
 
@@ -320,7 +320,8 @@ Ready time：482–497 s。
 3. **精度**：NVFP4 hybrid、BF16 GDN state、推測解碼與量化的交互；GSM8K 200 題太少，WP0 加長生成的 drift 測試。
 4. **時間都花在跟 upstream 同步**：main 每週變（kernel_zoo C6），plugin 簽名跟不上；WP0 的 trait / kwargs AST 對照測試要先做成 CI。
 5. **GB10 是共用機**：CI runner、常駐服務、網路曾斷三天；實驗要可中斷、結果要落盤（`run.sh` 已做）。
-6. **單人力**：WP4 階梯 3 與 WP7 步驟 4 是 scheduler / allocator 級改動，需要 Roy 或 WMC 參與；本計畫的 A、B 階段單人可做。
+6. **同事回報的潛在 bug（2026-10-22）**：這批 bring-up 改動被指出可能有 bug，尚未指明哪一個；候選與 rebase 後發現的 scaled-FP8 缺口記在 `kernel_zoo.md` F 節。進 WP1 之前先把它釐清。
+7. **單人力**：WP4 階梯 3 與 WP7 步驟 4 是 scheduler / allocator 級改動，需要 Roy 或 WMC 參與；本計畫的 A、B 階段單人可做。
 
 ---
 

@@ -189,6 +189,51 @@ NVIDIA 的 compute capability 是兩條產品線，不是一條階梯：sm_100/1
 
 ---
 
+## F. 2026-10-22 rebase 到 main（d71ea804 → 87a789d1，約 200 個 upstream commit）之後
+
+### F1. 同一個 bug 兩邊各修一次 → rebase 時只留測試
+- `54a85c2f`（Triton prefill tile 依 shared memory 選）跟 WMC 已合進 main 的 `8d9414fe`
+  修同一件事，邏輯等價（他的版本多了 `shared_memory_per_block` fallback 與警告）。
+  rebase 採 main 的版本，我們的 commit 縮成只剩 head_dim 256 的測試（`test_attention.py`）。
+- **教訓**：開工前先 `git log origin/main -- <檔案>`，同事可能已經修了。
+
+### F2. main 新增 per-tensor scaled FP8 KV cache（upstream #2414）→ 跟 C1 的 Triton 路徑有縫
+- main 現在把「checkpoint 自帶 k_scale/v_scale ≠ 1 的 FP8 cache」當成另一個 signature
+  （`scaled-fp8`，`ops/attention/mha/__init__.py::_blockscaled_signature_and_scales`），
+  只有 FlashInfer trtllm-gen 的 MHA kernel 宣告它；我們 C1 的 Triton「bf16 q × fp8 KV」只服務
+  unit-scale 的 dense fp8 signature。
+- 後果：GB10 上 `--kv-cache-dtype fp8_e4m3` 配 BF16 checkpoint（scale = 1）照常；**配自帶
+  KV scale 的 FP8 checkpoint 會在第一次 forward 才 `NoKernelFoundError`**，因為
+  `mha_fp8_cache_query_dtype` 啟動時只用 dense signature 探 registry，看不到這個缺口。
+- 修法候選：Triton kernel 多宣告 scaled-fp8 signature 並在 upcast 後乘 descale（FlashInfer
+  那邊是 `k_descale, v_descale = fp8_kv_scales`），或讓 `mha_fp8_cache_query_dtype` 也探
+  scaled signature 並在啟動時就報錯。**未修，先記著。**
+
+### F3. FlashInfer pin 0.7.1rc2 → 0.7.2（upstream #2338）
+- `tokenspeed-kernel/python/requirements/cuda.txt` 現在是 `flashinfer-python==0.7.2`；runbook
+  的 base image（`unieinfra/gb10/Dockerfile`、`build_wheels.sh`）原本是 0.7.1rc2，kernel build
+  會再撞 jit-cache 版本檢查（同 65f5c809 當初的問題）。已改成
+  `cu130-torch-2.14.0-flashinfer-0.7.2`（Docker Hub 有），**GB10 上尚未重建驗證**。
+- main 自己的 `docker/Dockerfile.nvidia_gb10`（CI 用）還停在 0.6.18 base，CI 的 kernel 編譯
+  是否還過要看下一次 `/ci-run`。
+
+### F4. 同事回報：這批改動可能有潛在 bug（2026-10-22，尚未指明是哪一個）
+- 尚未定位。依 rebase 後的審視，最值得先看的三處：
+  1. F2 的 scaled-fp8 縫（C1 的 `55ca2051`）。
+  2. `b5e5e71c`（`is_integrated` 時 KV sizing 取 `max(mem_get_info, MemAvailable)`）：
+     MemAvailable 把可回收 page cache 算進來，但 page cache 若正被另一個 process（CI、常駐
+     服務）的 mmap 權重佔著，回收會逼它們重讀磁碟；在共用機上可能把別人的服務拖慢。
+     KV 佔比用 `--gpu-memory-utilization 0.6` 時有緩衝，0.95 預設值時未測。
+  3. `5246eab6`（trtllm-gen MHA extend 的 max_arch 11.9）：decode 那支（`flashinfer_trtllm_mha_decode`）
+     仍是 min 10.0 無上限，無 plugin、預設 `mha` backend 時會在 sm_121 被選中但沒驗證過。
+- 確認是哪一個之後把這條改成具體的 症狀 → 根因 → 修法。
+
+### F5. kernel 套件重組（upstream #2317/#2323 gemm/moe 依實作分目錄、#2278 移除未引用 wrapper）
+- 我們改的 21 個 .py 與 plugin 全部通過靜態 import 檢查與 py_compile（Mac 上做的，沒有 CUDA）；
+  plugin 的 gemm/moe 模組本來就沒註冊。真正的驗證要等 GB10 重跑 level 1。
+
+---
+
 ## 量測紀錄（GB10, Qwen3.8-27B BF16, 輸出 128 token）
 
 local 副本：`bench-results/<label>/`（bench JSON、metrics.json、gsm8k report、run.log）。

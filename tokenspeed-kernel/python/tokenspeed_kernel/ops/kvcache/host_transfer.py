@@ -29,6 +29,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
+from tokenspeed_kernel.ops.kvcache.host_dma import submit_host_dma
 from tokenspeed_kernel.ops.kvcache.triton import (
     HOST_CACHE_TRANSFER_CHUNK_BYTES,
 )
@@ -946,20 +947,7 @@ def _transfer_dma(
     host_buffer: torch.Tensor,
     ranges: Sequence[tuple[int, int, int, int]],
 ) -> None:
-    byte_buffers = tuple(
-        buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers
-    )
-    for device_buffer_index, device_offset, host_offset, num_bytes in ranges:
-        device_slice = byte_buffers[device_buffer_index][
-            device_offset : device_offset + num_bytes
-        ]
-        host_slice = host_buffer[host_offset : host_offset + num_bytes]
-        destination, source = (
-            (host_slice, device_slice)
-            if direction == "d2h"
-            else (device_slice, host_slice)
-        )
-        destination.copy_(source, non_blocking=True)
+    submit_host_dma(direction, device_buffers, host_buffer, ranges)
 
 
 def _transfer_cache_ranges(

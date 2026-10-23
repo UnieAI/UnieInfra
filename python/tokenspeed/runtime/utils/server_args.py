@@ -499,7 +499,9 @@ class ServerArgs:
     enable_kvstore: bool = False
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
-    kvstore_io_backend: str = "kernel"
+    # The copy engines: a mapped-Host Triton copy ("kernel") moves a D2H at
+    # ~0.5 GB/s on H200 and takes SMs from the forward.
+    kvstore_io_backend: str = "direct"
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -2626,7 +2628,10 @@ class ServerArgs:
             type=str,
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
-            help="The IO backend for KVStore transfer between CPU and GPU.",
+            help="The IO backend for KVStore transfer between CPU and GPU. "
+            "'direct' copies on the DMA engines; 'kernel' copies with Triton "
+            "kernels reading and writing mapped Host memory, which runs on the "
+            "SMs and is far slower for Device-to-Host.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

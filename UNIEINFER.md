@@ -145,6 +145,73 @@ to read there.
 | `unieinfer/` | UnieAI plugins and tooling |
 | `legacy/` | everything from before this restructure — see `legacy/README.md` |
 
+## Name aliases
+
+The product is UnieInfer; the code still says `tokenspeed`, because that is
+upstream's name and renaming upstream code would make every rebase conflict.
+So the rename goes in phases, and **nothing old is removed**: every old name
+keeps working, and the new name is added next to it and becomes the one docs
+and `--help` show.
+
+| old name (keeps working) | new name | how |
+|---|---|---|
+| `tokenspeed` / `ts` commands | `unieinfer` | extra console script (`python/pyproject.toml`) |
+| `import tokenspeed[.x]` | `import unieinfer[.x]` | `python/unieinfer/__init__.py` |
+| `import tokenspeed_kernel[.x]` | `import unieinfer_kernel[.x]` | `tokenspeed-kernel/python/unieinfer_kernel/` |
+| `import tokenspeed_scheduler[.x]` | `import unieinfer_scheduler[.x]` | `tokenspeed-scheduler/python/unieinfer_scheduler/` (pure Python; the extension is not duplicated) |
+| `python -m tokenspeed.cli` | `python -m unieinfer.cli` | same import alias |
+| `TOKENSPEED_X`, `UNIEINFRA_X` env vars | `UNIEINFER_X` | `tokenspeed_kernel/env_alias.py` |
+| `tokenspeed:*` Prometheus metrics | `unieinfer:*` | `--metrics-prefix {tokenspeed,unieinfer,both}` |
+
+**Imports.** The alias packages are a meta-path finder, not copies:
+`unieinfer.runtime.x` *is* the module object `tokenspeed.runtime.x`, imported
+once under its real name, so `isinstance`, pickling, monkeypatching and module
+globals all behave the same through either name. The three alias packages
+carry an identical block; `test/runtime/test_unieinfer_import_alias.py` fails
+if they drift.
+
+**Environment variables.** `UNIEINFER_X` is the new spelling of both
+`TOKENSPEED_X` and `UNIEINFRA_X`. If both are set, `UNIEINFER_X` wins and the
+first disagreement is logged as a warning. Two mechanisms make that hold
+without editing upstream's call sites:
+
+- the `envs` registry (`runtime/utils/env.py`) looks both names up on every
+  read; `set()`/`override()`/`clear()` also clear the `UNIEINFER_` spelling, so
+  a value set in code is what everyone reads;
+- `import tokenspeed` and `import tokenspeed_kernel` copy every `UNIEINFER_X`
+  onto `TOKENSPEED_X` in `os.environ` before anything reads it, which covers
+  the direct `os.environ.get("TOKENSPEED_...")` reads in upstream code and
+  every child process.
+
+Not covered: `UNIEINFER_*` values assigned inside a running process after that
+import (only registry reads see them); build-time variables read by
+`tokenspeed-kernel/python/setup.py`; shell scripts; and `legacy/`.
+`UNIEINFRA_X` is only ever read through `env_alias.getenv` (the one live use is
+`UNIEINFRA_FA2_REGISTER_DECODE` in `unieinfer/kernel-sm120`).
+
+**Metrics.** `/metrics` defaults to `tokenspeed:*`, because dashboards and
+alerts query those names. `--metrics-prefix unieinfer` exports `unieinfer:*`
+instead; `both` exports each family under both names. Metrics are still
+recorded once under `tokenspeed:`; the rename happens when `/metrics` is
+scraped, so `both` costs nothing on the serving path, only a scrape response
+about twice as large.
+
+### Timeline
+
+1. **Phase 1 (done)** — user-facing text: docs, README, CLI banner and help,
+   the `unieinfer` command.
+2. **Phase 2 (done)** — the aliases above. Old names unchanged.
+3. Migration, at operators' pace: dashboards to `--metrics-prefix both`, then
+   `unieinfer`; deployment configs to `UNIEINFER_*`; UnieAI code under
+   `unieinfer/` to `unieinfer*` imports. Then flip the `--metrics-prefix`
+   default.
+4. **Phase 3 (deferred)** — physical rename of packages, directories and
+   distributions. Deferred because upstream keeps landing in
+   `python/tokenspeed` and `tokenspeed-kernel`, and a physical rename turns
+   every upstream merge into a whole-tree conflict. Revisit only if UnieInfer
+   stops tracking upstream; until then the aliases are the interface and the
+   old names stay.
+
 ## Staying current
 
 ```sh

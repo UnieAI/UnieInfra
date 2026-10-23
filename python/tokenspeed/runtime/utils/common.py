@@ -504,12 +504,13 @@ def set_prometheus_multiproc_dir():
     )
 
 
-def add_prometheus_middleware(app):
+def add_prometheus_middleware(app, metrics_prefix: str = "tokenspeed"):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+    from prometheus_client import make_asgi_app
 
-    registry = CollectorRegistry()
-    multiprocess.MultiProcessCollector(registry)
+    from tokenspeed.runtime.metrics.prefix import build_metrics_registry
+
+    registry = build_metrics_registry(metrics_prefix)
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
 
     # Workaround for 307 Redirect for /metrics
@@ -706,7 +707,9 @@ def nullable_str(val: str):
     return val
 
 
-def launch_dummy_health_check_server(host, port, enable_metrics):
+def launch_dummy_health_check_server(
+    host, port, enable_metrics, metrics_prefix: str = "tokenspeed"
+):
 
     import uvicorn
     from fastapi import FastAPI, Response
@@ -725,7 +728,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     # Add prometheus middleware
     if enable_metrics:
-        add_prometheus_middleware(app)
+        add_prometheus_middleware(app, metrics_prefix)
         enable_func_timer()
 
     config = uvicorn.Config(
@@ -775,7 +778,7 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
     port = server_args.metrics_port or get_free_port()
 
     app = FastAPI()
-    add_prometheus_middleware(app)
+    add_prometheus_middleware(app, getattr(server_args, "metrics_prefix", "tokenspeed"))
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     try:
         sock = config.bind_socket()

@@ -47,6 +47,7 @@ from tokenspeed.runtime.configs.numerics import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.metrics.config import resolve_metrics_options
+from tokenspeed.runtime.metrics.prefix import METRICS_PREFIX_CHOICES
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     EP_DISPATCH_ALGORITHMS,
     STATIC_EP_DISPATCH_ALGORITHMS,
@@ -413,6 +414,9 @@ class ServerArgs:
     metrics_port: int | None = None
     # Bind host for the /metrics endpoint. None binds the engine's --host.
     metrics_host: str | None = None
+    # UnieAI: namespace /metrics exports: tokenspeed (default), unieinfer or
+    # both. Applied at scrape time; see runtime/metrics/prefix.py.
+    metrics_prefix: str = "tokenspeed"
     app_key: str | None = None
 
     # Cache events
@@ -2865,6 +2869,16 @@ class ServerArgs:
             type=str,
             default=ServerArgs.metrics_host,
             help="Bind host for the /metrics endpoint. Defaults to --host.",
+        )
+        parser.add_argument(
+            "--metrics-prefix",
+            type=str,
+            choices=METRICS_PREFIX_CHOICES,
+            default=ServerArgs.metrics_prefix,
+            help="Name prefix of the Prometheus metrics on /metrics: tokenspeed "
+            "(default, e.g. tokenspeed:num_requests_running), unieinfer, or both "
+            "to export each metric under both names while dashboards migrate. "
+            "Renamed at scrape time, so no extra cost on the serving path.",
         )
 
         parser.add_argument(

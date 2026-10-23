@@ -699,6 +699,7 @@ def _launch_subprocesses(
             server_args.host,
             server_args.port,
             metrics_enabled(server_args, "prometheus"),
+            server_args.metrics_prefix,
         )
 
         for proc in scheduler_procs:

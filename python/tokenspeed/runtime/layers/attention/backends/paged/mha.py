@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_fp8_cache_query_dtype,
     mha_plan,
     mha_prefill,
 )
@@ -146,6 +147,9 @@ class MHAAttnBackend(PagedAttentionBackend):
         # decode metadata entry per block position and uniform non-causal
         # seq_lens (block_decode_expansion).
         self.draft_block_decode = bool(config.draft_block_decode)
+
+        # Query dtype per (operator, read geometry) on a unit-scale fp8 cache.
+        self._fp8_query_dtypes: dict[tuple, torch.dtype] = {}
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
@@ -327,6 +331,44 @@ class MHAAttnBackend(PagedAttentionBackend):
         metadata.num_extends = 0 if self.is_draft else num_extends
         self.forward_decode_metadata = metadata
 
+    def _fp8_cache_query(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        operator: str,
+        page_size: int,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The query for an fp8 cache read: left unquantized when a kernel
+        widens the cache in-kernel, else quantized to the cache dtype."""
+        if (
+            layer.fp8_kv_scales is not None
+            or self.kv_cache_dtype != torch.float8_e4m3fn
+        ):
+            return q.to(self.kv_cache_dtype)
+        key = (
+            operator,
+            layer.qk_head_dim,
+            page_size,
+            layer.sliding_window_size,
+            layer.logit_cap,
+            sinks is not None,
+        )
+        dtype = self._fp8_query_dtypes.get(key)
+        if dtype is None:
+            dtype = mha_fp8_cache_query_dtype(
+                operator,
+                q.dtype,
+                layer.qk_head_dim,
+                page_size,
+                window_left=layer.sliding_window_size,
+                logit_cap=layer.logit_cap,
+                sinks=sinks,
+                solution=self.kernel_solution,
+            )
+            self._fp8_query_dtypes[key] = dtype
+        return q.to(dtype)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -352,11 +394,16 @@ class MHAAttnBackend(PagedAttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
-            q = q.to(self.kv_cache_dtype)
-            scale_kwargs = _fp8_scale_kwargs(layer)
-
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        if self.is_fp8:
+            q = self._fp8_cache_query(
+                q,
+                layer,
+                "mha_decode_with_kvcache",
+                k_cache.shape[1],
+                kwargs.get("sinks"),
+            )
+            scale_kwargs = _fp8_scale_kwargs(layer)
         # A MIXED round's decode read skips the leading extend rows.
         page_table = metadata.page_table[metadata.num_extends :]
         cache_seqlens = metadata.seq_lens[metadata.num_extends :]
@@ -514,11 +561,12 @@ class MHAAttnBackend(PagedAttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
-            q = q.to(self.kv_cache_dtype)
-            scale_kwargs = _fp8_scale_kwargs(layer)
-
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        if self.is_fp8:
+            q = self._fp8_cache_query(
+                q, layer, "mha_extend_with_kvcache", k_cache.shape[1], sinks
+            )
+            scale_kwargs = _fp8_scale_kwargs(layer)
         output = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=metadata.cu_extend_seq_lens,

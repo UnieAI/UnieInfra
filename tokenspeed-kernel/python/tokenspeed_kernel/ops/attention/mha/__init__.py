@@ -171,6 +171,59 @@ def mha_plan(
     return {"extend_mode": extend_mode}
 
 
+def mha_fp8_cache_query_dtype(
+    operator: str,
+    dtype: torch.dtype,
+    head_dim: int,
+    page_size: int,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    solution: str | None = None,
+) -> torch.dtype:
+    """The query dtype to pair with a unit-scale fp8-e4m3 KV cache.
+
+    A kernel that widens the cache in-kernel takes the query as it is, which
+    loses nothing; without one the query is quantized to e4m3 for a kernel
+    that runs fp8 x fp8 (FA3's convention).
+
+    Args:
+        operator: ``"mha_extend_with_kvcache"`` or ``"mha_decode_with_kvcache"``.
+        dtype: The model's (unquantized) query dtype.
+        head_dim: Attention head dimension.
+        page_size: Tokens per KV-cache page.
+        window_left: Exclusive left sliding-window size, or -1.
+        logit_cap: Logit soft-cap value, or 0.0 when disabled.
+        sinks: Attention sinks tensor when sinks are enabled.
+        solution: Optional kernel solution to restrict the search.
+
+    Returns:
+        ``dtype`` when some kernel for ``operator`` reads the fp8 cache with
+        that query, else ``torch.float8_e4m3fn``.
+    """
+    traits = {
+        "head_dim": head_dim,
+        "page_size": page_size,
+        "logit_cap": logit_cap != 0.0,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
+    }
+    cache = dense_tensor_format(torch.float8_e4m3fn)
+    signature = format_signature(
+        q=dense_tensor_format(dtype), k_cache=cache, v_cache=cache
+    )
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        operator,
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    if any(spec_matches_traits(spec, traits) for spec in candidates):
+        return dtype
+    return torch.float8_e4m3fn
+
+
 def mha_prefill(
     # attention inputs
     q: torch.Tensor,
@@ -569,6 +622,7 @@ import tokenspeed_kernel.ops.attention.mha.gluon  # noqa: E402,F401
 
 __all__ = [
     "mha_plan",
+    "mha_fp8_cache_query_dtype",
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",

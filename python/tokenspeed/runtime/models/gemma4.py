@@ -612,6 +612,23 @@ class Gemma4Attention(nn.Module):
             qk_norm=None,
         )
 
+    def fold_constant_k_norm(self) -> None:
+        """Move a constant ``k_norm`` scale into the softmax scale.
+
+        The checkpoint's ``k_norm`` weights are one value repeated across
+        ``head_dim`` (about 0.45 on sliding layers, 0.06 on most full ones), so
+        ``q . (c * k_hat) * s == q . k_hat * (c * s)`` exactly. Folding ``c``
+        into the scale caches K at unit RMS: an fp8-e4m3 cache would otherwise
+        hold the full layers' keys mostly in its subnormal range, where they
+        keep a bit or two of precision. A per-channel weight is left alone.
+        """
+        weight = self.k_norm.weight.data
+        scale = weight[0]
+        if not bool(torch.all(weight == scale)):
+            return
+        self.attn.scaling = self.scaling * float(scale)
+        weight.fill_(1.0)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1400,6 +1417,8 @@ class Gemma4ForConditionalGeneration(BaseCausalLM):
                 f"{len(skipped)} checkpoint tensor(s) unclaimed "
                 f"(e.g. {skipped[:5]})."
             )
+        for layer in self.model.layers:
+            layer.self_attn.fold_constant_k_norm()
 
 
 # ``Gemma4ForCausalLM`` is the text-only architecture string; it maps to the

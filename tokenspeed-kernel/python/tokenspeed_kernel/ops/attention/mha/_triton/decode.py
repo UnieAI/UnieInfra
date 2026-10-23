@@ -136,6 +136,8 @@ def _fwd_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + off_q, mask=mask_d, other=0.0)
+        if K_Buffer.dtype.element_ty == tl.float8e4nv:
+            q = q.to(tl.float16)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             token_indices = kv_start_offset + offs_n
@@ -158,7 +160,7 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
-            qk = tl.sum(q[None, :] * k, 1)
+            qk = tl.sum(q[None, :] * k.to(q.dtype), 1)
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -181,7 +183,7 @@ def _fwd_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max)
             acc *= re_scale
-            acc += tl.sum(p[:, None] * v, 0)
+            acc += tl.sum(p[:, None] * v.to(q.dtype), 0)
 
             e_sum = e_sum * re_scale + tl.sum(p, 0)
             e_max = n_e_max
@@ -377,6 +379,11 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
+        if K_Buffer.dtype.element_ty == tl.float8e4nv:
+            # fp8 widens to fp16 in one instruction (to bf16 it takes several,
+            # which would make the read compute-bound), so an fp8 cache runs
+            # the dots in fp16.
+            q = q.to(tl.float16)
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -440,7 +447,7 @@ def _fwd_grouped_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -525,6 +532,13 @@ def _decode_grouped_att_m_fwd(
     if platform.is_amd:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16}
         num_stages = 1
+    elif k_buffer.dtype == torch.float8_e4m3fn:
+        # Half-width pages: a deeper pipeline keeps the read bandwidth-bound,
+        # and up to 256-wide heads take twice the tokens per tile (H200:
+        # 512 x 4 heads -20%, 256 x 16 heads -25% against the bf16 read).
+        num_stages = 3
+        if Lk <= 256:
+            BLOCK = 64
 
     _fwd_grouped_kernel_stage1[grid](
         q,

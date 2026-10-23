@@ -26,7 +26,11 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 __all__ = [
     "flash_attn_func",
@@ -838,5 +842,74 @@ elif platform.is_nvidia and platform.is_hopper:
             softmax_scale=softmax_scale,
             causal=is_causal,
             window_size=(window_left, 0) if window_left >= 0 else (None, None),
+        )
+        return out
+
+    # An fp8 cache on the 512-wide layers: FA4's SM90 dequant path reads the
+    # fp8 pages with a bf16/fp16 query and widens them in-kernel, so the query
+    # keeps its precision (FA3's fp8 path would quantize it). Its producer is
+    # TMA-only and loads a page per tile, hence the 64-token pages.
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="fa4_sm90_mha_extend_with_fp8_kvcache",
+        solution="fa4",
+        capability=_FA4_SM90_CAPABILITY,
+        signatures=frozenset(
+            format_signature(
+                q=dense_tensor_format(dtype),
+                k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                v_cache=dense_tensor_format(torch.float8_e4m3fn),
+            )
+            for dtype in (torch.float16, torch.bfloat16)
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": _FA4_SM90_HEAD_DIMS,
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False}),
+        },
+    )
+    def fa4_sm90_mha_extend_with_fp8_kvcache(
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        is_causal: bool = False,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        from tokenspeed_kernel.thirdparty.vllm_fa4.interface import _flash_attn_fwd
+
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        out, *_ = _flash_attn_fwd(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=is_causal,
+            fp8_kv_dequant=True,
         )
         return out

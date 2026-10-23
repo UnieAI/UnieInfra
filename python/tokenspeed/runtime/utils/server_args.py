@@ -502,6 +502,7 @@ class ServerArgs:
     # The copy engines: a mapped-Host Triton copy ("kernel") moves a D2H at
     # ~0.5 GB/s on H200 and takes SMs from the forward.
     kvstore_io_backend: str = "direct"
+    kvstore_store_final_state: bool = False
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -2632,6 +2633,16 @@ class ServerArgs:
             "'direct' copies on the DMA engines; 'kernel' copies with Triton "
             "kernels reading and writing mapped Host memory, which runs on the "
             "SMs and is far slower for Device-to-Host.",
+        )
+        parser.add_argument(
+            "--kvstore-store-final-state",
+            action="store_true",
+            help="Also copy to Host L2 the recurrent-state checkpoint (GDN / "
+            "Mamba) a request publishes when it finishes. Off by default: it "
+            "is a whole recurrent state per request (~100 MB on a 27B hybrid) "
+            "that only a continuation of that exact sequence can reuse, and "
+            "the Device copy serves that while resident. The prompt's "
+            "checkpoints and every KV page are copied either way.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

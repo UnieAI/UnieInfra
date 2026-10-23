@@ -1074,11 +1074,15 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
     }
 }
 
-void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> content_hashes) {
+void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> content_hashes, bool include_state) {
     if (host_pool_ == nullptr) {
         return;
     }
-    for (const CacheGroup& group : groups_) {
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (!include_state && GroupIsState(i)) {
+            continue;
+        }
+        const CacheGroup& group = groups_[i];
         // A tail hash holds fewer blocks than a page; Contains filters.
         for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
             if (group.Index().Contains(pool_, key)) {

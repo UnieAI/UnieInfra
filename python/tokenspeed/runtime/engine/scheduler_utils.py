@@ -360,6 +360,7 @@ def make_config(
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
+    store_final_state_to_host: bool = False,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -400,6 +401,8 @@ def make_config(
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
+        store_final_state_to_host: ``--kvstore-store-final-state``: copy a
+            finishing request's final recurrent-state checkpoint to Host L2.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -433,6 +436,7 @@ def make_config(
     cfg.num_snapshot_pages = num_snapshot_pages
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
+    cfg.store_final_state_to_host = store_final_state_to_host
     cfg.l3_prefetch_min_pages = l3_prefetch_min_pages
     cfg.enable_l3_storage = enable_l3_storage
     cfg.enable_kv_cache_events = enable_kv_cache_events

@@ -105,7 +105,7 @@ instanttensor = ["instanttensor>=0.1.9,<0.2"]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
-include = ["tokenspeed*"]
+include = ["tokenspeed*", "unieinfer"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "triton" = { msg = "Use tokenspeed_triton instead." }

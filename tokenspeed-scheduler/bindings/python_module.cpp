@@ -506,6 +506,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
+        .def(
+            "prefix_dedup_stats",
+            [](const tokenspeed::Scheduler& scheduler) {
+                const auto& stats = scheduler.PrefixDedup();
+                return std::make_tuple(stats.deferred_requests, stats.deferred_rounds, stats.cut_chunks);
+            },
+            "Cumulative shared-prefix dedup activity: (prompts deferred to an in-flight prefix, rounds they "
+            "waited, first chunks cut at a branch point).")
         .def("snapshot_pool_free_blocks", &tokenspeed::Scheduler::SnapshotPoolFreeBlocks,
              "Empty parents of the request-private snapshot pool (a leak check: every block belongs to some "
              "suspended request's image).")

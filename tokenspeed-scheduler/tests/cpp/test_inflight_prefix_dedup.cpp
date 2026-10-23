@@ -69,11 +69,20 @@ protected:
                 .sliding_window_tokens = 8,
             });
         }
+        if (WithStateGroup()) {
+            cfg.cache_groups.push_back(CacheGroupConfig{
+                .group_id = "linear_attention",
+                .block_granularity = 0,
+                .total_pages = cfg.device_allocator.total_pages,
+                .attn_kind = AttnKind::kState,
+            });
+        }
         SetTestSnapshotPool(cfg);
         return cfg;
     }
     virtual std::int32_t DeferPages() const { return 4; }
     virtual bool WithSlidingGroup() const { return false; }
+    virtual bool WithStateGroup() const { return false; }
 
     // `shared` tokens common to every prompt, then a private tail of `tail`.
     static std::vector<std::int32_t> Prompt(std::int32_t shared, std::int32_t tail, std::int32_t salt) {
@@ -120,6 +129,9 @@ TEST_F(InflightPrefixDedupSuite, TheLaterPromptWaitsAndResumesOnThePublishedPage
         }
     }
     EXPECT_EQ(b_prefix, 32);
+    EXPECT_EQ(scheduler_->PrefixDedup().deferred_requests, 1) << "b counts once however many rounds it waited";
+    EXPECT_GE(scheduler_->PrefixDedup().deferred_rounds, 1);
+    EXPECT_EQ(scheduler_->PrefixDedup().cut_chunks, 0) << "full-history groups take no cut";
 }
 
 TEST_F(InflightPrefixDedupSuite, APromptSharingFewerPagesIsNotHeldBack) {
@@ -160,6 +172,7 @@ TEST_F(InflightPrefixDedupSlidingSuite, TheFirstChunkEndsWhereTheSharingEnds) {
     ASSERT_TRUE(Holds(batch, "a"));
     EXPECT_FALSE(Holds(batch, "b"));
     EXPECT_EQ(batch->input_lengths.at(0), 32) << "a's first chunk stops at the end of the shared pages";
+    EXPECT_EQ(scheduler_->PrefixDedup().cut_chunks, 1);
 
     SendForwardDone("a");
     const ExecutionPlan second = PlanOnce();
@@ -193,6 +206,75 @@ TEST_F(InflightPrefixDedupSlidingSuite, TheFirstChunkEndsAtTheNearestBranchPoint
     EXPECT_FALSE(Holds(next, "c")) << "c waits for the rest of a's prompt";
 }
 
+TEST_F(InflightPrefixDedupSuite, APromptThatMayNotHitTheSharedPagesIsNotHeldBack) {
+    Submit(RequestSpec{.request_id = "a", .tokens = Prompt(32, 6, 0), .max_new_tokens = 4});
+    Submit(
+        RequestSpec{.request_id = "b", .tokens = Prompt(32, 6, 1), .max_new_tokens = 4, .max_cached_prefix_tokens = 8});
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    EXPECT_TRUE(Holds(batch, "a"));
+    EXPECT_TRUE(Holds(batch, "b")) << "b may take 2 pages from the cache, fewer than the threshold";
+    EXPECT_EQ(scheduler_->PrefixDedup().deferred_requests, 0);
+}
+
+class InflightPrefixDedupNoPrefixCacheSuite : public InflightPrefixDedupSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = InflightPrefixDedupSuite::MakeConfig();
+        cfg.disable_prefix_cache = true;
+        return cfg;
+    }
+};
+
+TEST_F(InflightPrefixDedupNoPrefixCacheSuite, WithoutPrefixMatchingNothingWaits) {
+    Submit(RequestSpec{.request_id = "a", .tokens = Prompt(32, 6, 0), .max_new_tokens = 4});
+    Submit(RequestSpec{.request_id = "b", .tokens = Prompt(32, 6, 1), .max_new_tokens = 4});
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    EXPECT_TRUE(Holds(batch, "a"));
+    EXPECT_TRUE(Holds(batch, "b")) << "b could never hit a's pages, so waiting for them gains nothing";
+    EXPECT_EQ(scheduler_->PrefixDedup().deferred_requests, 0);
+}
+
+class InflightPrefixDedupStateSuite : public InflightPrefixDedupSuite {
+protected:
+    bool WithStateGroup() const override { return true; }
+};
+
+// A State group publishes its checkpoint only at a junction or the prompt end,
+// so the branch-point cut is a's junction: b resumes from the state it leaves
+// there, not from KV alone it could not use.
+TEST_F(InflightPrefixDedupStateSuite, TheCutPublishesAStateCheckpointTheWaitingPromptResumesFrom) {
+    Submit(RequestSpec{.request_id = "a", .tokens = Prompt(32, 20, 0), .max_new_tokens = 4});
+    Submit(RequestSpec{.request_id = "b", .tokens = Prompt(32, 20, 1), .max_new_tokens = 4});
+
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(first);
+    ASSERT_TRUE(Holds(batch, "a"));
+    EXPECT_FALSE(Holds(batch, "b"));
+    EXPECT_EQ(batch->input_lengths.at(0), 32);
+
+    SendForwardDone("a");
+    std::int32_t b_prefix = -1;
+    for (std::int32_t round = 0; round < 4 && b_prefix < 0; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* next = FindForwardBatch(plan);
+        if (Holds(next, "b")) {
+            b_prefix = PrefixOf(next, "b");
+            const auto it = std::ranges::find(next->request_ids, "b");
+            const auto row = static_cast<std::size_t>(it - next->request_ids.begin());
+            EXPECT_GT(next->block_tables.at("linear_attention").at(row).at(0), 0)
+                << "b reads a's checkpoint, not a zero state";
+        }
+        if (Holds(next, "a")) {
+            SendForwardDone("a", {9});
+        }
+    }
+    EXPECT_EQ(b_prefix, 32);
+}
+
 class InflightPrefixDedupOffSuite : public InflightPrefixDedupSuite {
 protected:
     std::int32_t DeferPages() const override { return 0; }
@@ -207,6 +289,8 @@ TEST_F(InflightPrefixDedupOffSuite, ZeroAdmitsBothAndComputesTheSharedPagesTwice
     ASSERT_TRUE(Holds(batch, "a"));
     ASSERT_TRUE(Holds(batch, "b"));
     EXPECT_EQ(PrefixOf(batch, "b"), 0);
+    EXPECT_EQ(scheduler_->PrefixDedup().deferred_requests, 0);
+    EXPECT_EQ(scheduler_->PrefixDedup().cut_chunks, 0);
 }
 
 }  // namespace

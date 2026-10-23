@@ -18,6 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# UnieAI: copy UNIEINFER_* onto TOKENSPEED_* before any module below reads the
+# environment (see tokenspeed_kernel/env_alias.py).
+from tokenspeed_kernel.env_alias import apply_aliases as _apply_env_aliases
+
+_apply_env_aliases()
+
 from tokenspeed_kernel.profiling import (
     bootstrap_profiling_from_env as _bootstrap_profiling_from_env,
 )

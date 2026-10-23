@@ -18,6 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# UnieAI: UNIEINFER_* spellings of TOKENSPEED_* variables (UNIEINFER.md).
+from tokenspeed._env_alias import apply_env_aliases as _apply_env_aliases
+
+_apply_env_aliases()
+
 from tokenspeed._logging import suppress_noisy_third_party_logs
 
 _suppress_noisy_third_party_logs = suppress_noisy_third_party_logs

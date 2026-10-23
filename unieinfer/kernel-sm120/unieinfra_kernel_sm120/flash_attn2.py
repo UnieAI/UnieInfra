@@ -117,9 +117,9 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 
 import torch
+from tokenspeed_kernel import env_alias
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,8 @@ _FA2_PRIORITY_OFFSET = 1
 # reachable -- it needs no plan, no prepare hook and nothing that is illegal
 # under CUDA-graph capture, which is worth having if FlashInfer is ever absent
 # -- but it does not win selection unless someone asks for it.
-_REGISTER_DECODE = os.environ.get("UNIEINFRA_FA2_REGISTER_DECODE", "0") == "1"
+# UNIEINFER_FA2_REGISTER_DECODE is the new spelling and wins when both are set.
+_REGISTER_DECODE = env_alias.getenv("UNIEINFRA_FA2_REGISTER_DECODE", "0") == "1"
 
 
 def _load_fa2():
@@ -601,7 +602,7 @@ def register_flash_attn2() -> None:
 
     logger.info(
         "unieinfra-kernel-sm120: registered FA2 MHA prefill and extend at "
-        "priority %d; decode %s (set UNIEINFRA_FA2_REGISTER_DECODE=1 to "
+        "priority %d; decode %s (set UNIEINFER_FA2_REGISTER_DECODE=1 to "
         "enable, but FlashInfer's kernel is faster at every decode shape "
         "measured). PTX-JIT from compute_80: the first launch of each shape "
         "costs tens of seconds on a cold CUDA JIT cache.",

@@ -50,12 +50,16 @@ _RESET = "\033[0m"
 
 _TAGLINE = "Tokens at the speed of light"
 _DISABLE_ENV = "TOKENSPEED_DISABLE_LOGO"
+# New spelling, preferred when set. Read directly: the banner prints before
+# tokenspeed_kernel (and its env_alias) is imported.
+_DISABLE_ENV_NEW = "UNIEINFER_DISABLE_LOGO"
 # Visible width of one banner row: len(unie) + " " + len(infer).
 _BANNER_WIDTH = len(_UNIE_LINES[0]) + 1 + len(_INFER_LINES[0])
 
 
 def _is_disabled() -> bool:
-    value = os.environ.get(_DISABLE_ENV, "").strip().lower()
+    value = os.environ.get(_DISABLE_ENV_NEW, os.environ.get(_DISABLE_ENV, ""))
+    value = value.strip().lower()
     return value not in ("", "0", "false", "no")
 
 
@@ -89,8 +93,8 @@ def render_logo(version: str = __version__, *, color: bool = True) -> str:
 def print_logo(version: str = __version__, *, stream: IO[str] | None = None) -> None:
     """Write the banner to ``stream`` (default stderr).
 
-    No-op when ``TOKENSPEED_DISABLE_LOGO`` is truthy. ANSI colors are emitted
-    only when the target stream is a TTY.
+    No-op when ``UNIEINFER_DISABLE_LOGO`` (or ``TOKENSPEED_DISABLE_LOGO``) is
+    truthy. ANSI colors are emitted only when the target stream is a TTY.
     """
     if _is_disabled():
         return

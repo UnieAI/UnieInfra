@@ -94,9 +94,6 @@ class MHAExtendMetadata:
     extend_seq_lens_cpu: list[int]
     cu_extend_seq_lens_cpu: list[int]
     max_extend_seq_len: int
-    # Mixed target queries are cache-backed even when the leading prefills
-    # have no prefix; the fresh-prefill path must not discard decode history.
-    is_mixed: bool
     max_extend_prefix_len: int = 0
 
 
@@ -196,18 +193,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 "MHA decode metadata goes through refresh_decode_metadata; "
-                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
-            )
-        is_mixed = forward_mode.is_mixed()
-        if is_mixed and self.is_draft and not self.draft_block_decode:
-            raise RuntimeError("MHA mixed draft metadata requires block decoding")
-        # Block drafters share the target's mixed metadata initialization.
-        # Before their model forward, they refresh decode metadata and publish
-        # a uniform block window starting at each request's accepted prefix.
-        # This does not enable a mixed forward for ordinary token drafters.
-        if is_mixed and not 0 < num_extends < bs:
-            raise ValueError(
-                "MHA mixed metadata requires both prefill and decode requests"
+                f"init_forward_metadata only serves extend ({forward_mode})"
             )
 
         self.forward_num_extends = num_extends if forward_mode.is_mixed() else 0
@@ -256,25 +242,14 @@ class MHAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
     ) -> None:
         seq_lens = seq_lens[:bs]
-        prefill_prefix_lens = extend_prefix_lens[:num_extends]
-        query_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:num_extends].tolist()]
-        if is_mixed:
-            # The runner supplies extend lengths only for the leading prefill
-            # requests. Decode/verify queries follow them in request order and
-            # attend a causal suffix of each request's already-written cache.
-            query_lens = seq_lens.new_full((bs,), self.spec_num_tokens)
-            query_lens[:num_extends] = extend_seq_lens[:num_extends]
-            query_lens_cpu.extend([self.spec_num_tokens] * (bs - num_extends))
-            prefix_lens = seq_lens - query_lens
-        else:
-            query_lens = extend_seq_lens[:bs]
-            prefix_lens = prefill_prefix_lens
+        extend_seq_lens = extend_seq_lens[:bs]
+        extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
         cu_extend_seq_lens = torch.nn.functional.pad(
-            torch.cumsum(query_lens, dim=0, dtype=torch.int32),
+            torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32),
             (1, 0),
         )
         cu_extend_seq_lens_cpu = [0]
-        for length in query_lens_cpu:
+        for length in extend_seq_lens_cpu:
             cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
         cu_seqlens_kv = torch.nn.functional.pad(
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
@@ -283,19 +258,14 @@ class MHAAttnBackend(PagedAttentionBackend):
         self.forward_extend_metadata = MHAExtendMetadata(
             page_table=page_table[:bs],
             seq_lens=seq_lens,
-            extend_seq_lens=query_lens,
+            extend_seq_lens=extend_seq_lens,
             cu_extend_seq_lens=cu_extend_seq_lens,
             cu_seqlens_kv=cu_seqlens_kv,
-            extend_prefix_lens=prefix_lens,
-            extend_seq_lens_cpu=query_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens[:bs],
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
-            max_extend_seq_len=max(query_lens_cpu),
-            is_mixed=is_mixed,
-            # Only prefills have a host prefix mirror. Mixed batches always
-            # use cached attention, without reading decode lengths back to CPU.
-            max_extend_prefix_len=int(
-                extend_prefix_lens_cpu[:num_extends].max().item()
-            ),
+            max_extend_seq_len=max(extend_seq_lens_cpu),
+            max_extend_prefix_len=int(extend_prefix_lens_cpu[:bs].max().item()),
         )
 
     def _decode_views(self, bs: int) -> MHADecodeMetadata:
@@ -433,11 +403,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             return self._forward_mixed(
                 q, k, v, layer, token_to_kv_pool, bs, sinks, extend_mode
             )
-        if (
-            not metadata.is_mixed
-            and metadata.max_extend_prefix_len == 0
-            and extend_mode == "postwrite"
-        ):
+        if metadata.max_extend_prefix_len == 0 and extend_mode == "postwrite":
             return self._forward_prefill(q, k, v, layer, metadata, sinks)
         return self._forward_extend(q, layer, token_to_kv_pool, metadata, sinks)
 

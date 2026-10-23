@@ -41,6 +41,18 @@ Both decode and prefill are now bound by streaming the routed-expert weights,
 so the remaining lever is scheduling: letting more tokens share each pass over
 those weights. Next is closing the last 2% at concurrency 16.
 
+**Never computing a shared prefix twice.** Agent traffic is full of prompts
+that share long prefixes and arrive together: the samples of one RL rollout,
+the sub-calls an agent fans out, the questions asked of one document. A plain
+prefix cache only helps a prompt that arrives after the one it shares with has
+finished. The scheduler now also reuses prefixes between prompts that are
+waiting or still being computed, on every model family; see
+[Shared-prefix workloads](#shared-prefix-workloads).
+
+**Gemma-4-31B and Qwen3.8-27B on a single H200.** Gemma-4 is served with its
+per-layer KV geometry packed onto one plane, FA4 for its 512-wide global
+layers and an optional fp8 KV cache; Qwen3.8 with MTP speculative decoding.
+
 ## Performance
 
 ### DeepSeek-V4.1-Flash on 4x H200, against vLLM 0.31
@@ -85,6 +97,83 @@ milliseconds while others are decoding, so requests that arrive close together
 share one prefill step. A request that arrives while the engine is idle is
 never held. The concurrency 64 and 128 cells ran with `--max-num-seqs 128
 --max-cudagraph-capture-size 128`.
+
+### Shared-prefix workloads
+
+Four workloads of 256 requests at concurrency 64, 128 output tokens each, on
+one H200: **n-sample** (32 prompts of ~6k tokens, 8 samples each), **agent**
+(a 4k shared prompt, 32 sessions of 3k tokens, each fanning out to 8
+sub-calls), **doc-QA** (16 documents of 12k tokens, 16 questions each) and
+**mixed** (all three interleaved). Wall time with prefix dedup off and on; in
+parentheses, the share of the reachable prefix reuse obtained (a page-aligned
+prefix shared with any request sent earlier).
+
+| model | n-sample | agent | mixed |
+|---|---|---|---|
+| Gemma-4-31B (sliding window) | 58.0 → 46.1 s (100%) | 89.8 → **40.7 s** (99%) | 120.9 → 101.6 s (81%) |
+| Qwen3.8-27B (linear attention) | 53.9 → **34.9 s** (97%) | 45.1 → **30.1 s** (98%) | 71.6 → 61.8 s (88%) |
+| Qwen3.6-35B-A3B (linear attention, MoE) | 15.5 → 11.2 s (97%) | 14.5 → 12.1 s (98%) | 19.9 → 18.1 s (87%) |
+| Qwen3-8B (full attention) | 20.3 → 15.9 s (100%) | 19.0 → 16.2 s (100%) | 25.8 → 23.4 s (100%) |
+
+Two rules do it. A waiting prompt whose next uncached pages another prompt is
+computing waits a round for them instead of computing them again. And on a
+model whose sliding-window or recurrent-state layers keep history only where a
+chunk ends, a first chunk ends where the waiting prompts branch off, so the
+shared part stays hittable (on recurrent-state layers, as a state checkpoint).
+Mixed on Gemma-4 is bound by KV capacity: shared prefixes are evicted before
+their next sharer arrives; with `--kv-cache-dtype fp8_e4m3` it runs in 75.8 s
+at 92%.
+
+Dedup is on by default; `--inflight-prefix-defer-pages 0` turns it off (the
+number is the fewest shared pages worth waiting for, default 4). To watch it:
+
+- every `Prefill batch.` / `Mix batch.` log line ends with
+  `prefix reuse(last 256/all): 86.3%/83.1%, dedup(deferred/rounds/cut): 23/32/31`
+  -- cached over prompt tokens at admission for the last 256 prompts and since
+  start, then how many prompts waited for an in-flight prefix, the rounds they
+  waited and the chunks cut at a branch point;
+- with `--enable-metrics`, Prometheus has the reuse ratio as
+  `tokenspeed:prefix_cache_hits_total / tokenspeed:prompt_tokens_total` and the
+  dedup activity as `tokenspeed:prefix_dedup_deferred_requests_total`,
+  `tokenspeed:prefix_dedup_deferred_rounds_total` and
+  `tokenspeed:prefix_dedup_cut_chunks_total`.
+
+### Gemma-4-31B-it and Qwen3.8-27B on 1x H200, against vLLM 0.31
+
+AgentX agent traces as above (256 requests, about 9.7k input and 128 output
+tokens each), one H200, wall time in seconds:
+
+| model | concurrency | vLLM 0.31 | UnieInfra | speedup |
+|---|---|---|---|---|
+| Gemma-4-31B-it, fp8 KV cache | 16 | 80.9 | **75.6** | 1.07x |
+| Gemma-4-31B-it, fp8 KV cache | 64 | 49.1 | **45.9** | 1.07x |
+| Qwen3.8-27B, MTP | 16 | 61.2 | **34.5** | **1.77x** |
+| Qwen3.8-27B, MTP | 64 | 39.9 | **27.3** | **1.46x** |
+
+Gemma-4 with the bf16 cache takes 81.8 s and 52.3 s. The fp8 cache reads its
+pages with an unquantized query wherever a kernel can and folds the model's
+constant `k_norm` scale into the softmax scale, so keys are cached at unit
+RMS. GSM8K is 0.9697 on it against 0.9712 on the bf16 cache, and multi-needle
+retrieval in agentic haystacks of 8k/16k/28k tokens scores 0.985/0.985/0.985
+against 0.980/0.990/0.985. Gemma-4 at bf16 is close to the H200's limits for
+this trace (about 44 s at concurrency 64); the next lever is fp8 weights.
+
+```bash
+# Gemma-4-31B-it
+ts serve --model google/gemma-4-31B-it --trust-remote-code --tp 1 \
+  --kv-cache-dtype fp8_e4m3 --block-size 64 --enable-mixed-batch \
+  --chunked-prefill-size 8192 --max-prefill-tokens 8192 --prefill-graph-max-tokens 8192 \
+  --max-num-seqs 80 --max-model-len 32768 --gpu-memory-utilization 0.90
+
+# Qwen3.8-27B (4 draft steps at concurrency 16, 3 at 64)
+ts serve --model Qwen/Qwen3.8-27B --trust-remote-code --tp 1 \
+  --speculative-algorithm MTP --speculative-num-steps 4 --speculative-num-draft-tokens 5 \
+  --block-size 64 --chunked-prefill-size 8192 --max-prefill-tokens 8192 --prefill-graph-max-tokens 8192 \
+  --max-num-seqs 80 --max-model-len 32768 --gpu-memory-utilization 0.90
+```
+
+MTP refuses `--enable-mixed-batch` on Qwen3.8: mixing a decode row into a
+prefill pass would corrupt its linear-attention state.
 
 ## Getting started
 

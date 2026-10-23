@@ -671,11 +671,18 @@ def _solve_packing(fields):
 
 def _packing_by_group_ratio(raw_by_group):
     largest_payload = max(raw_by_group.values())
-    # Parent bytes must be divisible by every packing count. Powers of two
-    # keep unconstrained byte ratios from inflating that alignment via LCM;
-    # exact page strides and recipe pins are applied by the caller afterward.
+    # Parent bytes must be divisible by every packing count. A ratio that
+    # divides the largest payload exactly is a divisor of it, so it adds no
+    # LCM padding and fills the parent (gemma-4: ten full pages per sliding
+    # page). Any other ratio rounds down to a power of two, which keeps
+    # unrelated byte ratios from inflating that alignment via LCM; exact page
+    # strides and recipe pins are applied by the caller afterward.
     return {
-        group_id: 1 << ((largest_payload // payload).bit_length() - 1)
+        group_id: (
+            largest_payload // payload
+            if largest_payload % payload == 0
+            else 1 << ((largest_payload // payload).bit_length() - 1)
+        )
         for group_id, payload in raw_by_group.items()
     }
 

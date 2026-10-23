@@ -1187,8 +1187,10 @@ per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
-Automatic packing uses powers of two to avoid excessive LCM padding;
-exact page-stride constraints and explicit recipe packing take precedence.
+Automatic packing keeps a group's byte ratio when it divides the largest
+group's payload exactly (a divisor adds no LCM padding) and otherwise rounds
+it down to a power of two to avoid excessive LCM padding; exact page-stride
+constraints and explicit recipe packing take precedence.
 
 Ordinary recipes pin one CacheBlock per group in each parent, so a group's
 stride does not shrink with its layer count or cache dtype. For example,

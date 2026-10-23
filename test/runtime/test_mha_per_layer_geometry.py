@@ -775,5 +775,32 @@ class PoolRowViewWidthTest(unittest.TestCase):
         self.assertTrue(torch.equal(v_cache[loc].reshape(n, 2, 512), v))
 
 
+class PackingByGroupRatioTest(unittest.TestCase):
+    """A derived packing count keeps an exact ratio and rounds any other down
+    to a power of two."""
+
+    def test_an_exact_ratio_fills_the_parent(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            _packing_by_group_ratio,
+        )
+
+        self.assertEqual(
+            _packing_by_group_ratio({"sliding": 1000, "full": 100, "x": 1000}),
+            {"sliding": 1, "full": 10, "x": 1},
+        )
+
+    def test_an_inexact_ratio_rounds_down_to_a_power_of_two(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            _packing_by_group_ratio,
+        )
+
+        # 4237 / 313 = 13.5, 4237 / 3 = 1412.3: unrelated counts would set
+        # the parent's alignment to their LCM.
+        self.assertEqual(
+            _packing_by_group_ratio({"a": 4237, "b": 313, "c": 3}),
+            {"a": 1, "b": 8, "c": 1024},
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

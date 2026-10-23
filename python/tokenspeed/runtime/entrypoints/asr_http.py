@@ -142,7 +142,7 @@ def _transcribe(
 
 
 def create_app(engine, processor, served_model_name: str) -> FastAPI:
-    app = FastAPI(title="TokenSpeed ASR server")
+    app = FastAPI(title="UnieInfer ASR server")
     app.state.engine = engine
     app.state.processor = processor
 
@@ -159,7 +159,7 @@ def create_app(engine, processor, served_model_name: str) -> FastAPI:
                     "id": served_model_name,
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "tokenspeed",
+                    "owned_by": "unieinfer",
                 }
             ],
         }

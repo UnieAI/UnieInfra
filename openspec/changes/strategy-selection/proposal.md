@@ -1,7 +1,7 @@
 ## Why
 
 We are about to port a dozen implementations from vLLM / SGLang / TRT-LLM / TurboMind
-1:1 (see `unieinfra/xref/70-PORTS.md`). The rule for that work is **every strategy is
+1:1 (see `unieinfer/xref/70-PORTS.md`). The rule for that work is **every strategy is
 kept** — a ported implementation is registered alongside the existing one and the engine
 picks the best per hardware and objective, rather than one replacing the other.
 
@@ -65,4 +65,4 @@ ports land on.
 - `python/tokenspeed/runtime/layers/attention/registry.py`,
   `python/tokenspeed/runtime/sampling/registry.py` — runtime backend registries align with
   the same contract.
-- Every change in the `unieinfra/xref/70-PORTS.md` backlog depends on this one.
+- Every change in the `unieinfer/xref/70-PORTS.md` backlog depends on this one.

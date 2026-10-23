@@ -2,7 +2,7 @@
 
 Serving `Qwen3.6-35B-A3B`, `Qwen3.5-122B-A10B`, `Qwen3-Embedding-8B`,
 `Gemma4-31b-it` and `Whisper-large-v3` on two of the eight H200s (SM90, cc
-9.0) of the `roy` host, through the token-speed / UnieInfra engine. The
+9.0) of the `roy` host, through the UnieInfer engine. The
 engine is pinned to logical GPUs 0,1 (host 6,7); host 0–3 is never touched.
 
 | Family | Model | Path | TP | Backend result |
@@ -205,7 +205,7 @@ is the open mixed-backend defect, not a tunable flag.
 
 The short-prompt matrix above (conc 1/4/8/16) is a self-authored corpus and no
 longer the benchmark. The authoritative comparison is
-`UnieInfra/bench/agent-slo/` (SWE-agent multi-turn traces, no-replay: fresh
+`bench/agent-slo/` (SWE-agent multi-turn traces, no-replay: fresh
 server per cell, warmup on a disjoint corpus, target corpus served exactly
 once). Qwen3.6-35B-A3B, TP1, conc 8, temp 0, max_tokens 128, ignore_eos:
 

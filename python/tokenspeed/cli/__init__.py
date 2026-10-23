@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TokenSpeed CLI package."""
+"""UnieInfer CLI package."""
 
 from tokenspeed.cli.__main__ import main
 

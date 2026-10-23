@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrent gRPC vision benchmark for the TokenSpeed DeepSeek-V4 engine.
+"""Concurrent gRPC vision benchmark for the UnieInfer DeepSeek-V4 engine.
 
 The OpenAI gateway (smg) has no DeepSeek-V4 vision processor registered, so the
 engine is driven over the gRPC scheduler interface directly, exactly like the

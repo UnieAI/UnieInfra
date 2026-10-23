@@ -212,7 +212,7 @@ def vision_attn_fa_varlen(
     kernel (``flash_fwd_sm120`` here) and honours ``window_size`` there --
     verified against a banded-mask reference rather than assumed, since
     several of this kernel's options are silently closed on sm_120
-    (``unieinfra/xref/15-encoder-embedding.md`` §6.1).
+    (``unieinfer/xref/15-encoder-embedding.md`` §6.1).
 
     ``window_size`` is ``(left, right)`` in the kernel's terms. A
     bidirectional encoder wants it symmetric: ModernBERT's ``local_attention``
@@ -260,7 +260,7 @@ def vision_attn_sdpa_window(
     what an out-of-bounds access looks like when whether it faults depends on
     what happens to be mapped next to the buffer. A path that passes for that
     reason is not a path to serve on. Measured 2026-08-21; see
-    ``unieinfra/xref/15-encoder-embedding.md`` §6.8 before switching back.
+    ``unieinfer/xref/15-encoder-embedding.md`` §6.8 before switching back.
 
     The triton backend is stable but has no window parameter, so this fills
     the gap with ``scaled_dot_product_attention`` under an explicit band
@@ -351,7 +351,7 @@ def cross_attn_varlen(
     ``page_table`` is refused outright ("Paged KV not supported on SM 12.0"),
     ``gather_kv_indices`` needs ``qv``, and ``flash_attn_with_kvcache`` is an
     unregistered placeholder. Measured 2026-08-21; see
-    ``unieinfra/xref/15-encoder-embedding.md`` §6.1 before assuming the caller
+    ``unieinfer/xref/15-encoder-embedding.md`` §6.1 before assuming the caller
     still has to materialise the gather.
     """
     # ``flash_attn_varlen_func`` requires q/k/v in one dtype. The decoder's

@@ -176,7 +176,7 @@ def _get_longcat_moe_quant_config(
 
     raise ValueError(
         f"LongCat MoE layer {prefix} has partially ignored expert quantization "
-        f"({num_ignored}/{num_expected} expert projections). TokenSpeed requires "
+        f"({num_ignored}/{num_expected} expert projections). UnieInfer requires "
         "all experts in one fused MoE layer to use the same weight format."
     )
 

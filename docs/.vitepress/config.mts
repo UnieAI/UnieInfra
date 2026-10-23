@@ -2,20 +2,20 @@ import { defineConfig } from "vitepress";
 
 export default defineConfig({
   lang: "en-US",
-  title: "TokenSpeed",
-  description: "TokenSpeed is a speed-of-light LLM inference engine.",
+  title: "UnieInfer",
+  description: "UnieInfer is a speed-of-light LLM inference engine.",
   base: "/tokenspeed/",
   srcDir: ".",
   cleanUrls: true,
   lastUpdated: true,
   head: [
-    ["meta", { property: "og:title", content: "TokenSpeed Docs" }],
+    ["meta", { property: "og:title", content: "UnieInfer Docs" }],
     [
       "meta",
       {
         property: "og:description",
         content:
-          "Guides and reference for running TokenSpeed, configuring the server, and operating multi-GPU inference."
+          "Guides and reference for running UnieInfer, configuring the server, and operating multi-GPU inference."
       }
     ]
   ],
@@ -69,7 +69,7 @@ export default defineConfig({
       text: "Edit this page on GitHub"
     },
     footer: {
-      message: "TokenSpeed documentation",
+      message: "UnieInfer documentation",
       copyright: "Copyright © lightseekorg"
     },
     socialLinks: [

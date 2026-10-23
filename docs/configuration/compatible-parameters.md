@@ -1,12 +1,12 @@
 # Compatible parameters
 
-TokenSpeed keeps familiar serving parameter names when the operational meaning
+UnieInfer keeps familiar serving parameter names when the operational meaning
 is the same. This makes recipes portable while still documenting
-TokenSpeed-specific behavior explicitly.
+UnieInfer-specific behavior explicitly.
 
 ## Directly aligned
 
-| Parameter | TokenSpeed behavior |
+| Parameter | UnieInfer behavior |
 | --- | --- |
 | positional `model` | Model path or Hugging Face repo ID. |
 | `--model` | Equivalent to positional `model`. |
@@ -19,7 +19,7 @@ TokenSpeed-specific behavior explicitly.
 | `--kv-cache-dtype` | KV cache storage dtype. |
 | `--quantization` | Weight quantization method. |
 | `--max-model-len` | Maximum sequence length. |
-| `--device` | Device type. TokenSpeed currently serves CUDA. |
+| `--device` | Device type. UnieInfer currently serves CUDA. |
 | `--served-model-name` | OpenAI-compatible served model name. |
 | `--revision` | Model revision. |
 | `--download-dir` | Model download directory. |
@@ -46,20 +46,20 @@ TokenSpeed-specific behavior explicitly.
 
 ## Similar but not identical
 
-| Recipe parameter | TokenSpeed parameter | Difference |
+| Recipe parameter | UnieInfer parameter | Difference |
 | --- | --- | --- |
-| `--max-num-batched-tokens` | `--chunked-prefill-size` | TokenSpeed uses this as the scheduler per-iteration issue budget. |
-| `--max-num-batched-tokens` | `--max-total-tokens` | TokenSpeed uses this for the global token pool size override. |
-| `--tensor-parallel-size`, `--tp` | `--attn-tp-size` | The familiar alias maps to attention TP. TokenSpeed can split attention, dense, and MoE TP. |
-| `--expert-parallel-size` | `--expert-parallel-size`, `--ep-size` | TokenSpeed supports the familiar name and its existing short form. |
-| `--attention-backend` | `--attention-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
-| `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
+| `--max-num-batched-tokens` | `--chunked-prefill-size` | UnieInfer uses this as the scheduler per-iteration issue budget. |
+| `--max-num-batched-tokens` | `--max-total-tokens` | UnieInfer uses this for the global token pool size override. |
+| `--tensor-parallel-size`, `--tp` | `--attn-tp-size` | The familiar alias maps to attention TP. UnieInfer can split attention, dense, and MoE TP. |
+| `--expert-parallel-size` | `--expert-parallel-size`, `--ep-size` | UnieInfer supports the familiar name and its existing short form. |
+| `--attention-backend` | `--attention-backend` | Name is aligned; available backend values are UnieInfer-specific. |
+| `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are UnieInfer-specific. |
 | `--quantization-param-path` | `--quantization-param-path` | KV caches run unscaled: under an FP8 KV cache the file is accepted only when every factor is 1.0 (other KV dtypes do not read it), and checkpoint KV-cache scales other than 1.0 are rejected at load. |
 
 ## Recipe translation notes
 
 - Use `tokenspeed serve` as the launcher.
 - Pass the model path positionally, then keep `--trust-remote-code`, `--max-model-len`, `--kv-cache-dtype`, `--gpu-memory-utilization`, `--max-num-seqs`, `--tensor-parallel-size`, `--reasoning-parser`, and `--tool-call-parser` when the model needs them.
-- Review `--max-num-batched-tokens` before copying it. TokenSpeed usually wants `--chunked-prefill-size` for per-iteration scheduling.
-- Review backend names. TokenSpeed backends are optimized for its runtime and kernel packages.
-- Keep TokenSpeed-specific `--attn-tp-size`, `--moe-tp-size`, `--disaggregation-*`, and `--kvstore-*` only when the deployment needs those features.
+- Review `--max-num-batched-tokens` before copying it. UnieInfer usually wants `--chunked-prefill-size` for per-iteration scheduling.
+- Review backend names. UnieInfer backends are optimized for its runtime and kernel packages.
+- Keep UnieInfer-specific `--attn-tp-size`, `--moe-tp-size`, `--disaggregation-*`, and `--kvstore-*` only when the deployment needs those features.

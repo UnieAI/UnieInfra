@@ -5,7 +5,7 @@
 
 ## Collaboration principle
 
-The TokenSpeed core team designs and implements core features.
+The UnieInfer core team designs and implements core features.
 This isn't a matter of distrust in external contributions — writing code has
 gotten cheaper, but reviewing it, validating it, and deploying it safely at
 production scale hasn't. If anything, that cost has gone up. As Steve Jobs
@@ -60,7 +60,7 @@ people and average people is more than tenfold.
 
 ## Design principles
 
-TokenSpeed values one scheduling path and one execution path. Prefill/decode
+UnieInfer values one scheduling path and one execution path. Prefill/decode
 disaggregation or not, speculation or not, CUDA graph or not, overlap or not:
 these are parameters of the same path, never a second path. Make the general
 path cover the case instead of adding a mode-specific branch.
@@ -142,7 +142,7 @@ worked example:
   <= sm_103) and a Triton fallback, so sm_120 silently ran the fallback at 1.4x
   the TTFT. The fix was to register the flashinfer FA2 path -- and it still sits
   behind an env var, which is the same defect one level up.
-* **When a survey exists, read it before measuring.** `unieinfra/xref/` already
+* **When a survey exists, read it before measuring.** `unieinfer/xref/` already
   placed all five engines on the admission axis and named the recommended cell.
   Re-deriving it from A/B runs cost hours and produced a worse answer.
 

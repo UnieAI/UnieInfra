@@ -7,7 +7,7 @@
 #              ab_real/agentx-sweep/trace-c16 8
 #
 # Why this exists: every performance claim needs ms/step, kernels/step,
-# us/kernel and device-busy measured on the same span (unieinfra/xref/
+# us/kernel and device-busy measured on the same span (unieinfer/xref/
 # 72-PARITY-STRATEGY.md §1). The engine already renders all four through its own
 # torch profiler -- POST /start_profile on the control port (main + 1), whose
 # body selects the output directory and the activities, then POST /stop_profile

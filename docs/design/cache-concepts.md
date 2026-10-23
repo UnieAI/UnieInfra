@@ -983,7 +983,7 @@ Its responsibilities:
   **not** drop the L3 key. A `clear_cache` in this process group deletes
   objects under that stable prefix rather than minting a process-local
   generation, so a restarted rank still probes the same keys. Independent
-  TokenSpeed jobs that share a tenant are not in the TP/PP/DP MIN: a
+  UnieInfer jobs that share a tenant are not in the TP/PP/DP MIN: a
   fleet-wide wipe is an operator flush of every instance. A
   `batch_exists` hit is not a lease: the prefetch that follows lands what
   is still there.

@@ -1,9 +1,9 @@
-Engine (TokenSpeed) vision benchmark — DeepSeek-V4-Flash-Vision-Exp
+Engine (UnieInfer) vision benchmark — DeepSeek-V4-Flash-Vision-Exp
 ====================================================================
 
 Shape: 1 image + short text prompt; the prompt token sequence already carries
 the expanded sentinel block ``vocab_size + types`` (114 image tokens) — no
-image-placeholder token is used, per the engine's driver contract. TokenSpeed
+image-placeholder token is used, per the engine's driver contract. UnieInfer
 vision requests MUST go over gRPC: the OpenAI gateway (smg) has no DeepSeek-V4
 vision processor registered, so ``/v1/chat/completions`` rejects multimodal
 (``invalid_multimodal_request: multimodal not supported for model: dsv4``).

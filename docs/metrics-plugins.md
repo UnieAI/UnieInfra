@@ -1,6 +1,6 @@
 # Metric output plugins
 
-Metric output plugins receive the observations already collected by TokenSpeed.
+Metric output plugins receive the observations already collected by UnieInfer.
 They adapt those observations to an external monitoring service and own their
 delivery mechanism. They do not replace metric definitions, request timing, or
 rank selection. Prometheus remains the default and retains its native aggregation
@@ -15,7 +15,7 @@ Publish an ordinary Python package with a runtime plugin entry point:
 example_metrics = "example_metrics:register"
 ```
 
-TokenSpeed discovers installed entry points and calls `register` once per process.
+UnieInfer discovers installed entry points and calls `register` once per process.
 Registration must only declare factories; it must not start threads or acquire
 external resources. Install the package in the Python environment used
 by every participating node. Installation makes an output available; selecting
@@ -52,7 +52,7 @@ Prometheus endpoint.
 ## Register creation callbacks
 
 The metrics API version is independent of the model plugin API. Check it before
-registration, and declare the compatible TokenSpeed versions in the package's
+registration, and declare the compatible UnieInfer versions in the package's
 dependencies. A package entry point can register more than one output name.
 
 ```python
@@ -85,7 +85,7 @@ Pass `start_node=None` explicitly when no shared resource is needed. In this cas
 the normalized configuration becomes the producer configuration directly, and
 `create_sink` can construct the plugin's SDK adapter in each producer process.
 Only plain configuration crosses spawn; never return a live socket, thread, or
-SDK client in `producer_config`. TokenSpeed validates and copies both configuration
+SDK client in `producer_config`. UnieInfer validates and copies both configuration
 results before passing them to another process.
 
 Registering an existing name requires `override=True`. Failed plugin registration
@@ -148,9 +148,9 @@ bounded queue, perform delivery in the background, and report errors and dropped
 events with rate-limited logs. Do not report output failures recursively through
 the same metric channel.
 
-TokenSpeed lazily creates one shared sink per selected output in each producer
+UnieInfer lazily creates one shared sink per selected output in each producer
 process. A sink that raises during `emit` is disabled without stopping other
-outputs; its resources are retained for shutdown. TokenSpeed does not rebuild a
+outputs; its resources are retained for shutdown. UnieInfer does not rebuild a
 failed sink on the observation path.
 
 Stop accepting new events when `close` begins, and make repeated `close` calls safe.
@@ -158,7 +158,7 @@ Each process that reaches metrics cleanup drains its local sinks within a shared
 time budget. The launcher closes its local sinks before shared node resources.
 Metric reporters do not change worker termination: a forcibly terminated worker
 may lose queued events without running `close`. Factories must clean up resources
-they allocate before raising; TokenSpeed closes objects that were successfully
+they allocate before raising; UnieInfer closes objects that were successfully
 returned. An exception while closing one object does not skip the others.
 
 These are cooperative contracts for trusted Python plugins. Catching exceptions

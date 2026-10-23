@@ -23,7 +23,7 @@ the contract, close its two real gaps, and extend it downward to the scheduler.
 
 **Non-Goals**
 
-- Porting any specific implementation. Each item in `unieinfra/xref/70-PORTS.md` is its
+- Porting any specific implementation. Each item in `unieinfer/xref/70-PORTS.md` is its
   own change.
 - Unifying the three layers behind one API. They have different lifetimes (kernel
   selection is per-shape and cached; scheduler policy is per-process) and forcing one

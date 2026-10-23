@@ -1,10 +1,12 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/banner/tokenspeed-banner.png" alt="TokenSpeed: Tokens at the speed of light" width="100%" />
-</p>
+# UnieInfer
 
-TokenSpeed is a speed-of-light LLM inference engine designed for **agentic workloads**, with TensorRT-LLM-level performance and vLLM-level usability. The goal is to be the most performant inference engine for production agentic workloads.
+UnieInfer is UnieAI's LLM inference engine for **agentic workloads**. It is
+built on [TokenSpeed](https://github.com/lightseekorg/tokenspeed), the
+speed-of-light inference engine from the LightSeek Foundation, and carries
+UnieAI-specific work on top of it; see [UNIEINFER.md](UNIEINFER.md) for what
+UnieInfer adds and how it tracks upstream.
 
-Core components:
+Core components (inherited from TokenSpeed):
 
 - **Scheduler**: C++ control plane and Python execution plane. Request
   lifecycle, KV cache ownership, and overlap timing are encoded as a
@@ -17,7 +19,7 @@ Core components:
 
 ## Differentiation
 
-TokenSpeed takes a fundamentally different architectural approach from existing LLM inference engines. The **PyTorch Foundation highlighted these architectural differentiators** when [welcoming TokenSpeed](https://pytorch.org/blog/pytorch-ecosystem-landscape-q3-update/) to the PyTorch Ecosystem Landscape:
+UnieInfer inherits TokenSpeed's architecture. TokenSpeed takes a fundamentally different architectural approach from existing LLM inference engines. The **PyTorch Foundation highlighted these architectural differentiators** when [welcoming TokenSpeed](https://pytorch.org/blog/pytorch-ecosystem-landscape-q3-update/) to the PyTorch Ecosystem Landscape:
 
 > TokenSpeed is an open source LLM inference engine and the first to separate the control plane from the execution plane. The control plane is implemented in C++ as a finite-state machine, using the type system to enforce safe resource management, including request lifecycles and KV cache state, at compile time rather than runtime. The execution plane is implemented in Python, enabling fast iteration and lowering the cognitive load for researchers and engineers. This architecture combines strong correctness guarantees in the core scheduling system with the development velocity of a high-level execution layer.
 >
@@ -25,7 +27,7 @@ TokenSpeed takes a fundamentally different architectural approach from existing 
 
 More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors such as NVIDIA and AMD.
 
-## News
+## Upstream TokenSpeed news
 
 - [2026/10] [EAGLE-4](https://blog.eagle.ai/blog/introducing-eagle-4) training and serving with TorchSpec and TokenSpeed. [[blog](https://lightseek.org/blog/eagle-4.html)]
 - [2026/10] Reflection's [Beam](https://developers.reflection.ai/deployment-overview) at day 0: 501B MoE serving in NVFP4 on NVIDIA GB200 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-reflection-beam.html)]
@@ -51,7 +53,7 @@ For technical blogs, conference talks, and engineering articles from the LightSe
 
 LightSeek's work is advanced by the support of [sponsors and partners](https://lightseek.org/sponsors) across the AI ecosystem.
 
-## Performance comparison
+## Performance comparison (upstream TokenSpeed)
 
 <p align="center">
   <img
@@ -67,7 +69,7 @@ LightSeek's work is advanced by the support of [sponsors and partners](https://l
 
 ## Documentation
 
-Start here:
+In-repo docs live under [`docs/`](docs/). The upstream TokenSpeed docs site:
 
 - [Docs Index](https://lightseek.org/tokenspeed/)
 - [Getting Started](https://lightseek.org/tokenspeed/guides/getting-started)
@@ -78,6 +80,8 @@ Start here:
 - [Parallelism](https://lightseek.org/tokenspeed/serving/parallelism)
 
 ## Citation
+
+UnieInfer is built on TokenSpeed; please cite the upstream project:
 
 ```bibtex
 @misc{tokenspeed2026,

@@ -468,7 +468,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 # whole list lands in one prefill, above it the tail waits for
                 # the next. SGLang forces the same thing for embedding models
                 # (`enable_tokenizer_batch_encode`); see
-                # unieinfra/xref/15-encoder-embedding.md §3.5.
+                # unieinfer/xref/15-encoder-embedding.md §3.5.
                 #
                 # Deliberately not applied to generation: there, submitting
                 # the first prompt early lowers its TTFT, and a streaming

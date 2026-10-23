@@ -547,7 +547,7 @@ def build_sglang_compat_app(async_llm: "AsyncLLM") -> FastAPI:
     on ``--rl-control-port``; tests build it the same way. When
     ``--rl-control-api-key`` is set every route requires that bearer.
     """
-    app = FastAPI(title="tokenspeed SGLang-compatible RL control")
+    app = FastAPI(title="UnieInfer SGLang-compatible RL control")
     app.state.async_llm = async_llm
     api_key = async_llm.server_args.rl_control_api_key
     if api_key:

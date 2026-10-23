@@ -25,7 +25,7 @@ request, not a token stream. This module owns the reduction from the
 per-token hidden states of that prefill to that vector.
 
 Where the four reference engines put this differs (see
-``unieinfra/xref/15-encoder-embedding.md`` §3.4): vLLM makes it a layer the
+``unieinfer/xref/15-encoder-embedding.md`` §3.4): vLLM makes it a layer the
 runner calls, SGLang a layer the model calls, TRT-LLM hardcodes CLS inside
 the model. We follow vLLM: the model owns ``pooler`` but the reduction is
 here, so changing the pooling strategy does not touch a model file.

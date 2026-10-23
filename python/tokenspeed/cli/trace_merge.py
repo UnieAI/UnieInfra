@@ -365,7 +365,7 @@ def main(argv: list[str] | None = None) -> None:
         argv: Argument list to parse; defaults to ``sys.argv[1:]``.
     """
     parser = argparse.ArgumentParser(
-        prog="tokenspeed merge-traces",
+        prog="unieinfer merge-traces",
         description="Merge one or more Proton/VizTracer trace pairs onto a "
         "shared timeline.",
     )

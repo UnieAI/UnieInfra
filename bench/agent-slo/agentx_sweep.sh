@@ -174,7 +174,7 @@ case "$KIND" in
     # tokenspeed-scheduler/csrc/scheduler/operations/forward.cpp), so there is
     # no global mode to select. Passing the old flag fails to boot
     # ("unrecognized arguments"); the audit for it lives in
-    # unieinfra/xref/72-PARITY-STRATEGY.md §2 instead of an A/B.
+    # unieinfer/xref/72-PARITY-STRATEGY.md §2 instead of an A/B.
     # Do NOT pass --prefill-graph-capture-sizes here. That flag replaces the
     # prefill token-bucket ladder with an explicit list, and a single entry
     # (e.g. "8192") collapses it to one rung -- so every prefill step replays

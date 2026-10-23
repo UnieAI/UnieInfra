@@ -23,7 +23,7 @@
 Until now every pooling model this engine served was a *decoder* with a
 pooler bolted on (Qwen3-Embedding): causal attention, a paged KV pool, LAST
 reduction. The BERT family is the other shape -- bidirectional attention, no
-KV at all, one forward and done. ``unieinfra/xref/15-encoder-embedding.md``
+KV at all, one forward and done. ``unieinfer/xref/15-encoder-embedding.md``
 §1 is the four-engine survey; this file is the port.
 
 Three architectures, because "BERT / GTE / BGE" is not three checkpoints of

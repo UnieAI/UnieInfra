@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Token-for-token comparison of the UnieInfra DeepSeek-V4 vision tower
+"""Token-for-token comparison of the UnieInfer DeepSeek-V4 vision tower
 against the reference ``/models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp``
 ``inference/vision.py`` + ``inference/image_processor.py``.
 

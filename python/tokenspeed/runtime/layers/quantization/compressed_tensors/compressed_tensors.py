@@ -471,7 +471,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             raise NotImplementedError(
                 "compressed-tensors FP8 weight-only (W8A16) linears are not "
-                "supported: TokenSpeed has no FP8 weight-only GEMM"
+                "supported: UnieInfer has no FP8 weight-only GEMM"
             )
 
         # Detect If Mixed Precision
@@ -503,7 +503,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 raise NotImplementedError(
                     "compressed-tensors FP8 weights with input activations "
                     f"{input_quant} are not supported: W8A8 takes FP8 inputs and "
-                    "TokenSpeed has no FP8 weight-only GEMM"
+                    "UnieInfer has no FP8 weight-only GEMM"
                 )
 
         raise NotImplementedError(

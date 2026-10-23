@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="290" viewBox="0 0 840 290"><rect width="840" height="290" fill="#ffffff"/><text x="14" y="20" font-size="13" font-weight="600" fill="#111"></text><text x="52" y="20" font-size="13" font-weight="600" fill="#111">Goodput vs the TTFT budget</text>
+<line x1="52.0" y1="214.0" x2="406.0" y2="214.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="44.0" y="218.0" font-size="10" fill="#555" text-anchor="end">0</text>
+<line x1="52.0" y1="169.0" x2="406.0" y2="169.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="44.0" y="173.0" font-size="10" fill="#555" text-anchor="end">5</text>
+<line x1="52.0" y1="124.0" x2="406.0" y2="124.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="44.0" y="128.0" font-size="10" fill="#555" text-anchor="end">10</text>
+<line x1="52.0" y1="79.0" x2="406.0" y2="79.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="44.0" y="83.0" font-size="10" fill="#555" text-anchor="end">15</text>
+<line x1="52.0" y1="34.0" x2="406.0" y2="34.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="44.0" y="38.0" font-size="10" fill="#555" text-anchor="end">20</text>
+<text x="52.0" y="230.0" font-size="10" fill="#555" text-anchor="middle">1000</text>
+<line x1="52.0" y1="214.0" x2="52.0" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="122.8" y="230.0" font-size="10" fill="#555" text-anchor="middle">4000</text>
+<line x1="122.8" y1="214.0" x2="122.8" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="217.2" y="230.0" font-size="10" fill="#555" text-anchor="middle">8000</text>
+<line x1="217.2" y1="214.0" x2="217.2" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="311.6" y="230.0" font-size="10" fill="#555" text-anchor="middle">12000</text>
+<line x1="311.6" y1="214.0" x2="311.6" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="406.0" y="230.0" font-size="10" fill="#555" text-anchor="middle">16000</text>
+<line x1="406.0" y1="214.0" x2="406.0" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="210.0" y="252" font-size="11" fill="#333" text-anchor="middle">TTFT SLO (ms), TPOT SLO fixed at 100 ms</text>
+<polyline points="52.0,164.8 63.8,135.8 75.6,133.3 99.2,102.4 122.8,62.1 146.4,53.3 170.0,53.3 217.2,53.3 264.4,53.3 311.6,53.3 406.0,53.3" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="52.0" cy="164.8" r="2.6" fill="#2563eb"/>
+<circle cx="63.8" cy="135.8" r="2.6" fill="#2563eb"/>
+<circle cx="75.6" cy="133.3" r="2.6" fill="#2563eb"/>
+<circle cx="99.2" cy="102.4" r="2.6" fill="#2563eb"/>
+<circle cx="122.8" cy="62.1" r="2.6" fill="#2563eb"/>
+<circle cx="146.4" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="170.0" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="217.2" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="264.4" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="311.6" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="406.0" cy="53.3" r="2.6" fill="#2563eb"/>
+<polyline points="52.0,214.0 63.8,214.0 75.6,214.0 99.2,214.0 122.8,209.4 146.4,209.2 170.0,208.6 217.2,208.1 264.4,207.8 311.6,203.8 406.0,203.5" fill="none" stroke="#dc2626" stroke-width="2.4"/>
+<circle cx="52.0" cy="214.0" r="2.6" fill="#dc2626"/>
+<circle cx="63.8" cy="214.0" r="2.6" fill="#dc2626"/>
+<circle cx="75.6" cy="214.0" r="2.6" fill="#dc2626"/>
+<circle cx="99.2" cy="214.0" r="2.6" fill="#dc2626"/>
+<circle cx="122.8" cy="209.4" r="2.6" fill="#dc2626"/>
+<circle cx="146.4" cy="209.2" r="2.6" fill="#dc2626"/>
+<circle cx="170.0" cy="208.6" r="2.6" fill="#dc2626"/>
+<circle cx="217.2" cy="208.1" r="2.6" fill="#dc2626"/>
+<circle cx="264.4" cy="207.8" r="2.6" fill="#dc2626"/>
+<circle cx="311.6" cy="203.8" r="2.6" fill="#dc2626"/>
+<circle cx="406.0" cy="203.5" r="2.6" fill="#dc2626"/><text x="472" y="20" font-size="13" font-weight="600" fill="#111">Goodput vs the per-token budget</text>
+<line x1="472.0" y1="214.0" x2="826.0" y2="214.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="464.0" y="218.0" font-size="10" fill="#555" text-anchor="end">0</text>
+<line x1="472.0" y1="169.0" x2="826.0" y2="169.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="464.0" y="173.0" font-size="10" fill="#555" text-anchor="end">5</text>
+<line x1="472.0" y1="124.0" x2="826.0" y2="124.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="464.0" y="128.0" font-size="10" fill="#555" text-anchor="end">10</text>
+<line x1="472.0" y1="79.0" x2="826.0" y2="79.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="464.0" y="83.0" font-size="10" fill="#555" text-anchor="end">15</text>
+<line x1="472.0" y1="34.0" x2="826.0" y2="34.0" stroke="#d4d4d8" stroke-width="1"/>
+<text x="464.0" y="38.0" font-size="10" fill="#555" text-anchor="end">20</text>
+<text x="472.0" y="230.0" font-size="10" fill="#555" text-anchor="middle">40</text>
+<line x1="472.0" y1="214.0" x2="472.0" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="518.2" y="230.0" font-size="10" fill="#555" text-anchor="middle">100</text>
+<line x1="518.2" y1="214.0" x2="518.2" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="595.1" y="230.0" font-size="10" fill="#555" text-anchor="middle">200</text>
+<line x1="595.1" y1="214.0" x2="595.1" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="672.1" y="230.0" font-size="10" fill="#555" text-anchor="middle">300</text>
+<line x1="672.1" y1="214.0" x2="672.1" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="826.0" y="230.0" font-size="10" fill="#555" text-anchor="middle">500</text>
+<line x1="826.0" y1="214.0" x2="826.0" y2="218.0" stroke="#999" stroke-width="1"/>
+<text x="630.0" y="252" font-size="11" fill="#333" text-anchor="middle">TPOT SLO (ms), TTFT SLO fixed at 5000 ms</text>
+<polyline points="472.0,214.0 487.4,212.1 502.8,106.6 518.2,53.9 533.6,53.3 556.7,53.3 595.1,53.3 672.1,53.3 826.0,53.3" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="472.0" cy="214.0" r="2.6" fill="#2563eb"/>
+<circle cx="487.4" cy="212.1" r="2.6" fill="#2563eb"/>
+<circle cx="502.8" cy="106.6" r="2.6" fill="#2563eb"/>
+<circle cx="518.2" cy="53.9" r="2.6" fill="#2563eb"/>
+<circle cx="533.6" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="556.7" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="595.1" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="672.1" cy="53.3" r="2.6" fill="#2563eb"/>
+<circle cx="826.0" cy="53.3" r="2.6" fill="#2563eb"/>
+<polyline points="472.0,214.0 487.4,209.5 502.8,209.2 518.2,209.2 533.6,209.2 556.7,205.4 595.1,172.3 672.1,172.3 826.0,172.3" fill="none" stroke="#dc2626" stroke-width="2.4"/>
+<circle cx="472.0" cy="214.0" r="2.6" fill="#dc2626"/>
+<circle cx="487.4" cy="209.5" r="2.6" fill="#dc2626"/>
+<circle cx="502.8" cy="209.2" r="2.6" fill="#dc2626"/>
+<circle cx="518.2" cy="209.2" r="2.6" fill="#dc2626"/>
+<circle cx="533.6" cy="209.2" r="2.6" fill="#dc2626"/>
+<circle cx="556.7" cy="205.4" r="2.6" fill="#dc2626"/>
+<circle cx="595.1" cy="172.3" r="2.6" fill="#dc2626"/>
+<circle cx="672.1" cy="172.3" r="2.6" fill="#dc2626"/>
+<circle cx="826.0" cy="172.3" r="2.6" fill="#dc2626"/><rect x="590" y="266" width="11" height="11" fill="#2563eb"/><text x="606" y="276" font-size="11" fill="#111">UnieInfer (mixing)</text><rect x="720" y="266" width="11" height="11" fill="#dc2626"/><text x="736" y="276" font-size="11" fill="#111">vLLM 0.26</text></svg>

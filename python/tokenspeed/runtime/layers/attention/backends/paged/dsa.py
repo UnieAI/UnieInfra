@@ -903,7 +903,7 @@ class DSABackend(PagedAttentionBackend):
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
             raise NotImplementedError(
-                "TokenSpeed DSA fused dense attention does not support "
+                "UnieInfer DSA fused dense attention does not support "
                 f"logits_soft_cap={logits_soft_cap}. Sparse DSA kernels must "
                 "preserve the capped-score semantics before enabling this model."
             )
@@ -917,7 +917,7 @@ class DSABackend(PagedAttentionBackend):
         max_seq_len = int(active_seq_lens.max().item())
         if max_seq_len > self.index_topk:
             raise NotImplementedError(
-                "TokenSpeed DSA dense attention is exact only when every "
+                "UnieInfer DSA dense attention is exact only when every "
                 f"request has seq_len <= index_topk ({self.index_topk}); got "
                 f"max seq_len {max_seq_len}. Sparse DSA top-k indices are "
                 "required for longer contexts."

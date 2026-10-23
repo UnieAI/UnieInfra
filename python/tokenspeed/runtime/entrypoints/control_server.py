@@ -565,7 +565,7 @@ def build_control_server(
     _engine_grpc_addr = engine_grpc_addr
     _rl_control_url = rl_control_url
     logger.info(
-        f"Starting TokenSpeed HTTP server on {host!s}:{port:d} "
+        f"Starting UnieInfer HTTP server on {host!s}:{port:d} "
         f"(gateway: {gateway_url!s}, engine gRPC: {engine_grpc_addr!s}, weight "
         f"transfer: {rl_control_url or 'disabled'!s})",
     )

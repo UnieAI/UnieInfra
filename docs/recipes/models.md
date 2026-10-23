@@ -165,7 +165,7 @@ ts serve \
 
 ## MiniMax M3
 
-MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
+MiniMax M3 uses 128-token MSA blocks. UnieInfer configures its dense and sparse
 attention layers automatically. Select the dense backend with
 `--attention-backend` and run with `--disable-kvstore`.
 
@@ -242,7 +242,7 @@ Notes:
   layer in `dflash_config.target_layer_ids` (`[1, 12, 23, 35, 46, 57]` of M3's
   60 layers); the draft concatenates them in ascending layer order to feed its
   `fc`.
-- The draft checkpoint stores fp32 master weights. TokenSpeed loads it in the
+- The draft checkpoint stores fp32 master weights. UnieInfer loads it in the
   target's dtype rather than the standalone fp32-to-fp16 default, because the
   two exchange hidden states and share the target's embedding and LM head.
 - Measured on 4x GB300 with the launch above: gsm8k `mean_acc` 0.9719 versus
@@ -304,7 +304,7 @@ tokenspeed serve nvidia/Kimi-K2.6-NVFP4 \
 ```
 
 Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
-`--speculative-algorithm DFLASH` launch. TokenSpeed enables their grouped
+`--speculative-algorithm DFLASH` launch. UnieInfer enables their grouped
 dynamic convolutions and candidate selector automatically from the draft
 architecture. On GPU each convolution runs as a single fused Triton kernel.
 The torch node graph stays as the CPU reference. An MLA DFlash2 draft also
@@ -369,11 +369,11 @@ Notes:
   or `mla` with `--kv-cache-dtype bfloat16`. AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
-- The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly.
+- The SMG packages pinned by UnieInfer resolve `moonshotai/Kimi-K3` directly.
   You no longer need a flattened local checkpoint and a separately staged
   remote-code cache.
 - The checkpoint carries no FP8 KV scaling factors. When the target K3 uses an
-  FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
+  FP8 LCM cache, UnieInfer keeps the separate K3 DSpark draft cache in
   BF16 so context injection and draft attention match the reference precision.
 - DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
   `trtllm_mla` draft backends preserve every block row during eager execution
@@ -397,7 +397,7 @@ Notes:
   before the model-level AttnRes mix and final norm, matching the DSpark
   checkpoint's vLLM training and inference contract. A draft trained instead
   against the pre-norm AttnRes mixture declares
-  `"aux_hidden_stream": "attn_res"` in its config, and TokenSpeed serves it
+  `"aux_hidden_stream": "attn_res"` in its config, and UnieInfer serves it
   that stream. Feeding a draft the other stream raises nothing and shows up
   only as a lower acceptance rate, so the server logs the choice next to the
   tap ids at startup.
@@ -507,7 +507,7 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
 
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
 cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
-`zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`.
+`zai-org/GLM-5.2-FP8`. UnieInfer defaults the reasoning parser to `glm45`.
 Pass an explicit parser flag to override it. GLM5 DSA prefill planning reuses
 the host-side request lengths and the packed page/row plan across full-indexer
 layers. When integrating a custom attention backend, keep the
@@ -609,7 +609,7 @@ For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
 ### Qwen3-0.6B on Ascend NPU
 
 The Ascend path supports unquantized Qwen3-0.6B on one or more NPUs. It uses
-the normal TokenSpeed scheduler and paged KV cache: prefill runs eagerly, while
+the normal UnieInfer scheduler and paged KV cache: prefill runs eagerly, while
 the runtime captures fixed-shape decode batches as ACL Graphs. Aggregate
 serving can schedule prefill and decode work in the same deployment.
 
@@ -653,7 +653,7 @@ python -m tokenspeed.cli serve Qwen/Qwen3-0.6B \
 
 The setup script installs Transformers 5.12.0 and Triton-Ascend 3.2.1, installs
 `tokenspeed-kernel-npu` from this checkout in editable mode, and compiles and
-executes both a vector-add kernel and a TokenSpeed KV-cache kernel on the
+executes both a vector-add kernel and a UnieInfer KV-cache kernel on the
 visible NPU. Set `TOKENSPEED_CANN_ROOT` when CANN is installed outside the
 default path.
 
@@ -926,7 +926,7 @@ YaRN, and upgrades four axes of the hybrid design:
 - N-gram (predictive latent) embeddings
 - Muon optimization
 
-In TokenSpeed it runs as a hybrid linear-attention (GDN) / full-attention model
+In UnieInfer it runs as a hybrid linear-attention (GDN) / full-attention model
 with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
@@ -992,7 +992,7 @@ object:
   FP8 to save memory. Omit it to store the table in the model's compute
   dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
-  or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
+  or GPU memory when `false`. When omitted, UnieInfer enables offloading on
   NVIDIA CUDA and disables it on other platforms.
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
@@ -1152,7 +1152,7 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --port 8000
 ```
 
-TokenSpeed has not yet validated MTP on MI450.
+UnieInfer has not yet validated MTP on MI450.
 
 ### MTP speculative decoding
 
@@ -1394,7 +1394,7 @@ squared ReLU with NVFP4 weights on the FlashInfer TRT-LLM MoE, routed inside
 the kernel. Some dense projections are FP8 and the rest are BF16, as the
 checkpoint's per-layer ModelOpt config says.
 
-The checkpoint's KV cache scheme is FP8 with unit scales, which TokenSpeed does
+The checkpoint's KV cache scheme is FP8 with unit scales, which UnieInfer does
 not detect automatically, so pass `--kv-cache-dtype fp8`. The Mamba2 SSM state
 is FP32.
 
@@ -1480,7 +1480,7 @@ Notes:
   `TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` unset. With the drafter the
   default batch limit is 80 requests, not 160.
 - Name no `--reasoning-parser` or `--tool-call-parser`. The bundled
-  `tokenspeed-smg==1.13.0.post20261016` that TokenSpeed pins reads the output
+  `tokenspeed-smg==1.13.0.post20261016` that UnieInfer pins reads the output
   through the checkpoint's `response_template`.
 
 The first start on a fresh machine tunes kernels for 30 to 45 minutes; pass

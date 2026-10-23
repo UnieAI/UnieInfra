@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Startup banner for ``ts serve``: ``Token`` in bright black, ``Speed`` in blue."""
+"""Startup banner for ``ts serve``: ``Unie`` in bright black, ``Infer`` in blue."""
 
 from __future__ import annotations
 
@@ -28,30 +28,30 @@ from typing import IO
 
 from tokenspeed.version import __version__
 
-_TOKEN_LINES = (
-    "████████  ██████  ██   ██ ███████ ███    ██ ",
-    "   ██    ██    ██ ██  ██  ██      ████   ██ ",
-    "   ██    ██    ██ █████   █████   ██ ██  ██ ",
-    "   ██    ██    ██ ██  ██  ██      ██  ██ ██ ",
-    "   ██     ██████  ██   ██ ███████ ██   ████ ",
+_UNIE_LINES = (
+    "██    ██ ███    ██ ██ ███████ ",
+    "██    ██ ████   ██ ██ ██      ",
+    "██    ██ ██ ██  ██ ██ █████   ",
+    "██    ██ ██  ██ ██ ██ ██      ",
+    " ██████  ██   ████ ██ ███████ ",
 )
 
-_SPEED_LINES = (
-    "███████ ██████  ███████ ███████ ██████  ",
-    "██      ██   ██ ██      ██      ██   ██ ",
-    "███████ ██████  █████   █████   ██   ██ ",
-    "     ██ ██      ██      ██      ██   ██ ",
-    "███████ ██      ███████ ███████ ██████  ",
+_INFER_LINES = (
+    "██ ███    ██ ███████ ███████ ██████  ",
+    "██ ████   ██ ██      ██      ██   ██ ",
+    "██ ██ ██  ██ █████   █████   ██████  ",
+    "██ ██  ██ ██ ██      ██      ██   ██ ",
+    "██ ██   ████ ██      ███████ ██   ██ ",
 )
 
-_TOKEN_STYLE = "\033[90m"  # bright black (grey).
-_SPEED_STYLE = "\033[94m"  # bright blue.
+_UNIE_STYLE = "\033[90m"  # bright black (grey).
+_INFER_STYLE = "\033[94m"  # bright blue.
 _RESET = "\033[0m"
 
 _TAGLINE = "Tokens at the speed of light"
 _DISABLE_ENV = "TOKENSPEED_DISABLE_LOGO"
-# Visible width of one banner row: len(token) + " " + len(speed).
-_BANNER_WIDTH = len(_TOKEN_LINES[0]) + 1 + len(_SPEED_LINES[0])
+# Visible width of one banner row: len(unie) + " " + len(infer).
+_BANNER_WIDTH = len(_UNIE_LINES[0]) + 1 + len(_INFER_LINES[0])
 
 
 def _is_disabled() -> bool:
@@ -72,13 +72,13 @@ def _stream_supports_color(stream: IO[str]) -> bool:
 def render_logo(version: str = __version__, *, color: bool = True) -> str:
     """Return the multi-line banner. Trailing newline included."""
     if color:
-        token_open, speed_open, close = _TOKEN_STYLE, _SPEED_STYLE, _RESET
+        unie_open, infer_open, close = _UNIE_STYLE, _INFER_STYLE, _RESET
     else:
-        token_open = speed_open = close = ""
+        unie_open = infer_open = close = ""
 
     rows = [
-        f"{token_open}{token}{close} {speed_open}{speed}{close}"
-        for token, speed in zip(_TOKEN_LINES, _SPEED_LINES)
+        f"{unie_open}{unie}{close} {infer_open}{infer}{close}"
+        for unie, infer in zip(_UNIE_LINES, _INFER_LINES)
     ]
     footer = f"{_TAGLINE} · v{version}"
     pad = max(0, (_BANNER_WIDTH - len(footer)) // 2)

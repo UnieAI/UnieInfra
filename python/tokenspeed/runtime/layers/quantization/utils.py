@@ -102,7 +102,7 @@ def should_ignore_quant_layer(
             elif should_ignore_shard != should_ignore_layer:
                 raise ValueError(
                     f"Found a different quantization schemes for "
-                    f"{shard_proj_names} in {prefix}. TokenSpeed "
+                    f"{shard_proj_names} in {prefix}. UnieInfer "
                     "requires all to use the same scheme."
                 )
     else:

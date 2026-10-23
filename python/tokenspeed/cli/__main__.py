@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TokenSpeed CLI entry point."""
+"""UnieInfer CLI entry point."""
 
 import argparse
 import sys
@@ -73,7 +73,7 @@ def _announce_runtime(raw_argv: list[str]) -> None:
         raise SystemExit(
             "[ts serve] this is a diffusers pipeline (model_index.json), and "
             "the diffusion runtime is not built yet.\n"
-            "           Survey and plan: unieinfra/xref/16-diffusion.md"
+            "           Survey and plan: unieinfer/xref/16-diffusion.md"
         )
 
     missing = _RUNTIME_MISSING.get(runtime)
@@ -86,7 +86,7 @@ def _announce_runtime(raw_argv: list[str]) -> None:
             f"[ts serve] warning: no {missing} route exists yet, so this "
             f"model is not reachable over HTTP.\n"
             f"           The engine path is verified and usable in-process. "
-            f"See unieinfra/REPORT-encoder-serving.md §5."
+            f"See unieinfer/REPORT-encoder-serving.md §5."
         )
     return runtime
 
@@ -166,13 +166,13 @@ def _merge_traces(args: argparse.Namespace) -> None:
 def _version(args: argparse.Namespace) -> None:
     from tokenspeed.version import __version__
 
-    print(f"TokenSpeed v{__version__}")
+    print(f"UnieInfer v{__version__}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="tokenspeed",
-        description="TokenSpeed is a speed-of-light LLM inference engine.",
+        prog="unieinfer",
+        description="UnieInfer is a speed-of-light LLM inference engine.",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -181,8 +181,8 @@ def main() -> None:
     # don't register the engine's ServerArgs on this parser.
     serve_parser = subparsers.add_parser(
         "serve",
-        help="Launch the TokenSpeed inference server.",
-        description="Launch the TokenSpeed inference server: the full serving "
+        help="Launch the UnieInfer inference server.",
+        description="Launch the UnieInfer inference server: the full serving "
         "stack by default (currently an smg gateway fronting a gRPC engine), "
         "or the engine alone with --headless.",
     )
@@ -214,7 +214,7 @@ def main() -> None:
 
     version_parser = subparsers.add_parser(
         "version",
-        help="Print the TokenSpeed version.",
+        help="Print the UnieInfer version.",
     )
     version_parser.set_defaults(func=_version)
 

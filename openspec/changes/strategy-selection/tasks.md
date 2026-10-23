@@ -53,5 +53,5 @@
 
 - [ ] 6.1 Verify no default changed: run the existing sweep before and after and compare
       the selected implementation for every operation exercised.
-- [ ] 6.2 Record in `unieinfra/xref/70-PORTS.md` that the ports now land on this contract,
+- [ ] 6.2 Record in `unieinfer/xref/70-PORTS.md` that the ports now land on this contract,
       and which registry each port's "註冊成" column refers to.

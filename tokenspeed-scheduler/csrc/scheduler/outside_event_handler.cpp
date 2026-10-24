@@ -124,8 +124,8 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
             store_hashes.push_back(completed.completed_pages->tail->hash);
         }
     }
-    if (!config_.StreamsDeviceCacheToHost()) {
-        return std::nullopt;
+    if (!config_.StreamsDeviceCacheToHost() || coordinator_.WritesOnEvict()) {
+        return std::nullopt;  // write-on-evict copies it when it leaves the Device
     }
     // Every published entry of the request streams: its pages and its tail.
     // The state checkpoint published with the frontier only with

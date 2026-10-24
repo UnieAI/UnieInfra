@@ -165,7 +165,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
-        .def_rw("store_final_state_to_host", &tokenspeed::SchedulerConfig::store_final_state_to_host);
+        .def_rw("store_final_state_to_host", &tokenspeed::SchedulerConfig::store_final_state_to_host)
+        .def_rw("host_write_on_evict", &tokenspeed::SchedulerConfig::host_write_on_evict)
+        .def_rw("host_clean_reserve", &tokenspeed::SchedulerConfig::host_clean_reserve);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and

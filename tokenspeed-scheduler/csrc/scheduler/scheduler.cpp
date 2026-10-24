@@ -107,6 +107,7 @@ Scheduler::Scheduler(SchedulerConfig config)
         cache_group_ids_.push_back(group.group_id);
     }
     max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
+    coordinator_.SetWriteOnEvict(config_.StreamsDeviceCacheToHost() && config_.host_write_on_evict);
 
     if (config_.enable_kv_cache_events) {
         coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
@@ -475,6 +476,17 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // Boundary publications of live requests: their owners hold the pages,
         // and the ticket pins them until the ACK, so the copy stays off the
         // forward's critical path.
+        if (coordinator_.WritesOnEvict()) {
+            // What this round's admission evicted uncleaned, then the next
+            // victims -- one cleaner batch in flight at a time paces it.
+            if (auto store = tier_transfers_.StartEvictionStores()) {
+                write_back_operations.push_back(std::move(*store));
+            }
+            if (!tier_transfers_.HasPinnedStoresInFlight()) {
+                coordinator_.QueueEvictionCandidatesForStore(static_cast<std::int32_t>(
+                    config_.host_clean_reserve * static_cast<double>(coordinator_.TotalLcmBlocks())));
+            }
+        }
         if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck)) {
             write_back_operations.push_back(std::move(*store));
         }

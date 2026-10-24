@@ -95,6 +95,15 @@ struct SchedulerConfig {
     // Host L2: also copy the recurrent-state checkpoint a finishing request
     // publishes at its final token. Off, only its KV pages and tail stream.
     bool store_final_state_to_host{false};
+    // Host L2 write policy. Off (write-through), every published Device entry
+    // streams to Host as it is published. On, an entry is copied only on its
+    // way out of the Device (CacheCoordinator::SetWriteOnEvict): a Device
+    // cache that never fills copies nothing.
+    bool host_write_on_evict{false};
+    // With host_write_on_evict: the fraction of the Device LCM blocks the
+    // cleaner keeps empty or Host-backed ahead of admission, so evictions
+    // rarely wait on a stream-ordered copy. Zero copies only at eviction.
+    double host_clean_reserve{0.05};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

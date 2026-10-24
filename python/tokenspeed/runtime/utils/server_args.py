@@ -503,6 +503,8 @@ class ServerArgs:
     # ~0.5 GB/s on H200 and takes SMs from the forward.
     kvstore_io_backend: str = "direct"
     kvstore_store_final_state: bool = False
+    kvstore_write_policy: str = "write-through"
+    kvstore_clean_reserve: float = 0.05
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -2643,6 +2645,27 @@ class ServerArgs:
             "that only a continuation of that exact sequence can reuse, and "
             "the Device copy serves that while resident. The prompt's "
             "checkpoints and every KV page are copied either way.",
+        )
+        parser.add_argument(
+            "--kvstore-write-policy",
+            type=str,
+            choices=["write-through", "write-on-evict"],
+            default=ServerArgs.kvstore_write_policy,
+            help="When a Device cache entry is copied to Host L2. "
+            "'write-through' copies every entry as it is published. "
+            "'write-on-evict' copies an entry only on its way out of the "
+            "Device: a cleaner stores the next eviction victims ahead of "
+            "admission (see --kvstore-clean-reserve), and an entry evicted "
+            "before it was cleaned is copied in the round that evicts it. A "
+            "Device cache that never fills copies nothing.",
+        )
+        parser.add_argument(
+            "--kvstore-clean-reserve",
+            type=float,
+            default=ServerArgs.kvstore_clean_reserve,
+            help="With --kvstore-write-policy write-on-evict: the fraction of "
+            "the Device KV pool kept empty or already copied to Host, so "
+            "evictions rarely wait on a copy. 0 copies only at eviction.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

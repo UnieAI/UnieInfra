@@ -413,6 +413,29 @@ public:
     // tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes, bool include_state = true);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+
+    // Host L2 write-on-evict (SetWriteOnEvict): a published Device entry is
+    // not streamed to Host when it is published; it is copied only on its way
+    // out of the Device. Two paths carry it, both skipping entries Host
+    // already holds:
+    //   - the cleaner (QueueEvictionCandidatesForStore) queues the oldest
+    //     entries, the next eviction victims, as ordinary pinned stores while
+    //     the Device pool runs low, so most evictions find them Host-backed;
+    //   - an entry evicted before it was cleaned is recorded here and leaves
+    //     as a stream-ordered store in the round that evicted it
+    //     (TakeEvictedForStore): its page may be re-granted in that very plan.
+    // A Device cache that never fills therefore copies nothing.
+    void SetWriteOnEvict(bool write_on_evict) { write_on_evict_ = write_on_evict && host_pool_ != nullptr; }
+    bool WritesOnEvict() const { return write_on_evict_; }
+    // Queues the not yet Host-backed entries among the oldest Device entries
+    // that cover `reserve_lcm_blocks` minus the empty LCM blocks; nothing
+    // while that many blocks are already empty.
+    void QueueEvictionCandidatesForStore(std::int32_t reserve_lcm_blocks);
+    struct EvictedForStore {
+        CacheKey key;
+        CacheBlockLocation location;  // freed: valid only for this round's plan
+    };
+    std::vector<EvictedForStore> TakeEvictedForStore() { return std::exchange(evicted_for_store_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     // One Host block per (group, bucket) entry, in the bucket of the Device
     // block it will mirror -- under page-cyclic sharding the owner of a Host
@@ -599,6 +622,8 @@ private:
     // calls it for the companions of the block that left.
     bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location);
     bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    // Write-on-evict: remembers a Device entry that left without a Host copy.
+    void recordEvictedForStore(const CacheKey& key, CacheBlockLocation location);
     std::optional<CacheBlockLocation> deviceLocationOf(std::size_t group_index, const CacheKey& key) const;
     // Drops a tail hash from the tail table once no tier holds an entry for it.
     void pruneTailIfUnreferenced(const ContentHash& hash);
@@ -630,6 +655,8 @@ private:
     std::uint64_t next_access_epoch_{0};
     TailTable tails_;
     std::vector<StoreCandidate> pending_stores_;
+    bool write_on_evict_{false};
+    std::vector<EvictedForStore> evicted_for_store_;
     std::unordered_set<CacheKey, CacheKeyHash> storage_keys_;
     std::deque<CacheKey> storage_key_order_;
     std::size_t storage_key_limit_{0};

@@ -26,6 +26,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,6 +50,10 @@ public:
     // kPinnedUntilAck; a retraction's stream-ordered L2 leg does not use the
     // queue -- StartRetractionStores builds it from the victim's tables.
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard);
+    // Write-on-evict: one stream-ordered write-back of the Device entries this
+    // round evicted before the cleaner copied them. Their pages are already
+    // free, so the op must ride the plan of the round that evicted them.
+    std::optional<WriteBackOperation> StartEvictionStores();
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // The pre-admission L3 fill of one Submitted request: one op over the
@@ -154,6 +159,9 @@ private:
         CacheBlockRef device_block_ref;
         CacheBlockRef host_block_ref;
     };
+
+    // Every key some in-flight write-back is carrying.
+    std::unordered_set<CacheKey, CacheKeyHash> storingKeys() const;
 
     struct InFlightWriteBack {
         StoreSourceGuard guard;

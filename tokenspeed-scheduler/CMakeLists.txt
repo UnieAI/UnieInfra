@@ -111,6 +111,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_prefix_index.cpp
         tests/cpp/test_final_state_host_store.cpp
+        tests/cpp/test_write_on_evict.cpp
         tests/cpp/test_tail_table.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp

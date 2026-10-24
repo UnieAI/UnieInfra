@@ -181,6 +181,24 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 
 }  // namespace
 
+std::vector<std::string> Scheduler::candidatePrefixHashes(const Request& request) const {
+    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
+    // The last token is recomputed, so a page the prompt fills exactly can
+    // never be hit -- except on the D role, whose prompt-end state check
+    // needs the prompt's last page hashed when the prompt ends on it.
+    const std::int32_t candidate_prefix_pages = config_.role == Role::kD
+                                                    ? request.PrefillSize() / prefix_granularity
+                                                    : std::max((request.PrefillSize() - 1) / prefix_granularity, 0);
+    std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(false);
+    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+    return ComputePrefixHashes(prefix_pages, "");
+}
+
+std::int32_t Scheduler::maxCacheablePrefixTokens(const Request& request) const {
+    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
+    return std::max(std::min(request.PrefillSize() - replay_tokens, request.MaxCachedPrefixTokens()), 0);
+}
+
 Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
@@ -200,18 +218,8 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // may tighten the bound further (RequestSpec::max_cached_prefix_tokens) so
     // the positions it needs logits for are recomputed rather than matched.
     // The bound is in tokens: a hit may end at it exactly.
-    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
-    const std::int32_t max_cacheable_tokens =
-        std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
-    // The last token is recomputed, so a page the prompt fills exactly can
-    // never be hit -- except on the D role, whose prompt-end state check
-    // needs the prompt's last page hashed when the prompt ends on it.
-    const std::int32_t candidate_prefix_pages = config_.role == Role::kD
-                                                    ? request->PrefillSize() / prefix_granularity
-                                                    : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
-    std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
-    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");
+    const std::int32_t max_cacheable_tokens = maxCacheablePrefixTokens(*request);
+    std::vector<std::string> hashes = candidatePrefixHashes(*request);
 
     AdmissionMatch match;
     match.candidate_prefix_hashes = hashes;
@@ -314,6 +322,21 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // The D role's prompts are the peer's work; every other first chunk is local.
     const fsm::PrefillSource source =
         config_.role == Role::kD ? fsm::PrefillSource::kRemote : fsm::PrefillSource::kLocal;
+    const auto hit_pages = static_cast<std::int32_t>(match.prefix_hashes.size());
+    // Only the pages this prompt may take from the cache are worth waiting for.
+    const std::span<const std::string> cacheable_hashes =
+        std::span<const std::string>(match.candidate_prefix_hashes)
+            .first(std::min(
+                match.candidate_prefix_hashes.size(),
+                static_cast<std::size_t>(maxCacheablePrefixTokens(*request) / coordinator_.PrefixGranularity())));
+    if (source == fsm::PrefillSource::kLocal && prefixDedupEnabled() &&
+        defersToInflightPrefix(cacheable_hashes, hit_pages)) {
+        ++prefix_dedup_stats_.deferred_rounds;
+        if (deferred_prefix_ids_.insert(request->Id()).second) {
+            ++prefix_dedup_stats_.deferred_requests;
+        }
+        return FirstChunkOutcome{};
+    }
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
 
@@ -329,12 +352,45 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     // A remote landing completes the prompt in one transfer; no junction cut
     // can shorten it.
-    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                               ? unscheduled
-                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                                    unscheduled, remaining, junction_tokens);
+    std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
+                                         ? unscheduled
+                                         : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
+                                                              unscheduled, remaining, junction_tokens);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
+    }
+    // Pages this prompt shares with other waiting prompts are only reusable at
+    // a boundary its chunk ends on when a group is not full history: a sliding
+    // group keeps (and publishes) just the window behind a chunk end, and a
+    // State group checkpoints only there, so the pages a chunk runs past are
+    // gone before anyone can hit them. End the first chunk where the sharing
+    // ends; the prompts waiting on it (defersToInflightPrefix) resume there.
+    // With full-history groups alone every published page is a boundary.
+    const bool boundaries_at_chunk_ends = std::ranges::any_of(
+        config_.cache_groups, [](const CacheGroupConfig& group) { return group.attn_kind != AttnKind::kFull; });
+    // A State group publishes its checkpoint only at a junction (or the
+    // prompt end), not at an ordinary chunk end, so a cut on such a model
+    // becomes this request's junction: the next chunk publishes the state
+    // the cut leaves, and the waiting prompts resume from it rather than from
+    // KV they could not use alone.
+    std::int32_t dedup_junction_tokens = 0;
+    if (source == fsm::PrefillSource::kLocal && prefixDedupEnabled() && boundaries_at_chunk_ends) {
+        const std::int32_t shared = pagesSharedWithWaiting(match.candidate_prefix_hashes, hit_pages);
+        const std::int32_t cut_tokens = (hit_pages + shared) * prefix_granularity - hit_tokens;
+        if (shared >= config_.inflight_prefix_defer_pages && cut_tokens > 0 && cut_tokens < tokens_this_round) {
+            const std::int32_t kept =
+                ChunkKeepingFinalWindow(cut_tokens, unscheduled, coordinator_.ReplayWindowTokens());
+            if (kept > 0) {
+                tokens_this_round = kept;
+                ++prefix_dedup_stats_.cut_chunks;
+            }
+            const bool has_state_group = std::ranges::any_of(config_.cache_groups, [](const CacheGroupConfig& group) {
+                return group.attn_kind == AttnKind::kState;
+            });
+            if (has_state_group && kept == cut_tokens && junction_tokens == 0) {
+                dedup_junction_tokens = hit_tokens + cut_tokens;
+            }
+        }
     }
     const std::int32_t after_tokens = hit_tokens + tokens_this_round;
     const bool completes_prefill = tokens_this_round == unscheduled;
@@ -420,10 +476,17 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                          CacheBoundaryKind::kChunk);
         }
     }
+    if (source == fsm::PrefillSource::kLocal && prefixDedupEnabled()) {
+        std::vector<std::string> own(match.candidate_prefix_hashes.begin() + hit_pages,
+                                     match.candidate_prefix_hashes.end());
+        inflight_prefix_hashes_.insert(own.begin(), own.end());
+        inflight_prefix_pages_[request->Id()] = std::move(own);
+        deferred_prefix_ids_.erase(request->Id());
+    }
     fsm::CacheProgress cache_progress{
         .prefix_hashes = std::move(match.prefix_hashes),
         .access_epoch = admission->access_epoch,
-        .junction_tokens = admission->junction_tokens,
+        .junction_tokens = dedup_junction_tokens > 0 ? dedup_junction_tokens : admission->junction_tokens,
     };
     return FirstChunkOutcome{.state_prefix_cached = admission->state_prefix_cached,
                              .event = fsm::SchedulePrefillFirstChunkEvent{
@@ -1330,6 +1393,101 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
     maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
 }
 
+void Scheduler::refreshInflightPrefixPages() {
+    inflight_prefix_hashes_.clear();
+    if (!prefixDedupEnabled()) {
+        return;
+    }
+    std::unordered_set<std::string> waiting;
+    for (const std::unique_ptr<Request>& request : requests_) {
+        if (!request->Is<fsm::Submitted>()) {
+            continue;
+        }
+        waiting.insert(request->Id());
+        if (!waiting_prefix_pages_.contains(request->Id())) {
+            // A prompt counts as a sharer only for the pages it may hit.
+            std::vector<std::string> hashes = candidatePrefixHashes(*request);
+            hashes.resize(std::min(hashes.size(), static_cast<std::size_t>(maxCacheablePrefixTokens(*request) /
+                                                                           coordinator_.PrefixGranularity())));
+            for (const std::string& hash : hashes) {
+                ++waiting_prefix_counts_[hash];
+            }
+            waiting_prefix_pages_.emplace(request->Id(), std::move(hashes));
+        }
+    }
+    for (auto it = waiting_prefix_pages_.begin(); it != waiting_prefix_pages_.end();) {
+        if (waiting.contains(it->first)) {
+            ++it;
+            continue;
+        }
+        for (const std::string& hash : it->second) {
+            auto count = waiting_prefix_counts_.find(hash);
+            if (--count->second == 0) {
+                waiting_prefix_counts_.erase(count);
+            }
+        }
+        deferred_prefix_ids_.erase(it->first);
+        it = waiting_prefix_pages_.erase(it);
+    }
+    if (inflight_prefix_pages_.empty()) {
+        return;
+    }
+    std::unordered_map<std::string, std::vector<std::string>> live;
+    for (const std::unique_ptr<Request>& request : requests_) {
+        auto it = inflight_prefix_pages_.find(request->Id());
+        if (it == inflight_prefix_pages_.end() ||
+            !(request->Is<fsm::Prefilling>() || request->Is<fsm::PrefillDone>())) {
+            continue;
+        }
+        inflight_prefix_hashes_.insert(it->second.begin(), it->second.end());
+        live.emplace(it->first, std::move(it->second));
+    }
+    inflight_prefix_pages_ = std::move(live);
+}
+
+// Two prompts admitted together (or one while the other is mid-prefill) that
+// share pages past the cached prefix would both compute them: neither page
+// is published until its owner's chunk ends. The later prompt waits instead
+// -- the owner's chunk publishes the pages and the wait turns them into a hit.
+// Only the run of pages leading the candidate's uncached suffix counts: a
+// shared page after a private one has a different chain hash anyway.
+bool Scheduler::defersToInflightPrefix(std::span<const std::string> candidate_hashes, std::int32_t hit_pages) const {
+    const std::int32_t min_pages = config_.inflight_prefix_defer_pages;
+    if (min_pages <= 0 || inflight_prefix_hashes_.empty()) {
+        return false;
+    }
+    std::int32_t shared = 0;
+    for (std::size_t i = static_cast<std::size_t>(hit_pages); i < candidate_hashes.size(); ++i) {
+        if (!inflight_prefix_hashes_.contains(candidate_hashes[i])) {
+            break;
+        }
+        if (++shared >= min_pages) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The run of pages leading the candidate's uncached suffix that other
+// Submitted prompts carry too (the candidate counts itself once), up to the
+// first page where one of them branches off: each branch point needs its own
+// chunk end, and the nearest one is this chunk's. The prompts sharing the
+// rest resume there and cut again at the next branch point.
+std::int32_t Scheduler::pagesSharedWithWaiting(std::span<const std::string> candidate_hashes,
+                                               std::int32_t hit_pages) const {
+    std::int32_t shared = 0;
+    std::int32_t sharers = 0;
+    for (std::size_t i = static_cast<std::size_t>(hit_pages); i < candidate_hashes.size(); ++i) {
+        const auto count = waiting_prefix_counts_.find(candidate_hashes[i]);
+        if (count == waiting_prefix_counts_.end() || count->second < 2 || (shared > 0 && count->second < sharers)) {
+            break;
+        }
+        sharers = count->second;
+        ++shared;
+    }
+    return shared;
+}
+
 Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
                                                              std::vector<WriteBackOperation>& write_back_operations) {
     // The candidates arrive in submission order (requests_ is the FIFO),
@@ -1337,6 +1495,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     AdmissionFeedback feedback;
     PlanBuild build{plan};
     build.token_budget = config_.max_scheduled_tokens;
+    refreshInflightPrefixPages();
     switch (config_.role) {
         case Role::kP:
             buildPrefillWorkerPlan(feedback, build, candidates);

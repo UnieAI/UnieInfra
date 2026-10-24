@@ -62,6 +62,9 @@ void SchedulerConfig::Validate() const {
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
+    if (inflight_prefix_defer_pages < 0) {
+        throw std::invalid_argument("Scheduler: inflight_prefix_defer_pages must be >= 0");
+    }
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }

@@ -293,6 +293,8 @@ class EngineMetrics:
         # forward, so each round adds the difference.
         self._exported_serving_compiles = 0
         self._exported_serving_compile_seconds = 0.0
+        # The scheduler's cumulative shared-prefix dedup counts already exported.
+        self._exported_prefix_dedup = (0, 0, 0)
 
         factory = MetricFactory(
             enabled=enabled,
@@ -372,6 +374,31 @@ class EngineMetrics:
         self.jit_serving_compile_seconds = factory.counter(
             name="tokenspeed:jit_serving_compile_seconds",
             documentation="Wall time spent in Triton kernel compilations after startup.",
+            labelnames=labelnames,
+        )
+        # Shared-prefix dedup (--inflight-prefix-defer-pages). Its effect shows
+        # in the reuse ratio, prefix_cache_hits_total / prompt_tokens_total;
+        # these count what the scheduler did to get it.
+        self.prefix_dedup_deferred_requests_total = factory.counter(
+            name="tokenspeed:prefix_dedup_deferred_requests",
+            documentation=(
+                "Prompts that waited for pages another prompt was computing "
+                "instead of computing them again."
+            ),
+            labelnames=labelnames,
+        )
+        self.prefix_dedup_deferred_rounds_total = factory.counter(
+            name="tokenspeed:prefix_dedup_deferred_rounds",
+            documentation="Scheduler rounds those prompts waited, summed.",
+            labelnames=labelnames,
+        )
+        self.prefix_dedup_cut_chunks_total = factory.counter(
+            name="tokenspeed:prefix_dedup_cut_chunks",
+            documentation=(
+                "First prefill chunks ended where other waiting prompts branch "
+                "off, so the shared pages stay hittable on a sliding-window or "
+                "recurrent-state model."
+            ),
             labelnames=labelnames,
         )
         self.num_nan_aborted_requests = factory.counter(
@@ -506,6 +533,22 @@ class EngineMetrics:
         )
         self._exported_serving_compiles = stats.serving_compiles
         self._exported_serving_compile_seconds = stats.serving_seconds
+
+    def record_prefix_dedup(self, cumulative: tuple[int, int, int]) -> None:
+        """Export the scheduler's ``prefix_dedup_stats()`` since the last call."""
+        if not self.enabled:
+            return
+        counters = (
+            self.prefix_dedup_deferred_requests_total,
+            self.prefix_dedup_deferred_rounds_total,
+            self.prefix_dedup_cut_chunks_total,
+        )
+        for counter, now, before in zip(
+            counters, cumulative, self._exported_prefix_dedup
+        ):
+            if now > before:
+                counter.labels(**self.labels).inc(now - before)
+        self._exported_prefix_dedup = tuple(cumulative)
 
     def record_nan_abort(self) -> None:
         if not self.enabled:

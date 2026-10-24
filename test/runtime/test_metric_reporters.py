@@ -229,6 +229,34 @@ def test_preemptions_preserve_positive_round_deltas(reporters):
         )
 
 
+def test_prefix_dedup_exports_the_scheduler_totals_as_deltas():
+    sink = ListSink()
+    registry = CollectorRegistry()
+    metrics = EngineMetrics(
+        LABELS,
+        enabled=True,
+        reporters=["prometheus", "test_reporter"],
+        event_sink=sink,
+        registry=registry,
+    )
+    # Cumulative scheduler totals, sampled every round: only what moved is sent.
+    for totals in ((0, 0, 0), (2, 3, 1), (2, 3, 1), (5, 9, 1)):
+        metrics.record_prefix_dedup(totals)
+    assert [(event.metric, event.value) for event in sink.events] == [
+        ("tokenspeed:prefix_dedup_deferred_requests_total", 2),
+        ("tokenspeed:prefix_dedup_deferred_rounds_total", 3),
+        ("tokenspeed:prefix_dedup_cut_chunks_total", 1),
+        ("tokenspeed:prefix_dedup_deferred_requests_total", 3),
+        ("tokenspeed:prefix_dedup_deferred_rounds_total", 6),
+    ]
+    for name, total in (
+        ("tokenspeed:prefix_dedup_deferred_requests_total", 5),
+        ("tokenspeed:prefix_dedup_deferred_rounds_total", 9),
+        ("tokenspeed:prefix_dedup_cut_chunks_total", 1),
+    ):
+        assert registry.get_sample_value(name, LABELS) == total
+
+
 def test_dual_scheduler_snapshot_and_compile_deltas():
     from tokenspeed_kernel.compile_monitor import CompileStats
 

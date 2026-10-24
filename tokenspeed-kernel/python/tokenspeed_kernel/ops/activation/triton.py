@@ -26,7 +26,9 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
 
@@ -1729,3 +1731,77 @@ def tanh_softcap(x: torch.Tensor, cap: float) -> torch.Tensor:
         **_TANH_SOFTCAP_LAUNCH_OPTIONS,
     )
     return out
+
+
+# ===-----------------------------------------------------------------------===#
+# Registrations: portable Triton, any vendor Triton targets
+# ===-----------------------------------------------------------------------===#
+
+_TRITON_VENDORS = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
+_TRITON_FLOATS = {torch.bfloat16, torch.float16, torch.float32}
+
+
+@register_kernel(
+    "activation",
+    "silu_and_mul",
+    name="triton_silu_and_mul",
+    solution="triton",
+    capability=_TRITON_VENDORS,
+    signatures=format_signatures("x", "dense", _TRITON_FLOATS),
+    traits={"limited": frozenset({False, True})},
+    priority=Priority.PORTABLE,
+)
+def triton_silu_and_mul(x, limit, out=None):
+    return silu_and_mul(x, out, limit=limit)
+
+
+@register_kernel(
+    "activation",
+    "situ_and_mul",
+    name="triton_situ_and_mul",
+    solution="triton",
+    capability=_TRITON_VENDORS,
+    signatures=format_signatures("x", "dense", _TRITON_FLOATS),
+    priority=Priority.PORTABLE,
+)
+def triton_situ_and_mul(x, beta, linear_beta, out=None):
+    return situ_and_mul(x, out, beta=beta, linear_beta=linear_beta)
+
+
+@register_kernel(
+    "activation",
+    "sigmoid_mul",
+    name="triton_sigmoid_mul",
+    solution="triton",
+    capability=_TRITON_VENDORS,
+    signatures=format_signatures(("x", "gate"), "dense", _TRITON_FLOATS),
+    priority=Priority.PORTABLE,
+)
+def triton_sigmoid_mul(x, gate, head_bias=None):
+    return sigmoid_mul(x, gate, head_bias)
+
+
+@register_kernel(
+    "activation",
+    "swiglu_oai",
+    name="triton_swiglu_oai",
+    solution="triton",
+    capability=_TRITON_VENDORS,
+    signatures=format_signatures("gate_up", "dense", _TRITON_FLOATS),
+    priority=Priority.PORTABLE,
+)
+def triton_swiglu_oai(gate_up, alpha, limit):
+    return swiglu_oai(gate_up, alpha=alpha, limit=limit)
+
+
+@register_kernel(
+    "activation",
+    "fused_swiglu_fp8_ue8m0",
+    name="triton_fused_swiglu_fp8_ue8m0",
+    solution="triton",
+    capability=_TRITON_VENDORS,
+    signatures=format_signatures("gate_up", "dense", {torch.bfloat16}),
+    priority=Priority.PORTABLE,
+)
+def triton_fused_swiglu_fp8_ue8m0(gate_up, swiglu_limit, swiglu_alpha, swiglu_beta):
+    return fused_swiglu_fp8_ue8m0(gate_up, swiglu_limit, swiglu_alpha, swiglu_beta)

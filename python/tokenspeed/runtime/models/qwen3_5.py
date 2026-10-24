@@ -27,7 +27,7 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.activation import sigmoid_mul
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.qwen3_5_config import (

@@ -20,7 +20,10 @@
 
 """KV cache kernel entry points."""
 
+import tokenspeed_kernel.ops.kvcache.backends  # noqa: F401  (registers)
 import torch
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 def zero_byte_ranges(
@@ -52,15 +55,13 @@ def zero_byte_ranges(
             raise ValueError("CPU zeroing requires host storage")
         for offset, size in ranges:
             backing[offset : offset + size].zero_()
-    elif backing.device.type == "cpu":
-        from tokenspeed_kernel.ops.kvcache.cute_dsl import (
-            cute_dsl_zero_host_byte_ranges,
-        )
-
-        cute_dsl_zero_host_byte_ranges(backing, ranges, device=execution_device)
     else:
-        from tokenspeed_kernel.ops.kvcache.triton import (
-            zero_byte_ranges as zero_device_byte_ranges,
+        mode = (
+            "zero_host_byte_ranges"
+            if backing.device.type == "cpu"
+            else "zero_device_byte_ranges"
         )
-
-        zero_device_byte_ranges(backing, ranges)
+        kernel = select_kernel(
+            "kvcache", mode, format_signature(backing=dense_tensor_format(torch.uint8))
+        )
+        kernel(backing, ranges, device=execution_device)

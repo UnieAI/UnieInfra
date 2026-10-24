@@ -24,7 +24,7 @@ import logging
 from collections.abc import Iterable
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.activation import sigmoid_mul
 from torch import nn
 from transformers import PretrainedConfig
 

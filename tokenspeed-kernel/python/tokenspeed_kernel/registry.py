@@ -502,6 +502,7 @@ def load_builtin_kernels() -> None:
                 del sys.modules[key]
     # PyTorch references, the ground truth for numerics and benchmark checks.
     import tokenspeed_kernel.numerics.torch  # noqa: F401
+    import tokenspeed_kernel.ops.activation  # noqa: F401
     import tokenspeed_kernel.ops.attention  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
@@ -518,6 +519,8 @@ def load_builtin_kernels() -> None:
     import tokenspeed_kernel.ops.attention.rmha  # noqa: F401
     import tokenspeed_kernel.ops.embedding  # noqa: F401
     import tokenspeed_kernel.ops.gemm  # noqa: F401
+    import tokenspeed_kernel.ops.kvcache  # noqa: F401
+    import tokenspeed_kernel.ops.kvcache.host_dma  # noqa: F401
     import tokenspeed_kernel.ops.layernorm  # noqa: F401
     import tokenspeed_kernel.ops.moe  # noqa: F401
     import tokenspeed_kernel.ops.quantization  # noqa: F401

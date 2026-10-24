@@ -20,6 +20,10 @@
 
 """Ascend activation kernels."""
 
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel_npu.ops.activation import (
     dequant_silu_and_mul_quant,
     silu_and_mul,
@@ -27,3 +31,19 @@ from tokenspeed_kernel_npu.ops.activation import (
 )
 
 __all__ = ["dequant_silu_and_mul_quant", "silu_and_mul", "silu_and_mul_quant"]
+
+
+@register_kernel(
+    "activation",
+    "silu_and_mul",
+    name="ascend_silu_and_mul",
+    solution="ascend",
+    capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    traits={"limited": frozenset({False})},
+    priority=Priority.PERFORMANT,
+)
+def ascend_silu_and_mul(x, limit, out=None):
+    return silu_and_mul(x, out)

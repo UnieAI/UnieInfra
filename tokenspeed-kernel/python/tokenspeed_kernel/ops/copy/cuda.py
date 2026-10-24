@@ -22,9 +22,21 @@
 
 from __future__ import annotations
 
-from tokenspeed_kernel.platform import current_platform
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
+@register_kernel(
+    "copy",
+    "memcpy_2d",
+    name="cuda_memcpy_2d",
+    solution="cuda",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures("bytes", "dense", {torch.uint8}),
+    priority=Priority.PERFORMANT,
+)
 def memcpy_2d_async(
     *,
     dst: int,

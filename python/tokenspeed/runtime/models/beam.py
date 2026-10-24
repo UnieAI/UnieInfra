@@ -31,8 +31,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from compressed_tensors.quantization import QuantizationStrategy
+from tokenspeed_kernel.ops.activation import sigmoid_mul
 from tokenspeed_kernel.ops.activation.triton import (
-    sigmoid_mul,
     tanh_softcap,
     tanh_softcap_rejection,
 )

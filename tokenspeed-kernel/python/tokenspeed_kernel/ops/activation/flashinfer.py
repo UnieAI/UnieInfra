@@ -17,8 +17,14 @@
 
 """FlashInfer activation kernels."""
 
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import (
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 gelu_and_mul = error_fn
 gelu_tanh_and_mul = error_fn
@@ -35,3 +41,61 @@ if current_platform().is_nvidia:
         pass
 
 __all__ = ["gelu_and_mul", "gelu_tanh_and_mul", "silu_and_mul"]
+
+_NVIDIA = CapabilityRequirement(vendors=frozenset({"nvidia"}))
+_HALF = format_signatures("x", "dense", {torch.bfloat16, torch.float16})
+
+
+def _gated_out(x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+    if out is not None:
+        return out
+    return torch.empty(
+        x.shape[:-1] + (x.shape[-1] // 2,), dtype=x.dtype, device=x.device
+    )
+
+
+if silu_and_mul is not error_fn:
+
+    @register_kernel(
+        "activation",
+        "silu_and_mul",
+        name="flashinfer_silu_and_mul",
+        solution="flashinfer",
+        capability=_NVIDIA,
+        signatures=_HALF,
+        # FlashInfer has no clamp: a limited SwiGLU takes the Triton kernel.
+        traits={"limited": frozenset({False})},
+        priority=Priority.PERFORMANT,
+    )
+    def flashinfer_silu_and_mul(x, limit, out=None):
+        return silu_and_mul(x, _gated_out(x, out), enable_pdl=pdl_enabled())
+
+
+if gelu_and_mul is not error_fn:
+
+    @register_kernel(
+        "activation",
+        "gelu_and_mul",
+        name="flashinfer_gelu_and_mul",
+        solution="flashinfer",
+        capability=_NVIDIA,
+        signatures=_HALF,
+        priority=Priority.PERFORMANT,
+    )
+    def flashinfer_gelu_and_mul(x, out=None):
+        return gelu_and_mul(x, _gated_out(x, out), enable_pdl=pdl_enabled())
+
+
+if gelu_tanh_and_mul is not error_fn:
+
+    @register_kernel(
+        "activation",
+        "gelu_tanh_and_mul",
+        name="flashinfer_gelu_tanh_and_mul",
+        solution="flashinfer",
+        capability=_NVIDIA,
+        signatures=_HALF,
+        priority=Priority.PERFORMANT,
+    )
+    def flashinfer_gelu_tanh_and_mul(x, out=None):
+        return gelu_tanh_and_mul(x, _gated_out(x, out), enable_pdl=pdl_enabled())

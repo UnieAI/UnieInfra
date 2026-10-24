@@ -66,6 +66,7 @@ def multicast_reachable(group: dist.ProcessGroup) -> bool:
     import torch.distributed as dist
     from tokenspeed_kernel.ops.communication.fabric import (
         group_has_fabric,
+        group_has_multicast,
         group_host_span,
     )
 
@@ -73,7 +74,7 @@ def multicast_reachable(group: dist.ProcessGroup) -> bool:
         return False
     ranks = dist.get_process_group_ranks(group)
     span = group_host_span(ranks)
-    if span is None:
+    if span is None or not group_has_multicast(ranks):
         return False
     if span <= 1:
         return True

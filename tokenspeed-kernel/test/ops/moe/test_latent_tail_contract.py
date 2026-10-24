@@ -320,6 +320,7 @@ def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
     finally:
         fabric._fabric_map = None
         fabric._host_map = None
+        fabric._multicast_map = None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the gather needs a device")
@@ -341,7 +342,7 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
         assert local[1].item() == 100, "the host id never reached the payload"
         gathered[0].copy_(local)
         for rank, slot in enumerate(gathered[1:], start=1):
-            slot.copy_(torch.tensor([1, 100 + rank // 2], dtype=torch.int64))
+            slot.copy_(torch.tensor([1, 100 + rank // 2, 1], dtype=torch.int64))
 
     fabric._fabric_map = None
     fabric._host_map = None
@@ -357,6 +358,7 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
                 fabric.torch.distributed, "all_gather", side_effect=two_hosts
             ),
             mock.patch.object(fabric, "fabric_allocation_supported", return_value=True),
+            mock.patch.object(fabric, "multicast_bind_supported", return_value=True),
             mock.patch.object(
                 fabric, "_host_identity", return_value=100
             ) as host_identity,
@@ -371,6 +373,7 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
     finally:
         fabric._fabric_map = None
         fabric._host_map = None
+        fabric._multicast_map = None
 
 
 def test_the_host_id_is_stable_across_processes() -> None:
@@ -470,3 +473,86 @@ def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
                 fabric.group_has_fabric([0, 1])
     finally:
         fabric._fabric_map = saved
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gather needs a device")
+def test_a_failed_multicast_bind_declines_node_local_groups() -> None:
+    """One host is no proof that multicast works.
+
+    A fabric manager that lost the NVSwitch state keeps reporting multicast
+    support while every bind fails; torch then skips multicast and the
+    multimem kernels store through a null pointer. The rank whose bind failed
+    must take its node-local groups off the multicast routes, and only those.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+    import tokenspeed_kernel.ops.moe._cute_dsl.latent_tail as tail
+
+    def one_rank_cannot_bind(gathered, local, group=None):
+        assert local[2].item() == 1, "the bind verdict never reached the payload"
+        for rank, slot in enumerate(gathered):
+            slot.copy_(torch.tensor([0, 100, int(rank != 3)], dtype=torch.int64))
+
+    fabric._fabric_map = None
+    fabric._host_map = None
+    fabric._multicast_map = None
+    try:
+        with (
+            mock.patch.object(
+                fabric, "current_platform", return_value=mock.Mock(is_nvidia=True)
+            ),
+            mock.patch.object(
+                fabric.torch.distributed, "get_world_size", return_value=4
+            ),
+            mock.patch.object(
+                fabric.torch.distributed, "all_gather", side_effect=one_rank_cannot_bind
+            ),
+            mock.patch.object(
+                fabric, "fabric_allocation_supported", return_value=False
+            ),
+            mock.patch.object(fabric, "multicast_bind_supported", return_value=True),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            fabric.gather_fabric_map()
+            assert fabric.group_has_multicast([0, 1, 2]) is True
+            assert fabric.group_has_multicast([0, 3]) is False
+            with (
+                mock.patch.object(tail.dist, "is_initialized", return_value=True),
+                mock.patch.object(
+                    tail.dist, "get_process_group_ranks", side_effect=lambda g: g
+                ),
+            ):
+                assert tail.multicast_reachable([0, 1]) is True
+                assert tail.multicast_reachable([2, 3]) is False
+    finally:
+        fabric._fabric_map = None
+        fabric._host_map = None
+        fabric._multicast_map = None
+
+
+def test_an_ungathered_multicast_map_keeps_the_topology_answer() -> None:
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    saved = fabric._multicast_map
+    fabric._multicast_map = None
+    try:
+        assert fabric.group_has_multicast([0, 1]) is True
+    finally:
+        fabric._multicast_map = saved
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="the bind probe needs two devices",
+)
+def test_the_bind_probe_leaves_the_context_as_it_found_it() -> None:
+    """The probe runs inside a live server; it must not move the current device."""
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    torch.cuda.set_device(0)
+    torch.zeros(1, device="cuda")
+    fabric._probe_multicast_bind(0)
+    assert torch.cuda.current_device() == 0
+    torch.zeros(1, device="cuda").add_(1)
+    torch.cuda.synchronize()

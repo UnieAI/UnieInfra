@@ -487,6 +487,7 @@ class LogitsProcessor(nn.Module):
 
         from tokenspeed_kernel.ops.communication.fabric import (
             group_has_fabric,
+            group_has_multicast,
         )
 
         from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -496,6 +497,8 @@ class LogitsProcessor(nn.Module):
         spans_hosts = bool(nprocs_per_node) and (
             len({rank // nprocs_per_node for rank in self.tp_group}) > 1
         )
+        if not group_has_multicast(self.tp_group):
+            return False
         if not spans_hosts:
             return True
         return group_has_fabric(self.tp_group)

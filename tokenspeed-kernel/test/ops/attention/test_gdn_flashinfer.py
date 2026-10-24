@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.attention.gdn import flashinfer
 
 
@@ -42,8 +41,7 @@ def test_gdn_flashinfer_shape_gate(
     monkeypatch.setattr(flashinfer, "is_available", lambda: True)
 
     assert (
-        flashinfer.is_supported(head_dim, dtype, num_q_heads, num_v_heads)
-        is expected
+        flashinfer.is_supported(head_dim, dtype, num_q_heads, num_v_heads) is expected
     )
 
 

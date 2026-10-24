@@ -127,9 +127,13 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
-    // Every published entry of the request streams: its pages, its tail and
-    // the state checkpoint published with the frontier.
-    coordinator_.QueueCachedBlocksForStore(store_hashes);
+    // Every published entry of the request streams: its pages and its tail.
+    // The state checkpoint published with the frontier only with
+    // store_final_state_to_host: it is a whole recurrent state (~100 MB on a
+    // 27B hybrid) that only a continuation of this very sequence can hit,
+    // and the Device copy keeps serving that while it stays resident. The
+    // prompt's checkpoints streamed when they were published.
+    coordinator_.QueueCachedBlocksForStore(store_hashes, config_.store_final_state_to_host);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);

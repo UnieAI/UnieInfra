@@ -132,6 +132,9 @@ protected:
         SchedulerConfig cfg = FinishOnlyWriteBackTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;
         cfg.host_allocator.total_pages = 16;
+        // Opted in: by default a finish leaves its final states on Device
+        // (test_final_state_host_store.cpp).
+        cfg.store_final_state_to_host = true;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         for (std::int32_t i = 0; i < 3; ++i) {
             CacheGroupConfig state = cfg.cache_groups.front();

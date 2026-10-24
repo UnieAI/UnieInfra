@@ -407,10 +407,11 @@ public:
         std::vector<CacheBlockRef> blocks;
         HostAllocationStats stats;
     };
-    // Queue every already-published non-state Device cache entry under these
-    // content hashes (chain hashes and tail hashes alike) for D2H Store.
-    // Missing keys and an absent Host tier are silently skipped.
-    void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
+    // Queue every already-published Device cache entry under these content
+    // hashes (chain hashes and tail hashes alike) for D2H Store, State
+    // checkpoints only with include_state. Missing keys and an absent Host
+    // tier are silently skipped.
+    void QueueCachedBlocksForStore(std::span<const std::string> content_hashes, bool include_state = true);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     // One Host block per (group, bucket) entry, in the bucket of the Device

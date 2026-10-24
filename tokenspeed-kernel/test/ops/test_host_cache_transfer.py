@@ -1136,6 +1136,43 @@ def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
 
 
 @requires_cuda
+@pytest.mark.parametrize("submitter", ["cuda-batch", "copy"])
+def test_cache_ranges_dma_submitters_are_byte_exact(monkeypatch, submitter):
+    module = _load_host_transfer_contract_module()
+    host_dma = importlib.import_module("tokenspeed_kernel.ops.kvcache.host_dma")
+    monkeypatch.setenv("TOKENSPEED_HOST_DMA_SUBMITTER", submitter)
+    monkeypatch.setattr(host_dma, "_active", None)
+    # Three runtime calls for seven ranges.
+    monkeypatch.setattr(host_dma, "CUDA_MEMCPY_BATCH", 3)
+    if submitter not in host_dma.host_dma_submitters():
+        pytest.skip(f"{submitter} is unavailable here")
+
+    device = torch.randint(0, 255, (7 * 512,), dtype=torch.uint8, device="cuda")
+    host = torch.zeros(7 * 1024, dtype=torch.uint8, pin_memory=True)
+    ranges = tuple((0, 512 * i, 1024 * (6 - i) + 16, 400 + i) for i in range(7))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    module._transfer_cache_ranges("d2h", (device,), host, ranges, stream)
+    stream.synchronize()
+    assert host_dma.host_dma_submitters()[0] == submitter
+    for _, device_offset, host_offset, num_bytes in ranges:
+        assert torch.equal(
+            host[host_offset : host_offset + num_bytes],
+            device[device_offset : device_offset + num_bytes].cpu(),
+        )
+
+    host.add_(1)
+    module._transfer_cache_ranges("h2d", (device,), host, ranges, stream)
+    stream.synchronize()
+    for _, device_offset, host_offset, num_bytes in ranges:
+        assert torch.equal(
+            device[device_offset : device_offset + num_bytes].cpu(),
+            host[host_offset : host_offset + num_bytes],
+        )
+
+
+@requires_cuda
 def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
     module = _load_host_transfer_contract_module()
     geometry = module.build_host_transfer_geometry(
@@ -1352,3 +1389,35 @@ def test_layered_h2d_reuses_workspaces_after_delayed_flag_reset():
         offset = generation * 16
         assert torch.equal(first.cpu(), host[offset : offset + 8])
         assert torch.equal(second.cpu(), host[offset + 8 : offset + 16])
+
+
+def test_host_dma_falls_back_when_a_submitter_refuses(monkeypatch):
+    host_dma = importlib.import_module("tokenspeed_kernel.ops.kvcache.host_dma")
+    calls = []
+
+    def refuse(*args):
+        calls.append("refuse")
+        return False
+
+    def accept(*args):
+        calls.append("accept")
+        return True
+
+    monkeypatch.delenv("TOKENSPEED_HOST_DMA_SUBMITTER", raising=False)
+    monkeypatch.setattr(host_dma, "_registry", dict(host_dma._registry))
+    monkeypatch.setattr(host_dma, "_active", None)
+    host_dma.register_host_dma_submitter(
+        host_dma.HostDmaSubmitter("refuses", 100, lambda: True, refuse)
+    )
+    host_dma.register_host_dma_submitter(
+        host_dma.HostDmaSubmitter("accepts", 50, lambda: True, accept)
+    )
+    host_dma.register_host_dma_submitter(
+        host_dma.HostDmaSubmitter("absent", 200, lambda: False, refuse)
+    )
+
+    assert host_dma.submit_host_dma("d2h", (), None, ()) == "accepts"
+    assert host_dma.submit_host_dma("d2h", (), None, ()) == "accepts"
+    # Retired after its first refusal; never-available ones are never tried.
+    assert calls == ["refuse", "accept", "accept"]
+    assert host_dma.host_dma_submitters()[0] == "accepts"

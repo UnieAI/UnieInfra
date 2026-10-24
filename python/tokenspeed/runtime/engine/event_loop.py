@@ -201,6 +201,7 @@ def scheduler_config_from_args(
         # The threshold is unset (None) without a store; the binding takes 0.
         l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages if has_l3 else 0,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
+        store_final_state_to_host=server_args.kvstore_store_final_state,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,

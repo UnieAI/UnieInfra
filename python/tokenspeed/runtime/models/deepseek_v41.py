@@ -112,6 +112,7 @@ from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
+    is_breakable_capture_active,
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import (
@@ -1017,7 +1018,6 @@ class DeepseekV41Attention(nn.Module):
             main_rope_cache=main_rope_cache,
         )
 
-    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -1032,6 +1032,250 @@ class DeepseekV41Attention(nn.Module):
         hidden_codes/hidden_scales optionally carry hidden_states already
         quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
         """
+        # Under a prefill capture only the cache writes, selection and attention
+        # stay an eager break; the token-local projections around them are
+        # captured into the graph segments. The narrowing layer changes the row
+        # count inside the layer, and indexer QCP and KVP partition rows by
+        # request, so those keep the whole-layer break.
+        backend, mode = ctx.attn_backend, ctx.forward_mode
+        if (
+            is_breakable_capture_active()
+            and mode is not None
+            and mode.is_extend()
+            and self.layer_id != self.ced_decoder_start
+            and len(backend.spec.indexer_query_group) <= 1
+            and backend.kvp_size == 1
+        ):
+            return self._captured_extend_forward(
+                positions,
+                hidden_states,
+                ctx,
+                reduce_output,
+                hidden_codes,
+                hidden_scales,
+            )
+        return self._layer_forward(
+            positions, hidden_states, ctx, reduce_output, hidden_codes, hidden_scales
+        )
+
+    def _captured_extend_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None,
+        hidden_scales: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The extend path of ``_layer_forward`` split around a narrow break.
+
+        Runs on the bucket's padded rows. The replayed graph also serves mixed
+        extend+decode batches; those take the same projections and RoPE as a
+        pure extend in ``_layer_forward`` (the decode-only query padding and
+        aux-stream overlap apply to pure decode alone).
+        """
+        qkv, _ = self.wq_a_wkv(
+            hidden_states if hidden_codes is None else hidden_codes,
+            block_scale=hidden_scales,
+            output_dtype=None if hidden_codes is None else hidden_states.dtype,
+        )
+        qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
+        qr, q_input, q_scale, index_q_input, index_q_scale = self._query_inputs(qr)
+        self.rotary_emb._prepare_cache(hidden_states.device)
+        index_q, index_weights = (
+            self.indexer(
+                hidden_states, index_q_input, index_q_scale, positions, self.rotary_emb
+            )
+            if self.indexer is not None
+            else (None, None)
+        )
+        q, _ = self.wq_b(
+            q_input,
+            block_scale=q_scale,
+            output_dtype=qr.dtype if q_scale is not None else None,
+        )
+        q = self.rotary_emb.apply_owned(
+            q.unflatten(-1, (self.n_local_heads, self.head_dim)), positions, False
+        )
+        swa, swa_rope_cache, swa_norm_weight = self._swa_inputs(swa, positions)
+        out_rope_cache = self._out_rope_cache(q)
+        out = self._extend_attention(
+            hidden_states,
+            q,
+            swa,
+            index_q,
+            index_weights,
+            swa_rope_cache,
+            swa_norm_weight,
+            out_rope_cache,
+            ctx,
+        )
+        return self._output_projection(out, positions, out_rope_cache, reduce_output)
+
+    @break_point
+    def _extend_attention(
+        self,
+        hidden_states: torch.Tensor,
+        q: torch.Tensor,
+        swa: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        swa_rope_cache: torch.Tensor | None,
+        swa_norm_weight: torch.Tensor | None,
+        out_rope_cache: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Cache writes, global selection and attention over the live rows."""
+        backend, mode = ctx.attn_backend, ctx.forward_mode
+        meta = _row_plan(self.layer_id, self.ced_decoder_start, ctx).source
+        hidden_states, q, swa, index_q, index_weights = slice_to_real_tokens(
+            meta.positions.numel(), hidden_states, q, swa, index_q, index_weights
+        )
+        positions, requests = meta.positions, meta.request_indices
+        self._write_global_kv(hidden_states, positions, requests, backend, mode)
+        if self.indexer is not None and not backend.indexer_needs_scores(
+            self.layer_id, positions, requests, mode
+        ):
+            # The graph projects every source; a short history selects all rows.
+            index_q = index_weights = None
+        out = backend.forward_v41(
+            q,
+            swa,
+            layer_id=self.layer_id,
+            positions=positions,
+            request_indices=requests,
+            forward_mode=mode,
+            index_q=index_q,
+            index_weights=index_weights,
+            attn_sink=self._kernel_attn_sink(),
+            softmax_scale=self.head_dim**-0.5,
+            index_process_group=None,
+            swa_rope_cache=swa_rope_cache,
+            swa_norm_weight=swa_norm_weight,
+            swa_norm_eps=self.kv_norm.variance_epsilon,
+            out_rope_cache=out_rope_cache,
+        )
+        return out[:, : self.n_local_heads]
+
+    def _query_inputs(self, qr: torch.Tensor):
+        """Normalize the query LoRA rows and, where wq_b takes FP8, quantize them.
+
+        Returns (qr, wq_b input, its scale, indexer input, its scale).
+        """
+        if (
+            qr.is_cuda
+            and qr.dtype == torch.bfloat16
+            and (
+                current_platform().is_nvidia
+                or current_platform().is_cdna4
+                or current_platform().is_cdna5
+            )
+            and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
+        ):
+            qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
+                qr,
+                self.q_norm.weight,
+                self.q_norm.variance_epsilon,
+                override=None,
+                solution="triton",
+            )
+        else:
+            qr = q_input = _attention_norm(qr, self.q_norm)
+            q_scale = None
+        index_q_input, index_q_scale = qr, None
+        if (
+            q_scale is not None
+            and self.indexer is not None
+            and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
+        ):
+            # Both reference methods consume canonical group-32 UE8M0 scales
+            # and reuse their prepared weight scales where the native GEMM runs.
+            index_q_input, index_q_scale = q_input, q_scale
+        return qr, q_input, q_scale, index_q_input, index_q_scale
+
+    def _swa_inputs(self, swa: torch.Tensor, positions: torch.Tensor):
+        """Normalize and rotate the SWA rows, or defer both to the cache writer.
+
+        Returns (swa, SWA RoPE cache or None, deferred norm weight or None).
+        """
+        swa_rope_cache = None
+        swa_norm_weight = None
+        if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
+            self.rotary_emb._prepare_cache(swa.device)
+            swa_rope_cache = self.rotary_emb.cos_sin_cache
+            if (
+                current_platform().is_blackwell
+                or current_platform().is_cdna4
+                or current_platform().is_cdna5
+            ):
+                swa_norm_weight = self.kv_norm.weight
+            else:
+                swa = _attention_norm(swa, self.kv_norm)
+        else:
+            swa = _attention_norm(swa, self.kv_norm)
+            swa = self.rotary_emb.apply_owned(swa, positions, False)
+        return swa, swa_rope_cache, swa_norm_weight
+
+    def _out_rope_cache(self, q: torch.Tensor) -> torch.Tensor | None:
+        # CDNA4/5 rotate the attention output back inside the attention kernel.
+        return (
+            self.rotary_emb.inverse_cos_sin_cache
+            if q.is_cuda
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
+            else None
+        )
+
+    def _output_projection(
+        self,
+        out: torch.Tensor,
+        positions: torch.Tensor,
+        out_rope_cache: torch.Tensor | None,
+        reduce_output: bool,
+    ) -> torch.Tensor:
+        """Inverse RoPE, grouped output LoRA and the TP reduction."""
+        if out_rope_cache is None:
+            out = self.rotary_emb.apply_owned(out, positions, True)
+        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
+        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+        target = None
+        if self.mapping.attn.has_tp:
+            target = _all_reduce_output(
+                (grouped.shape[0], self.wo_b.output_size),
+                grouped,
+                self.mapping.attn.tp_group,
+            )
+        method = self.wo_b.quant_method
+        if (
+            grouped.is_cuda
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
+            and isinstance(method, _ReferenceFp8LinearMethod)
+            and method.prepared_weight_scales is None
+        ):
+            # wo_b's group-32 activation quantization runs in wo_a's epilogue.
+            codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
+            out, _ = self.wo_b(codes, scale=scales, out=target)
+        else:
+            out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+            out, _ = self.wo_b(out, scale=None, out=target)
+        if self.mapping.attn.has_tp and reduce_output:
+            out = all_reduce(
+                out,
+                group=self.mapping.attn.tp_group,
+                backend=None,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        return out
+
+    @break_point
+    def _layer_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None = None,
+        hidden_scales: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
@@ -1065,35 +1309,7 @@ class DeepseekV41Attention(nn.Module):
             output_dtype=None if hidden_codes is None else hidden_states.dtype,
         )
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
-        if (
-            qr.is_cuda
-            and qr.dtype == torch.bfloat16
-            and (
-                current_platform().is_nvidia
-                or current_platform().is_cdna4
-                or current_platform().is_cdna5
-            )
-            and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
-        ):
-            qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
-                qr,
-                self.q_norm.weight,
-                self.q_norm.variance_epsilon,
-                override=None,
-                solution="triton",
-            )
-        else:
-            qr = q_input = _attention_norm(qr, self.q_norm)
-            q_scale = None
-        index_q_input, index_q_scale = qr, None
-        if (
-            q_scale is not None
-            and self.indexer is not None
-            and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
-        ):
-            # Both reference methods consume canonical group-32 UE8M0 scales
-            # and reuse their prepared weight scales where the native GEMM runs.
-            index_q_input, index_q_scale = q_input, q_scale
+        qr, q_input, q_scale, index_q_input, index_q_scale = self._query_inputs(qr)
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
@@ -1201,22 +1417,7 @@ class DeepseekV41Attention(nn.Module):
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
             else:
                 q = self.rotary_emb.apply_owned(q, positions, False)
-            swa_rope_cache = None
-            swa_norm_weight = None
-            if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
-                self.rotary_emb._prepare_cache(swa.device)
-                swa_rope_cache = self.rotary_emb.cos_sin_cache
-                if (
-                    current_platform().is_blackwell
-                    or current_platform().is_cdna4
-                    or current_platform().is_cdna5
-                ):
-                    swa_norm_weight = self.kv_norm.weight
-                else:
-                    swa = _attention_norm(swa, self.kv_norm)
-            else:
-                swa = _attention_norm(swa, self.kv_norm)
-                swa = self.rotary_emb.apply_owned(swa, positions, False)
+            swa, swa_rope_cache, swa_norm_weight = self._swa_inputs(swa, positions)
         if overlap:
             # Aux-owned scratch can outlive this layer through source/reuse
             # records. Main consumers and allocator reuse both follow the join.
@@ -1229,13 +1430,7 @@ class DeepseekV41Attention(nn.Module):
             if record.candidates is not None:
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
-        # CDNA4/5 rotate the attention output back inside the attention kernel.
-        out_rope_cache = (
-            self.rotary_emb.inverse_cos_sin_cache
-            if q.is_cuda
-            and (current_platform().is_cdna4 or current_platform().is_cdna5)
-            else None
-        )
+        out_rope_cache = self._out_rope_cache(q)
         out = backend.forward_v41(
             q,
             swa,
@@ -1253,39 +1448,9 @@ class DeepseekV41Attention(nn.Module):
             swa_norm_eps=self.kv_norm.variance_epsilon,
             out_rope_cache=out_rope_cache,
         )
-        out = out[:, : self.n_local_heads]
-        if out_rope_cache is None:
-            out = self.rotary_emb.apply_owned(out, positions, True)
-        grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
-        weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
-        target = None
-        if self.mapping.attn.has_tp:
-            target = _all_reduce_output(
-                (grouped.shape[0], self.wo_b.output_size),
-                grouped,
-                self.mapping.attn.tp_group,
-            )
-        method = self.wo_b.quant_method
-        if (
-            grouped.is_cuda
-            and (current_platform().is_cdna4 or current_platform().is_cdna5)
-            and isinstance(method, _ReferenceFp8LinearMethod)
-            and method.prepared_weight_scales is None
-        ):
-            # wo_b's group-32 activation quantization runs in wo_a's epilogue.
-            codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
-            out, _ = self.wo_b(codes, scale=scales, out=target)
-        else:
-            out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
-            out, _ = self.wo_b(out, scale=None, out=target)
-        if self.mapping.attn.has_tp and reduce_output:
-            out = all_reduce(
-                out,
-                group=self.mapping.attn.tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        return out
+        return self._output_projection(
+            out[:, : self.n_local_heads], positions, out_rope_cache, reduce_output
+        )
 
 
 class DeepseekV41MoE(DeepseekV4MoE):

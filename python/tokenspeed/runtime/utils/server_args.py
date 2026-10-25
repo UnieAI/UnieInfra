@@ -378,6 +378,11 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
+    # Hold new generate requests up to this long (ms) while other requests
+    # are decoding, so requests arriving close together prefill in one step.
+    # A prefill step costs a fixed weight stream plus a per-token part; on
+    # DeepSeek-V4.1 H200 TP4 about 24 ms + 17.5 ms per 1k tokens. 0 is off.
+    prefill_coalesce_ms: float = 0.0
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
     # JSON on the CLI, normalized once to generic runtime options.
@@ -2595,6 +2600,18 @@ class ServerArgs:
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the "
             "same iteration. Not supported with aggregated DCP.",
+        )
+        parser.add_argument(
+            "--prefill-coalesce-ms",
+            type=float,
+            default=ServerArgs.prefill_coalesce_ms,
+            help=(
+                "Hold new requests up to this many milliseconds while other "
+                "requests are decoding, so requests that arrive close together "
+                "prefill in one step and pay the step's fixed cost once "
+                "(0 = admit immediately). A request arriving while nothing "
+                "decodes is never held."
+            ),
         )
         parser.add_argument(
             "--prefix-granularity",

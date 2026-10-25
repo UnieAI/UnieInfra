@@ -222,11 +222,42 @@ class V41PrefillRequestPlan:
     history_slots: dict[int, torch.Tensor]
 
 
+class V41PrefillHistory(NamedTuple):
+    """Workspace placement of the requests' global history for one ratio.
+
+    ``groups`` lists (query rows or None for the whole window, history slots):
+    each group's history fills the workspace tail in turn, so one group's rows
+    stay within the context-length budget. ``base`` [T] is the workspace row of
+    global row 0 of each query's request, -1 for queries outside every request.
+    """
+
+    groups: tuple[tuple[torch.Tensor | None, torch.Tensor], ...]
+    base: torch.Tensor
+    capacity: int
+
+
 @dataclass
 class V41SWAQueryPlan:
+    """Prefill addresses shared by every layer of one forward.
+
+    The batched prefill reads one BF16 workspace for the whole window:
+    ``[current rows (T) | every request's old SWA prefix | global history]``.
+    ``prefix_slots`` are the SWA slots copied into the prefix block, and
+    ``swa_indices`` [T, 128] each query's workspace rows of its SWA keys.
+    """
+
     positions: torch.Tensor
     request_indices: torch.Tensor
     requests: tuple[V41PrefillRequestPlan, ...]
+    prefix_slots: torch.Tensor
+    swa_indices: torch.Tensor
+    histories: dict[int, V41PrefillHistory]
+    # (owner, workspace) of the last layer whose single-group history was
+    # gathered: later layers of that owner read the same global history this
+    # forward and rewrite only the workspace head. ``shared_indices`` keeps the
+    # last prefill indices with the owner and selection tensors they encode.
+    shared_workspace: tuple[int, torch.Tensor] | None = None
+    shared_indices: tuple | None = None
 
 
 @dataclass
@@ -299,6 +330,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decode_buffers: V41Metadata | None = None
         self._max_decode_bs = 0
         self._swa_plans: dict[tuple[ForwardMode, int], V41SWAQueryPlan] = {}
+        # One sparse-attention pass per prefill window instead of per request;
+        # the per-request loop remains for KVP and QCP head exchange.
+        self._batch_prefill = True
         self._prefill_spans: tuple[V41PrefillSpan, ...] = ()
         self._decoder_view: V41DecoderView | None = None
         self._decode_schedule_keepalive: list[object] = []
@@ -1756,9 +1790,301 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     request, rows, last_position, prefix_slots, indices, {}
                 )
             )
-        plan = V41SWAQueryPlan(positions, requests, tuple(plans))
+        # Rebase each request's key list onto the shared workspace: its prefix
+        # follows all query rows, and its own query rows are the window rows.
+        n = positions.numel()
+        swa_indices = torch.full((n, 128), -1, dtype=torch.int32, device=self.device)
+        prefix_base = n
+        for request in plans:
+            count = request.prefix_slots.numel()
+            rows = request.rows
+            if isinstance(rows, slice):
+                rows = torch.arange(rows.start, rows.stop, device=self.device)
+            keys = torch.cat(
+                (
+                    torch.arange(prefix_base, prefix_base + count, device=self.device),
+                    rows,
+                )
+            ).to(torch.int32)
+            local = request.swa_indices
+            swa_indices[request.rows] = keys[local.clamp_min(0).long()].masked_fill(
+                local < 0, -1
+            )
+            prefix_base += count
+        prefix_slots = (
+            torch.cat([request.prefix_slots for request in plans])
+            if plans
+            else torch.empty(0, dtype=torch.int64, device=self.device)
+        )
+        plan = V41SWAQueryPlan(
+            positions, requests, tuple(plans), prefix_slots, swa_indices, {}
+        )
         self._swa_plans[key] = plan
         return plan
+
+    def _prefill_history(self, plan, owner, forward_mode) -> V41PrefillHistory:
+        """Place the window's requests' global history rows of ``owner``'s ratio.
+
+        A request attends any of its rows below its last position, so all of
+        them are copied; the selected ones are read by index. Requests are
+        grouped so a group's history stays within the context length.
+        """
+        ratio = self.spec.compress_ratios[owner]
+        history = plan.histories.get(ratio)
+        if history is not None:
+            return history
+        n = plan.positions.numel()
+        start = n + plan.prefix_slots.numel()
+        groups, group, total = [], [], 0
+        for request in plan.requests:
+            count = (request.last_position + 1) // ratio
+            if group and total + count > self.context_len:
+                groups.append(group)
+                group, total = [], 0
+            group.append((request, count))
+            total += count
+        if group:
+            groups.append(group)
+        base = torch.full((n,), -1, dtype=torch.int32, device=self.device)
+        placed = []
+        for group in groups:
+            offset = start
+            for request, count in group:
+                base[request.rows] = offset
+                offset += count
+            counts = [count for _, count in group]
+            history_positions = torch.cat(
+                [torch.arange(count, device=self.device) for count in counts]
+            )
+            history_requests = torch.repeat_interleave(
+                self._upload_int64([request.request for request, _ in group]),
+                self._upload_int64(counts),
+                output_size=history_positions.numel(),
+            )
+            slots = self.cache_slots(
+                self._owner_group(owner),
+                history_positions * ratio,
+                history_requests,
+                forward_mode,
+            )
+            rows = None
+            if len(groups) > 1:
+                rows = torch.cat(
+                    [
+                        (
+                            torch.arange(
+                                request.rows.start,
+                                request.rows.stop,
+                                device=self.device,
+                            )
+                            if isinstance(request.rows, slice)
+                            else request.rows
+                        )
+                        for request, _ in group
+                    ]
+                )
+            placed.append((rows, slots))
+        history = V41PrefillHistory(
+            tuple(placed),
+            base,
+            max((slots.numel() for _, slots in placed), default=0),
+        )
+        plan.histories[ratio] = history
+        return history
+
+    def _prefill_indices(
+        self, plan, owner, shared, logical_rows, global_slots, base, rows
+    ):
+        """``dsv41.prefill_indices``, reused by the layers that share a selection.
+
+        Reuse layers of one source attend the same selection through the same
+        history placement, so with a shared workspace their indices agree.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        hit = plan.shared_indices if shared else None
+        if (
+            hit is not None
+            and hit[0] == owner
+            and hit[1] is global_slots
+            and hit[2] is logical_rows
+        ):
+            return hit[3]
+        indices = dsv41.prefill_indices(
+            plan.swa_indices, logical_rows, global_slots, base, rows, None
+        )
+        if shared:
+            plan.shared_indices = (owner, global_slots, logical_rows, indices)
+        return indices
+
+    def _batched_prefill_eligible(
+        self, plan, canonical, q, index_process_group, owner
+    ) -> bool:
+        """Whether one batched pass serves the window.
+
+        KVP gathers each request's history from its owners, and QCP exchanges
+        heads per request, so both keep the per-request loop.
+        """
+        if not self._batch_prefill or self.kvp_size > 1:
+            return False
+        if not (canonical and q.is_cuda and index_process_group is None):
+            return True
+        group = self.spec.attention_query_group
+        for request in plan.requests:
+            rows = request.rows
+            count = rows.stop - rows.start if isinstance(rows, slice) else rows.numel()
+            if should_exchange_prefill_heads(
+                num_queries=count,
+                local_heads=q.shape[1],
+                group_size=len(group),
+                min_queries=self.spec.attention_query_min_tokens,
+                swa_min_queries=self.spec.attention_query_swa_min_tokens,
+                has_global=owner >= 0,
+            ):
+                return False
+        return True
+
+    def _forward_prefill_batched(
+        self,
+        plan,
+        q,
+        swa_kv,
+        *,
+        owner,
+        cache,
+        global_cache,
+        global_slots,
+        locations,
+        positions,
+        request_indices,
+        forward_mode,
+        attn_sink,
+        softmax_scale,
+        swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
+        out_rope_cache,
+    ):
+        """Attend every request of a prefill window in one sparse pass.
+
+        The BF16 workspace holds [current rows | every old SWA prefix | global
+        history]; the sparse prefill kernel reads it through per-query indices.
+        Outputs match the per-request loop, which reads the same quantized rows.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        n = positions.numel()
+        prefix_count = plan.prefix_slots.numel()
+        history = (
+            self._prefill_history(plan, owner, forward_mode) if owner >= 0 else None
+        )
+        history_start = n + prefix_count
+        shared = history is not None and len(history.groups) == 1
+        workspace, history_ready = None, False
+        if shared and plan.shared_workspace is not None:
+            if plan.shared_workspace[0] == owner:
+                workspace, history_ready = plan.shared_workspace[1], True
+        if workspace is None:
+            workspace = q.new_empty(
+                (history_start + (history.capacity if history is not None else 0), 512)
+            )
+            if shared:
+                plan.shared_workspace = (owner, workspace)
+        # Read every old prefix before this layer publishes its own rows.
+        dsv41.cache_gather(
+            cache,
+            plan.prefix_slots,
+            self.swa_format,
+            workspace[n:history_start],
+        )
+        # Current rows are quantized exactly as cache storage.
+        if swa_rope_cache is None:
+            dsv41.cache_unpack(
+                dsv41.cache_pack(swa_kv, self.swa_format, None),
+                self.swa_format,
+                workspace[:n],
+            )
+        else:
+            dsv41.swa_rope_scatter(
+                swa_kv,
+                positions,
+                swa_rope_cache,
+                cache,
+                locations,
+                self.swa_format,
+                workspace[:n],
+                swa_norm_weight,
+                swa_norm_eps,
+            )
+        kv = workspace[:, None, :]
+
+        def attend(rows, indices):
+            return dsv41.selected_attention(
+                q if rows is None else q[rows],
+                cache,
+                None,
+                None,
+                global_cache,
+                None,
+                None,
+                attn_sink,
+                softmax_scale,
+                None,
+                V41_PREFILL_QUERY_TILE,
+                None,
+                kv,
+                indices,
+                lse=None,
+            )
+
+        if history is None:
+            out = attend(None, plan.swa_indices)
+        else:
+            record = self.sparse_topk.prefill
+            if (
+                record.positions is positions
+                and record.request_indices is request_indices
+            ):
+                logical_rows = record.logical_rows
+            else:
+                selected = self._selection_rows(record, positions, request_indices)
+                logical_rows = record.logical_rows[selected.clamp_min(0)].masked_fill(
+                    selected[:, None] < 0, -1
+                )
+            # Several groups only when the requests' histories together exceed
+            # the context-length workspace; each group then attends its rows.
+            out = None if len(history.groups) == 1 else torch.zeros_like(q)
+            for rows, slots in history.groups:
+                # Stream order keeps a shared history intact: this layer's
+                # writes to the workspace head follow the previous layer's read.
+                if not history_ready:
+                    dsv41.cache_gather(
+                        global_cache,
+                        slots,
+                        self.global_format,
+                        workspace[history_start : history_start + slots.numel()],
+                    )
+                result = attend(
+                    rows,
+                    self._prefill_indices(
+                        plan,
+                        owner,
+                        shared,
+                        logical_rows,
+                        global_slots,
+                        history.base,
+                        rows,
+                    ),
+                )
+                if rows is None:
+                    out = result
+                else:
+                    out[rows] = result
+        if swa_rope_cache is None:
+            dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+        if out_rope_cache is not None:
+            dsv41.rope_inplace(out, positions, out_rope_cache, None)
+        return out
 
     def _prefill_global_history(self, plan, owner, forward_mode):
         ratio = self.spec.compress_ratios[owner]
@@ -2072,6 +2398,28 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 lse=None,
             )
         plan = self._swa_query_plan(positions, request_indices, forward_mode)
+        if self._batched_prefill_eligible(
+            plan, canonical, q, index_process_group, owner
+        ):
+            return self._forward_prefill_batched(
+                plan,
+                q,
+                swa_kv,
+                owner=owner,
+                cache=cache,
+                global_cache=global_cache,
+                global_slots=global_slots,
+                locations=locations,
+                positions=positions,
+                request_indices=request_indices,
+                forward_mode=forward_mode,
+                attn_sink=attn_sink,
+                softmax_scale=softmax_scale,
+                swa_rope_cache=swa_rope_cache,
+                swa_norm_weight=swa_norm_weight,
+                swa_norm_eps=swa_norm_eps,
+                out_rope_cache=out_rope_cache,
+            )
         # Quantize current rows exactly as cache storage, without publishing them
         # until every request has read its old sliding prefix.
         prefixes = [

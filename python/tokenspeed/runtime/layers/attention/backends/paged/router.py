@@ -361,12 +361,15 @@ class CacheGroupRouter(AttentionBackend):
         return self._geometry
 
     def _table_specs(self) -> list[GroupTableSpec]:
+        # A router bound by geometry alone (no pool) addresses contiguous pages.
+        arena = None if self.cache_pool is None else self.cache_pool.arena
         return [
             GroupTableSpec(
                 group_id=gid,
                 block_granularity=self.geometry.granularity_of(gid),
                 kernel_page_size=leaf.kernel_page_size,
                 max_num_pages=leaf.max_num_pages,
+                page_spacing=1 if arena is None else arena.page_spacing(gid),
             )
             for gid, leaf in self.leaves.items()
         ]

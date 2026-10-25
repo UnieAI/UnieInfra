@@ -31,7 +31,11 @@ from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
 from tokenspeed_kernel.ops.attention.mha._triton.qkv_rotary import *  # noqa: F403
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
@@ -155,8 +159,15 @@ def triton_mha_extend_with_kvcache(
     name="triton_mha_decode_with_kvcache",
     solution="triton",
     capability=_PORTABLE_CAPABILITY,
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
+    # An fp8-e4m3 cache (unit scale) is read with a query left unquantized.
+    signatures=format_signatures(("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES)
+    | frozenset(
+        format_signature(
+            q=dense_tensor_format(dtype),
+            k_cache=dense_tensor_format(torch.float8_e4m3fn),
+            v_cache=dense_tensor_format(torch.float8_e4m3fn),
+        )
+        for dtype in _PORTABLE_DTYPES
     ),
     priority=Priority.PORTABLE,
     traits={

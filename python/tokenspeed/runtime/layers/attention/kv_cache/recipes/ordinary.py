@@ -27,6 +27,7 @@ MHA draft is just layers with two different geometries in one plan.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import cached_property
@@ -47,6 +48,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
+    cache_dtype_bytes,
     cache_dtype_name,
     mxfp8_kv_scale_fields,
     scatter_stored_dtype_name,
@@ -153,6 +155,32 @@ class OrdinaryRecipe(CacheRecipe):
             )
         return capacity
 
+    @cached_property
+    @override
+    def layer_kv_head_counts(self) -> tuple[int, ...] | None:
+        """Per-layer KV head count (PRE-TP) when a model differs by layer.
+
+        None keeps the uniform default: every layer serves the pool's one
+        head count and the cache spec carries no per-layer vector, exactly as
+        before. Only a per-layer model (gemma-4) publishes its real per-layer
+        counts so the pool and scheduler know the layers are not byte-uniform.
+        """
+        target = _config_kv_head_counts(self.attn_config, self.num_target_layers)
+        draft = _config_kv_head_counts(self.draft_attn_config, self.num_draft_layers)
+        if target is None and draft is None:
+            return None
+        target = target or (
+            (self.attn_config.component(SoftmaxAttnConfig).num_kv_heads,)
+            * self.num_target_layers
+        )
+        if self.draft_attn_config is None:
+            return target
+        draft = draft or (
+            (self.draft_attn_config.component(SoftmaxAttnConfig).num_kv_heads,)
+            * self.num_draft_layers
+        )
+        return target + draft
+
     # ---- geometry ----
 
     @property
@@ -168,9 +196,39 @@ class OrdinaryRecipe(CacheRecipe):
         # padding; the profiled byte budget still bounds the arena capacity.
         return float("inf")
 
+    @property
+    def per_layer_geometry(self) -> bool:
+        """Whether this model's layers are not byte-uniform across groups.
+
+        The one predicate that separates the two capacity/packing regimes.
+        It reuses the single signal a per-layer model already publishes --
+        ``layer_kv_head_counts`` is ``None`` for every uniform model
+        (gemma-3, llama, qwen, every MLA/DSA/MSA) and a per-layer vector only
+        for a model (gemma-4) whose full and sliding layers differ in head_dim
+        and therefore cannot share a byte-uniform slab. No ``if gemma4`` lives
+        anywhere; both the packing and capacity seams branch on this alone.
+        """
+        return self.layer_kv_head_counts is not None
+
     @override
-    def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
-        """One CacheBlock per parent: the block span is the identity grain."""
+    def packing(
+        self, groups: tuple[CacheGroupDeclaration, ...]
+    ) -> Mapping[str, int] | None:
+        """How many of each group's CacheBlocks share one physical parent.
+
+        A per-layer-geometry model (gemma-4) returns ``None`` so :func:`pack`
+        derives per-group packing from the groups' byte ratios -- the general
+        path: its groups share one flat plane, and a parent holds as many of a
+        group's pages as fit. Its two geometries are not byte-equal (full 4 x 512,
+        sliding 16 x 256), so pinning every group to one CacheBlock per parent
+        would size each group's stride at the whole LCM block while its payload
+        fills only its own planes, blowing the padding fraction far past the
+        limit. A uniform model keeps the shared-slab pin every current model
+        relies on: one CacheBlock per parent, the block span as the identity
+        grain.
+        """
+        if self.per_layer_geometry:
+            return None
         return {spec.group_id: 1 for spec, _ in groups}
 
     # ---- fields ----
@@ -195,13 +253,21 @@ class OrdinaryRecipe(CacheRecipe):
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
+        # A per-layer-geometry model derives per-group packing (its groups
+        # pack at different CacheBlocks-per-parent, so a parent no longer spans
+        # the identity grain), so the shared-slab shortcut below is wrong for
+        # it: defer to the general base formula, which sizes a parent from the
+        # tightest packing it actually carries (``_max_packing(layout) *
+        # prefix_granularity``) and the budget against the packed LCM-block
+        # bytes.
+        if self.per_layer_geometry:
+            return super().num_lcm_blocks(layout)
+        bytes_per_token = _config_bytes_per_token(
             self.attn_config, self.num_target_layers
         )
         if self.draft_attn_config is not None:
-            bytes_per_token += (
-                self.draft_attn_config.cache_cell_size()
-                * _storage_layers(self.draft_attn_config, self.num_draft_layers)
+            bytes_per_token += _config_bytes_per_token(
+                self.draft_attn_config, self.num_draft_layers
             )
         if bytes_per_token <= 0:
             raise ValueError(
@@ -227,6 +293,35 @@ class OrdinaryRecipe(CacheRecipe):
                 )
             return min(budgeted, (logical_pages + shard_count - 1) // shard_count)
         return self._capped_parents(budgeted, parent_tokens=parent_tokens)
+
+
+def _config_kv_head_counts(config, num_layers: int) -> tuple[int, ...] | None:
+    """Per-layer KV head count (PRE-TP) of one config, or None when uniform."""
+    if config is None:
+        return None
+    spec = config.component(SoftmaxAttnConfig)
+    geometry = getattr(spec, "layer_kv_geometry", None)
+    if geometry is None:
+        return None
+    if len(geometry) != num_layers:
+        raise ValueError("layer_kv_geometry must cover every layer")
+    return tuple(kv_heads for kv_heads, _ in geometry)
+
+
+def _config_bytes_per_token(config, num_layers: int) -> int:
+    """Per-token KV bytes an ordinary config costs across its layers.
+
+    The uniform default charges one cell size times the slab divisor -- the
+    i-th layer of each group shares slab i, so the hybrid full+sliding model
+    pays for the largest group's depth, not every layer. A per-layer model
+    (gemma-4) whose layers differ in head_dim cannot share a slab (the rows
+    are not byte-equal), so it charges each layer's own cell and skips the
+    divisor; ``total_cache_bytes_per_token`` does the summation.
+    """
+    spec = config.component(SoftmaxAttnConfig)
+    if getattr(spec, "layer_kv_geometry", None) is not None:
+        return spec.total_cache_bytes_per_token(config, num_layers)
+    return config.cache_cell_size() * _storage_layers(config, num_layers)
 
 
 def _storage_layers(config, num_layers: int) -> int:
@@ -274,18 +369,63 @@ def _config_layer_fields(
             _index_k_field(config, layer_id),
         )
     if isinstance(spec, MSAConfig):
-        fields = _mha_layer_fields(config, layer_id, occurrence)
+        fields = _mha_layer_fields(config, layer_id, local_layer_id, occurrence)
         if local_layer_id in spec.sparse_layer_ids:
             fields += (_index_k_field(config, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, layer_id, occurrence)
     if isinstance(spec, MHAConfig):
-        return _mha_layer_fields(config, layer_id, occurrence)
+        return _mha_layer_fields(config, layer_id, local_layer_id, occurrence)
     raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
-def _mha_layer_fields(config, layer_id: int, occurrence: int):
+def _mha_layer_geometry(spec, local_layer_id: int) -> tuple[int, int]:
+    """This layer's ``(kv_heads, head_dim)`` AFTER TP sharding.
+
+    The uniform default reads the one model-wide ``num_kv_heads`` / ``head_dim``
+    every current model carries, so the resolved page is byte-identical to
+    before. A per-layer model (gemma-4) reads this layer's own geometry out of
+    ``layer_kv_geometry`` -- full-attention layers at 4 x 512, sliding at
+    16 x 256 -- so a mixed-head_dim model pages each layer at its true width.
+    """
+    geometry = getattr(spec, "layer_kv_geometry", None)
+    if geometry is None:
+        return max(spec.num_kv_heads // spec.attn_tp_size, 1), spec.head_dim
+    kv_heads, head_dim = geometry[local_layer_id]
+    return max(kv_heads // spec.attn_tp_size, 1), head_dim
+
+
+# The one plane every K/V field of a per-layer-geometry model shares.
+FLAT_KV_PLANE = "unit.flat"
+
+
+def _mha_plane(spec, occurrence: int, name: str) -> tuple[str, bool]:
+    """Plane id of an MHA layer's K or V field, and whether its kernel needs
+    an exact page stride.
+
+    A uniform model keeps the bare ``unit.{occurrence}`` planes every current
+    model uses: the i-th layer of each cache group deliberately shares one
+    plane (full and sliding layers are byte-equal, so the hybrid slab pairs
+    them and a parent serves whichever group owns it with every byte).
+
+    A per-layer-geometry model (gemma-4) cannot pair layers that way: a
+    4 x 512 full layer and a 16 x 256 sliding layer have different payloads.
+    Giving each group its own planes leaves the other group's planes of every
+    parent unused -- half the arena for gemma-4. Instead every field lands on
+    one flat plane: a group's page is all of its fields back to back, a
+    parent holds one whole sliding page or ten whole full pages, and no byte
+    sits in a plane its owner does not use. The fields' page strides then
+    exceed their payloads; the arena serves each as a row view whose kernel
+    pages are spaced by ``stride / payload`` (see ``CacheArena.page_spacing``),
+    so the attention and store kernels keep their contiguous-row contract.
+    """
+    if getattr(spec, "layer_kv_geometry", None) is None:
+        return f"unit.{occurrence}.{name}", True
+    return FLAT_KV_PLANE, False
+
+
+def _mha_layer_fields(config, layer_id: int, local_layer_id: int, occurrence: int):
     """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
     spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)
@@ -295,8 +435,7 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
             f"{MXFP8_KV_SCALE_TILE_TOKENS} (the attention kernel consumes "
             "the interleaved paged scale layout)"
         )
-    kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
-    head_dim = spec.head_dim
+    kv_heads, head_dim = _mha_layer_geometry(spec, local_layer_id)
     if config.prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
     shape = (config.prefix_granularity, kv_heads, head_dim)
@@ -307,10 +446,22 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
         if mxfp8
         else scatter_stored_dtype_name(config.kv_cache_dtype)
     )
-    fields = (
-        CacheFieldSpec(f"layer.{layer_id}.k", f"unit.{occurrence}.k", shape, kv_dtype),
-        CacheFieldSpec(f"layer.{layer_id}.v", f"unit.{occurrence}.v", shape, kv_dtype),
-    )
+    payload_bytes = math.prod(shape) * cache_dtype_bytes(kv_dtype)
+    fields = ()
+    for name in ("k", "v"):
+        plane_id, exact_page_stride = _mha_plane(spec, occurrence, name)
+        fields += (
+            CacheFieldSpec(
+                f"layer.{layer_id}.{name}",
+                plane_id,
+                shape,
+                kv_dtype,
+                exact_page_stride=exact_page_stride,
+                # A spaced field's stride must be whole payloads, so its pages
+                # sit on the kernel-page grid of its row view.
+                page_stride_alignment_bytes=1 if exact_page_stride else payload_bytes,
+            ),
+        )
     if not mxfp8:
         return fields
     return fields + mxfp8_kv_scale_fields(

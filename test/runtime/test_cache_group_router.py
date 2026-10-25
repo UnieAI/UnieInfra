@@ -572,6 +572,7 @@ class TestCacheGroupRouterTest:
             paged_group_ids=groups,
             arena=SimpleNamespace(
                 offload=None,
+                page_spacing=lambda group_id: 1,
                 cache_group_specs=tuple(
                     SimpleNamespace(
                         group_id=gid,
@@ -1404,7 +1405,11 @@ def _spec(
 
 def _pool(*specs, paged=(FULL, SWA)):
     return SimpleNamespace(
-        arena=SimpleNamespace(cache_group_specs=tuple(specs), offload=None),
+        arena=SimpleNamespace(
+            cache_group_specs=tuple(specs),
+            offload=None,
+            page_spacing=lambda group_id: 1,
+        ),
         paged_group_ids=tuple(paged),
     )
 

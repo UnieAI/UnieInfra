@@ -26,7 +26,11 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 __all__ = [
     "flash_attn_func",
@@ -540,6 +544,10 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # Hopper FlashAttention-3 is built for these head sizes only; a
+            # wider head (gemma-4's 512-wide global layers) must select another
+            # kernel rather than fail inside this one.
+            "head_dim": frozenset({64, 96, 128, 192, 256}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -597,6 +605,10 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # Hopper FlashAttention-3 is built for these head sizes only; a
+            # wider head (gemma-4's 512-wide global layers) must select another
+            # kernel rather than fail inside this one.
+            "head_dim": frozenset({64, 96, 128, 192, 256}),
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
@@ -660,6 +672,10 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            # Hopper FlashAttention-3 is built for these head sizes only; a
+            # wider head (gemma-4's 512-wide global layers) must select another
+            # kernel rather than fail inside this one.
+            "head_dim": frozenset({64, 96, 128, 192, 256}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -700,3 +716,200 @@ elif platform.is_nvidia and platform.is_hopper:
             sinks=sinks,
         )
         return out.view_as(q)
+
+    # FA3 stops at 256-wide heads. vLLM's FA4 build serves Hopper up to 512
+    # (thirdparty/vllm_fa4), so gemma-4's 512-wide global layers prefill there
+    # instead of on the Triton fallback, which runs them 3-6x slower. Decode
+    # stays on Triton: its split-K kernel already reads the cache as fast.
+    _FA4_SM90_HEAD_DIMS = frozenset({512})
+    _FA4_SM90_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(9, 0),
+        vendors=frozenset({"nvidia"}),
+    )
+
+    def _fa4_sm90_varlen():
+        # Imported on first use: the package compiles CuTe DSL kernels and
+        # pulls in cutlass, which a model without 512-wide heads never needs.
+        from tokenspeed_kernel.thirdparty.vllm_fa4.interface import (
+            flash_attn_varlen_func as fa4_varlen,
+        )
+
+        return fa4_varlen
+
+    @register_kernel(
+        "attention",
+        "mha_prefill",
+        name="fa4_sm90_mha_prefill",
+        solution="fa4",
+        capability=_FA4_SM90_CAPABILITY,
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": _FA4_SM90_HEAD_DIMS,
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "sinks": frozenset({False}),
+            "skip_softmax": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
+        },
+    )
+    def fa4_sm90_mha_prefill(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_cpu: list[int],
+        max_seqlen: int,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        out, _ = _fa4_sm90_varlen()(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=(window_left, 0) if window_left >= 0 else (None, None),
+        )
+        return out
+
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="fa4_sm90_mha_extend_with_kvcache",
+        solution="fa4",
+        capability=_FA4_SM90_CAPABILITY,
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": _FA4_SM90_HEAD_DIMS,
+            "is_causal": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
+        },
+    )
+    def fa4_sm90_mha_extend_with_kvcache(
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        is_causal: bool = False,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        out, _ = _fa4_sm90_varlen()(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=is_causal,
+            window_size=(window_left, 0) if window_left >= 0 else (None, None),
+        )
+        return out
+
+    # An fp8 cache on the 512-wide layers: FA4's SM90 dequant path reads the
+    # fp8 pages with a bf16/fp16 query and widens them in-kernel, so the query
+    # keeps its precision (FA3's fp8 path would quantize it). Its producer is
+    # TMA-only and loads a page per tile, hence the 64-token pages.
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="fa4_sm90_mha_extend_with_fp8_kvcache",
+        solution="fa4",
+        capability=_FA4_SM90_CAPABILITY,
+        signatures=frozenset(
+            format_signature(
+                q=dense_tensor_format(dtype),
+                k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                v_cache=dense_tensor_format(torch.float8_e4m3fn),
+            )
+            for dtype in (torch.float16, torch.bfloat16)
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": _FA4_SM90_HEAD_DIMS,
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "sinks": frozenset({False}),
+            "sliding_window": frozenset({False}),
+        },
+    )
+    def fa4_sm90_mha_extend_with_fp8_kvcache(
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        is_causal: bool = False,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        from tokenspeed_kernel.thirdparty.vllm_fa4.interface import _flash_attn_fwd
+
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        out, *_ = _flash_attn_fwd(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=is_causal,
+            fp8_kv_dequant=True,
+        )
+        return out

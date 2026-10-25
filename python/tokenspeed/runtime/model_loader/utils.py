@@ -45,6 +45,46 @@ def set_default_torch_dtype(dtype: torch.dtype) -> Generator[None]:
         torch.set_default_dtype(old_dtype)
 
 
+# Fallback map from a config's ``model_type`` to the registered architecture,
+# for checkpoints whose config arrives with ``architectures = None`` (e.g. a
+# Gemma 3 text sub-config). Keyed by ``model_type`` PREFIX so both the
+# multimodal wrapper ("gemma3") and its text sub-config ("gemma3_text") resolve
+# to the same entry class; the text-only decoder is handled by that class.
+# The gemma-4-31B-it checkpoint ships a top-level ``Gemma4ForConditionalGeneration``
+# architecture (resolved directly), but a bare text release arrives with
+# ``architectures = None`` and ``model_type = "gemma4_text"`` -- without this
+# alias ``resolve_architecture`` falls back to the config class name
+# ("Gemma4TextConfig"), which is not registered and raises "not supported".
+# Keying on the "gemma4" prefix makes both the wrapper ("gemma4") and the text
+# sub-config ("gemma4_text") resolve to the registered entry class.
+_MODEL_TYPE_ARCH_ALIASES: tuple[tuple[str, str], ...] = (
+    ("gemma3", "Gemma3ForConditionalGeneration"),
+    ("gemma4", "Gemma4ForConditionalGeneration"),
+)
+
+
+def _architectures_from_model_type(hf_config) -> list[str]:
+    model_type = str(getattr(hf_config, "model_type", "") or "")
+    for prefix, arch in _MODEL_TYPE_ARCH_ALIASES:
+        if model_type.startswith(prefix):
+            return [arch]
+    return []
+
+
+def _architectures_from_config_class(hf_config) -> list[str]:
+    """Last-resort architecture name from the HF config class.
+
+    Used when ``resolve_architecture`` is unavailable in this tokenspeed tree.
+    """
+    name = type(hf_config).__name__
+    # Strip a trailing "Config" so e.g. Gemma3TextConfig -> Gemma3Text, which is
+    # still not a registered arch but is better than raising AttributeError on
+    # a None architectures list.
+    if name.endswith("Config"):
+        name = name[: -len("Config")]
+    return [name] if name else []
+
+
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     from tokenspeed.runtime.models.registry import ModelRegistry
 

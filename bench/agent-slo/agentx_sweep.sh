@@ -28,6 +28,8 @@ DATA=${1:?data}; shift
 WARM=${1:?warm}; shift
 
 HERE=/workspace/roy
+# The engine tree an "ours" cell runs; a worktree points the cell at itself.
+REPO=${REPO:-$HERE/UnieInfra}
 # The reference cell on GPUs 0-3 (deepseek-DeepSeek-V4.1-Flash-sglang-1) serves
 # /models/deepseek-ai/DeepSeek-V4.1-Flash-1017 under the *served* name
 # DeepSeek-V4-Flash-Vision-Exp. That alias hid a real difference: the
@@ -58,8 +60,8 @@ export ENDPOINT
 PROFILE=${PROFILE:-dsv41}
 case "$PROFILE" in
   dsv41) SRV_NAME=DeepSeek-V4-Flash-Vision-Exp ;;
-  qwen38) SRV_NAME="$MODEL" ;;
-  *) echo "unknown PROFILE $PROFILE (dsv41|qwen38)" >&2; exit 1 ;;
+  qwen38|dense) SRV_NAME="$MODEL" ;;
+  *) echo "unknown PROFILE $PROFILE (dsv41|qwen38|dense)" >&2; exit 1 ;;
 esac
 # drive.py counts generated tokens with the checkpoint's own tokenizer when a
 # server sends no usage chunk, so token counts mean the same thing on every
@@ -89,7 +91,7 @@ RUN_ARGS=()
 case "$KIND" in
   ours)
     case "$PROFILE" in
-      qwen38)
+      qwen38|dense)
         # No tool-call/reasoning parser and no expert parallel: this checkpoint
         # is dense, its own chat template is unused because the cells drive
         # /v1/completions, and TP=1 leaves EP nothing to shard.
@@ -141,7 +143,7 @@ case "$KIND" in
     # ours on the device instead costs 22.9 GiB of HBM per rank and leaves no
     # room for the KV arena on a 140 GiB H200 (the probe reported -1.13 GiB),
     # so device placement was never the comparable configuration.
-    if [ "$PROFILE" != qwen38 ]; then
+    if [ "$PROFILE" = dsv41 ]; then
       RUN_ARGS+=(--engram-host-table --engram-host-table-dir "$HERE/.engram")
     fi
     # --ep-size == --tp: the reference cell runs ep-size==tp-size==4 so the MoE
@@ -214,7 +216,7 @@ case "$KIND" in
     MN="$SRV_NAME"
     ;;
   sglang)
-    if [ "$PROFILE" = qwen38 ]; then
+    if [ "$PROFILE" != dsv41 ]; then
       # Plain defaults: no speculative decoding, no hierarchical cache -- nothing
       # the other two arms do not also run. Only a plain cell separates scheduler
       # and kernel work from extra machinery.
@@ -266,15 +268,15 @@ case "$KIND" in
     # source of truth -- but it also means a stale .so silently runs older C++
     # scheduling semantics underneath newer Python. It was stale by three days
     # when this check was added. Fail fast instead of measuring the wrong C++.
-    SCHED_PKG=$HERE/UnieInfra/tokenspeed-scheduler/python/tokenspeed_scheduler
+    SCHED_PKG=$REPO/tokenspeed-scheduler/python/tokenspeed_scheduler
     SCHED_SO=$(ls "$SCHED_PKG"/tokenspeed_scheduler_ext*.so 2>/dev/null | head -1)
-    REBUILD_HINT="docker run --rm -v /workspace:/workspace -w /workspace/roy/UnieInfra/tokenspeed-scheduler ts-env:gpu pip wheel . -w /workspace/roy/.wheels --no-deps, then unzip the .so over $SCHED_PKG"
+    REBUILD_HINT="docker run --rm -v /workspace:/workspace -w $REPO/tokenspeed-scheduler ts-env:gpu pip wheel . -w /workspace/roy/.wheels --no-deps, then unzip the .so over $SCHED_PKG"
     if [ -z "$SCHED_SO" ]; then
       echo "no tokenspeed_scheduler_ext*.so in $SCHED_PKG: the mount would hide the image's copy and the engine cannot import the scheduler." >&2
       echo "Rebuild: $REBUILD_HINT" >&2
       exit 1
     fi
-    newer=$(find "$HERE/UnieInfra/tokenspeed-scheduler/csrc" "$HERE/UnieInfra/tokenspeed-scheduler/bindings" -newer "$SCHED_SO" -type f 2>/dev/null | wc -l)
+    newer=$(find "$REPO/tokenspeed-scheduler/csrc" "$REPO/tokenspeed-scheduler/bindings" -newer "$SCHED_SO" -type f 2>/dev/null | wc -l)
     if [ "$newer" -ne 0 ]; then
       echo "$newer scheduler source files are newer than $(basename "$SCHED_SO"), so this cell would run the old C++ scheduler under the new Python." >&2
       echo "Rebuild: $REBUILD_HINT" >&2
@@ -295,10 +297,10 @@ case "$KIND" in
     fi
     docker run -d --name "$NAME" --gpus \"device=$GPU\" --shm-size 32g \
       "${PUBLISH_ARGS[@]}" -v /models:/models -v /workspace:/workspace \
-      -v "$HERE/UnieInfra/tokenspeed-scheduler/python/tokenspeed_scheduler:$SCHED_SITE/tokenspeed_scheduler:ro" \
+      -v "$REPO/tokenspeed-scheduler/python/tokenspeed_scheduler:$SCHED_SITE/tokenspeed_scheduler:ro" \
       -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
       -e FLASHINFER_WORKSPACE_BASE=/workspace/roy/.fiws \
-      -e PYTHONPATH=/workspace/roy/UnieInfra/python:/workspace/roy/UnieInfra/tokenspeed-kernel/python \
+      -e PYTHONPATH=$REPO/python:$REPO/tokenspeed-kernel/python \
       -e TOKENSPEED_DSV4_FP8_INDEXER_FUSED_VERIFY="${DSV4_FP8_VERIFY:-0}" \
       -e TOKENSPEED_DSV4_FP8_INDEXER_FUSED="${DSV4_FP8_FUSED:-0}" \
       -e TORCH_EXTENSIONS_DIR="${TORCH_EXT_DIR:-/workspace/roy/.torch_ext}" \

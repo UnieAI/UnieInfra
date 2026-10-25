@@ -45,7 +45,9 @@ __all__ = [
     "fabric_allocation_supported",
     "gather_fabric_map",
     "group_has_fabric",
+    "group_has_multicast",
     "group_host_span",
+    "multicast_bind_supported",
 ]
 
 logger = logging.getLogger(__name__)
@@ -56,10 +58,14 @@ _CU_MEM_ALLOCATION_TYPE_PINNED = 1
 _CU_MEM_HANDLE_TYPE_FABRIC = 8
 _CU_MEM_LOCATION_TYPE_DEVICE = 1
 _CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
+_CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1
+_CU_MULTICAST_GRANULARITY_MINIMUM = 0
 
 _probe_cache: dict[int, bool] = {}
+_multicast_probe_cache: dict[int, bool] = {}
 _fabric_map: list[bool] | None = None
 _host_map: list[int] | None = None
+_multicast_map: list[bool] | None = None
 
 
 class _CUmemLocation(ctypes.Structure):
@@ -72,6 +78,16 @@ class _CUmemAllocationPropAllocFlags(ctypes.Structure):
         ("gpuDirectRDMACapable", ctypes.c_ubyte),
         ("usage", ctypes.c_ushort),
         ("reserved", ctypes.c_ubyte * 4),
+    ]
+
+
+class _CUmulticastObjectProp(ctypes.Structure):
+    # Mirrors CUmulticastObjectProp_st from cuda.h.
+    _fields_ = [
+        ("numDevices", ctypes.c_uint),
+        ("size", ctypes.c_size_t),
+        ("handleTypes", ctypes.c_ulonglong),
+        ("flags", ctypes.c_ulonglong),
     ]
 
 
@@ -186,6 +202,143 @@ def fabric_allocation_supported(device_index: int) -> bool:
     return cached
 
 
+def _probe_multicast_bind(device_index: int) -> bool:
+    """Bind one granularity of this device's memory into a two-device team.
+
+    The driver reports multicast support from the hardware, so it stays set
+    after the fabric manager loses track of the NVSwitch state (a fabric
+    manager restart under live GPUs does it; the log says every GPU in the
+    partition needs a reset). The bind is what fails, with
+    CUDA_ERROR_ILLEGAL_STATE, and torch's symmetric memory then skips
+    multicast and hands out a null multicast pointer that the multimem kernels
+    store through. A one-device team is rejected outright, so the team takes
+    a second visible device; binding only this device's memory needs nothing
+    from the other.
+    """
+    try:
+        libcuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return False
+    try:
+        if libcuda.cuInit(0) != 0:
+            return False
+        count = ctypes.c_int(0)
+        if libcuda.cuDeviceGetCount(ctypes.byref(count)) != 0:
+            return False
+        if count.value < 2:
+            # A single visible device has no peer to multicast to, and no
+            # team to test with; leave the answer to the topology gates.
+            return True
+        device = ctypes.c_int()
+        peer = ctypes.c_int()
+        if libcuda.cuDeviceGet(ctypes.byref(device), device_index) != 0:
+            return False
+        if libcuda.cuDeviceGet(ctypes.byref(peer), 1 if device_index == 0 else 0) != 0:
+            return False
+
+        prev_ctx = ctypes.c_void_p()
+        if libcuda.cuCtxGetCurrent(ctypes.byref(prev_ctx)) != 0:
+            return False
+        retained = False
+        if not prev_ctx.value:
+            primary_ctx = ctypes.c_void_p()
+            if libcuda.cuDevicePrimaryCtxRetain(ctypes.byref(primary_ctx), device) != 0:
+                return False
+            retained = True
+            libcuda.cuCtxSetCurrent(primary_ctx)
+        mc_handle = ctypes.c_ulonglong(0)
+        mem_handle = ctypes.c_ulonglong(0)
+        bound = False
+        size = 0
+        try:
+            mc_prop = _CUmulticastObjectProp(
+                2, 0, _CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0
+            )
+            granularity = ctypes.c_size_t(0)
+            if (
+                libcuda.cuMulticastGetGranularity(
+                    ctypes.byref(granularity),
+                    ctypes.byref(mc_prop),
+                    _CU_MULTICAST_GRANULARITY_MINIMUM,
+                )
+                != 0
+            ):
+                return False
+            size = granularity.value
+            mc_prop.size = size
+            if (
+                libcuda.cuMulticastCreate(
+                    ctypes.byref(mc_handle), ctypes.byref(mc_prop)
+                )
+                != 0
+            ):
+                return False
+            for member in (device, peer):
+                if libcuda.cuMulticastAddDevice(mc_handle, member) != 0:
+                    return False
+
+            prop = _CUmemAllocationProp()
+            prop.type = _CU_MEM_ALLOCATION_TYPE_PINNED
+            prop.requestedHandleTypes = _CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            prop.location.type = _CU_MEM_LOCATION_TYPE_DEVICE
+            prop.location.id = device.value
+            if (
+                libcuda.cuMemCreate(
+                    ctypes.byref(mem_handle),
+                    ctypes.c_size_t(size),
+                    ctypes.byref(prop),
+                    ctypes.c_ulonglong(0),
+                )
+                != 0
+            ):
+                return False
+            bound = (
+                libcuda.cuMulticastBindMem(
+                    mc_handle,
+                    ctypes.c_size_t(0),
+                    mem_handle,
+                    ctypes.c_size_t(0),
+                    ctypes.c_size_t(size),
+                    ctypes.c_ulonglong(0),
+                )
+                == 0
+            )
+            return bound
+        finally:
+            if bound:
+                libcuda.cuMulticastUnbind(
+                    mc_handle, device, ctypes.c_size_t(0), ctypes.c_size_t(size)
+                )
+            if mem_handle.value:
+                libcuda.cuMemRelease(mem_handle)
+            if mc_handle.value:
+                libcuda.cuMemRelease(mc_handle)
+            if retained:
+                libcuda.cuCtxSetCurrent(prev_ctx)
+                libcuda.cuDevicePrimaryCtxRelease(device)
+    except (OSError, AttributeError):
+        return False
+
+
+def multicast_bind_supported(device_index: int) -> bool:
+    """Return True iff this device's memory binds into a multicast team.
+
+    Cached per device. A False here on a host whose driver advertises
+    multicast is a fabric fault, not a capability gap, so it warns: every
+    multicast path on the host falls back to NCCL until the GPUs are reset.
+    """
+    cached = _multicast_probe_cache.get(device_index)
+    if cached is None:
+        cached = _probe_multicast_bind(device_index)
+        _multicast_probe_cache[device_index] = cached
+        if not cached:
+            logger.warning(
+                f"multicast bind failed on device {device_index!s}; "
+                "multicast collectives fall back to NCCL"
+            )
+    return cached
+
+
 def _host_identity() -> int:
     """An id every rank on one host computes identically, and no other host does.
 
@@ -225,7 +378,7 @@ def gather_fabric_map() -> list[bool]:
     the ones that entered would wait out the NCCL timeout. The caller it
     replaced read a server argument, which was uniform; this reads the machine.
     """
-    global _fabric_map, _host_map
+    global _fabric_map, _host_map, _multicast_map
 
     if _fabric_map is not None:
         return _fabric_map
@@ -235,11 +388,16 @@ def gather_fabric_map() -> list[bool]:
         # No fabric to map, so every rank is its own host and every span declines.
         _fabric_map = [False] * world_size
         _host_map = list(range(world_size))
+        _multicast_map = [False] * world_size
         return _fabric_map
 
     device = torch.device("cuda", torch.cuda.current_device())
     local = torch.tensor(
-        [int(fabric_allocation_supported(device.index)), _host_identity()],
+        [
+            int(fabric_allocation_supported(device.index)),
+            _host_identity(),
+            int(multicast_bind_supported(device.index)),
+        ],
         dtype=torch.int64,
         device=device,
     )
@@ -247,9 +405,11 @@ def gather_fabric_map() -> list[bool]:
     torch.distributed.all_gather(gathered, local, group=torch.distributed.group.WORLD)
     _fabric_map = [bool(value[0].item()) for value in gathered]
     _host_map = [int(value[1].item()) for value in gathered]
+    _multicast_map = [bool(value[2].item()) for value in gathered]
     logger.info(
         f"fabric allocation available on {sum(_fabric_map)!s}/{len(_fabric_map)!s} "
-        f"ranks across {len(set(_host_map))!s} hosts",
+        f"ranks across {len(set(_host_map))!s} hosts; multicast binds on "
+        f"{sum(_multicast_map)!s}/{len(_multicast_map)!s}",
     )
     return _fabric_map
 
@@ -270,6 +430,18 @@ def group_has_fabric(ranks: Sequence[int]) -> bool:
             "distributed initialization before any reachability gate"
         )
     return all(_fabric_map[rank] for rank in ranks)
+
+
+def group_has_multicast(ranks: Sequence[int]) -> bool:
+    """Return whether every rank in ``ranks`` bound memory into a multicast team.
+
+    An ungathered map answers True: unlike the fabric verdict this is a fault
+    check layered on the topology gates, and a caller outside a server that
+    never gathered keeps the answer those gates gave before it existed.
+    """
+    if _multicast_map is None:
+        return True
+    return all(_multicast_map[rank] for rank in ranks)
 
 
 def group_host_span(ranks: Sequence[int]) -> int | None:

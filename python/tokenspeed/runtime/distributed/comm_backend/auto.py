@@ -232,11 +232,21 @@ class AutoBackend(CommBackend):
         ``attn_tp_size=8``, which is smaller than one host's device count while
         living on two hosts, so counting would admit it with no probe at all.
 
+        Topology is not enough on one host either: a fabric manager that lost
+        the NVSwitch state still reports multicast, the bind fails, and the
+        rendezvous hands back a null multicast pointer that the multimem
+        kernels store through. Each rank's bind probe rides the same map.
+
         The world fabric map is gathered during distributed initialization, so
         the group verdict is a local lookup with no dispatch-time collective.
         """
-        from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
+        from tokenspeed_kernel.ops.communication.fabric import (
+            group_has_fabric,
+            group_has_multicast,
+        )
 
+        if not group_has_multicast(group):
+            return False
         if not AutoBackend._group_spans_nodes(group):
             return True
         return group_has_fabric(group)

@@ -67,6 +67,13 @@ def test_prefix_replay_tokens_binding_defaults_to_zero_and_round_trips() -> None
     assert cfg.prefix_replay_tokens == 4
 
 
+def test_inflight_prefix_defer_pages_binding_defaults_to_four_and_round_trips() -> None:
+    cfg = _make_config()
+    assert cfg.inflight_prefix_defer_pages == 4
+    cfg.inflight_prefix_defer_pages = 0
+    assert cfg.inflight_prefix_defer_pages == 0
+
+
 def _make_spec(
     request_id: str, num_pages: int, prefix_granularity: int = 2, start: int = 1
 ) -> ts.RequestSpec:

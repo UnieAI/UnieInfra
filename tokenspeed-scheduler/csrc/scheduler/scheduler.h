@@ -93,6 +93,19 @@ public:
     // Requests whose pages PD still pins. This resource count overlaps FSM states.
     std::size_t PdTransferSize() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
+
+    // Cumulative shared-prefix dedup activity
+    // (SchedulerConfig::inflight_prefix_defer_pages), for monitoring.
+    struct PrefixDedupStats {
+        // Prompts that waited at least one round for pages another prompt was
+        // computing, and the rounds they waited in all.
+        std::int64_t deferred_requests{0};
+        std::int64_t deferred_rounds{0};
+        // First chunks ended early at a branch point so the shared pages
+        // stay hittable.
+        std::int64_t cut_chunks{0};
+    };
+    const PrefixDedupStats& PrefixDedup() const { return prefix_dedup_stats_; }
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
@@ -468,6 +481,32 @@ private:
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
+
+    // In-flight prefix dedup (SchedulerConfig::inflight_prefix_defer_pages).
+    // The prefix hashes of the full prompt pages each admitted prompt
+    // computes itself (past its hit), by request id, kept while the pages
+    // can still be unpublished: Prefilling, and PrefillDone until its first
+    // decode publishes the prompt end. The union is rebuilt every round.
+    std::unordered_map<std::string, std::vector<std::string>> inflight_prefix_pages_;
+    std::unordered_set<std::string> inflight_prefix_hashes_;
+    // The same hashes for every Submitted prompt, and how many of them carry
+    // each hash, kept incrementally (a prompt is hashed once, on first sight).
+    std::unordered_map<std::string, std::vector<std::string>> waiting_prefix_pages_;
+    std::unordered_map<std::string, std::int32_t> waiting_prefix_counts_;
+    // Submitted prompts deferred at least once, so each counts once.
+    std::unordered_set<std::string> deferred_prefix_ids_;
+    PrefixDedupStats prefix_dedup_stats_;
+    // Shared-prefix dedup is on: a threshold is set and prefixes are matched
+    // at all (without matching, a deferred prompt would wait for nothing).
+    bool prefixDedupEnabled() const { return config_.inflight_prefix_defer_pages > 0 && !config_.disable_prefix_cache; }
+    // The prompt tokens an admission may take from the cache: the final token
+    // (or the configured replay tail) is always recomputed, and a request may
+    // bound the hit further (RequestSpec::max_cached_prefix_tokens).
+    std::int32_t maxCacheablePrefixTokens(const Request& request) const;
+    void refreshInflightPrefixPages();
+    bool defersToInflightPrefix(std::span<const std::string> candidate_hashes, std::int32_t hit_pages) const;
+    std::int32_t pagesSharedWithWaiting(std::span<const std::string> candidate_hashes, std::int32_t hit_pages) const;
+    std::vector<std::string> candidatePrefixHashes(const Request& request) const;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).

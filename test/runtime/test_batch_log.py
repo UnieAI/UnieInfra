@@ -35,7 +35,9 @@ from tokenspeed.runtime.engine.batch_log import BatchLogger
 STATS = {"num_active_pages": 40, "num_cached_pages": 15, "num_queue_reqs": 7}
 
 # Request "r<i>" holds 100 + i tokens, so a bs-2 decode round averages 100.5.
-CONTEXT_LENGTHS = {f"r{i}": 100 + i for i in range(8)}
+# Prompts "a" and "b" (40 and 60 tokens) are read at their first chunk for the
+# prefix-reuse ratio.
+CONTEXT_LENGTHS = {f"r{i}": 100 + i for i in range(8)} | {"a": 40, "b": 60}
 
 
 def _logger(**overrides) -> BatchLogger:
@@ -108,9 +110,10 @@ def test_extend_round_counts_cached_tokens_once_per_request():
 
     assert messages == [
         "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 10, "
-        "#running-req: 2, #queue-req: 7",
+        "#running-req: 2, #queue-req: 7, prefix reuse(last 2/all): 10.0%/10.0%",
+        # The ratio counts each prompt once, at its first chunk.
         "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 0, "
-        "#running-req: 2, #queue-req: 7",
+        "#running-req: 2, #queue-req: 7, prefix reuse(last 2/all): 10.0%/10.0%",
     ]
 
 
@@ -123,7 +126,7 @@ def test_mixed_round_is_labelled_mix():
 
     assert messages == [
         "Mix batch. #dp-rank: 2, #new-seq: 1, #new-token: 12, #cached-token: 4, "
-        "#running-req: 3, #queue-req: 7"
+        "#running-req: 3, #queue-req: 7, prefix reuse(last 1/all): 10.0%/10.0%"
     ]
 
 
@@ -319,6 +322,19 @@ def test_pd_lifecycle_counts_are_read_only_when_a_line_is_emitted():
     )
 
 
+def test_prefill_line_reports_shared_prefix_dedup():
+    logger = _logger()
+    stats = STATS | {"prefix_dedup": (3, 5, 2)}
+    with _captured_messages() as messages:
+        logger.log_dispatch(_extend_op(["a"], 1, [8], [32]), stats)
+
+    assert messages == [
+        "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 8, #cached-token: 32, "
+        "#running-req: 1, #queue-req: 7, prefix reuse(last 1/all): 80.0%/80.0%, "
+        "dedup(deferred/rounds/cut): 3/5/2"
+    ]
+
+
 def test_pd_prefill_line_queues_bootstrapping_requests():
     logger = _logger(pd_lifecycle=lambda: (9, 1, 0, 0, 1))
     with _captured_messages() as messages:
@@ -328,4 +344,5 @@ def test_pd_prefill_line_queues_bootstrapping_requests():
         "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 10, "
         "#cached-token: 0, #running-req: 1, #queue-req: 16"
         ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 9/1/0/0/1"
+        ", prefix reuse(last 1/all): 0.0%/0.0%"
     ]

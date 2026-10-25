@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -50,6 +51,8 @@ LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
 # The prefill line reports first-touch cached tokens, so it remembers which
 # requests it has already counted. Bound the growth: this is log dedup only.
 MAX_SEEN_PREFILL_IDS = 100_000
+# Prompts the windowed prefix-reuse ratio on a prefill line covers.
+REUSE_WINDOW_PROMPTS = 256
 
 
 class BatchLogger:
@@ -107,6 +110,11 @@ class BatchLogger:
 
         self._step = 0
         self._seen_prefill_ids: set[str] = set()
+        # Prefix reuse, counted at each prompt's first chunk: (prompt tokens,
+        # tokens it started from the cache) for the last prompts, and totals.
+        self._reuse_window: deque[tuple[int, int]] = deque(maxlen=REUSE_WINDOW_PROMPTS)
+        self._reuse_prompt_tokens = 0
+        self._reuse_cached_tokens = 0
         # Decode throughput window: committed tokens since the last line.
         self._num_generated_tokens = 0
         self._num_decode_steps = 0
@@ -152,14 +160,18 @@ class BatchLogger:
     def _log_extend(self, forward_op, num_extends: int, bs: int, stats: dict) -> None:
         mode = "Prefill" if num_extends == bs else "Mix"
         total_tokens = sum(forward_op.input_lengths)
-        cached_tokens = sum(
-            prefix_len
-            for rid, prefix_len in zip(
-                forward_op.request_ids[:num_extends],
-                forward_op.extend_prefix_lens,
-            )
-            if rid not in self._seen_prefill_ids
-        )
+        cached_tokens = 0
+        for rid, prefix_len in zip(
+            forward_op.request_ids[:num_extends], forward_op.extend_prefix_lens
+        ):
+            if rid in self._seen_prefill_ids:
+                continue
+            cached_tokens += prefix_len
+            # A first chunk holds no output yet: the context is the prompt.
+            prompt_len = self._context_length(rid)
+            self._reuse_window.append((prompt_len, prefix_len))
+            self._reuse_prompt_tokens += prompt_len
+            self._reuse_cached_tokens += prefix_len
         if len(self._seen_prefill_ids) > MAX_SEEN_PREFILL_IDS:
             self._seen_prefill_ids.clear()
         self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
@@ -167,8 +179,25 @@ class BatchLogger:
             f"{mode!s} batch. #dp-rank: {self._dp_rank!s}, "
             f"#new-seq: {num_extends!s}, #new-token: {total_tokens!s}, "
             f"#cached-token: {cached_tokens!s}, "
-            f"#running-req: {bs!s}{self._queue_suffix(stats)!s}",
+            f"#running-req: {bs!s}{self._queue_suffix(stats)!s}"
+            f"{self._reuse_suffix(stats)!s}",
         )
+
+    def _reuse_suffix(self, stats: dict) -> str:
+        """Prefix reuse (cached / prompt tokens at admission) over the last
+        prompts and since start, plus what shared-prefix dedup did for it."""
+        window_prompt = sum(prompt for prompt, _ in self._reuse_window)
+        window_cached = sum(cached for _, cached in self._reuse_window)
+        suffix = (
+            f", prefix reuse(last {len(self._reuse_window)!s}/all): "
+            f"{window_cached / max(window_prompt, 1):.1%}/"
+            f"{self._reuse_cached_tokens / max(self._reuse_prompt_tokens, 1):.1%}"
+        )
+        dedup = stats.get("prefix_dedup")
+        if dedup is not None:
+            deferred, rounds, cuts = dedup
+            suffix += f", dedup(deferred/rounds/cut): {deferred!s}/{rounds!s}/{cuts!s}"
+        return suffix
 
     def _log_decode(self, request_ids, bs: int, stats: dict) -> None:
         now = time.time()

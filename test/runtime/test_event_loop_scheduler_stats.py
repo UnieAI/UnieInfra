@@ -71,6 +71,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": 0,
         "num_queue_reqs": 0,
+        "prefix_dedup": (0, 0, 0),
     }
 
     request = ts.RequestSpec()
@@ -81,6 +82,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": 0,
         "num_queue_reqs": 1,
+        "prefix_dedup": (0, 0, 0),
     }
 
     scheduler.next_execution_plan()
@@ -88,6 +90,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": active_parents,
         "num_cached_pages": 0,
         "num_queue_reqs": 0,
+        "prefix_dedup": (0, 0, 0),
     }
 
     result = ts.ForwardEvent.ExtendResult()
@@ -102,6 +105,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": cached_parents,
         "num_queue_reqs": 0,
+        "prefix_dedup": (0, 0, 0),
     }
 
     assert scheduler.clear_cache()
@@ -109,6 +113,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_active_pages": 0,
         "num_cached_pages": 0,
         "num_queue_reqs": 0,
+        "prefix_dedup": (0, 0, 0),
     }
 
 

@@ -164,7 +164,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
-        .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
+        .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
+        .def_rw("inflight_prefix_defer_pages", &tokenspeed::SchedulerConfig::inflight_prefix_defer_pages);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -505,6 +506,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
+        .def(
+            "prefix_dedup_stats",
+            [](const tokenspeed::Scheduler& scheduler) {
+                const auto& stats = scheduler.PrefixDedup();
+                return std::make_tuple(stats.deferred_requests, stats.deferred_rounds, stats.cut_chunks);
+            },
+            "Cumulative shared-prefix dedup activity: (prompts deferred to an in-flight prefix, rounds they "
+            "waited, first chunks cut at a branch point).")
         .def("snapshot_pool_free_blocks", &tokenspeed::Scheduler::SnapshotPoolFreeBlocks,
              "Empty parents of the request-private snapshot pool (a leak check: every block belongs to some "
              "suspended request's image).")

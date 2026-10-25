@@ -201,6 +201,7 @@ def scheduler_config_from_args(
         # The threshold is unset (None) without a store; the binding takes 0.
         l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages if has_l3 else 0,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
+        inflight_prefix_defer_pages=server_args.inflight_prefix_defer_pages,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
@@ -453,6 +454,8 @@ class EventLoop:
             f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
             f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "
             f"prefix_replay_tokens={scheduler_cfg.prefix_replay_tokens!s} "
+            f"inflight_prefix_defer_pages="
+            f"{scheduler_cfg.inflight_prefix_defer_pages!s} "
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)
@@ -1106,6 +1109,7 @@ class EventLoop:
                 self._scheduler_cache_geometry.num_usable_pages - empty - active
             ),
             "num_queue_reqs": self.scheduler.waiting_size(),
+            "prefix_dedup": self.scheduler.prefix_dedup_stats(),
         }
 
     def _record_scheduler_iteration_metrics(
@@ -1119,6 +1123,7 @@ class EventLoop:
             num_iteration_tokens=num_iteration_tokens,
         )
         self.metrics.record_jit_compiles(compile_stats())
+        self.metrics.record_prefix_dedup(stats["prefix_dedup"])
 
     # ------------------------------------------------------------------
     # Event loops

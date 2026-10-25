@@ -529,6 +529,11 @@ class ServerArgs:
     # Decoding (N > 0) or Prefilling (N < 0) request without capacity
     # pressure, to exercise the suspend/restore path. 0 (off) in serving.
     debug_force_retraction_interval: int = 0
+    # Shared-prefix dedup in the scheduler: a waiting prompt whose next
+    # uncached pages (at least this many) an admitted prompt is computing waits
+    # for them, and a first chunk on a sliding/State model ends where other
+    # waiting prompts branch off. 0 disables both.
+    inflight_prefix_defer_pages: int = 4
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -2737,6 +2742,17 @@ class ServerArgs:
             "path runs on every request of a test run. Refused with "
             "--retraction-snapshot-ratio 0. 0 (the default) is off; never set it "
             "in serving.",
+        )
+        parser.add_argument(
+            "--inflight-prefix-defer-pages",
+            type=int,
+            default=ServerArgs.inflight_prefix_defer_pages,
+            help="Shared-prefix dedup: a waiting prompt whose next uncached "
+            "pages (at least this many) an admitted prompt is still computing "
+            "waits for them instead of computing them again, and on a model "
+            "with sliding-window or recurrent-state groups a first chunk ends "
+            "where other waiting prompts branch off, so the shared part stays "
+            "hittable. 0 disables both.",
         )
         # Mamba Cache
         parser.add_argument(

@@ -36,16 +36,9 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     std::vector<CacheBlockRef> device_block_refs;
     std::vector<std::uint32_t> group_ids;
     std::vector<std::int32_t> buckets;
-    // Keys already travelling: every ticket of every in-flight write-back.
-    // Derived from write_backs_ on demand rather than mirrored in a second
-    // container that would have to be kept in step with it. Candidates join
-    // the same set so a key queued twice in one round is stored once.
-    std::unordered_set<CacheKey, CacheKeyHash> storing_keys;
-    for (const auto& [op_id, write_back] : write_backs_) {
-        for (const StoreTicket& ticket : write_back.tickets) {
-            storing_keys.insert(ticket.key);
-        }
-    }
+    // Candidates join the in-flight keys so a key queued twice in one round
+    // is stored once.
+    std::unordered_set<CacheKey, CacheKeyHash> storing_keys = storingKeys();
     for (auto& candidate : coordinator_.TakePendingStores()) {
         if (coordinator_.ContainsHostCachedBlock(candidate.key) || !storing_keys.insert(candidate.key).second) {
             continue;
@@ -112,6 +105,72 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         .transfers = std::move(transfers),
         .source_pinned = pin_source,
     };
+}
+
+std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
+    std::vector<CacheCoordinator::EvictedForStore> evicted = coordinator_.TakeEvictedForStore();
+    if (evicted.empty()) {
+        return std::nullopt;
+    }
+    std::unordered_set<CacheKey, CacheKeyHash> storing_keys = storingKeys();
+    std::vector<std::uint32_t> group_ids;
+    std::vector<std::int32_t> buckets;
+    std::vector<CacheCoordinator::EvictedForStore> kept;
+    for (CacheCoordinator::EvictedForStore& entry : evicted) {
+        if (coordinator_.ContainsHostCachedBlock(entry.key) || !storing_keys.insert(entry.key).second) {
+            continue;
+        }
+        group_ids.push_back(entry.key.group_id);
+        buckets.push_back(
+            coordinator_.Allocator(static_cast<std::int32_t>(entry.key.group_id)).BucketOf(entry.location));
+        kept.push_back(std::move(entry));
+    }
+    if (kept.empty()) {
+        return std::nullopt;
+    }
+    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids, buckets);
+    _assert(host_allocation.blocks.size() == kept.size(), "Host allocation result must stay aligned");
+    std::vector<CacheTransfer> transfers;
+    std::vector<StoreTicket> tickets;
+    for (std::size_t i = 0; i < kept.size(); ++i) {
+        CacheBlockRef& host_block_ref = host_allocation.blocks[i];
+        if (!host_block_ref) {
+            continue;  // L2 is full of pinned entries: this one is lost, as without L2
+        }
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(group_ids[i]));
+        transfers.push_back(CacheTransfer{
+            .group_id = group_ids[i],
+            .source_page = manager.ResolveCacheBlockId(kept[i].location),
+            .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
+            .content_hash = kept[i].key.content_hash,
+            .page_offset = kept[i].key.page_offset,
+        });
+        tickets.push_back(StoreTicket{std::move(kept[i].key), CacheBlockRef{}, std::move(host_block_ref)});
+    }
+    if (transfers.empty()) {
+        return std::nullopt;
+    }
+    const std::uint32_t op_id = nextOpId();
+    const bool inserted =
+        write_backs_.emplace(op_id, InFlightWriteBack{StoreSourceGuard::kStreamOrdered, std::move(tickets)}).second;
+    _assert(inserted, "duplicate store op id");
+    return WriteBackOperation{
+        .op_id = op_id,
+        .transfers = std::move(transfers),
+        .source_pinned = false,
+    };
+}
+
+std::unordered_set<CacheKey, CacheKeyHash> TierTransferManager::storingKeys() const {
+    // Derived from write_backs_ on demand rather than mirrored in a second
+    // container that would have to be kept in step with it.
+    std::unordered_set<CacheKey, CacheKeyHash> keys;
+    for (const auto& [op_id, write_back] : write_backs_) {
+        for (const StoreTicket& ticket : write_back.tickets) {
+            keys.insert(ticket.key);
+        }
+    }
+    return keys;
 }
 
 bool TierTransferManager::HasPinnedStoresInFlight() const {

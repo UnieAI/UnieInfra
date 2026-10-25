@@ -166,6 +166,8 @@ bool CacheCoordinator::ClearDeviceCache() {
         evictCachedBlock(group_id, location);
         FatalCheck(!pool_.IsOccupied(location), "clearable Device cache entry disappeared");
     }
+    // A cleared cache is dropped, not written back.
+    evicted_for_store_.clear();
     return true;
 }
 
@@ -1074,11 +1076,15 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
     }
 }
 
-void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> content_hashes) {
+void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> content_hashes, bool include_state) {
     if (host_pool_ == nullptr) {
         return;
     }
-    for (const CacheGroup& group : groups_) {
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (!include_state && GroupIsState(i)) {
+            continue;
+        }
+        const CacheGroup& group = groups_[i];
         // A tail hash holds fewer blocks than a page; Contains filters.
         for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
             if (group.Index().Contains(pool_, key)) {
@@ -1134,7 +1140,7 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
     }
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     const bool automatically_streams_to_host =
-        stream_device_cache_to_host_ &&
+        stream_device_cache_to_host_ && !write_on_evict_ &&
         (groups_[group_index].Spec().attn_kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
@@ -1342,6 +1348,7 @@ bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockL
     if (!removed) {
         return false;
     }
+    recordEvictedForStore(*removed, location);
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
@@ -1354,6 +1361,7 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     if (!removed) {
         return false;
     }
+    recordEvictedForStore(*removed, location);
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
@@ -1374,6 +1382,60 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     }
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
+}
+
+void CacheCoordinator::recordEvictedForStore(const CacheKey& key, CacheBlockLocation location) {
+    if (write_on_evict_ && !ContainsHostCachedBlock(key)) {
+        evicted_for_store_.push_back(EvictedForStore{.key = key, .location = location});
+    }
+}
+
+void CacheCoordinator::QueueEvictionCandidatesForStore(std::int32_t reserve_lcm_blocks) {
+    if (!write_on_evict_) {
+        return;
+    }
+    const std::int32_t to_cover = reserve_lcm_blocks - pool_.NumEmptyLcmBlocks();
+    if (to_cover <= 0) {
+        return;
+    }
+    // Every group's eviction order merged by access epoch, oldest first: the
+    // order admission takes victims in.
+    struct GroupWalk {
+        PrefixCacheIndex::EvictionCursor cursor;
+        std::vector<PrefixCacheIndex::EvictionCandidate> epoch;
+    };
+    std::vector<GroupWalk> walks(groups_.size());
+    const auto advance = [&](std::size_t i) {
+        walks[i].epoch.clear();
+        groups_[i].Index().NextEvictionEpoch(pool_, walks[i].cursor, walks[i].epoch);
+    };
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (!GroupIsReplayable(static_cast<std::int32_t>(i))) {
+            advance(i);
+        }
+    }
+    std::unordered_set<std::int32_t> covered;
+    while (static_cast<std::int32_t>(covered.size()) < to_cover) {
+        std::optional<std::size_t> oldest;
+        for (std::size_t i = 0; i < walks.size(); ++i) {
+            if (!walks[i].epoch.empty() && (!oldest || walks[i].epoch.front().metadata.last_access_epoch <
+                                                           walks[*oldest].epoch.front().metadata.last_access_epoch)) {
+                oldest = i;
+            }
+        }
+        if (!oldest) {
+            return;  // every unpinned entry is covered
+        }
+        const PrefixCacheIndex& index = groups_[*oldest].Index();
+        for (const PrefixCacheIndex::EvictionCandidate& candidate : walks[*oldest].epoch) {
+            covered.insert(candidate.location.lcm_block_id);
+            std::optional<CacheKey> key = index.KeyAt(pool_, candidate.location);
+            if (key && !ContainsHostCachedBlock(*key)) {
+                pending_stores_.push_back(StoreCandidate{.key = std::move(*key)});
+            }
+        }
+        advance(*oldest);
+    }
 }
 
 bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {

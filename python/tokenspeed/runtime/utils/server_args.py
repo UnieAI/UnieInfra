@@ -499,7 +499,12 @@ class ServerArgs:
     enable_kvstore: bool = False
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
-    kvstore_io_backend: str = "kernel"
+    # The copy engines: a mapped-Host Triton copy ("kernel") moves a D2H at
+    # ~0.5 GB/s on H200 and takes SMs from the forward.
+    kvstore_io_backend: str = "direct"
+    kvstore_store_final_state: bool = False
+    kvstore_write_policy: str = "write-through"
+    kvstore_clean_reserve: float = 0.05
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -2631,7 +2636,41 @@ class ServerArgs:
             type=str,
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
-            help="The IO backend for KVStore transfer between CPU and GPU.",
+            help="The IO backend for KVStore transfer between CPU and GPU. "
+            "'direct' copies on the DMA engines; 'kernel' copies with Triton "
+            "kernels reading and writing mapped Host memory, which runs on the "
+            "SMs and is far slower for Device-to-Host.",
+        )
+        parser.add_argument(
+            "--kvstore-store-final-state",
+            action="store_true",
+            help="Also copy to Host L2 the recurrent-state checkpoint (GDN / "
+            "Mamba) a request publishes when it finishes. Off by default: it "
+            "is a whole recurrent state per request (~100 MB on a 27B hybrid) "
+            "that only a continuation of that exact sequence can reuse, and "
+            "the Device copy serves that while resident. The prompt's "
+            "checkpoints and every KV page are copied either way.",
+        )
+        parser.add_argument(
+            "--kvstore-write-policy",
+            type=str,
+            choices=["write-through", "write-on-evict"],
+            default=ServerArgs.kvstore_write_policy,
+            help="When a Device cache entry is copied to Host L2. "
+            "'write-through' copies every entry as it is published. "
+            "'write-on-evict' copies an entry only on its way out of the "
+            "Device: a cleaner stores the next eviction victims ahead of "
+            "admission (see --kvstore-clean-reserve), and an entry evicted "
+            "before it was cleaned is copied in the round that evicts it. A "
+            "Device cache that never fills copies nothing.",
+        )
+        parser.add_argument(
+            "--kvstore-clean-reserve",
+            type=float,
+            default=ServerArgs.kvstore_clean_reserve,
+            help="With --kvstore-write-policy write-on-evict: the fraction of "
+            "the Device KV pool kept empty or already copied to Host, so "
+            "evictions rarely wait on a copy. 0 copies only at eviction.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

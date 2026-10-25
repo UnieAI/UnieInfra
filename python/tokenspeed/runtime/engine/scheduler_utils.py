@@ -361,6 +361,9 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     inflight_prefix_defer_pages: int = 4,
+    store_final_state_to_host: bool = False,
+    host_write_on_evict: bool = False,
+    host_clean_reserve: float = 0.05,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -403,6 +406,13 @@ def make_config(
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
         inflight_prefix_defer_pages: ``--inflight-prefix-defer-pages``: the
             shared-prefix dedup threshold in prefix pages; 0 disables it.
+        store_final_state_to_host: ``--kvstore-store-final-state``: copy a
+            finishing request's final recurrent-state checkpoint to Host L2.
+        host_write_on_evict: ``--kvstore-write-policy write-on-evict``: copy a
+            Device entry to Host L2 only on its way out of the Device.
+        host_clean_reserve: ``--kvstore-clean-reserve``: the fraction of the
+            Device pool write-on-evict keeps empty or Host-backed ahead of
+            admission.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -437,6 +447,9 @@ def make_config(
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.inflight_prefix_defer_pages = inflight_prefix_defer_pages
+    cfg.store_final_state_to_host = store_final_state_to_host
+    cfg.host_write_on_evict = host_write_on_evict
+    cfg.host_clean_reserve = host_clean_reserve
     cfg.l3_prefetch_min_pages = l3_prefetch_min_pages
     cfg.enable_l3_storage = enable_l3_storage
     cfg.enable_kv_cache_events = enable_kv_cache_events

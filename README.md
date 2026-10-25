@@ -2,21 +2,12 @@
 
 UnieInfer is UnieAI's LLM inference engine for **agent workloads**: a fixed
 system prompt and tool schemas shared by every request, conversations that grow
-turn by turn, and many agents running at once. It is built on
-[TokenSpeed](https://github.com/lightseekorg/tokenspeed) from the LightSeek
-Foundation and tracks it closely. UnieAI's model support, scheduling and kernel
-work sits on top; [UNIEINFER.md](UNIEINFER.md) describes what UnieInfer adds and
-how it follows upstream.
+turn by turn, and many agents running at once. It serves an OpenAI-compatible
+API, and its scheduler reuses KV cache across requests that share a prefix,
+including requests that arrive together.
 
-Inherited from TokenSpeed:
-
-- **Scheduler**: C++ control plane and Python execution plane. Request
-  lifecycle and KV cache ownership are a finite-state machine, and the type
-  system checks safe KV reuse at compile time.
-- **Kernels**: a pluggable kernel system with a portable public API and a
-  central registry, so each platform selects its own implementation.
-- **Entrypoint**: an OpenAI-compatible server with low-overhead request
-  handling.
+UnieInfer is built on the open-source TokenSpeed engine (see
+[Upstream](#upstream)). [UNIEINFER.md](UNIEINFER.md) lists what UnieInfer adds.
 
 ## Results at a glance
 
@@ -32,16 +23,9 @@ output throughput divided by vLLM's at that concurrency.
 For Qwen3.8, the vLLM figure is the faster of vLLM with and without MTP at each
 concurrency.
 
-Some of this work is still under review and not yet merged into `unieai`.
-Until it lands, a recipe below needs the branch listed for it:
-
-| work | branch |
-|---|---|
-| DeepSeek-V4.1 performance and prefill coalescing | `dsv41-perf` (#28; full history in #26) |
-| Qwen3.8 MTP | `q38-mtp-fix` (#32) |
-| Gemma-4 serving, packed KV, FA4 prefill, fp8 KV cache | `gemma4-serve` |
-| Shared-prefix dedup | `sched-shared-prefix` |
-| Host L2 on the DMA engines, write-on-evict | `l2-direct-dma`, `l2-write-on-evict` |
+The Qwen3.8, Gemma-4, dedup and Host L2 results are from `unieai`. The
+DeepSeek-V4.1 results are from the `dsv41-perf` branch (#28); porting that work
+onto `unieai` is in progress.
 
 ## Benchmark setup
 
@@ -85,7 +69,7 @@ How c16 went from 51.4 s to 24.2 s (vLLM 0.31 takes 47.3 s):
 
 | step | c16 (s) |
 |---|---|
-| upstream TokenSpeed with DeepSeek-V4.1 support | 51.4 |
+| starting point: upstream DeepSeek-V4.1 support | 51.4 |
 | batch prefill attention, fuse the Hopper index top-k glue | 45.3 |
 | capture the attention projections in prefill CUDA graphs | 36.5 |
 | prefill graphs up to 4096 tokens, W4A8 MoE (FP8 activations) | 32.8 |
@@ -225,11 +209,11 @@ number is the fewest shared pages worth waiting for, default 4. To watch it:
     last 256 prompts and since start.
   - The dedup figures count the prompts that waited for an in-flight prefix,
     the rounds they waited, and the chunks cut at a branch point.
-- With `--enable-metrics`, Prometheus has the reuse ratio as
-  `tokenspeed:prefix_cache_hits_total / tokenspeed:prompt_tokens_total`. The
-  dedup activity is in `tokenspeed:prefix_dedup_deferred_requests_total`,
-  `tokenspeed:prefix_dedup_deferred_rounds_total` and
-  `tokenspeed:prefix_dedup_cut_chunks_total`.
+- With `--enable-metrics --metrics-prefix unieinfer`, Prometheus has the reuse
+  ratio as `unieinfer:prefix_cache_hits_total / unieinfer:prompt_tokens_total`.
+  The dedup activity is in `unieinfer:prefix_dedup_deferred_requests_total`,
+  `unieinfer:prefix_dedup_deferred_rounds_total` and
+  `unieinfer:prefix_dedup_cut_chunks_total`.
 
 ## Host L2 KV tier
 
@@ -240,40 +224,32 @@ cache overflows and an evicted prefix is needed again.
 Across the four models and five workloads above:
 - Gemma-4 mixed is the only case that read data back. There the L2 was 21%
   faster.
-- Every other case only paid the copy cost, 12% at the median.
+- Every other case only paid the copy cost: 12% at the median when every
+  cached page is copied to the host as it is written (the default).
+- With `--kvstore-write-policy write-on-evict`, a page is copied only when it
+  leaves the GPU. The median cost drops to 0.1%.
 
-Until the Host L2 work under review lands, serve with `--disable-kvstore`, as
-in the recipes above.
+The L2 helps only when the GPU cache overflows. The recipes above use
+`--disable-kvstore`; to keep it, add `--kvstore-write-policy write-on-evict`.
 
 ## Getting started
 
-UnieInfer installs, launches and is configured the same way as TokenSpeed.
-`unieinfer`, `tokenspeed` and `ts` are the same command. The upstream
-documentation applies:
+`unieinfer serve` starts the server; the recipes above are complete examples.
+Server flags follow the upstream documentation:
+[launching a server](https://lightseek.org/tokenspeed/guides/launching),
+[server parameters](https://lightseek.org/tokenspeed/configuration/server) and
+[parallelism](https://lightseek.org/tokenspeed/serving/parallelism). In-repo docs
+live under [`docs/`](docs/).
 
-- [Getting Started](https://lightseek.org/tokenspeed/guides/getting-started)
-- [Launching a Server](https://lightseek.org/tokenspeed/guides/launching)
-- [Model Recipes](https://lightseek.org/tokenspeed/recipes/models)
-- [Server Parameters](https://lightseek.org/tokenspeed/configuration/server)
-- [Parallelism](https://lightseek.org/tokenspeed/serving/parallelism)
+The older names still work: `tokenspeed` and `ts` run the same command as
+`unieinfer`, and `UNIEINFER_*` environment variables are the new spelling of
+`TOKENSPEED_*` (both are read).
 
-In-repo docs live under [`docs/`](docs/).
+## Upstream
 
-## Built on TokenSpeed
-
-UnieInfer regularly merges upstream TokenSpeed, which the
-[LightSeek Foundation](https://lightseek.org/) develops and releases under the
-MIT license (see [LICENSE](LICENSE)). Fixes that belong upstream go back
-upstream. For upstream news and the design behind the engine, see the
-[TokenSpeed repository](https://github.com/lightseekorg/tokenspeed) and the
-[LightSeek blog](https://lightseek.org/blog/). When citing the engine design,
-please cite TokenSpeed:
-
-```bibtex
-@misc{tokenspeed2026,
-  author       = {{TokenSpeed Team}},
-  title        = {{TokenSpeed}: A Speed-of-Light {LLM} Inference Engine},
-  year         = {2026},
-  howpublished = {\url{https://github.com/lightseekorg/tokenspeed}}
-}
-```
+UnieInfer is built on [TokenSpeed](https://github.com/lightseekorg/tokenspeed),
+which the [LightSeek Foundation](https://lightseek.org/) develops and releases
+under the MIT license (see [LICENSE](LICENSE)). UnieInfer merges upstream
+regularly and sends fixes that belong upstream back there. Python packages and
+some metric names still carry the upstream name (`tokenspeed.*`), so upstream
+changes keep merging cleanly.

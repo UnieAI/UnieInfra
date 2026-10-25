@@ -17,7 +17,10 @@
 
 """CUDA activation kernels."""
 
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.activation import (
@@ -29,3 +32,17 @@ except ImportError:
     silu_and_mul_fuse_nvfp4_quant = error_fn
 
 __all__ = ["silu_and_mul_fuse_block_quant", "silu_and_mul_fuse_nvfp4_quant"]
+
+if silu_and_mul_fuse_block_quant is not error_fn:
+
+    @register_kernel(
+        "activation",
+        "silu_and_mul_fp8_block_quant",
+        name="cuda_silu_and_mul_fp8_block_quant",
+        solution="cuda",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+        priority=Priority.PERFORMANT,
+    )
+    def cuda_silu_and_mul_fp8_block_quant(x, scale, out):
+        return silu_and_mul_fuse_block_quant(x, scale, out)

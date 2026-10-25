@@ -27,7 +27,7 @@ import math
 from collections.abc import Iterable, Sequence
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import swiglu_oai
+from tokenspeed_kernel.ops.activation import swiglu_oai
 from tokenspeed_kernel.ops.attention.prologue import qk_norm_rope
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared

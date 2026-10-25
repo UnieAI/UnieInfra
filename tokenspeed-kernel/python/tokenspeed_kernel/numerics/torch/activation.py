@@ -67,21 +67,31 @@ def torch_sigmoid_mul(
     return (x.float() * (1.0 / (1.0 + torch.exp(-z))).reshape(x.shape)).to(x.dtype)
 
 
+def _into(result: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+    """``result``, written into ``out`` when the caller supplied one."""
+    if out is None:
+        return result
+    return out.copy_(result)
+
+
 @register_kernel(
     "activation",
     "silu_and_mul",
     name="torch_silu_and_mul",
     solution="torch",
     signatures=format_signatures("x", "dense", _FLOAT_DTYPES),
+    traits={"limited": frozenset({False, True})},
     priority=Priority.REFERENCE,
 )
-def torch_silu_and_mul(x: torch.Tensor, limit: float | None) -> torch.Tensor:
+def torch_silu_and_mul(
+    x: torch.Tensor, limit: float | None, out: torch.Tensor | None = None
+) -> torch.Tensor:
     """``silu(gate) * up``; a ``limit`` clamps gate above and up on both sides."""
     gate, up = _halves(x)
     if limit is not None:
         gate = gate.clamp(max=limit)
         up = up.clamp(-limit, limit)
-    return (F.silu(gate) * up).to(x.dtype)
+    return _into((F.silu(gate) * up).to(x.dtype), out)
 
 
 def eager_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
@@ -142,13 +152,16 @@ def situ(x: torch.Tensor, beta: float) -> torch.Tensor:
     priority=Priority.REFERENCE,
 )
 def torch_situ_and_mul(
-    x: torch.Tensor, beta: float, linear_beta: float | None
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``situ(gate) * up``; a ``linear_beta`` soft-caps up with ``tanh``."""
     gate, up = _halves(x)
     if linear_beta is not None:
         up = linear_beta * torch.tanh(up / linear_beta)
-    return (situ(gate, beta) * up).to(x.dtype)
+    return _into((situ(gate, beta) * up).to(x.dtype), out)
 
 
 @register_kernel(

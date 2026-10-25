@@ -1136,16 +1136,14 @@ def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
 
 
 @requires_cuda
-@pytest.mark.parametrize("submitter", ["cuda-batch", "copy"])
+@pytest.mark.parametrize("submitter", ["host_dma_cuda_batch", "host_dma_copy"])
 def test_cache_ranges_dma_submitters_are_byte_exact(monkeypatch, submitter):
     module = _load_host_transfer_contract_module()
     host_dma = importlib.import_module("tokenspeed_kernel.ops.kvcache.host_dma")
-    monkeypatch.setenv("TOKENSPEED_HOST_DMA_SUBMITTER", submitter)
-    monkeypatch.setattr(host_dma, "_active", None)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_OVERRIDE_KVCACHE_HOST_DMA", submitter)
+    monkeypatch.setattr(host_dma, "_refused", set())
     # Three runtime calls for seven ranges.
     monkeypatch.setattr(host_dma, "CUDA_MEMCPY_BATCH", 3)
-    if submitter not in host_dma.host_dma_submitters():
-        pytest.skip(f"{submitter} is unavailable here")
 
     device = torch.randint(0, 255, (7 * 512,), dtype=torch.uint8, device="cuda")
     host = torch.zeros(7 * 1024, dtype=torch.uint8, pin_memory=True)
@@ -1155,7 +1153,8 @@ def test_cache_ranges_dma_submitters_are_byte_exact(monkeypatch, submitter):
 
     module._transfer_cache_ranges("d2h", (device,), host, ranges, stream)
     stream.synchronize()
-    assert host_dma.host_dma_submitters()[0] == submitter
+    if submitter in host_dma._refused:
+        pytest.skip(f"{submitter} is unavailable here")
     for _, device_offset, host_offset, num_bytes in ranges:
         assert torch.equal(
             host[host_offset : host_offset + num_bytes],
@@ -1403,21 +1402,37 @@ def test_host_dma_falls_back_when_a_submitter_refuses(monkeypatch):
         calls.append("accept")
         return True
 
-    monkeypatch.delenv("TOKENSPEED_HOST_DMA_SUBMITTER", raising=False)
-    monkeypatch.setattr(host_dma, "_registry", dict(host_dma._registry))
-    monkeypatch.setattr(host_dma, "_active", None)
-    host_dma.register_host_dma_submitter(
-        host_dma.HostDmaSubmitter("refuses", 100, lambda: True, refuse)
-    )
-    host_dma.register_host_dma_submitter(
-        host_dma.HostDmaSubmitter("accepts", 50, lambda: True, accept)
-    )
-    host_dma.register_host_dma_submitter(
-        host_dma.HostDmaSubmitter("absent", 200, lambda: False, refuse)
-    )
+    from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
+    from tokenspeed_kernel.signature import format_signatures
 
-    assert host_dma.submit_host_dma("d2h", (), None, ()) == "accepts"
-    assert host_dma.submit_host_dma("d2h", (), None, ()) == "accepts"
-    # Retired after its first refusal; never-available ones are never tried.
-    assert calls == ["refuse", "accept", "accept"]
-    assert host_dma.host_dma_submitters()[0] == "accepts"
+    registry = KernelRegistry.get()
+    monkeypatch.delenv("TOKENSPEED_KERNEL_OVERRIDE_KVCACHE_HOST_DMA", raising=False)
+    monkeypatch.setattr(host_dma, "_refused", set())
+    monkeypatch.setattr(host_dma, "FALLBACK", "test_host_dma_accepts")
+    signatures = format_signatures("host", "dense", {torch.uint8})
+    # A plugin outranks every built-in on any vendor.
+    register_kernel(
+        "kvcache",
+        "host_dma",
+        name="test_host_dma_refuses",
+        solution="test",
+        signatures=signatures,
+        priority=Priority.PLUGIN,
+    )(refuse)
+    register_kernel(
+        "kvcache",
+        "host_dma",
+        name="test_host_dma_accepts",
+        solution="test",
+        signatures=signatures,
+        priority=Priority.REFERENCE,
+    )(accept)
+    try:
+        assert host_dma.submit_host_dma("d2h", (), None, ()) == "test_host_dma_accepts"
+        assert host_dma.submit_host_dma("d2h", (), None, ()) == "test_host_dma_accepts"
+        # Refused for the process after its first refusal.
+        assert calls == ["refuse", "accept", "accept"]
+    finally:
+        registry._unregister("test_host_dma_refuses")
+        registry._unregister("test_host_dma_accepts")
+        registry.clear_cache()

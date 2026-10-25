@@ -195,12 +195,10 @@ class PrefillPackScratch:
 
     def _pack_cuda(self, items: list[object]) -> Iterable[Sge]:
         import torch
-        from tokenspeed_kernel.platform import current_platform
+        from tokenspeed_kernel.ops.copy import memcpy_2d_async, memcpy_2d_supported
 
-        if not torch.cuda.is_available() or not current_platform().is_nvidia:
+        if not torch.cuda.is_available() or not memcpy_2d_supported():
             return flatten_transfer_blocks(items)
-
-        from tokenspeed_kernel.ops.copy.cuda import memcpy_2d_async
 
         packed_bytes = 0
         for item in items:

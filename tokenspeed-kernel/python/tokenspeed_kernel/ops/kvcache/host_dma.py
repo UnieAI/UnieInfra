@@ -18,94 +18,50 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Pluggable submitters for the Host cache's DMA byte ranges.
+"""Submitters for the Host cache's DMA byte ranges: kvcache family, mode
+``host_dma`` in the kernel registry.
 
 A submitter enqueues every ``(device_buffer_index, device_offset,
 host_offset, num_bytes)`` range of one transfer on the current stream. One
 ``copy_`` per range costs ~20 us of CPU on the submitting (forward) thread --
-as long as the copy itself for a 256 KiB range -- so each vendor plugs in the
+as long as the copy itself for a 256 KiB range -- so each vendor registers the
 cheapest batch submission its runtime has:
 
-  ``cuda-batch``  NVIDIA, ``cudaMemcpyBatchAsync`` (CUDA 12.8+), ~1 us a range
-  ``copy``        any device, one ``Tensor.copy_`` per range (the fallback)
+  ``host_dma_cuda_batch``  NVIDIA, ``cudaMemcpyBatchAsync`` (CUDA 12.8+)
+  ``host_dma_copy``        any device, one ``Tensor.copy_`` per range
 
-Another backend (e.g. a HIP batch for AMD) registers itself with
-``register_host_dma_submitter``. The highest-priority available submitter is
-used unless ``TOKENSPEED_HOST_DMA_SUBMITTER`` names one. A submitter that
-returns False before submitting anything (say, a driver without the API) is
-retired for the process and the next one takes over.
+Another backend (e.g. a HIP batch for AMD) registers the same family and mode
+with ``vendors={"amd"}`` -- from an out-of-tree plugin with
+``Priority.PLUGIN``. Selection is the registry's, so
+``TOKENSPEED_KERNEL_OVERRIDE_KVCACHE_HOST_DMA=<name>`` forces one. A submitter
+returns False, having enqueued nothing, when its runtime turns out not to
+support it (say, a driver without the API); it is then refused for the
+process and ``host_dma_copy`` carries the transfer.
 """
 
 from __future__ import annotations
 
-import os
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Literal
 
 import torch
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 Direction = Literal["d2h", "h2d"]
 Range = tuple[int, int, int, int]
-SubmitFn = Callable[
-    [Direction, Sequence[torch.Tensor], torch.Tensor, Sequence[Range]], bool
-]
 
-
-@dataclass(frozen=True)
-class HostDmaSubmitter:
-    """One way to enqueue a transfer's ranges.
-
-    Attributes:
-        name: The name ``TOKENSPEED_HOST_DMA_SUBMITTER`` selects it by.
-        priority: Higher is tried first.
-        available: Whether this process can use it at all (checked once).
-        submit: Enqueues every range on the current stream and returns True,
-            or returns False without enqueuing anything when it cannot.
-    """
-
-    name: str
-    priority: int
-    available: Callable[[], bool]
-    submit: SubmitFn
-
-
-_registry: dict[str, HostDmaSubmitter] = {}
-# Submitters in the order they are tried, resolved on first use.
-_active: list[HostDmaSubmitter] | None = None
-
-
-def register_host_dma_submitter(submitter: HostDmaSubmitter) -> None:
-    """Add (or replace) a submitter; it competes from the next transfer on."""
-    global _active
-    _registry[submitter.name] = submitter
-    _active = None
-
-
-def host_dma_submitters() -> list[str]:
-    """The names of the usable submitters, in the order they are tried."""
-    return [submitter.name for submitter in _resolve()]
-
-
-def _resolve() -> list[HostDmaSubmitter]:
-    global _active
-    if _active is None:
-        forced = os.environ.get("TOKENSPEED_HOST_DMA_SUBMITTER")
-        if forced:
-            if forced not in _registry:
-                raise ValueError(
-                    f"unknown TOKENSPEED_HOST_DMA_SUBMITTER {forced!r}; "
-                    f"registered: {sorted(_registry)}"
-                )
-            candidates = [_registry[forced]]
-        else:
-            candidates = sorted(
-                _registry.values(), key=lambda submitter: -submitter.priority
-            )
-        _active = [submitter for submitter in candidates if submitter.available()]
-        if _registry["copy"] not in _active:
-            _active.append(_registry["copy"])
-    return _active
+FALLBACK = "host_dma_copy"
+_SIGNATURE = format_signature(host=dense_tensor_format(torch.uint8))
+_SIGNATURES = format_signatures("host", "dense", {torch.uint8})
+# Submitters whose runtime refused them; process-wide.
+_refused: set[str] = set()
 
 
 def submit_host_dma(
@@ -115,18 +71,29 @@ def submit_host_dma(
     ranges: Sequence[Range],
 ) -> str:
     """Enqueue ``ranges`` on the current stream; return the submitter used."""
-    active = _resolve()
-    while True:
-        submitter = active[0]
-        if submitter.submit(direction, device_buffers, host_buffer, ranges):
-            return submitter.name
-        # Nothing was enqueued: retire it for the process.
-        active.pop(0)
+    kernel = select_kernel("kvcache", "host_dma", _SIGNATURE)
+    if kernel.name not in _refused and kernel(
+        direction, device_buffers, host_buffer, ranges
+    ):
+        return kernel.name
+    # Nothing was enqueued: refuse it for the process.
+    _refused.add(kernel.name)
+    kernel = select_kernel("kvcache", "host_dma", _SIGNATURE, override=FALLBACK)
+    kernel(direction, device_buffers, host_buffer, ranges)
+    return kernel.name
 
 
 # --- copy: one Tensor.copy_ per range -----------------------------------------
 
 
+@register_kernel(
+    "kvcache",
+    "host_dma",
+    name=FALLBACK,
+    solution="torch",
+    signatures=_SIGNATURES,
+    priority=Priority.PORTABLE,
+)
 def _submit_copy(direction, device_buffers, host_buffer, ranges) -> bool:
     byte_buffers = tuple(
         buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers
@@ -145,13 +112,6 @@ def _submit_copy(direction, device_buffers, host_buffer, ranges) -> bool:
     return True
 
 
-register_host_dma_submitter(
-    HostDmaSubmitter(
-        name="copy", priority=0, available=lambda: True, submit=_submit_copy
-    )
-)
-
-
 # --- cuda-batch: cudaMemcpyBatchAsync ------------------------------------------
 
 # Copies per call; the driver's cost per copy grows past a few thousand in one
@@ -165,21 +125,25 @@ def _cuda_runtime():
     return runtime
 
 
-def _cuda_batch_available() -> bool:
-    # ROCm builds report "cuda" devices too; cuda.bindings drives NVIDIA only.
-    if torch.version.hip is not None or not torch.cuda.is_available():
-        return False
+@register_kernel(
+    "kvcache",
+    "host_dma",
+    name="host_dma_cuda_batch",
+    solution="cuda",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_SIGNATURES,
+    priority=Priority.PERFORMANT,
+)
+def _submit_cuda_batch(direction, device_buffers, host_buffer, ranges) -> bool:
+    if not ranges:
+        return True
     try:
-        return hasattr(_cuda_runtime(), "cudaMemcpyBatchAsync")
+        runtime = _cuda_runtime()
     except ImportError:
         return False
-
-
-def _submit_cuda_batch(direction, device_buffers, host_buffer, ranges) -> bool:
-    device = device_buffers[0].device
-    if device.type != "cuda":
+    if not hasattr(runtime, "cudaMemcpyBatchAsync"):
         return False
-    runtime = _cuda_runtime()
+    device = device_buffers[0].device
     attributes = runtime.cudaMemcpyAttributes()
     attributes.srcAccessOrder = (
         runtime.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
@@ -219,13 +183,3 @@ def _submit_cuda_batch(direction, device_buffers, host_buffer, ranges) -> bool:
                 return False
             raise RuntimeError(f"cudaMemcpyBatchAsync failed: {error}")
     return True
-
-
-register_host_dma_submitter(
-    HostDmaSubmitter(
-        name="cuda-batch",
-        priority=10,
-        available=_cuda_batch_available,
-        submit=_submit_cuda_batch,
-    )
-)

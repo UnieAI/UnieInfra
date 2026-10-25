@@ -62,12 +62,12 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.activation import sigmoid_mul
 from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
     rmsnorm_gated_sigmoid,
-    sigmoid_mul,
 )
 from tokenspeed_kernel.ops.attention.mla import (
     mla_normalize_project_query,

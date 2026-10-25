@@ -27,7 +27,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.activation import sigmoid_mul
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping

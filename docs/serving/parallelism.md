@@ -1,6 +1,6 @@
 # Parallelism
 
-TokenSpeed exposes familiar `--tensor-parallel-size` and `--tp` entry points
+UnieInfer exposes familiar `--tensor-parallel-size` and `--tp` entry points
 plus additional split parallelism controls for attention, dense, and MoE layers.
 
 Scheduler process names in `ps` include their parallel ranks, for example
@@ -20,7 +20,7 @@ tokenspeed serve <model> \
   --tensor-parallel-size 8
 ```
 
-`--tensor-parallel-size` maps to TokenSpeed attention tensor parallelism, and
+`--tensor-parallel-size` maps to UnieInfer attention tensor parallelism, and
 you cannot combine it with `--attn-tp-size`.
 
 ## Split parallelism
@@ -113,7 +113,7 @@ cached prefix. Under head TP each rank holds `kv_b_proj` for its `H / W`
 heads and the latent cache for its own requests only, so no rank can expand
 the other heads of its prefix, and no other rank holds that prefix to expand
 it for it: the full-head K/V of a prefill is not available on the layout.
-TokenSpeed therefore refuses the layout over DP ranks outside
+UnieInfer therefore refuses the layout over DP ranks outside
 `--disaggregation-mode decode` (head TP over the query shards of a prefill
 engine serves its extend rows through the absorbed sparse prefill instead,
 see below), and the decode engine keeps every extend-shaped forward off its
@@ -141,7 +141,7 @@ no host sync. The shapes without a table -- a prefill's one row per request
 or its logprob rows, a MIXED round, a model selecting its own logits rows --
 exchange the counts. A drafter sharing the target's head must build its own
 head on the same layout (the NextN, Eagle3-MLA and Llama-Eagle3 drafters do;
-TokenSpeed refuses the others with a clear error). It cannot combine with
+UnieInfer refuses the others with a clear error). It cannot combine with
 `--dp-sampling`, and admission refuses a request asking for prompt logprobs
 (`logprob_start_len`): that path pushes the prompt rows through the LM head
 in per-request chunks, a per-rank number of row exchanges the group cannot
@@ -196,7 +196,7 @@ logs and ignores a conflicting pin rather than rejecting it.
 
 With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 `ts serve` to enable per-rank affinity routing. This requires bundled smg
-releases that carry the TokenSpeed dp-affinity support; see the lockstep
+releases that carry the UnieInfer dp-affinity support; see the lockstep
 note in `serve_smg.py`.
 
 ## MoE deployments
@@ -215,16 +215,16 @@ Start with the recipe closest to your model family, then tune:
 - `--all2all-backend`
 - `--deepep-mode`
 
-With `--moe-backend flashinfer_trtllm`, TokenSpeed automatically pads NVFP4
+With `--moe-backend flashinfer_trtllm`, UnieInfer automatically pads NVFP4
 expert shards to a multiple of 64 along their per-rank intermediate
 dimension. The padding zero-fills the packed weights and block scales in the
 tail, so the extra dimensions do not change the MoE result. For example,
-TokenSpeed pads a 640-wide expert under MoE TP4 from 160 to 192 values per
-rank. TokenSpeed zero-pads BF16 SiLU/SwiGLU expert shards the same way to a
+UnieInfer pads a 640-wide expert under MoE TP4 from 160 to 192 values per
+rank. UnieInfer zero-pads BF16 SiLU/SwiGLU expert shards the same way to a
 multiple of 64 (128 when it cannot adapt the installed FlashInfer launcher,
 or when FlashInfer's JIT cannot build the adapted one). For example,
 Qwen3-30B-A3B's 768-wide experts need no padding under MoE TP4 (192 per
-rank), while TokenSpeed pads a 96-wide shard to 128.
+rank), while UnieInfer pads a 96-wide shard to 128.
 
 On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
 (`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input
@@ -288,7 +288,7 @@ change attention caches or token ownership.
 QKV and output projection sharding support BF16 and 128×128 block-FP8 weights
 with BF16 activations, including the FP8 attention weights in an NVFP4
 checkpoint. The sharding preserves checkpoint FP8 codes and scales. QKV TP
-requires gated MLA with Q-LoRA. TokenSpeed rejects gated MLA without Q-LoRA
+requires gated MLA with Q-LoRA. UnieInfer rejects gated MLA without Q-LoRA
 even with replicated projections. MLA Q-B, KV-B, KDA convolution and
 norms keep their existing mapping. Target-model projection settings do not
 change the draft model.
@@ -383,7 +383,7 @@ For block-scale FP8 with `deep_gemm`, keep `auto` unless the instance only ever
 sees one shape -- for example, a decode-only worker in a PD split, which can pin
 `low_latency` and skip the normal-mode buffers. The nvfp4
 `flashinfer_cutedsl` kernel implements only the low-latency legs, so it requires
-an explicit `--deepep-mode low_latency`. TokenSpeed rejects `auto` and
+an explicit `--deepep-mode low_latency`. UnieInfer rejects `auto` and
 `normal` while building the execution plan. Every forward on such an
 instance, including any prefill, must fit
 `--low-latency-max-num-tokens-per-gpu`.
@@ -397,7 +397,7 @@ Each forward picks the mode from a value every rank agrees on, because the two
 modes are different collectives. With DP attention that value is "every DP rank
 is decoding", so one extending rank moves the whole group to the normal legs.
 
-When DeepEP is selected, TokenSpeed disables the prefill CUDA graph:
+When DeepEP is selected, UnieInfer disables the prefill CUDA graph:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
 graph cannot capture a host sync. Decode graphs are unaffected.
 
@@ -447,13 +447,13 @@ uniform share of routes, and the rank holding them carries the layer's
 critical path. `--ep-num-redundant-experts R` gives every MoE layer
 `P = E + R` physical expert slots, `P / ep_size` per rank, and an *expert
 placement* decides which logical expert each slot holds, so the placement
-replicates a hot expert across ranks. TokenSpeed derives the placement from
+replicates a hot expert across ranks. UnieInfer derives the placement from
 recorded load with DeepSeek's EPLB algorithm — once at startup from a
 profile record, or online from the live counters ([dynamic
 rebalancing](#dynamic-expert-rebalancing) below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
 from the placement and loading every placed slot — LongCat-Flash does.
-TokenSpeed refuses the placement flags for any other model, so it
+UnieInfer refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):
 replicas live on other ranks.
@@ -531,7 +531,7 @@ replicas live on other ranks.
      rl-bitwise slot-combine path) exactly one rank must compute each route, so the
      replica is a pure function of the token:
      `replicas[logical, (token row + route rank) mod replicas]`, identical
-     on every rank. TokenSpeed refuses random replica choice on this path.
+     on every rank. UnieInfer refuses random replica choice on this path.
 
    Under `--numerics rl-bitwise` the placement must be deterministic (static
    algorithms only) and drafts stay trivially placed. The MoE output remains
@@ -567,10 +567,10 @@ bounds the stall each scheduling round pays: the rebalance switches the
 model's MoE layers `L` per round, each layer's weights first and its routing
 tables right after, so a forward never sees a layer whose tables and slots
 disagree.
-TokenSpeed allows `--ep-num-redundant-experts 0`: the rebalance then only
+UnieInfer allows `--ep-num-redundant-experts 0`: the rebalance then only
 permutes experts across ranks. `--init-expert-location` still seeds the first
 placement. `POST /rebalance_experts` starts one rebalance now (it replies
-once it takes the load snapshot; the moves follow). TokenSpeed refuses the
+once it takes the load snapshot; the moves follow). UnieInfer refuses the
 `EXPERT_LOAD` profile activity under `--enable-eplb`, since the rebalance
 owns the same counters. The engine log reports the balancedness each snapshot
 saw and the one the new placement is expected to reach.
@@ -808,7 +808,7 @@ ranks run the engine only and expose no endpoint.
 
 ### Under a launcher
 
-Inside a multi-node Slurm step, TokenSpeed derives `--nnodes`, `--node-rank`,
+Inside a multi-node Slurm step, UnieInfer derives `--nnodes`, `--node-rank`,
 and `--dist-init-addr` from the step environment when you do not give them,
 so the same command line runs on every node:
 
@@ -826,27 +826,27 @@ Rules:
 
 - An explicit `--nnodes` or `--node-rank` that contradicts the environment is
   an error, not an override. Omit the flag to accept the launcher's value.
-- TokenSpeed always uses an explicit `--dist-init-addr` as given.
+- UnieInfer always uses an explicit `--dist-init-addr` as given.
 - Derivation only engages inside an `srun` step of more than one node. Outside
   a step — including the batch script of a multi-node `sbatch` — or in a
   single-node step, behavior is unchanged: launch the ranks yourself and pass
   `--nnodes`/`--node-rank`/`--dist-init-addr`.
-- If TokenSpeed detects a multi-node step but cannot resolve the topology,
+- If UnieInfer detects a multi-node step but cannot resolve the topology,
   startup fails with the reason rather than falling back to a single node.
 - The derived address is the one the head node's hostname resolves to. Where
   that is not the interface you want carrying bootstrap traffic, set
   `--dist-init-addr` explicitly.
-- TokenSpeed sets `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` from the
+- UnieInfer sets `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` from the
   interface that routes to the head node, unless they are already present in
   the environment. Gloo needs this: it has no peer-address heuristic and
   otherwise binds whatever the local hostname resolves to, which is a loopback
-  entry on many hosts. NCCL normally selects correctly on its own. TokenSpeed
+  entry on many hosts. NCCL normally selects correctly on its own. UnieInfer
   sets it for consistency.
-- TokenSpeed does not set `NCCL_IB_HCA`. NCCL's own device selection prefers
+- UnieInfer does not set `NCCL_IB_HCA`. NCCL's own device selection prefers
   the higher-bandwidth InfiniBand devices and skips Ethernet-link ones.
 - The rendezvous port is a fixed constant, not a function of `--port`. Every
   node has to arrive at the same port without talking to any other node, and
-  under `tokenspeed serve` TokenSpeed allocates the engine's own port per
+  under `tokenspeed serve` UnieInfer allocates the engine's own port per
   node. The constant also stays clear of the kernel's ephemeral range, which
   startup checks. Pass `--dist-init-addr` to use a different port.
 
@@ -883,7 +883,7 @@ experts instead of all picking the same ones, and, with speculative
 decoding, set `TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN` to the `avg_accept_len`
 of a real run.
 
-TokenSpeed currently supports the flag on AMD GPUs, on one node, without
+UnieInfer currently supports the flag on AMD GPUs, on one node, without
 pipeline, context or attention data parallelism, an MoE TP x EP size other
 than the attention TP size, `--mm-encoder-tp-mode data`, PD disaggregation,
 fused all-reduce, or an `--all2all-backend` transport.

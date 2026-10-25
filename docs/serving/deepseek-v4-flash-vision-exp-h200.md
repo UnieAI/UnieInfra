@@ -2,7 +2,7 @@
 
 Running `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` (a quantized
 DeepSeek-V4-Flash variant) on two of the eight H200s (Hopper / SM90, cc 9.0)
-of the `roy` host, through the token-speed / UnieInfra engine.
+of the `roy` host, through the UnieInfer engine.
 
 ## Status
 
@@ -348,7 +348,7 @@ bash /workspace/roy/launch_vision.sh v4vision
 ```
 
 Watch the log: `Kernel tuning finished`, `Capturing batches ... 23/23`,
-`TokenSpeed gRPC server is ready`, `Starting TokenSpeed HTTP server`. Engine
+`TokenSpeed gRPC server is ready` (printed by the SMG gateway package), `Starting UnieInfer HTTP server`. Engine
 gRPC on port 56749, OpenAI HTTP on 30102 (also accepted on 30101).
 
 When serving with the DSPARK speculative draft (`--speculative-algorithm

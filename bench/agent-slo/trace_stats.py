@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize a TokenSpeed chrome trace the way the parity method needs it.
+"""Summarize a UnieInfer chrome trace the way the parity method needs it.
 
 The engine already renders the numbers a decode investigation asks for: POST
 ``/start_profile`` with a body of ``{"output_dir": ..., "num_steps": N,

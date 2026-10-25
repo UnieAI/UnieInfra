@@ -48,7 +48,7 @@ class MooncakeTransferEngine:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run TokenSpeed with MooncakeTransferEngine."
+                "to run UnieInfer with MooncakeTransferEngine."
             ) from e
 
         self.engine = TransferEngine()

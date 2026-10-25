@@ -26,7 +26,7 @@ test = [
 build-dir = "build"
 cmake.version = ">=3.22"
 cmake.args = ["-DTOKENSPEED_SCHEDULER_BUILD_TESTS=OFF", "-DTOKENSPEED_SCHEDULER_BUILD_PYTHON=ON"]
-wheel.packages = ["python/tokenspeed_scheduler"]
+wheel.packages = ["python/tokenspeed_scheduler", "python/unieinfer_scheduler"]
 
 [tool.setuptools]
 license-files = ["LICENSE"]

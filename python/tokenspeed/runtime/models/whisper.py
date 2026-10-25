@@ -27,7 +27,7 @@ output is spliced into the LM's input embeddings and the rest is ordinary
 causal decode. Whisper is a real encoder-decoder: the decoder cross-attends
 to a fixed encoder output that is computed once and read by every decode
 step. That fixed KV is the whole design question, and the four reference
-engines disagree about it (``unieinfra/xref/15-encoder-embedding.md`` §3.3):
+engines disagree about it (``unieinfer/xref/15-encoder-embedding.md`` §3.3):
 vLLM gives it its own KV spec, manager and cache group; TRT-LLM gives it a
 separate resource manager with its own slice of the KV budget; SGLang folds
 it into the ordinary paged pool by offsetting the layer id so cross-attention

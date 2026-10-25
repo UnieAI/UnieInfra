@@ -101,7 +101,7 @@ def _encode_embedding(vector: list[float], encoding_format: str):
 
 
 def create_app(engine, served_model_name: str) -> FastAPI:
-    app = FastAPI(title="TokenSpeed pooling server")
+    app = FastAPI(title="UnieInfer pooling server")
     app.state.engine = engine
     app.state.model = served_model_name
 
@@ -118,7 +118,7 @@ def create_app(engine, served_model_name: str) -> FastAPI:
                     "id": served_model_name,
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "tokenspeed",
+                    "owned_by": "unieinfer",
                 }
             ],
         }

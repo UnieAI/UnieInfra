@@ -645,7 +645,7 @@ For orientation, one iteration of `event_loop`:
   then CP, then PP) and then across attention DP — DP replicas share
   Mooncake objects — then MIN-reduce an error-returning L3
   `remove_by_prefix`, before any rank mutates Device/Host. The frontend
-  ANDs every DP worker's reply. Independent TokenSpeed jobs that share a
+  ANDs every DP worker's reply. Independent UnieInfer jobs that share a
   tenant are not in those groups.
   PP fans the request stream across WORLD so every cache-owning rank enters
   the same exists MIN; without PP the attention-TP broadcast already does.

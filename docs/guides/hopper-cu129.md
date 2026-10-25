@@ -39,7 +39,7 @@ an old environment.
 
 DeepEP follows the same pinned installation path as the other native packages.
 The dependency remains `tokenspeed-deepep==2.1.0.post20260810`; pending upstream
-DeepEP changes are maintained separately from TokenSpeed. If a temporary build
+DeepEP changes are maintained separately from UnieInfer. If a temporary build
 is needed, install its cu129/Python 3.11 wheel manually **after** the complete
 environment installation, with `DEEPEP_WHEEL` set to that wheel's path:
 

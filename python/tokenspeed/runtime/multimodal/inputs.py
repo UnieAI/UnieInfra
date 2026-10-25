@@ -226,7 +226,7 @@ class MultimodalDataItem(msgspec.Struct, eq=False, kw_only=True, array_like=True
             if self.feature_shm is not None:
                 raise ValueError(
                     "SHM-backed multimodal items must carry content hash or "
-                    "pad_value before TokenSpeed consumes them"
+                    "pad_value before UnieInfer consumes them"
                 )
             self.hash = hash_feature(self.feature)
         if self.hash is None:

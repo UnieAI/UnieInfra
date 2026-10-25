@@ -32,13 +32,13 @@ This is why the dependency is an extra rather than a core one: as a core
 dependency, every ARM install would compile it, whether or not anyone ever
 requests the format.
 
-TokenSpeed imports it lazily, so it loads only when you select
+UnieInfer imports it lazily, so it loads only when you select
 `--load-format instanttensor`.
 
 ## Usage
 
 Pass `--load-format instanttensor`. It works with any parallelism
-configuration. When the job spans multiple ranks, TokenSpeed hands the world
+configuration. When the job spans multiple ranks, UnieInfer hands the world
 process group to InstantTensor, so InstantTensor shards reads across ranks.
 
 ```bash
@@ -100,7 +100,7 @@ Tuning:
   raises an error.
 - InstantTensor supports only `*.safetensors` checkpoints (same shard selection
   as `--load-format safetensors`).
-- TokenSpeed rejects checkpoints declaring a sub-byte safetensors dtype
+- UnieInfer rejects checkpoints declaring a sub-byte safetensors dtype
   (`F4`, `F6_E2M3`, `F6_E3M2`) up front, because InstantTensor reads them at
   twice their true length without raising. This does not affect NVFP4 or MXFP4 checkpoints,
   which store their packed 4-bit values as byte-aligned `U8`.

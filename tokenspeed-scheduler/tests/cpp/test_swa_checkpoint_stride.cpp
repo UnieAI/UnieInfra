@@ -25,7 +25,7 @@
 // parent -- so a 6,656-token chunk claimed 52 parents in each of three groups,
 // admission refused every new request, and concurrency sat at one while vLLM
 // held twelve. Every reference engine charges O(1) state per request here
-// (unieinfra/xref/46 6.1), so the pages between checkpoints must be able to
+// (unieinfer/xref/46 6.1), so the pages between checkpoints must be able to
 // stay unbacked.
 //
 // The stride defaults to 1, which is a block per page and byte-for-byte the old

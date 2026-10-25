@@ -10,7 +10,7 @@ That cross-engine comparison needs vLLM importable, so it is not run here. What
 this file pins is everything checkable without it: pack/unpack round-trips, the
 two scale permutations spelled out independently of the implementation, the
 permutation property (every element moved, none invented), the group-vs-channel
-branch, and the shape-validation rules. See ``unieinfra/xref/70-PORTS.md`` for
+branch, and the shape-validation rules. See ``unieinfer/xref/70-PORTS.md`` for
 the port and its acceptance criteria.
 """
 

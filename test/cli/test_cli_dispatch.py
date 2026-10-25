@@ -37,7 +37,7 @@ def test_version_subcommand_runs(capsys):
     with patch.object(sys, "argv", ["ts", "version"]):
         main()
     out = capsys.readouterr().out
-    assert out.startswith("TokenSpeed v")
+    assert out.startswith("UnieInfer v")
 
 
 def test_serve_dispatches_to_smg_orchestrator(monkeypatch):

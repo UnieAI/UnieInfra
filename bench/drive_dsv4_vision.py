@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive one vision generation through the running TokenSpeed gRPC server.
+"""Drive one vision generation through the running UnieInfer gRPC server.
 
 Builds the request exactly the way the reference ``inference`` preprocessor
 leaves it: the prompt token sequence already carries the expanded sentinel

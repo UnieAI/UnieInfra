@@ -30,9 +30,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 
 from tokenspeed.cli._logo import (
+    _INFER_STYLE,
     _RESET,
-    _SPEED_STYLE,
-    _TOKEN_STYLE,
+    _UNIE_STYLE,
     print_logo,
     render_logo,
 )
@@ -43,17 +43,17 @@ class _TTYBuffer(io.StringIO):
         return True
 
 
-def test_render_logo_colored_wraps_token_in_grey_and_speed_in_blue():
+def test_render_logo_colored_wraps_unie_in_grey_and_infer_in_blue():
     out = render_logo("9.9.9", color=True)
 
     body_rows = out.splitlines()[:-1]
     assert len(body_rows) == 5
     for row in body_rows:
-        assert row.startswith(_TOKEN_STYLE)
-        assert _SPEED_STYLE in row
+        assert row.startswith(_UNIE_STYLE)
+        assert _INFER_STYLE in row
         assert row.endswith(_RESET)
-        # Token segment must close before the speed one opens.
-        assert row.index(_RESET) < row.index(_SPEED_STYLE)
+        # Unie segment must close before the infer one opens.
+        assert row.index(_RESET) < row.index(_INFER_STYLE)
 
     assert "Tokens at the speed of light · v9.9.9" in out
     assert out.endswith("\n")
@@ -72,8 +72,8 @@ def test_print_logo_writes_to_stream_with_color_on_tty(monkeypatch):
 
     print_logo("1.2.3", stream=buf)
 
-    assert _TOKEN_STYLE in buf.getvalue()
-    assert _SPEED_STYLE in buf.getvalue()
+    assert _UNIE_STYLE in buf.getvalue()
+    assert _INFER_STYLE in buf.getvalue()
     assert "Tokens at the speed of light · v1.2.3" in buf.getvalue()
 
 

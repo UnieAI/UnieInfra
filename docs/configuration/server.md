@@ -1,8 +1,8 @@
 # Server parameters
 
-This page documents the parameters operators usually set directly. TokenSpeed
+This page documents the parameters operators usually set directly. UnieInfer
 uses familiar serving parameter names where the semantics match and keeps
-TokenSpeed-specific knobs for runtime features with different meaning.
+UnieInfer-specific knobs for runtime features with different meaning.
 
 For a compact compatibility table, see
 [Compatible parameters](./compatible-parameters.md).
@@ -235,8 +235,8 @@ fails at the first request, not only at the first prompt-logprob request.
 
 ### Slime RL compatibility
 
-TokenSpeed exposes the SGLang HTTP surface used by slime. The supported path is
-an externally launched TokenSpeed rollout engine on separate GPUs, using full
+UnieInfer exposes the SGLang HTTP surface used by slime. The supported path is
+an externally launched UnieInfer rollout engine on separate GPUs, using full
 NCCL weight updates. Attention data parallelism of any size is supported:
 each weight op fans out to every DP worker and the frontend ANDs the
 replies, and the scheduler completes an op only in a round where every DP
@@ -252,7 +252,7 @@ rank holds it (see [Weight updates under attention DP](#weight-updates-under-att
 - memory control: `POST /release_memory_occupation` and
   `POST /resume_memory_occupation`.
 
-Use TokenSpeed's control-server address, not its OpenAI gateway address, as the
+Use UnieInfer's control-server address, not its OpenAI gateway address, as the
 external rollout-engine address. Real rollout log probabilities require
 `--enable-output-logprobs`.
 
@@ -300,7 +300,7 @@ These slime paths are not yet supported end to end:
 - quantized-update hooks `post_process_weights` and `weights_checker`;
 - disk-delta `pull_weights`;
 - slime's retained top-p token set (`rollout_top_p != 1.0`). Use
-  `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
+  `--rollout-top-p 1.0` until UnieInfer returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
 `POST /update_weights_from_disk` reloads the weights in place from a checkpoint
@@ -336,7 +336,7 @@ on its output. The weight version does not advance on any failure.
 `POST /update_weights_from_tensor` stays on the router for slime-compatible
 clients, but answers `501 Not Implemented` with
 `{"success": false, "message": "..."}` before anything reaches the scheduler:
-TokenSpeed's scheduler does not implement the CUDA-IPC receive path. Use
+UnieInfer's scheduler does not implement the CUDA-IPC receive path. Use
 `POST /update_weights_from_distributed`, `POST /update_weights_from_disk`, or
 the Mooncake update described below. For the same reason the engine advertises
 `rl.update_from = "disk,distributed,mooncake"`, so a gateway never routes a
@@ -353,7 +353,7 @@ ANDs those replies too, but joins every message with ` | `, repeats included.
 Each scheduler queues the op and completes it only in a round where every DP
 rank holds the same kind of op at the head of its queue, decided on the
 per-round DP all-reduce that already carries flush intent. One op completes
-per round. TokenSpeed then MIN-reduces the device result across the replica
+per round. UnieInfer then MIN-reduces the device result across the replica
 before it publishes the L3 weight version, so a failure on one rank fails the
 update everywhere. A rank whose peer never receives the op waits
 indefinitely, as with `/flush_cache`. The design rationale is in
@@ -434,7 +434,7 @@ Trainer-side contract:
   or restart the engine before resuming dispatch. The same holds for the
   distributed update.
 
-### Driving TokenSpeed from an external gateway
+### Driving UnieInfer from an external gateway
 
 A gateway that fronts several engines (for example SMG with `--enable-rl`)
 talks to this control app directly. The `ts serve` sidecar is not involved.
@@ -457,7 +457,7 @@ for gateway discovery.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
+| `--max-model-len` | Maximum sequence length. If omitted, UnieInfer uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
@@ -492,7 +492,7 @@ Unset token sizes use the existing default ladder. Unset batch sizes use the
 minimum request count that fits each token bucket within the model context.
 
 `--chunked-prefill-size` is intentionally separate from
-`--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
+`--max-num-batched-tokens`: in UnieInfer it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
 
 ## Parallelism
@@ -523,7 +523,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--emulate-rank-zero` | Run only global rank 0 of the configured layout on one GPU, with local stand-ins for its collectives. For single-GPU performance work; outputs are not meaningful. See [Emulating rank 0 on one GPU](../serving/parallelism.md#emulating-rank-0-on-one-gpu). |
 
 Use `--tensor-parallel-size` for simple launches. When attention, dense,
-and MoE layers need different process groups, use the TokenSpeed-specific
+and MoE layers need different process groups, use the UnieInfer-specific
 split knobs.
 
 ### Expert placement
@@ -573,7 +573,7 @@ A LongCat layer runs two dense MLPs and one MoE off the same attention output.
 Its rows follow the dense comm pattern. When the MoE pattern differs
 (attention TP equal to the dense TP but not to the MoE TP x EP width, as under
 attention DP with `--enable-expert-parallel`), the layer re-gathers the MoE
-output into the dense layout. TokenSpeed rejects `--enable-allreduce-fusion`
+output into the dense layout. UnieInfer rejects `--enable-allreduce-fusion`
 for that layout.
 
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
@@ -716,7 +716,7 @@ sentinel is written as
 would read as the sentinel, and the cap keeps the `+ 1.0` representable.
 Under PD disaggregation the prefill node's candidates land the same way, so
 the decode node's first verify of a landed request accepts nothing.
-TokenSpeed refuses the flag on the prefill role (`--disaggregation-mode
+UnieInfer refuses the flag on the prefill role (`--disaggregation-mode
 prefill`): that role never verifies a chain and its candidates ship without
 `q`, so it would only allocate the distribution buffer. Pass it to the decode
 role only.
@@ -767,7 +767,7 @@ spell that `block_size` differently:
 A checkpoint that declares no `block_size` leaves both flags as given.
 
 A checkpoint whose architecture is `DFlash2DraftModel` uses the same `DFLASH`
-launch method. TokenSpeed selects its grouped-convolution and candidate-selector
+launch method. UnieInfer selects its grouped-convolution and candidate-selector
 runtime from the checkpoint architecture, so you need no separate algorithm
 flag. Draft proposals greedily follow the selector's transition-conditioned
 path. One Triton kernel per verify step walks it. The target's verification
@@ -776,7 +776,7 @@ proposal, so the served distribution is the target's whatever the drafter
 proposed.
 `DFlash2BeamDraftModel`, Beam's drafter, is a DFlash2 drafter as well.
 
-On a prefill server with `--pipeline-parallel-size > 1`, TokenSpeed accepts
+On a prefill server with `--pipeline-parallel-size > 1`, UnieInfer accepts
 speculation for `MTP` and `DSPARK` only. The drafter runs on the last stage,
 the only stage that samples. It writes the candidate block the remote decode
 carries to the decode server, which verifies it as usual. `DSPARK` also
@@ -785,7 +785,7 @@ and matching dense/attention TP groups. An `MTP` (NextN) draft reads only the
 last stage's final hidden states: the other stages build and load no draft
 model at all, and the NextN checkpoint must ship its `embed_tokens` weight
 because the target embedding lives on the first stage. `DFLASH` and `EAGLE3`
-read target taps from several stages, and TokenSpeed rejects them on a
+read target taps from several stages, and UnieInfer rejects them on a
 pipeline. The runtime decides layerwise transfer
 (`--disaggregation-layerwise-interval`) per stage: stages before the last own
 no draft cache and always allow it. The last stage allows it exactly when the
@@ -1011,9 +1011,9 @@ carry the `model_name` and `app_key` labels:
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
-## TokenSpeed-specific runtime knobs
+## UnieInfer-specific runtime knobs
 
-These parameters are TokenSpeed-specific. They expose runtime
+These parameters are UnieInfer-specific. They expose runtime
 features directly:
 
 - `--max-total-tokens`
@@ -1234,7 +1234,7 @@ sub-backend of a hybrid model: different implementations can produce
 different downstream KV even with identical cache layouts. This
 namespace extension intentionally starts a cold L3 cache instead of
 reusing objects written without backend identity.
-TokenSpeed splits `global_segment_size` across
+UnieInfer splits `global_segment_size` across
 attention-TP × pipeline-parallel ranks so the mounted total matches the
 configured size. Use the resolved `mapping.attn.tp_size`, not
 `--attn-tp-size` alone. L3 requires Host L2 (do not pass `--disable-kvstore`)

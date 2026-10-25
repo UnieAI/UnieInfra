@@ -2,7 +2,7 @@
 layout: home
 
 hero:
-  name: TokenSpeed
+  name: UnieInfer
   text: Speed-of-light LLM inference
   tagline: Production-oriented docs for launching, tuning, and operating low-latency OpenAI-compatible serving.
   actions:
@@ -20,7 +20,7 @@ features:
   - title: Launch first
     details: Start with concrete commands, then tune the exact knobs that affect memory, scheduling, parallelism, and kernels.
   - title: Familiar parameters
-    details: TokenSpeed keeps familiar parameter names where the runtime semantics match, with TokenSpeed-specific knobs documented separately.
+    details: UnieInfer keeps familiar parameter names where the runtime semantics match, with UnieInfer-specific knobs documented separately.
   - title: Model recipes
     details: Recipes collect the launch patterns used for Kimi and GPT-OSS deployments.
   - title: Operational surface

@@ -1,7 +1,7 @@
 """Tests for the chrome-trace summarizer used by the parity measurements.
 
 The numbers ``trace_stats`` prints are the numerators and denominators of every
-performance claim in ``unieinfra/xref/72-PARITY-STRATEGY.md``: ms/step,
+performance claim in ``unieinfer/xref/72-PARITY-STRATEGY.md``: ms/step,
 kernels/step, us/kernel and device-busy. A summarizer that silently counts a
 kernel twice, or attributes a kernel to the wrong step, would make a slow step
 look fast, so these tests build traces whose answers are known by construction.

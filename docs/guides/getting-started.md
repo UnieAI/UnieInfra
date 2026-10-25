@@ -1,6 +1,6 @@
 # Getting started
 
-This guide brings up a TokenSpeed development environment and verifies that the
+This guide brings up a UnieInfer development environment and verifies that the
 runtime can start.
 
 ## Prerequisites
@@ -157,7 +157,7 @@ For model-specific examples, continue with [Model Recipes](../recipes/models.md)
 `gfx1201` devices, including the Radeon AI PRO R9700, use the existing portable
 Triton kernels and ROCm library implementations. Install a ROCm PyTorch build
 that includes `gfx1201` device support. Dense BF16 inference is the initial
-supported path. TokenSpeed does not enable the `gfx950` and `gfx1250`
+supported path. UnieInfer does not enable the `gfx950` and `gfx1250`
 specialized kernels for this architecture.
 
 For a small single-GPU model, start with Triton attention and eager execution:

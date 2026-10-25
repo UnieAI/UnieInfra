@@ -23,6 +23,7 @@ import warnings
 from contextlib import contextmanager
 from typing import Any
 
+from tokenspeed_kernel import env_alias as _env_alias
 from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -157,12 +158,14 @@ class EnvField:
 
     def __set_name__(self, owner, name):
         self.name = name
+        # UnieAI: UNIEINFER_X spelling of TOKENSPEED_X, preferred when set.
+        self.alias = _env_alias.new_name(name)
 
     def parse(self, value: str) -> Any:
         raise NotImplementedError()
 
     def get(self) -> Any:
-        value = os.getenv(self.name)
+        value = _env_alias.getenv(self.name)
         if self._set_to_none:
             if value is not None:
                 raise RuntimeError(f"{self.name} is set while marked as None.")
@@ -181,13 +184,16 @@ class EnvField:
 
     def is_set(self):
         #  If None is manually set, it is considered as set.
-        return self.name in os.environ or self._set_to_none
+        return _env_alias.is_set(self.name) or self._set_to_none
 
     def get_set_value_or(self, or_value: Any):
         #  Ugly usage, but only way to get custom default value.
         return self.get() if self.is_set() else or_value
 
     def set(self, value: Any):
+        # A value set in code replaces the UNIEINFER_ spelling too.
+        if self.alias is not None:
+            os.environ.pop(self.alias, None)
         if value is None:
             self._set_to_none = True
             os.environ.pop(self.name, None)
@@ -197,19 +203,22 @@ class EnvField:
 
     @contextmanager
     def override(self, value: Any):
-        backup_present = self.name in os.environ
-        backup_value = os.environ.get(self.name)
+        names = [self.name] if self.alias is None else [self.name, self.alias]
+        backup = {name: os.environ.get(name) for name in names}
         backup_set_to_none = self._set_to_none
         self.set(value)
         yield
-        if backup_present:
-            os.environ[self.name] = backup_value
-        else:
-            os.environ.pop(self.name, None)
+        for name, backup_value in backup.items():
+            if backup_value is not None:
+                os.environ[name] = backup_value
+            else:
+                os.environ.pop(name, None)
         self._set_to_none = backup_set_to_none
 
     def clear(self):
         os.environ.pop(self.name, None)
+        if self.alias is not None:
+            os.environ.pop(self.alias, None)
         self._set_to_none = False
 
     @property

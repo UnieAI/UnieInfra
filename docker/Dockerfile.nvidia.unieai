@@ -8,7 +8,7 @@
 #
 # Same build as Dockerfile.nvidia -- same base image and install order --
 # widened to cover the sm_120 workstation tier. It is kept as a separate file,
-# never an edit to Dockerfile.nvidia, for the reason UNIEINFRA.md gives: adding
+# never an edit to Dockerfile.nvidia, for the reason UNIEINFER.md gives: adding
 # a file never conflicts on rebase, editing an upstream one conflicts on every
 # rebase.
 #

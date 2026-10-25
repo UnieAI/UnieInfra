@@ -1,4 +1,4 @@
-UnieInfra engine (ts serve) baseline — text-only, DeepSeek-V4-Flash-Vision-Exp, TP2, physically 6/7
+UnieInfer engine (ts serve) baseline — text-only, DeepSeek-V4-Flash-Vision-Exp, TP2, physically 6/7
 Command (same as vLLM):
   vllm bench serve --backend openai-chat --model dsv4 --tokenizer /models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
     --dataset-name random --num-prompts 64 --request-rate 4 --random-input-len 256 --random-output-len 128 \

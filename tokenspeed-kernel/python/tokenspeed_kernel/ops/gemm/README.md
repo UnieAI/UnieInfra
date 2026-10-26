@@ -62,6 +62,11 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+`mv_weightless_rmsnorm_gated_sigmoid` normalizes, gates and projects one row
+through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
+registered kernel serves it only where the separate gated norm and `mv` select
+the kernels it reproduces bit for bit; otherwise callers keep the two calls.
+
 On SM107, FlashInfer's TGV/CuTe DSL search supports BF16 output projections
 with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
 The kernels accumulate in FP32 and return BF16; reduction order can change

@@ -721,11 +721,10 @@ the selected-index and single-buffer KV handoffs.
 
 ### DeepSeek V4 attention
 
-The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
-provides dense-workspace selected prefill, while both architectures provide
-page-planar selected decode. Decode reads a sliding-window (SWA) cache and an
-optional compressed cache; both segments share one softmax, with the attention
-sink applied once.
+The gfx950 and gfx1250 packages provide MXFP4 index selection,
+dense-workspace selected prefill and page-planar selected decode. Decode reads
+a sliding-window (SWA) cache and an optional compressed cache; both segments
+share one softmax, with the attention sink applied once.
 
 #### Contract
 
@@ -792,6 +791,14 @@ and scales through native TDM into padded LDS. Double buffering and a
 one-page-ahead software pipeline overlap these transfers with WMMA scoring
 while keeping the transfer geometry aligned and the number of nearby TDM
 operations bounded.
+
+Gfx1250 selected prefill also gives each (token, 16-head group) one four-wave
+workgroup, but each wave owns 32 rows of every 128-row step and runs its own
+online softmax in the transposed form `S^T = K Q^T`, `O^T += V^T P^T`, so the
+softmax and P stay inside the wave. Rows arrive by TDM gather, with each
+step's indices loaded a step ahead and clamped to a zero-filled row past the
+end. The four partial softmaxes merge once, behind a single barrier, through
+the dead KV tile. Q^T stays in LDS so two workgroups fit on a CU.
 
 On gfx1250, decode fuses page-planar dequantization, BF16 wave32 WMMA attention,
 FP32 online softmax, and output reduction. A workgroup covers 32 or 64 query
@@ -950,9 +957,32 @@ over many CUs.
 gfx950 contract, split and zero-query shortcut above. QK and PV use 16x16x32
 BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
 scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
-BF16 power of two, the E4M3 global scale as BF16. Rows are not prefetched,
-and V is read from LDS only after QK: the registers this saves buy more
-workgroups per CU than the overlap would.
+BF16 power of two, the E4M3 global scale as BF16. V is read from LDS only
+after QK, so the K and V operands are never live together.
+
+A workgroup stages its slots in LDS, resolving each position's gather row (-1
+when unusable) in one pass, since TDM takes row indices in SGPRs. Its tiles
+then run through a two-deep LDS ring: while one tile is dequantized, a TDM
+gather fetches the next tile's value rows and an async copy its scales.
+Prefetching rows into registers instead was slower: it doubled the live rows.
+The gathers view a cache as rows of a page's value bytes (512 SWA, 256
+global) with int32 row indices, so page strides must be whole such rows, as
+the arena plan aligns them, and a cache spans at most 2^31 rows. Invalid rows
+gather as zero values while their scale copies read row 0, so a cache needs at
+least one page; the dequant reads NaN scale bytes as tiny or zero, so those
+rows stay zero even over unwritten memory.
+
+Tiles dequantize from the ring straight into the QK operand layout, which
+reads 16 value rows at once, so the ring pads every 256 bytes of a row by 8
+to keep them off shared banks; the BF16 tile in LDS only feeds the
+transposed PV read.
+SWA and global tiles share the ring, so a workgroup takes 146 KiB of LDS, two
+fit on a CU and rows split until the grid reaches 512 workgroups. The
+zero-query check, the staged slot rows and the reduce's splits load clamped
+rather than masked, since a row mask becomes a branch and a full wait around
+each load. Outputs and partials store straight from the WMMA layout. The
+reduce loads all splits at once; its width depends only on the slot widths,
+so batch size never recompiles it.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks

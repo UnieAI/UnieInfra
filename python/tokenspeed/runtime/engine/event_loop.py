@@ -557,7 +557,7 @@ class EventLoop:
 
         self.metrics = EngineMetrics(
             labels={
-                "model_name": server_args.served_model_name,
+                "model_name": server_args.canonical_served_model_name,
                 "app_key": server_args.app_key or "",
                 "dp_rank": str(dp_rank),
             },
@@ -819,7 +819,6 @@ class EventLoop:
             self.output_processor.mark_abort(request_id)
 
     def _process_new_requests(self):
-        self.request_handler.engine_busy = self._num_running() > 0
         recv_reqs = self.request_handler.recv_reqs()
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
@@ -1172,6 +1171,14 @@ class EventLoop:
         - pp_size: the prefill chunk pipeline — consecutive chunks occupy
           different pipeline stages; committing the queue head (join the
           forward thread, then its copy event) is the backpressure.
+
+        One refinement regardless of depth: a prefill/extend head commits as
+        soon as its forward has run, rather than waiting the depth-1 extra
+        round. That head carries a request's FIRST token, so deferring it adds
+        a full step to TTFT for no benefit (the head already ran on the GPU, so
+        the commit never blocks). Decode->decode keeps the one-step overlap.
+        This only orders a commit earlier, never later, so the depth stays a
+        pure performance knob.
 
         Correctness never depends on the depth: any dispatch whose inputs
         depend on a pending commit's side effects drains the queue first

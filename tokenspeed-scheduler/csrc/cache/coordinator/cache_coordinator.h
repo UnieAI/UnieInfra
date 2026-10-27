@@ -410,9 +410,9 @@ public:
     // Queue every already-published non-state Device cache entry under these
     // content hashes (chain hashes and tail hashes alike) for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
-    void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
+    void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
     // Queue the newest already-published Device checkpoint from each state group.
-    void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
+    void QueueLatestSnapshotBlocksForStore(std::span<const std::string> content_hashes);
     // When newly published Device pages are copied to the Host tier.
     //   kEager: every published page is queued for a store as it completes.
     //   kOnReuse: a page is held as a deferred candidate and queued only when

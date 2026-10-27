@@ -233,6 +233,13 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
         if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
             continue;
         }
+        // A State group has no token span: its two-slot table is not prefix-
+        // indexed by page, so it has no boundary pages to count here (and
+        // BlockGranularity() would assert). Boundary residency is a
+        // token-spanned-group question.
+        if (GroupIsState(group_index)) {
+            continue;
+        }
         const std::int32_t pages_per_prefix_hash =
             tail_tokens > 0 ? TailBlocksFor(static_cast<std::int32_t>(group_index), tail_tokens)
                             : BlocksPerBoundary(static_cast<std::int32_t>(group_index));
@@ -1089,7 +1096,7 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
     }
 }
 
-void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes) {
+void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> content_hashes) {
     if (host_pool_ == nullptr) {
         return;
     }
@@ -1098,7 +1105,7 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
             continue;
         }
         // A tail hash holds fewer blocks than a page; Contains filters.
-        for (CacheKey& key : keysForGroup(prefix_hashes, group.Id())) {
+        for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
             if (!group.Index().Contains(pool_, key)) {
                 continue;
             }

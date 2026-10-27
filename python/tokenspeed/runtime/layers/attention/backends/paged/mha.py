@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -93,11 +93,15 @@ class MHAExtendMetadata:
     extend_prefix_lens: torch.Tensor
     extend_seq_lens_cpu: list[int]
     cu_extend_seq_lens_cpu: list[int]
+    # Host mirror of seq_lens (prefix + extend) for sync-free FlashInfer plan.
+    cache_seqlens_cpu: list[int]
     max_extend_seq_len: int
     # Mixed target queries are cache-backed even when the leading prefills
     # have no prefix; the fresh-prefill path must not discard decode history.
     is_mixed: bool
     max_extend_prefix_len: int = 0
+    # FlashInfer FA2 plan cache: lifecycle = one forward (cleared next init).
+    plan_cache: dict = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
@@ -131,17 +135,30 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.is_mxfp8
         )
+        # Triton (and flashinfer paged) read fp8 KV and upcast to the query
+        # dtype in-kernel. Casting Q to fp8 loses accuracy, forces an
+        # all-fp8 signature Triton does not declare, and with empty_like(q)
+        # would return e4m3 activations. Only fa3/fa4 need an fp8 query.
+        self.cast_query_to_fp8 = self.kernel_solution in ("fa3", "fa4")
+        self._plan_dtype = (
+            torch.float8_e4m3fn
+            if self.is_mxfp8
+            else (
+                self.kv_cache_dtype
+                if self.is_fp8 and self.cast_query_to_fp8
+                else self.qkv_dtype
+            )
+        )
+        # Legacy single-head_dim binder (tests / callers). Prefer _plan_for_layer.
         self.plan = partial(
             mha_plan,
-            dtype=(
-                torch.float8_e4m3fn
-                if self.is_mxfp8
-                else (self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype)
-            ),
+            dtype=self._plan_dtype,
             head_dim=self.head_dim,
             return_lse=False,
             solution=self.kernel_solution,
         )
+        # F3c: Gemma-4 mixes head_dim 256/512; cache plans per layer head_dim.
+        self._plan_by_head_dim: dict[tuple, dict] = {}
         # DFLASH draft: the whole block in one decode forward, with one
         # decode metadata entry per block position and uniform non-causal
         # seq_lens (block_decode_expansion).
@@ -244,6 +261,10 @@ class MHAAttnBackend(PagedAttentionBackend):
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
             (1, 0),
         )
+        prefix_cpu = [int(x) for x in extend_prefix_lens_cpu[:bs].tolist()]
+        cache_seqlens_cpu = [
+            prefix_cpu[i] + extend_seq_lens_cpu[i] for i in range(bs)
+        ]
         self.forward_extend_metadata = MHAExtendMetadata(
             page_table=page_table[:bs],
             seq_lens=seq_lens,
@@ -253,6 +274,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             extend_prefix_lens=prefix_lens,
             extend_seq_lens_cpu=query_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+            cache_seqlens_cpu=cache_seqlens_cpu,
             max_extend_seq_len=max(query_lens_cpu),
             is_mixed=is_mixed,
             # Only prefills have a host prefix mirror. Mixed batches always
@@ -260,6 +282,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_extend_prefix_len=int(
                 extend_prefix_lens_cpu[:num_extends].max().item()
             ),
+            plan_cache={},
         )
 
     def _decode_views(self, bs: int) -> MHADecodeMetadata:
@@ -309,6 +332,35 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
 
+    def _plan_for_layer(self, layer: PagedAttention, sinks) -> dict:
+        """Plan extend_mode using this layer's qk_head_dim (F3c).
+
+        Backend ``self.head_dim`` is the model default (often 256). Gemma-4
+        global layers use 512; planning with the layer dim lets sm90 pick
+        ``prewrite`` so those layers hit paged FA2 extend instead of Triton
+        ragged prefill.
+        """
+        head_dim = int(layer.qk_head_dim)
+        key = (
+            head_dim,
+            int(layer.sliding_window_size),
+            float(layer.logit_cap),
+            sinks is not None,
+        )
+        cached = self._plan_by_head_dim.get(key)
+        if cached is None:
+            cached = mha_plan(
+                dtype=self._plan_dtype,
+                head_dim=head_dim,
+                window_left=layer.sliding_window_size,
+                logit_cap=layer.logit_cap,
+                sinks=sinks,
+                return_lse=False,
+                solution=self.kernel_solution,
+            )
+            self._plan_by_head_dim[key] = cached
+        return cached
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -344,7 +396,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
             scale_kwargs = _fp8_scale_kwargs(layer)
 
@@ -412,11 +464,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         return self._extend_rows(q, k, v, layer, token_to_kv_pool, metadata, sinks)
 
     def _extend_rows(self, q, k, v, layer, token_to_kv_pool, metadata, sinks):
-        plan = self.plan(
-            window_left=layer.sliding_window_size,
-            logit_cap=layer.logit_cap,
-            sinks=sinks,
-        )
+        plan = self._plan_for_layer(layer, sinks)
         extend_mode = plan.get("extend_mode", "prewrite")
         if (
             not metadata.is_mixed
@@ -445,6 +493,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen=metadata.max_extend_seq_len,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             skip_softmax_threshold=self.skip_softmax_threshold,
             solution=self.kernel_solution,
@@ -466,7 +515,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
             scale_kwargs = _fp8_scale_kwargs(layer)
 
@@ -484,8 +533,14 @@ class MHAAttnBackend(PagedAttentionBackend):
             is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             solution=self.kernel_solution,
+            host_meta={
+                "cu_seqlens_q_cpu": metadata.cu_extend_seq_lens_cpu,
+                "cache_seqlens_cpu": metadata.cache_seqlens_cpu,
+                "plan_cache": metadata.plan_cache,
+            },
             **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)

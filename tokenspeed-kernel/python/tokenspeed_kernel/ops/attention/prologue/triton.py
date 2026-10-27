@@ -461,10 +461,7 @@ def triton_gqa_prologue(
             S1=s1,
             S2=s2,
             RETURN_K=return_kv and not prepared,
-<<<<<<< HEAD
             KV_SCALED=scales is not None,
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
             BLOCK_T=block_t,
             BLOCK=triton.next_power_of_2(head_dim),
             HALF_BLOCK=max(triton.next_power_of_2(half_rotary), 1),

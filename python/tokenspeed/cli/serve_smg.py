@@ -53,12 +53,7 @@ from pathlib import Path
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.cli._argsplit import (
-    OrchestratorOpts,
-    SplitResult,
-    split_argv,
-    split_headless_argv,
-)
+from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv, split_headless_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
@@ -90,11 +85,8 @@ KIMI_K3_REASONING_PARSER = "kimi_k3"
 KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
 MUSE_SPARK_REASONING_PARSER = "muse"
 MUSE_SPARK_TOOL_CALL_PARSER = "muse"
-<<<<<<< HEAD
 MUSE_SPARK_GATEWAY_PARSER = "symphony"
 MUSE_SPARK_GRAMMAR_BACKEND = "xgrammar"
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 DEFAULT_SMG_LOG_LEVEL = "warn"
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
@@ -371,6 +363,52 @@ def _free_port_avoiding_ephemeral_range() -> int:
     return port
 
 
+
+def _gateway_args_with_served_model_aliases(
+    gateway_args: list[str], engine_args: list[str]
+) -> list[str]:
+    """Map extra ``--served-model-name`` values to SMG ``--model-alias``.
+
+    Engine canonical = first name (GetModelInfo). Extras become
+    ``--model-alias extra=canonical`` so chat routes before/without a
+    create_worker rebuild that lists them as first-class ModelCards.
+    Existing explicit ``--model-alias`` entries are left alone.
+    """
+    names: list[str] = []
+    i = 0
+    while i < len(engine_args):
+        tok = engine_args[i]
+        if tok == "--served-model-name":
+            i += 1
+            while i < len(engine_args) and not engine_args[i].startswith("--"):
+                names.append(engine_args[i])
+                i += 1
+            continue
+        if tok.startswith("--served-model-name="):
+            names.append(tok.split("=", 1)[1])
+        i += 1
+    if len(names) < 2:
+        return gateway_args
+    canonical = names[0]
+    result = list(gateway_args)
+    for alias in names[1:]:
+        if alias == canonical:
+            continue
+        entry = f"{alias}={canonical}"
+        # Skip if already present as --model-alias entry
+        skip = False
+        for j, tok in enumerate(result):
+            if tok == "--model-alias" and j + 1 < len(result) and result[j + 1] == entry:
+                skip = True
+                break
+            if tok == f"--model-alias={entry}":
+                skip = True
+                break
+        if not skip:
+            result.extend(["--model-alias", entry])
+    return result
+
+
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
     """Bind the smg Prometheus exporter to a freshly allocated free port.
 
@@ -552,7 +590,6 @@ def _is_muse_spark_model(model_id: str | None) -> bool:
     )
 
 
-<<<<<<< HEAD
 def _args_select_tree_drafting(engine_args: list[str]) -> bool:
     """Whether the engine argv drafts a tree (``--speculative-eagle-topk`` != 1).
 
@@ -572,8 +609,6 @@ def _args_select_tree_drafting(engine_args: list[str]) -> bool:
         return True
 
 
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -609,15 +644,12 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", MUSE_SPARK_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", MUSE_SPARK_TOOL_CALL_PARSER])
-<<<<<<< HEAD
         if "--parser" not in gateway_result:
             gateway_result.extend(["--parser", MUSE_SPARK_GATEWAY_PARSER])
         if "--grammar-backend" not in engine_result and not _args_select_tree_drafting(
             engine_result
         ):
             engine_result.extend(["--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND])
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 
     elif _is_deepseek_v41_model(model_id):
         if (
@@ -926,6 +958,9 @@ async def run_smg(
 
         # Allocate the metrics port only now — see
         # _gateway_args_with_default_prometheus_port for why earlier is racy.
+        gateway_args = _gateway_args_with_served_model_aliases(
+            gateway_args, engine_args
+        )
         gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
         gateway = await spawn_gateway(
             gateway_args, engine_host="127.0.0.1", engine_port=engine_port
@@ -1051,71 +1086,6 @@ def _run_headless(argv: list[str]) -> None:
     run_scheduler_headless_from_cli(argv)
 
 
-# Gateway-side flags the embedding server honors. Anything else routed to the
-# gateway is refused rather than dropped: the embedding server has no gateway.
-_EMBEDDING_SERVER_GATEWAY_FLAGS = frozenset(
-    {"--model", "--host", "--port", "--api-key", "--reasoning-parser"}
-)
-
-
-def _embedding_server_args(split: SplitResult):
-    """Return the engine ``ServerArgs`` when this launch is an embedding server.
-
-    The decision is the engine's own (``resolve_pooling_config``): a checkpoint
-    with a sentence-transformers pooling config, or ``--is-embedding``. The
-    smg gateway has no embedding RPC, so such a launch is served by
-    ``entrypoints/embedding_server`` instead. Returns None for a generative
-    launch without parsing the engine arguments.
-    """
-    from tokenspeed.runtime.configs.model_config import (
-        read_sentence_transformers_pooling,
-        resolve_pooling_config,
-    )
-    from tokenspeed.runtime.utils.server_args import prepare_server_args
-
-    if "--no-is-embedding" in split.engine:
-        return None
-    model = _get_from_args(split.engine, "--model")
-    if "--is-embedding" not in split.engine and (
-        model is None or read_sentence_transformers_pooling(model) is None
-    ):
-        return None
-    server_args = prepare_server_args(split.engine)
-    if resolve_pooling_config(server_args.model, server_args) is None:
-        return None
-    return server_args
-
-
-def _run_embedding_server(server_args, split: SplitResult) -> None:
-    """Serve ``/v1/embeddings`` for a pooling checkpoint (no smg gateway)."""
-    from tokenspeed.runtime.entrypoints.embedding_server import serve
-
-    unsupported = sorted(
-        token
-        for token in split.gateway
-        if token.startswith("--") and token not in _EMBEDDING_SERVER_GATEWAY_FLAGS
-    )
-    if unsupported:
-        raise SystemExit(
-            f"ts serve: {', '.join(unsupported)} configure the smg gateway, which "
-            "an embedding server does not run."
-        )
-    if split.opts != OrchestratorOpts():
-        raise SystemExit(
-            "ts serve: gateway orchestration flags (--engine-startup-timeout, "
-            "--gateway-startup-timeout, --drain-timeout, --control-port) do not "
-            "apply to an embedding server."
-        )
-    if server_args.nnodes != 1:
-        raise SystemExit("ts serve: an embedding server runs on a single node.")
-    serve(
-        server_args,
-        host=_get_from_args(split.gateway, "--host", DEFAULT_GATEWAY_HOST),
-        port=int(_get_from_args(split.gateway, "--port", str(DEFAULT_GATEWAY_PORT))),
-        api_key=_get_from_args(split.gateway, "--api-key"),
-    )
-
-
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
     headless_argv = split_headless_argv(raw_argv)
@@ -1136,13 +1106,8 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     print_logo()
 
-    split = split_argv(raw_argv)
-    embedding_server_args = _embedding_server_args(split)
-    if embedding_server_args is not None:
-        _run_embedding_server(embedding_server_args, split)
-        return
-
     _check_serve_extra_installed()
+    split = split_argv(raw_argv)
     engine_args, gateway_args = _args_with_default_model_parsers(
         split.engine, split.gateway
     )

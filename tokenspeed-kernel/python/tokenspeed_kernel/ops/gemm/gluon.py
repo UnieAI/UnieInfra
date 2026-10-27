@@ -73,7 +73,6 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
     )
-<<<<<<< HEAD
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
     )
@@ -83,8 +82,6 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gemv_a16w16_gfx950 as _supports_gemv_a16w16,
     )
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
     )

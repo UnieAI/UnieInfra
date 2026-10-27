@@ -378,19 +378,13 @@ private:
         Request* victim{nullptr};
         bool image_fits{false};
     };
-<<<<<<< HEAD
-    // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
-    VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
-=======
-    // `drop_exempt_last_resort` lets the choice sacrifice an otherwise-exempt
-    // resident (ReserveCoversGeneration true) when every candidate is exempt
-    // and the blocker is itself a resident that cannot progress -- the
-    // capacity-deadlock backstop. The caller passes false while a waiting
-    // prompt is the blocker, where admission back-pressure (not a sacrifice)
-    // is the correct response. No default: the two paths differ in whether a
-    // covered request may be aborted.
+    // `drop_exempt_last_resort`: allow the reserve-exempt last resort (abort or
+    // reversible host-retraction of the newest resident) only when a resident
+    // stuck on its own next page is the blocker; a waiting prompt is the
+    // blocker where admission back-pressure (not a sacrifice) is the correct
+    // response. No default: the two paths differ in whether a covered request
+    // may be aborted.
     VictimChoice chooseVictim(std::span<Request* const> candidates, bool drop_exempt_last_resort) const;
->>>>>>> 3b9654e3 (scheduler: break the reserve-exempt capacity deadlock)
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
@@ -442,7 +436,6 @@ private:
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
-
     // Length-aware prefill admission (see scheduleShortPromptsAhead): prompts
     // of at most short_prompt_tokens_ may be admitted ahead of a resident
     // chunked prefill with more than that left, as long as the round keeps at

@@ -1672,7 +1672,6 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
-<<<<<<< HEAD
     topk_weights_dtypes = apply_spec.traits.get(
         "topk_weights_dtype", frozenset({torch.float32})
     )
@@ -1690,8 +1689,6 @@ def moe_plan(
             f"MoE kernel {apply_spec.name!r} uses unsupported deferred-finalize "
             f"weight dtype {topk_weights_dtype}"
         )
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     supports_prequantized_input = True in apply_spec.traits.get(
         "supports_prequantized_input", frozenset({False})
     )
@@ -1716,10 +1713,7 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
-<<<<<<< HEAD
         "topk_weights_dtype": topk_weights_dtype,
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         "supports_prequantized_input": supports_prequantized_input,
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
         # routes, so routing may pick per-rank replicas. Otherwise every

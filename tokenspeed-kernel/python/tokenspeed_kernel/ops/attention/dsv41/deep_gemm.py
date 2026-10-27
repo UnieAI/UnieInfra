@@ -57,18 +57,8 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     clean_logits,
     clean_logits_for_selection,
     dense_ranges,
-<<<<<<< HEAD
-    gather_index_cache,
-<<<<<<< HEAD
-    gather_index_fp8,
-    pack_index_queries,
-    pool_lengths,
-=======
-=======
     finish_selection,
->>>>>>> f6ef2a8c (perf(dsv41): Optimize sparse indexer scoring and Top-K preparation (#2290))
     pack_index_inputs,
->>>>>>> 2d328a89 (perf(dsv41): Fuse attention preprocessing and share Q quantization (#2219))
     quantize_index_queries,
     safe_metadata,
     write_selection,
@@ -484,14 +474,22 @@ def _index_planes(cache):
     )
 
 
-def _hopper_dense_scores(
-    queries, keys, weights, starts, ends, table, pages, capacity, *, clean
-):
-    """Score one tile against a request's gathered keys.
+def _gather_index_fp8(cache, slots):
+    """Read the selected physical slots as (E4M3 values, FP32 scales)."""
+    values, scales = _index_planes(cache)
+    live = (slots >= 0) & (slots < cache.shape[0] * 64)
+    safe = slots.clamp_min(0)
+    pages, rows = safe // 64, safe % 64
+    gathered = values[pages, rows]
+    gathered = torch.where(live[:, None], gathered, torch.zeros_like(gathered))
+    row_scales = torch.where(live, scales[pages, rows], torch.zeros_like(live).float())
+    return gathered.view(torch.float8_e4m3fn).contiguous(), row_scales.contiguous()
 
-    ``starts``/``ends`` are the tile's int32 key ranges from
-    :func:`dense_ranges`; ``ends`` doubles as the clamped visible lengths.
-    """
+
+def _hopper_dense_scores(
+    queries, keys, weights, lengths, table, pages, capacity, *, clean
+):
+    starts, ends = dense_ranges(lengths, capacity)
     logits = _hopper_api(queries[0]).fp8_mqa_logits(
         q=queries[0],
         kv=keys,
@@ -507,36 +505,22 @@ def _hopper_dense_scores(
 def _hopper_paged_scores(
     queries, cache, weights, block_table, valid_lengths, capacity, *, clean
 ):
-    """Score one tile through its page table.
-
-    Returns ``(logits, lengths)``: FP32 ``[rows, >= capacity]`` scores and the
-    int32 lengths clamped to ``[0, capacity]`` that bound them.
-    """
     if cache.stride(0) >= 2**31 or cache.stride(0) % 16 or cache.data_ptr() % 16:
         raise ValueError(
             "DeepGEMM packed pages require aligned sub-2GiB strides; use the portable solution"
         )
-    rows = queries[0].shape[0]
-    if rows == 0:
-        return (
-            torch.zeros((0, capacity), dtype=torch.float32, device=cache.device),
-            torch.zeros((0,), dtype=torch.int32, device=cache.device),
-        )
+    if queries[0].shape[0] == 0:
+        return torch.zeros((0, capacity), dtype=torch.float32, device=cache.device)
     api = _hopper_api(queries[0])
+    table, lengths = safe_metadata(
+        block_table, valid_lengths, cache.shape[0], capacity, 64
+    )
     # DeepGEMM's schedule generator faults when the batch holds no keys at all
     # (every context length 0), which a padded warmup batch is. Score block 0
-    # for such rows -- safe_metadata made every page valid -- and let the
-    # cleaner erase it below with the true lengths. No sync, so this holds
-    # under graph capture too. The sanitizer writes those raised lengths.
-    context_lens = torch.empty((rows, 1), dtype=torch.int32, device=cache.device)
-    table, lengths = safe_metadata(
-        block_table,
-        valid_lengths,
-        cache.shape[0],
-        capacity,
-        64,
-        context=context_lens[:, 0],
-    )
+    # for such rows -- safe_metadata made every page valid -- and let
+    # clean_logits erase it below with the true lengths. No sync, so this
+    # holds under graph capture too.
+    context_lens = lengths.clamp_min(1)[:, None]
     schedule = api.get_paged_mqa_logits_metadata(context_lens, 64, api.get_num_sms())
     # DeepGEMM reads the fused [pages, block, 1, values + scale] tensor.
     flat = _index_pages(cache)
@@ -554,12 +538,16 @@ def _hopper_paged_scores(
         capacity,
         clean_logits=False,
     )
-    logits = logits.reshape(rows, -1)[:, :capacity]
-    if clean:
-        logits = clean_logits(
-            logits, lengths, block_table, cache.shape[0], capacity, 64
-        )
-    return logits, lengths
+    if not clean:
+        return logits.reshape(queries[0].shape[0], -1)[:, :capacity]
+    return clean_logits(
+        logits.reshape(queries[0].shape[0], -1)[:, :capacity],
+        lengths,
+        block_table,
+        cache.shape[0],
+        capacity,
+        64,
+    )
 
 
 # V4.1 selects at most 512 rows and at most 2048 candidate blocks per query;
@@ -569,25 +557,19 @@ _ROW_CAPACITY = 512
 _BLOCK_CAPACITY = 2048
 
 
-def _select(
-    scores, k, capacity, destination, lengths, candidates=None, ends=None, zeros=None
-):
+def _select(scores, k, capacity, destination, lengths, candidates=None, ends=None):
     """Take the k best columns per row with the CuTe DSL DeepSelect kernel.
 
-    ``ends`` (int32, contiguous) bounds each row (default: the whole row,
-    at the cost of one fill launch); a row shorter than ``k`` is taken whole.
-    ``candidates`` marks ``scores`` as candidate-compacted and maps the winning
-    columns back to row ids. ``zeros``, a ``[rows]`` int32 output, is
-    zero-filled in the finishing launch. Ties at the k-th score break
-    arbitrarily but deterministically; the op guarantees no particular tie
-    order.
+    ``ends`` bounds each row (default: the whole row); a row shorter than
+    ``k`` is taken whole. ``candidates`` marks ``scores`` as
+    candidate-compacted and maps the winning columns back to row ids. Ties at
+    the k-th score break arbitrarily but deterministically; the op guarantees
+    no particular tie order.
     """
     width = min(k, scores.shape[1])
     if width == 0:
         destination.fill_(-1)
         lengths.zero_()
-        if zeros is not None:
-            zeros.zero_()
         return
     if ends is None:
         ends = torch.full(
@@ -600,57 +582,29 @@ def _select(
         scores, ends, width, capacity=capacity, cluster_size=cluster_size
     )
     # Null blocks resolve to negative ids; their -inf score drops them below.
-    _finish_topk(values, indices, destination, lengths, candidates, zeros)
+    _finish_topk(values, indices, destination, lengths, candidates)
 
 
 def _native_select(
-    logits,
-    visible,
-    candidates,
-    topk,
-    candidate_topk,
-    out,
-    scores,
-    block_stats=None,
-    score_ends=None,
+    logits, visible, candidates, topk, candidate_topk, out, scores, block_stats=None
 ):
     """Select rows, and blocks when this pass sources the candidate pool.
 
-    ``visible`` holds int32 visible lengths already clamped to the score
-    width. ``scores`` is the candidate-compacted score matrix when it was
-    produced directly, with ``score_ends`` its int32 row widths, or None to
-    gather it here from the dense ``logits``. A pass that sources candidates
-    always needs the dense row, so it never supplies it. ``block_stats``
-    optionally supplies maxima and valid block counts already produced while
-    cleaning logits; their unwritten tails are never selected.
+    ``scores`` is the candidate-compacted score matrix when it was produced
+    directly, or None to gather it here from the dense ``logits``. A pass that
+    sources candidates always needs the dense row, so it never supplies it.
+    ``block_stats`` optionally supplies maxima and valid block counts already
+    produced while cleaning logits; their unwritten tails are never selected.
     """
     rows, lengths, blocks, block_lengths = out
-    # Outputs may be uninitialized; a pass that sources no candidates still
-    # owes the caller the empty pool every other solution writes. The row
-    # selection's finishing launch zeroes its lengths.
-    zeros = None if candidate_topk else block_lengths
     if candidates is None:
         # Columns past a query's visible length are -inf; skipping them keeps
         # short contexts in a wide capacity cheap.
-        _select(logits, topk, _ROW_CAPACITY, rows, lengths, ends=visible, zeros=zeros)
+        _select(logits, topk, _ROW_CAPACITY, rows, lengths, ends=visible)
     else:
         if scores is None:
-            score_ends = torch.empty(
-                (candidates.shape[0],), dtype=torch.int32, device=candidates.device
-            )
-            scores = candidate_scores(logits, candidates, score_ends)
-        elif score_ends is None:
-            raise ValueError("supplied candidate scores require their row widths")
-        _select(
-            scores,
-            topk,
-            _ROW_CAPACITY,
-            rows,
-            lengths,
-            candidates,
-            ends=score_ends,
-            zeros=zeros,
-        )
+            scores = candidate_scores(logits, candidates)
+        _select(scores, topk, _ROW_CAPACITY, rows, lengths, candidates)
     if candidate_topk:
         maxima, block_ends = (
             block_maxima_with_lengths(logits, visible)
@@ -665,8 +619,11 @@ def _native_select(
             block_lengths,
             ends=block_ends,
         )
-    elif blocks.numel():
+    else:
+        # Outputs may be uninitialized; a pass that sources no candidates still
+        # owes the caller the empty pool every other solution writes.
         blocks.fill_(-1)
+        block_lengths.zero_()
 
 
 @register_kernel(
@@ -734,12 +691,14 @@ def hopper_index_topk(
     tile = min(query_chunk_size, max(1, budget // (capacity * 4)))
     # The logits kernels apply no query scale, so it rides in the weights.
     queries, folded = quantize_index_queries(index_q, weights)
-    keys = starts = visible_all = pool_ends = None
+    keys = None
     if dense:
-        # A zero row stride proves every query reads one request's history:
-        # gather its keys once, with unmapped pages zeroed in the same pass.
-        keys = gather_index_fp8(index_cache, page_table[0], capacity)
-        starts, visible_all = dense_ranges(visible_lens, capacity)
+        logical = torch.arange(capacity, dtype=torch.int64, device=index_q.device)
+        pages = page_table[0, logical // 64]
+        slots = (pages.to(torch.int64) * 64 + logical % 64).masked_fill(
+            (pages < 0) | (pages >= index_cache.shape[0]), -1
+        )
+        keys = _gather_index_fp8(index_cache, slots)
     # A Reindex pass reads only its candidate pool, so scoring the whole
     # history and discarding the rest is pure waste. DeepGEMM has no sm90
     # sparse kernel, so the pool is scored by the CuTe DSL one. A pass that
@@ -754,22 +713,18 @@ def hopper_index_topk(
     if sparse:
         values, scales = _index_planes(index_cache)
         planes = (values.view(torch.float8_e4m3fn), scales)
-        pool_ends, visible_all = pool_lengths(
-            visible_lens, capacity, candidate_blocks.shape[1] * 8
-        )
     for begin in range(0, n, tile):
         end = min(begin + tile, n)
+        visible = visible_lens[begin:end].clamp(0, capacity).to(torch.int32)
         packed = (queries[begin:end],)
-        tile_out = tuple(tensor[begin:end] for tensor in out)
         if sparse:
-            visible = visible_all[begin:end]
             _native_select(
                 None,
                 visible,
                 candidate_blocks[begin:end],
                 topk,
                 candidate_topk,
-                tile_out,
+                tuple(tensor[begin:end] for tensor in out),
                 sparse_index_scores(
                     queries[begin:end],
                     folded[begin:end],
@@ -780,7 +735,6 @@ def hopper_index_topk(
                     candidate_blocks[begin:end],
                     pdl_enabled(),
                 ),
-                score_ends=pool_ends[begin:end],
             )
             continue
         # Candidate gathering can read past visible into a partial block. Keep
@@ -788,12 +742,10 @@ def hopper_index_topk(
         # partially initialized output of the fused cleaner.
         bounded = bool(candidate_topk) and candidate_blocks is None
         if dense:
-            visible = visible_all[begin:end]
             logits = _hopper_dense_scores(
                 packed,
                 keys,
                 folded[begin:end],
-                starts[begin:end],
                 visible,
                 page_table[begin:end],
                 index_cache.shape[0],
@@ -801,12 +753,12 @@ def hopper_index_topk(
                 clean=not bounded,
             )
         else:
-            logits, visible = _hopper_paged_scores(
+            logits = _hopper_paged_scores(
                 packed,
                 index_cache,
                 folded[begin:end],
                 page_table[begin:end],
-                visible_lens[begin:end],
+                visible,
                 capacity,
                 clean=not bounded,
             )
@@ -823,7 +775,7 @@ def hopper_index_topk(
             candidates,
             topk,
             candidate_topk,
-            tile_out,
+            tuple(tensor[begin:end] for tensor in out),
             None,
             block_stats=block_stats,
         )

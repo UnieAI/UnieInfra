@@ -22,20 +22,10 @@ GPQA_HUGGINGFACE_DATASET_ARGS = (
 GPQA_MODELSCOPE_DATASET_ARGS = (
     '{"gpqa_diamond":{"dataset_id":"AI-ModelScope/gpqa_diamond"}}'
 )
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 MUSE_SPARK_AIME26_CONFIGS = {
     4: "muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml",
     8: "muse-spark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
 }
-<<<<<<< HEAD
-=======
-MUSE_SPARK_AIME26_CONFIG = "muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml"
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 MUSE_SPARK_AIME26_PROMPT = (
     "Solve the following math problem. Show your reasoning step by step.\n"
     "Enclose only your final answer in standard LaTeX boxed-answer notation. "
@@ -56,15 +46,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-<<<<<<< HEAD
-<<<<<<< HEAD
         "count": 15,
-=======
-        "count": 14,
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        "count": 15,
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -174,15 +156,7 @@ def test_evalscope_configs_use_expected_dataset_sources():
             ), path
             dataset_args = json.loads(flag_value(tokens, "--dataset-args"))
         expected_dataset_args = {dataset: expected["dataset_args"]}
-<<<<<<< HEAD
-<<<<<<< HEAD
         if path.name in MUSE_SPARK_AIME26_CONFIGS.values():
-=======
-        if path.name == MUSE_SPARK_AIME26_CONFIG:
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        if path.name in MUSE_SPARK_AIME26_CONFIGS.values():
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             expected_dataset_args = {
                 dataset: {
                     **expected["dataset_args"],
@@ -214,50 +188,21 @@ def test_gpt_oss_gpqa_uses_runner_specific_batch_sizes_and_retries():
     assert flag_value(command, "--eval-batch-size") == "${GPT_OSS_EVAL_BATCH_SIZE:-64}"
 
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 @pytest.mark.parametrize("world_size", MUSE_SPARK_AIME26_CONFIGS)
 def test_muse_spark_aime26_uses_validated_mxfp4_configuration(world_size):
     path = EVAL_CONFIG_DIR / MUSE_SPARK_AIME26_CONFIGS[world_size]
-=======
-def test_muse_spark_aime26_uses_validated_mxfp4_configuration():
-    path = EVAL_CONFIG_DIR / MUSE_SPARK_AIME26_CONFIG
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-@pytest.mark.parametrize("world_size", MUSE_SPARK_AIME26_CONFIGS)
-def test_muse_spark_aime26_uses_validated_mxfp4_configuration(world_size):
-    path = EVAL_CONFIG_DIR / MUSE_SPARK_AIME26_CONFIGS[world_size]
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     task = yaml.safe_load(path.read_text(encoding="utf-8"))
     server_tokens = shlex.split(task["server"]["command"])
     eval_tokens = shlex.split(task["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
 
-<<<<<<< HEAD
-<<<<<<< HEAD
     assert task["runner"]["labels"] == [f"amd-mi35x-{world_size}gpu-test"]
-=======
-    assert task["runner"]["labels"] == ["amd-mi35x-4gpu-test"]
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    assert task["runner"]["labels"] == [f"amd-mi35x-{world_size}gpu-test"]
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     assert (
         flag_value(server_tokens, "--model")
         == "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4"
     )
-<<<<<<< HEAD
-<<<<<<< HEAD
     assert flag_value(server_tokens, "--tp") == str(world_size)
     assert flag_value(server_tokens, "--ep-size") == str(world_size)
-=======
-    assert flag_value(server_tokens, "--tp") == "4"
-    assert flag_value(server_tokens, "--ep-size") == "4"
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    assert flag_value(server_tokens, "--tp") == str(world_size)
-    assert flag_value(server_tokens, "--ep-size") == str(world_size)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     assert flag_value(server_tokens, "--quantization") == "mxfp4"
     assert flag_value(server_tokens, "--moe-backend") == "gluon"
     assert flag_value(server_tokens, "--max-num-seqs") == "16"

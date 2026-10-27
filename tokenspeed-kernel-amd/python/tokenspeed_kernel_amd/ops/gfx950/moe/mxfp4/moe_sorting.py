@@ -431,14 +431,6 @@ def gluon_moe_sorting(
         num_programs = max(E, num_programs)
     tokens_per_program = triton.cdiv(numel, num_programs)
     if runtime_rows:
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-        if tokens_per_program > 32:
-            raise ValueError("runtime-row sorting supports at most 32 routes per chunk")
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         route_block = 32
     else:
         route_block = triton.next_power_of_2(tokens_per_program)

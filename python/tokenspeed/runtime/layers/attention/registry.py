@@ -1294,8 +1294,6 @@ def create_attn_components(
         draft_cache_family,
         draft_family_declared=draft_profile is not None,
     )
-<<<<<<< HEAD
-=======
     # F3: FA2 paged-extend float workspace + JIT must land before KV budgeting
     # so the ~256 MiB scratch is not stolen from the cache pool at first request.
     try:
@@ -1317,7 +1315,6 @@ def create_attn_components(
     except Exception as exc:  # noqa: BLE001 — never block server start
         logger.warning("fa4_sm90 hd512 extend warmup skipped: %s", exc)
 
->>>>>>> b18e37bf (gemma4: speed up gemma-4 serving on SM90 past vLLM)
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:
         profiled_cache_bytes = profile_available_cache_memory_bytes(

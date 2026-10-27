@@ -1640,18 +1640,8 @@ def iris_pull_oneshot_rmsnorm_persistent(
         )
 
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 class ProducerAllReduce:
     """Prepared BF16 TP4/TP8 Lamport, push and pull variants over producer storage.
-=======
-class TP4AllReduce:
-    """Prepared BF16 TP4 Lamport, push and pull variants over producer storage.
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-class ProducerAllReduce:
-    """Prepared BF16 TP4/TP8 Lamport, push and pull variants over producer storage.
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
     The owner selects this measured payload policy. Pull scratch is shared with
     the generic producer reduction; all uses and consumers must be stream ordered.
@@ -1662,8 +1652,6 @@ class ProducerAllReduce:
     PUSH_MAX_ELEMENTS = 128 * 8192
 
     @staticmethod
-<<<<<<< HEAD
-<<<<<<< HEAD
     def heap_bytes(max_numel: int, *, world_size: int, enable_lamport: bool) -> int:
         lamport = (
             min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_MAX_ELEMENTS)
@@ -1682,69 +1670,24 @@ class ProducerAllReduce:
                 if lamport
                 else 0
             )
-=======
-    def heap_bytes(max_numel: int, *, enable_lamport: bool) -> int:
-=======
-    def heap_bytes(max_numel: int, *, world_size: int, enable_lamport: bool) -> int:
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
-        lamport = (
-            min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_MAX_ELEMENTS)
-            if enable_lamport
-            else 0
-        )
-        alignment = world_size * 8
-        push = min(
-            max_numel // alignment * alignment, ProducerAllReduce.PUSH_MAX_ELEMENTS
-        )
-        return (
-            allocation_bytes((_PULL_MAX_PROGRAMS, world_size), torch.uint32)
-            + 2 * allocation_bytes((push,), torch.bfloat16)
-<<<<<<< HEAD
-            + (allocation_bytes((3, 4, lamport), torch.bfloat16) if lamport else 0)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            + (
-                allocation_bytes((3, world_size, lamport), torch.bfloat16)
-                if lamport
-                else 0
-            )
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         )
 
     def __init__(self, pull: ProducerPull, *, enable_lamport: bool):
         producer = pull.producer
         peers = producer.peers
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         assert current_platform().is_cdna4 and peers.world_size in (4, 8)
         assert (
             producer.data.dtype == torch.bfloat16
             and producer.data.numel() >= peers.world_size * 8
         )
-<<<<<<< HEAD
         self.pull = pull
         self.world_size = peers.world_size
-=======
-        assert current_platform().is_cdna4 and peers.world_size == 4
-        assert producer.data.dtype == torch.bfloat16 and producer.data.numel() >= 32
-        self.pull = pull
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        self.pull = pull
-        self.world_size = peers.world_size
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         max_numel = producer.data.numel()
         self.lamport_max_numel = (
             min(max_numel // 512 * 512, self.LAMPORT_MAX_ELEMENTS)
             if enable_lamport
             else 0
         )
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         alignment = self.world_size * 8
         self.push_max_numel = min(
             max_numel // alignment * alignment, self.PUSH_MAX_ELEMENTS
@@ -1752,19 +1695,10 @@ class ProducerAllReduce:
         self.ready_flags = peers.ctx.zeros(
             (_PULL_MAX_PROGRAMS, self.world_size), dtype=torch.uint32
         )
-<<<<<<< HEAD
-=======
-        self.push_max_numel = min(max_numel // 32 * 32, self.PUSH_MAX_ELEMENTS)
-        self.ready_flags = peers.ctx.zeros((_PULL_MAX_PROGRAMS, 4), dtype=torch.uint32)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         self.epochs = torch.zeros(
             _PULL_MAX_PROGRAMS, dtype=torch.uint32, device=peers.device
         )
         self.push_inbox = peers.ctx.empty(
-<<<<<<< HEAD
-<<<<<<< HEAD
             (self.world_size, self.push_max_numel // self.world_size),
             dtype=torch.bfloat16,
         )
@@ -1773,23 +1707,6 @@ class ProducerAllReduce:
             peers.ctx.empty(
                 (3, self.world_size, self.lamport_max_numel), dtype=torch.bfloat16
             )
-=======
-            (4, self.push_max_numel // 4), dtype=torch.bfloat16
-        )
-        self.push_output = peers.ctx.empty((self.push_max_numel,), dtype=torch.bfloat16)
-        self.lamport_region = (
-            peers.ctx.empty((3, 4, self.lamport_max_numel), dtype=torch.bfloat16)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            (self.world_size, self.push_max_numel // self.world_size),
-            dtype=torch.bfloat16,
-        )
-        self.push_output = peers.ctx.empty((self.push_max_numel,), dtype=torch.bfloat16)
-        self.lamport_region = (
-            peers.ctx.empty(
-                (3, self.world_size, self.lamport_max_numel), dtype=torch.bfloat16
-            )
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             if self.lamport_max_numel
             else None
         )
@@ -1813,40 +1730,16 @@ class ProducerAllReduce:
     ) -> torch.Tensor:
         """Select packed Lamport, bounded push, or the large pull protocol."""
         assert 0 < numel <= self.pull.producer.data.numel()
-<<<<<<< HEAD
-<<<<<<< HEAD
         assert numel % (self.world_size * 8) == 0
         if numel <= self.lamport_max_numel and numel % 512 == 0:
             iris_lamport_bf16_allreduce[(numel // 512,)](
-=======
-        assert numel % 32 == 0
-        if numel <= self.lamport_max_numel and numel % 512 == 0:
-            iris_lamport_allreduce_tp4[(numel // 512,)](
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        assert numel % (self.world_size * 8) == 0
-        if numel <= self.lamport_max_numel and numel % 512 == 0:
-            iris_lamport_bf16_allreduce[(numel // 512,)](
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 input,
                 self.lamport_region,
                 output,
                 self.lamport_epochs,
-<<<<<<< HEAD
-<<<<<<< HEAD
                 self.lamport_peer_addresses[: self.world_size],
                 RANK=self.pull.producer.peers.rank,
                 WORLD_SIZE=self.world_size,
-=======
-                self.lamport_peer_addresses[:4],
-                RANK=self.pull.producer.peers.rank,
-                WORLD_SIZE=4,
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-                self.lamport_peer_addresses[: self.world_size],
-                RANK=self.pull.producer.peers.rank,
-                WORLD_SIZE=self.world_size,
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 total_elements=numel,
                 MAX_ELEMENTS=self.lamport_max_numel,
                 NUM_STAGES=3,
@@ -1854,35 +1747,15 @@ class ProducerAllReduce:
             )
             return output
         if numel <= self.push_max_numel:
-<<<<<<< HEAD
-<<<<<<< HEAD
             iris_push_twoshot_allreduce[(_PULL_MAX_PROGRAMS,)](
-=======
-            iris_push_twoshot_allreduce_tp4[(_PULL_MAX_PROGRAMS,)](
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            iris_push_twoshot_allreduce[(_PULL_MAX_PROGRAMS,)](
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 input,
                 self.push_inbox,
                 self.push_output,
                 self.ready_flags,
                 self.epochs,
-<<<<<<< HEAD
-<<<<<<< HEAD
                 self.pull.producer.peers.addresses[: self.world_size],
                 numel,
                 MAX_PARTITION=self.push_max_numel // self.world_size,
-=======
-                self.pull.producer.peers.addresses[:4],
-                numel,
-                MAX_PARTITION=self.push_max_numel // 4,
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-                self.pull.producer.peers.addresses[: self.world_size],
-                numel,
-                MAX_PARTITION=self.push_max_numel // self.world_size,
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 RANK=self.pull.producer.peers.rank,
                 BLOCK=1024,
                 NUM_SUBGROUPS=4,
@@ -1891,29 +1764,13 @@ class ProducerAllReduce:
             return self.push_output
         if input.data_ptr() != self.pull.producer.data.data_ptr():
             self.pull.producer.data[:numel].copy_(input.view(-1))
-<<<<<<< HEAD
-<<<<<<< HEAD
         iris_pull_twoshot_allreduce[(_PULL_MAX_PROGRAMS,)](
-=======
-        iris_pull_twoshot_allreduce_tp4[(_PULL_MAX_PROGRAMS,)](
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        iris_pull_twoshot_allreduce[(_PULL_MAX_PROGRAMS,)](
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             self.pull.producer.data,
             self.pull.scratch,
             output,
             self.ready_flags,
             self.epochs,
-<<<<<<< HEAD
-<<<<<<< HEAD
             self.pull.producer.peers.addresses[: self.world_size],
-=======
-            self.pull.producer.peers.addresses[:4],
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            self.pull.producer.peers.addresses[: self.world_size],
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             numel,
             RANK=self.pull.producer.peers.rank,
             BLOCK=2048,
@@ -1924,17 +1781,12 @@ class ProducerAllReduce:
 
 
 @gluon.jit
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 def _iris_group_heap_base(rank, heaps):
     """Select the supplied base address for a group rank."""
     base = heaps[0]
     for peer in gl.static_range(1, len(heaps)):
         base = gl.where(rank == peer, heaps[peer], base)
     return base
-<<<<<<< HEAD
 
 
 @gluon.jit
@@ -1943,41 +1795,12 @@ def _iris_peer_pointers(pointer, heaps, RANK: gl.constexpr):
     offset = pointer.to(gl.uint64) - heaps[RANK]
     peers = ()
     for peer in gl.static_range(len(heaps)):
-=======
-def _iris_tp4_heap_base(rank, heaps):
-    """Select the supplied base address for one of four group ranks."""
-    base = gl.where(rank == 0, heaps[0], heaps[3])
-    base = gl.where(rank == 1, heaps[1], base)
-    return gl.where(rank == 2, heaps[2], base)
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
-
-
-@gluon.jit
-def _iris_peer_pointers(pointer, heaps, RANK: gl.constexpr):
-    """Return peer pointers at pointer's offset within each symmetric heap."""
-    offset = pointer.to(gl.uint64) - heaps[RANK]
-    peers = ()
-<<<<<<< HEAD
-    for peer in gl.static_range(4):
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    for peer in gl.static_range(len(heaps)):
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         peers += (gl.multiple_of((heaps[peer] + offset).to(pointer.dtype), 16),)
     return peers
 
 
 @gluon.jit
-<<<<<<< HEAD
-<<<<<<< HEAD
 def _iris_rendezvous(
-=======
-def _tp4_rendezvous(
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-def _iris_rendezvous(
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     flags,
     heaps,
     block,
@@ -1986,56 +1809,23 @@ def _iris_rendezvous(
     NUM_WARPS: gl.constexpr,
     PUBLISH_RELEASE: gl.constexpr,
 ):
-<<<<<<< HEAD
-<<<<<<< HEAD
     """Publish a workgroup counter and wait for all group ranks to reach it.
-=======
-    """Publish a workgroup counter and wait for all four ranks to reach it.
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    """Publish a workgroup counter and wait for all group ranks to reach it.
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
     PUBLISH_RELEASE publishes prior producer writes with a release atomic.
     Otherwise the caller must first finish its write-through stores. Acquire
     peer flags before returning so subsequent reads see the published data.
     """
-<<<<<<< HEAD
-<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(heaps)
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, WORLD_SIZE, layout=layout)
     remote = peers != RANK
     bases = gl.full((WORLD_SIZE,), 0, gl.uint64, layout)
     for peer in gl.static_range(WORLD_SIZE):
-=======
-=======
-    WORLD_SIZE: gl.constexpr = len(heaps)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
-    peers = gl.arange(0, WORLD_SIZE, layout=layout)
-    remote = peers != RANK
-<<<<<<< HEAD
-    bases = gl.full((4,), 0, gl.uint64, layout)
-    for peer in gl.static_range(4):
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    bases = gl.full((WORLD_SIZE,), 0, gl.uint64, layout)
-    for peer in gl.static_range(WORLD_SIZE):
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         bases = gl.where(peers == peer, heaps[peer], bases)
     peer_flags = (bases + flags.to(gl.uint64) - heaps[RANK]).to(flags.dtype)
     if PUBLISH_RELEASE:
         gl.atomic_xchg(
-<<<<<<< HEAD
-<<<<<<< HEAD
             peer_flags + block * WORLD_SIZE + RANK,
-=======
-            peer_flags + block * 4 + RANK,
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            peer_flags + block * WORLD_SIZE + RANK,
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             epoch,
             mask=remote,
             sem="release",
@@ -2044,26 +1834,12 @@ def _iris_rendezvous(
     else:
         # Callers have already drained every subgroup's write-through stores.
         gl.store(
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             peer_flags + block * WORLD_SIZE + RANK,
             epoch,
             mask=remote,
             cache_modifier=".wt",
-<<<<<<< HEAD
         )
     local = flags + block * WORLD_SIZE + peers
-=======
-            peer_flags + block * 4 + RANK, epoch, mask=remote, cache_modifier=".wt"
-        )
-    local = flags + block * 4 + peers
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        )
-    local = flags + block * WORLD_SIZE + peers
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     seen = gl.load(local, mask=remote, other=epoch, cache_modifier=".cv", volatile=True)
     while gl.sum((remote & ((seen - epoch).to(gl.int32) < 0)).to(gl.int32), 0) != 0:
         seen = gl.load(
@@ -2074,15 +1850,7 @@ def _iris_rendezvous(
 
 
 @gluon.jit(do_not_specialize=["total_elements"])
-<<<<<<< HEAD
-<<<<<<< HEAD
 def iris_lamport_bf16_allreduce(
-=======
-def iris_lamport_allreduce_tp4(
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-def iris_lamport_bf16_allreduce(
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     input_sym_ptr,
     region_sym_ptr,
     output_ptr,
@@ -2094,30 +1862,14 @@ def iris_lamport_bf16_allreduce(
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
-<<<<<<< HEAD
-<<<<<<< HEAD
     """All-reduce BF16 tiles across the group using rotating sentinel mailboxes.
-=======
-    """All-reduce BF16 tiles across four ranks using rotating sentinel mailboxes.
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    """All-reduce BF16 tiles across the group using rotating sentinel mailboxes.
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
 
     Push input_sym_ptr to the peer addresses in regions, wait for incoming data
     in region_sym_ptr, and write a rank-ordered FP32 sum rounded to BF16 at
     output_ptr. Clear consumed mailboxes and advance epochs for each tile.
     Replace negative zero with zero so data cannot match the empty marker.
     """
-<<<<<<< HEAD
-<<<<<<< HEAD
     gl.static_assert(WORLD_SIZE == 4 or WORLD_SIZE == 8)
-=======
-    gl.static_assert(WORLD_SIZE == 4)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    gl.static_assert(WORLD_SIZE == 4 or WORLD_SIZE == 8)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     gl.static_assert(MAX_ELEMENTS % 512 == 0)
     gl.static_assert(NUM_STAGES >= 3)
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
@@ -2134,15 +1886,7 @@ def iris_lamport_bf16_allreduce(
     local = _iris_sanitize_lamport_bf16(local)
     for delta in gl.static_range(1, WORLD_SIZE):
         peer = (RANK + delta) % WORLD_SIZE
-<<<<<<< HEAD
-<<<<<<< HEAD
         destination = _iris_group_heap_base(peer, regions)
-=======
-        destination = _iris_tp4_heap_base(peer, regions)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        destination = _iris_group_heap_base(peer, regions)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         # Preserve 16-byte publication stores after casting integer addresses.
         destination = gl.multiple_of(destination.to(gl.pointer_type(gl.bfloat16)), 16)
         destination += generation * stride + RANK * MAX_ELEMENTS
@@ -2190,15 +1934,7 @@ def iris_lamport_bf16_allreduce(
 
 
 @gluon.jit(do_not_specialize=["numel"])
-<<<<<<< HEAD
-<<<<<<< HEAD
 def iris_push_twoshot_allreduce(
-=======
-def iris_push_twoshot_allreduce_tp4(
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-def iris_push_twoshot_allreduce(
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     input_ptr,
     inbox_ptr,
     output_ptr,
@@ -2211,8 +1947,6 @@ def iris_push_twoshot_allreduce(
     BLOCK: gl.constexpr,
     NUM_SUBGROUPS: gl.constexpr,
 ):
-<<<<<<< HEAD
-<<<<<<< HEAD
     """Push BF16 partials to partition owners, then distribute their sums.
 
     Split input_ptr's numel elements into equal consecutive partitions. Each rank
@@ -2226,143 +1960,54 @@ def iris_push_twoshot_allreduce(
     block = gl.program_id(0)
     epoch = gl.load(epochs + block).to(gl.uint32) + 2
     part = gl.multiple_of(numel // WORLD_SIZE, 8)
-=======
-    """Push BF16 partials to four partition owners, then distribute their sums.
-=======
-    """Push BF16 partials to partition owners, then distribute their sums.
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
-
-    Split input_ptr's numel elements into equal consecutive partitions. Each rank
-    receives its partition in inbox_ptr, sums all inputs in FP32, rounds
-    to BF16, and pushes the result into every output_ptr. flags and epochs
-    separate the two phases and ensure all output writes finish before return.
-    """
-    WORLD_SIZE: gl.constexpr = len(heaps)
-    inboxes = _iris_peer_pointers(inbox_ptr, heaps, RANK)
-    outputs = _iris_peer_pointers(output_ptr, heaps, RANK)
-    block = gl.program_id(0)
-    epoch = gl.load(epochs + block).to(gl.uint32) + 2
-<<<<<<< HEAD
-    part = gl.multiple_of(numel // 4, 8)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    part = gl.multiple_of(numel // WORLD_SIZE, 8)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_SUBGROUPS], [0])
     offsets = gl.arange(0, BLOCK, layout=layout)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
         index = tile * BLOCK + offsets
         mask = index < part
-<<<<<<< HEAD
-<<<<<<< HEAD
         for step in gl.static_range(WORLD_SIZE):
             owner = (RANK + step) % WORLD_SIZE
             values = gl.amd.cdna4.buffer_load(input_ptr, owner * part + index, mask, 0)
             gl.amd.cdna4.buffer_store(
                 values,
                 inboxes[(RANK + step) % WORLD_SIZE],
-=======
-        for step in gl.static_range(4):
-            owner = (RANK + step) % 4
-            values = gl.amd.cdna4.buffer_load(input_ptr, owner * part + index, mask, 0)
-            gl.amd.cdna4.buffer_store(
-                values,
-                inboxes[(RANK + step) % 4],
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        for step in gl.static_range(WORLD_SIZE):
-            owner = (RANK + step) % WORLD_SIZE
-            values = gl.amd.cdna4.buffer_load(input_ptr, owner * part + index, mask, 0)
-            gl.amd.cdna4.buffer_store(
-                values,
-                inboxes[(RANK + step) % WORLD_SIZE],
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 RANK * MAX_PARTITION + index,
                 mask,
                 cache=".wt",
             )
     _iris_drain_subgroup_vmem()
     gl.barrier()
-<<<<<<< HEAD
-<<<<<<< HEAD
     _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, False)
-=======
-    _tp4_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, False)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, False)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
         index = tile * BLOCK + offsets
         mask = index < part
         values = ()
-<<<<<<< HEAD
-<<<<<<< HEAD
         for peer in gl.static_range(WORLD_SIZE):
-=======
-        for peer in gl.static_range(4):
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        for peer in gl.static_range(WORLD_SIZE):
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             values += (
                 gl.amd.cdna4.buffer_load(
                     inbox_ptr, peer * MAX_PARTITION + index, mask, 0, cache=".cg"
                 ).to(gl.float32),
             )
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         result = (values[0] + values[1]) + (values[2] + values[3])
         if WORLD_SIZE == 8:
             result += (values[4] + values[5]) + (values[6] + values[7])
         result = result.to(gl.bfloat16)
         for step in gl.static_range(WORLD_SIZE):
-<<<<<<< HEAD
             gl.amd.cdna4.buffer_store(
                 result,
                 outputs[(RANK + step) % WORLD_SIZE],
-=======
-        result = ((values[0] + values[1]) + (values[2] + values[3])).to(gl.bfloat16)
-        for step in gl.static_range(4):
-            gl.amd.cdna4.buffer_store(
-                result,
-                outputs[(RANK + step) % 4],
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            gl.amd.cdna4.buffer_store(
-                result,
-                outputs[(RANK + step) % WORLD_SIZE],
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
                 RANK * part + index,
                 mask,
                 cache=".wt",
             )
     _iris_drain_subgroup_vmem()
     gl.barrier()
-<<<<<<< HEAD
-<<<<<<< HEAD
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
-=======
-    _tp4_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     gl.store(epochs + block, epoch)
 
 
 @gluon.jit(do_not_specialize=["numel"])
-<<<<<<< HEAD
-<<<<<<< HEAD
 def iris_pull_twoshot_allreduce(
-=======
-def iris_pull_twoshot_allreduce_tp4(
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-def iris_pull_twoshot_allreduce(
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     input_ptr,
     scratch_ptr,
     output_ptr,
@@ -2374,27 +2019,13 @@ def iris_pull_twoshot_allreduce(
     BLOCK: gl.constexpr,
     NUM_SUBGROUPS: gl.constexpr,
 ):
-<<<<<<< HEAD
-<<<<<<< HEAD
     """Reduce BF16 input partitions, then gather the full result locally.
 
     Each rank pulls its consecutive partition of input_ptr from all peers, sums
-=======
-    """Reduce four BF16 input partitions, then gather the full result locally.
-
-    Each rank pulls its consecutive quarter of input_ptr from all peers, sums
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    """Reduce BF16 input partitions, then gather the full result locally.
-
-    Each rank pulls its consecutive partition of input_ptr from all peers, sums
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     in FP32, and stores BF16 values in scratch_ptr. After exchanging ready
     counters, pull each peer's scratch into output_ptr. The next invocation's
     entry wait protects scratch while peers finish reading the previous result.
     """
-<<<<<<< HEAD
-<<<<<<< HEAD
     WORLD_SIZE: gl.constexpr = len(heaps)
     inputs = _iris_peer_pointers(input_ptr, heaps, RANK)
     scratch = _iris_peer_pointers(scratch_ptr, heaps, RANK)
@@ -2402,52 +2033,22 @@ def iris_pull_twoshot_allreduce(
     epoch = gl.load(epochs + block).to(gl.uint32) + 2
     _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, True)
     part = gl.multiple_of(numel // WORLD_SIZE, 8)
-=======
-    inputs = _iris_tp4_peer_pointers(input_ptr, heaps, RANK)
-    scratch = _iris_tp4_peer_pointers(scratch_ptr, heaps, RANK)
-    block = gl.program_id(0)
-    epoch = gl.load(epochs + block).to(gl.uint32) + 2
-    _tp4_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, True)
-    part = gl.multiple_of(numel // 4, 8)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    WORLD_SIZE: gl.constexpr = len(heaps)
-    inputs = _iris_peer_pointers(input_ptr, heaps, RANK)
-    scratch = _iris_peer_pointers(scratch_ptr, heaps, RANK)
-    block = gl.program_id(0)
-    epoch = gl.load(epochs + block).to(gl.uint32) + 2
-    _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, True)
-    part = gl.multiple_of(numel // WORLD_SIZE, 8)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_SUBGROUPS], [0])
     offsets = gl.arange(0, BLOCK, layout=layout)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
         index = tile * BLOCK + offsets
         mask = index < part
         values = ()
-<<<<<<< HEAD
-<<<<<<< HEAD
         for peer in gl.static_range(WORLD_SIZE):
-=======
-        for peer in gl.static_range(4):
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-        for peer in gl.static_range(WORLD_SIZE):
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             values += (
                 gl.amd.cdna4.buffer_load(
                     inputs[peer], RANK * part + index, mask, 0, cache=".cg"
                 ).to(gl.float32),
             )
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
         result = (values[0] + values[1]) + (values[2] + values[3])
         if WORLD_SIZE == 8:
             result += (values[4] + values[5]) + (values[6] + values[7])
         result = result.to(gl.bfloat16)
-<<<<<<< HEAD
         gl.amd.cdna4.buffer_store(result, scratch_ptr, index, mask, cache=".wt")
     _iris_drain_subgroup_vmem()
     gl.barrier()
@@ -2459,26 +2060,6 @@ def iris_pull_twoshot_allreduce(
             peer = (RANK + step) % WORLD_SIZE
             values = gl.amd.cdna4.buffer_load(
                 scratch[(RANK + step) % WORLD_SIZE], index, mask, 0, cache=".cg"
-=======
-        result = ((values[0] + values[1]) + (values[2] + values[3])).to(gl.bfloat16)
-=======
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
-        gl.amd.cdna4.buffer_store(result, scratch_ptr, index, mask, cache=".wt")
-    _iris_drain_subgroup_vmem()
-    gl.barrier()
-    _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
-    for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
-        index = tile * BLOCK + offsets
-        mask = index < part
-        for step in gl.static_range(WORLD_SIZE):
-            peer = (RANK + step) % WORLD_SIZE
-            values = gl.amd.cdna4.buffer_load(
-<<<<<<< HEAD
-                scratch[(RANK + step) % 4], index, mask, 0, cache=".cg"
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-                scratch[(RANK + step) % WORLD_SIZE], index, mask, 0, cache=".cg"
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             )
             gl.amd.cdna4.buffer_store(values, output_ptr, peer * part + index, mask)
     # Phase two proves every peer consumed the old input. The next scratch
@@ -2487,15 +2068,7 @@ def iris_pull_twoshot_allreduce(
 
 
 @gluon.jit
-<<<<<<< HEAD
-<<<<<<< HEAD
 def _iris_sync_peers(
-=======
-def _iris_tp4_sync_peers(
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-def _iris_sync_peers(
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     ready_flags,
     slot,
     epoch,
@@ -2503,52 +2076,21 @@ def _iris_sync_peers(
     rank: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-<<<<<<< HEAD
-<<<<<<< HEAD
     """Publish one slot's epoch and wait for matching peer epochs across the group."""
     WORLD_SIZE: gl.constexpr = len(heaps)
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [num_warps], [0])
     peers = gl.arange(0, WORLD_SIZE, layout=layout)
     peer_heaps = _iris_group_heap_base(peers, heaps)
-=======
-    """Publish one slot's epoch and wait for matching peer epochs across TP4."""
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [num_warps], [0])
-    peers = gl.arange(0, 4, layout=layout)
-    peer_heaps = _iris_tp4_heap_base(peers, heaps)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    """Publish one slot's epoch and wait for matching peer epochs across the group."""
-    WORLD_SIZE: gl.constexpr = len(heaps)
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [num_warps], [0])
-    peers = gl.arange(0, WORLD_SIZE, layout=layout)
-    peer_heaps = _iris_group_heap_base(peers, heaps)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     flags_offset = tl.cast(ready_flags, gl.uint64) - heaps[rank]
     remote_flags = tl.cast(
         peer_heaps + flags_offset,
         gl.pointer_type(gl.int32),
     )
-<<<<<<< HEAD
-<<<<<<< HEAD
     remote_flags += slot * WORLD_SIZE + rank
     peer_mask = peers != rank
     gl.store(remote_flags, epoch, mask=peer_mask, cache_modifier=".wt")
 
     wait_flags = ready_flags + slot * WORLD_SIZE + peers
-=======
-    remote_flags += slot * 4 + rank
-    peer_mask = peers != rank
-    gl.store(remote_flags, epoch, mask=peer_mask, cache_modifier=".wt")
-
-    wait_flags = ready_flags + slot * 4 + peers
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    remote_flags += slot * WORLD_SIZE + rank
-    peer_mask = peers != rank
-    gl.store(remote_flags, epoch, mask=peer_mask, cache_modifier=".wt")
-
-    wait_flags = ready_flags + slot * WORLD_SIZE + peers
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
     seen = gl.load(
         wait_flags,
         mask=peer_mask,
@@ -2574,12 +2116,4 @@ def _iris_sync_peers(
             volatile=True,
         )
     # Peer payload addresses are reused; .cg loads can still hit stale L2 lines.
-<<<<<<< HEAD
-<<<<<<< HEAD
     gl.atomic_add(ready_flags + slot * WORLD_SIZE + rank, 0, sem="acquire", scope="sys")
-=======
-    gl.atomic_add(ready_flags + slot * 4 + rank, 0, sem="acquire", scope="sys")
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-    gl.atomic_add(ready_flags + slot * WORLD_SIZE + rank, 0, sem="acquire", scope="sys")
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))

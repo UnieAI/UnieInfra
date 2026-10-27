@@ -302,17 +302,8 @@ __all__ = [
     "qk_rmsnorm_rope_neox",
     "reference_rmsnorm",
     "rmsnorm",
-<<<<<<< HEAD
-<<<<<<< HEAD
-    "weightless_qk_rmsnorm",
-    "weightless_rmsnorm",
-    "weightless_rmsnorm_gated_sigmoid",
-=======
     "rmsnorm_residual_rmsnorm",
->>>>>>> b18e37bf (gemma4: speed up gemma-4 serving on SM90 past vLLM)
-=======
     "weightless_qk_rmsnorm",
     "weightless_rmsnorm",
     "weightless_rmsnorm_gated_sigmoid",
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 ]

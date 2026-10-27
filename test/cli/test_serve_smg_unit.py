@@ -50,11 +50,8 @@ from tokenspeed.cli.serve_smg import (
     INKLING_TOOL_CALL_PARSER,
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
-<<<<<<< HEAD
     MUSE_SPARK_GATEWAY_PARSER,
     MUSE_SPARK_GRAMMAR_BACKEND,
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     MUSE_SPARK_REASONING_PARSER,
     MUSE_SPARK_TOOL_CALL_PARSER,
     _add_metrics_port,
@@ -453,7 +450,6 @@ class _ModelFamily(NamedTuple):
     detector: Callable[[str | None], bool]
     reasoning_parser: str
     tool_call_parser: str
-<<<<<<< HEAD
     # Further ``--flag value`` pairs the family appends, after the parsers.
     extra_engine_args: tuple[str, ...] = ()
     extra_gateway_args: tuple[str, ...] = ()
@@ -465,23 +461,12 @@ _MODEL_FAMILIES = (
     _ModelFamily(
         "muse_spark",
         MUSE_SPARK_MODEL_ID,
-=======
-
-
-_MODEL_FAMILIES = (
-    _ModelFamily(
-        "muse_spark",
-        "meta-models/Muse-Spark-Open-816B-A42B",
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
         _make_muse_spark_model_dir,
         _is_muse_spark_model,
         MUSE_SPARK_REASONING_PARSER,
         MUSE_SPARK_TOOL_CALL_PARSER,
-<<<<<<< HEAD
         extra_engine_args=("--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND),
         extra_gateway_args=("--parser", MUSE_SPARK_GATEWAY_PARSER),
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     ),
     _ModelFamily(
         "deepseek_v4",
@@ -527,10 +512,7 @@ def test_model_gets_default_parsers(tmp_path, family, from_local_config):
         model,
         "--reasoning-parser",
         family.reasoning_parser,
-<<<<<<< HEAD
         *family.extra_engine_args,
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     ]
     # Order matters: the reasoning parser is appended before the tool parser.
     assert gateway_args == [
@@ -540,7 +522,6 @@ def test_model_gets_default_parsers(tmp_path, family, from_local_config):
         family.reasoning_parser,
         "--tool-call-parser",
         family.tool_call_parser,
-<<<<<<< HEAD
         *family.extra_gateway_args,
     ]
 
@@ -572,24 +553,6 @@ def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
         *_explicit(family.extra_gateway_args),
     ]
 
-=======
-    ]
-
-
-@pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
-def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
-    model = family.make_model_dir(tmp_path)
-    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
-    gateway_args = [
-        "--model",
-        model,
-        "--reasoning-parser",
-        "custom_reasoning",
-        "--tool-call-parser",
-        "custom_tools",
-    ]
-
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     assert _args_with_default_model_parsers(engine_args, gateway_args) == (
         engine_args,
         gateway_args,
@@ -652,7 +615,6 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
 
 
-<<<<<<< HEAD
 def test_muse_spark_explicit_gateway_parser_wins(tmp_path):
     """An operator ``--parser`` stays; the ``muse`` names are still defaulted."""
     model = _make_muse_spark_model_dir(tmp_path)
@@ -770,8 +732,6 @@ def test_muse_spark_chain_drafting_keeps_xgrammar_default(tmp_path):
     )
 
 
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 def _make_inkling_model_dir(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(

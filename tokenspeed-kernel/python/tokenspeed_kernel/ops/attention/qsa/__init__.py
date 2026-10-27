@@ -175,12 +175,8 @@ def qsa_sparse_attention(
     The SM100/SM103 CuTe DSL implementation is preferred when its specialization
     matches a uniform decode. Prefill and mixed/ragged queries use FlashInfer
     FA2 on supported NVIDIA architectures; other decode geometries retain
-<<<<<<< HEAD
     the registered fallback. GFX950 uses the Gluon kernel and other AMD GPUs
     the portable Triton kernel. Kernel
-=======
-    the registered fallback. AMD GPUs use the portable Triton kernel. Kernel
->>>>>>> 379fa008 (feat(amd): enable Qwen3.8-Flash-Next MXFP4 TP2 on gfx950 (#2223))
     selection preserves this distinction before adapting ragged inputs to
     independent one-token query rows.
     """

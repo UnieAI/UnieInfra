@@ -18,15 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
 import math
+import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
-<<<<<<< HEAD
-=======
 # Grouped stage-1 packs up to this many q heads (of one kv head) per CTA.
 _GROUPED_BLOCK_H = 16
 
@@ -203,7 +203,6 @@ def _resolve_kv_splits(
             cache_seqlens, window_left, max_kv_splits, _TRITON_DECODE_SPLIT_MIN_TOKENS
         )
     return max_kv_splits, num_kv_splits
->>>>>>> b18e37bf (gemma4: speed up gemma-4 serving on SM90 past vLLM)
 
 
 @triton.jit
@@ -661,7 +660,7 @@ def _decode_grouped_att_m_fwd(
     total_q, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    BLOCK_H = 16
+    BLOCK_H = _GROUPED_BLOCK_H
     MAX_KV_SPLITS = max_kv_splits
     grid = (
         total_q,
@@ -1048,7 +1047,9 @@ def _triton_mha_decode_with_kvcache_impl(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    max_kv_splits = 4
+    max_kv_splits, num_kv_splits = _resolve_kv_splits(
+        q, k_cache.shape[2], cache_seqlens, window_left
+    )
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
@@ -1063,9 +1064,6 @@ def _triton_mha_decode_with_kvcache_impl(
         max_kv_splits,
         dtype=torch.float32,
         device=q.device,
-    )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
     )
     decode_attention_fwd(
         q,

@@ -29,24 +29,16 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     triton_topk_from_logits,
 )
-<<<<<<< HEAD
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
     max_active_ctas,
 )
-=======
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
->>>>>>> 379fa008 (feat(amd): enable Qwen3.8-Flash-Next MXFP4 TP2 on gfx950 (#2223))
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
-<<<<<<< HEAD
 _SCORE_MAX_WAVES = 3
-=======
-_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
->>>>>>> 379fa008 (feat(amd): enable Qwen3.8-Flash-Next MXFP4 TP2 on gfx950 (#2223))
 LOG2E = math.log2(math.e)
 
 
@@ -2430,11 +2422,8 @@ __all__ = [
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",
     "qwen4_exp_qsa_selected_slots",
-<<<<<<< HEAD
     "triton_qsa_block_scores",
     "triton_qsa_block_topk_select",
     "triton_qsa_block_topk_stream",
-=======
->>>>>>> 379fa008 (feat(amd): enable Qwen3.8-Flash-Next MXFP4 TP2 on gfx950 (#2223))
     "triton_qsa_sparse_attention",
 ]

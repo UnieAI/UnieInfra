@@ -172,11 +172,7 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
     def dense():
         logits = deep_gemm._hopper_paged_scores(
             (queries,), cache, folded, table, visible, capacity, clean=True
-<<<<<<< HEAD
-        )[0]
-=======
         )
->>>>>>> d6c64a4b (fix(dsv41): address the post-merge review of the DSV4.1 performance PRs (#2477))
         return candidate_scores(logits, candidates)
 
     def sparse(field):
@@ -266,11 +262,7 @@ def test_sparse_index_scores_compile_once_across_table_and_pool_widths():
             ), f"table width {table_width} / {blocks} blocks recompiled"
         logits = deep_gemm._hopper_paged_scores(
             (queries,), cache, folded, table, visible, capacity, clean=True
-<<<<<<< HEAD
-        )[0]
-=======
         )
->>>>>>> d6c64a4b (fix(dsv41): address the post-merge review of the DSV4.1 performance PRs (#2477))
         expected = candidate_scores(logits, candidates)
         torch.testing.assert_close(
             torch.isinf(actual), torch.isinf(expected), rtol=0, atol=0
@@ -395,11 +387,7 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
     # which is the selection the pass reproduces.
     logits = deep_gemm._hopper_paged_scores(
         (queries,), cache, folded, table, visible, capacity, clean=True
-<<<<<<< HEAD
-    )[0]
-=======
     )
->>>>>>> d6c64a4b (fix(dsv41): address the post-merge review of the DSV4.1 performance PRs (#2477))
     for query in range(tokens):
         kept = int(dense_lengths[query])
         taken = set(sparse[query, :kept].tolist())
@@ -477,11 +465,7 @@ def test_sparse_index_scores_address_a_cache_whose_scale_plane_passes_four_gigae
     expected = candidate_scores(
         deep_gemm._hopper_paged_scores(
             (queries,), view, folded, table, visible, capacity, clean=True
-<<<<<<< HEAD
-        )[0],
-=======
         ),
->>>>>>> d6c64a4b (fix(dsv41): address the post-merge review of the DSV4.1 performance PRs (#2477))
         candidates,
     )
     values, scales = deep_gemm._index_planes(view)

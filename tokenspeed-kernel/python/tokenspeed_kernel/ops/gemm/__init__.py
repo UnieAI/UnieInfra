@@ -45,10 +45,7 @@ from tokenspeed_kernel.ops.gemm._triton.kimi3 import (
 )
 from tokenspeed_kernel.ops.gemm.triton_router_gemv import fp32_router_gemv_counters
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-<<<<<<< HEAD
 from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
-=======
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
 from tokenspeed_kernel.platform import (
     Platform,
     current_platform,
@@ -106,12 +103,6 @@ __all__ = [
     "fp32_router_gemv_execute",
     "fp32_router_gemv_plan",
     "fp32_router_gemv_process_weight",
-<<<<<<< HEAD
-=======
-    "fp8_linear",
-    "fp8_linear_into",
-    "fp8_linear_prepacked",
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -136,11 +127,7 @@ __all__ = [
     "mxfp4_swiglu_linear",
     "prepare_mxfp4_linear",
     "mm",
-<<<<<<< HEAD
     "prepare_mxfp8_weight_scales",
-=======
-    "prepare_fp8_linear",
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     "prepare_nvfp4_a16_weights",
 ]
 
@@ -1802,7 +1789,6 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     platform = current_platform()
     n = weight.shape[0]
     if platform.is_cdna4:
-<<<<<<< HEAD
         impl = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
         if impl is torch_decode_gemv:
             return False
@@ -1814,12 +1800,6 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
             or prefers_gluon_rowcta_bf16_gemv_gfx950(n, k)
             or impl is KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950")
         )
-=======
-        measured_single_row = (m, n, k) == (1, 4608, 8192)
-        return (m >= 2 or measured_single_row) and _select_mv(
-            m, n, k, True, x.dtype, weight.dtype, False
-        ) is not (torch_decode_gemv)
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
     if not platform.is_cdna5 or k < 256:
         return False
     return (

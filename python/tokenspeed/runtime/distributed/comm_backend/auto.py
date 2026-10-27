@@ -234,9 +234,20 @@ class AutoBackend(CommBackend):
 
         The world fabric map is gathered during distributed initialization, so
         the group verdict is a local lookup with no dispatch-time collective.
+
+        Intra-node is not unconditionally safe either: some NVSwitch hosts
+        advertise multicast while ``cuMulticastBindMem`` returns ILLEGAL_STATE
+        (null multicast_ptr after rendezvous). Those hosts must not take the
+        Triton RSAG multimem path or they illegal-memory-access; see
+        ``nvls_multicast_mapping_usable``.
         """
+        from tokenspeed.runtime.distributed.nvls_multicast import (
+            nvls_multicast_mapping_usable,
+        )
         from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
 
+        if nvls_multicast_mapping_usable() is False:
+            return False
         if not AutoBackend._group_spans_nodes(group):
             return True
         return group_has_fabric(group)
@@ -309,15 +320,7 @@ class AutoBackend(CommBackend):
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
         if (
             not current_platform().is_cdna4
-<<<<<<< HEAD
-<<<<<<< HEAD
             or len(group) not in (4, 8)
-=======
-            or len(group) != 4
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            or len(group) not in (4, 8)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             or self._force_deterministic_rsag()
             or self._group_spans_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
@@ -328,15 +331,7 @@ class AutoBackend(CommBackend):
     def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
         if (
             not current_platform().is_cdna4
-<<<<<<< HEAD
-<<<<<<< HEAD
             or len(group) not in (4, 8)
-=======
-            or len(group) != 4
->>>>>>> 3d44d6e9 (feat(models): add Muse Spark Open support (#2388))
-=======
-            or len(group) not in (4, 8)
->>>>>>> 050ca725 (feat(amd): Enable Muse Spark TP8/EP8 optimizations (#2449))
             or self._group_spans_nodes(group)
         ):
             return False

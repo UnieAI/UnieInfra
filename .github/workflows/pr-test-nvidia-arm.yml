@@ -14,7 +14,7 @@ on:
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-tests.yml"
-      - ".github/workflows/nvidia-gb10-tests.yml"
+      - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   pull_request:
@@ -29,7 +29,7 @@ on:
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-tests.yml"
-      - ".github/workflows/nvidia-gb10-tests.yml"
+      - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
@@ -61,7 +61,6 @@ jobs:
     # Run jobs for pull requests, or for push/manual events in the official
     # repository or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
-      false &&
       (github.event.action != 'labeled' || github.event.label.name == 'high priority') &&
       (
         github.event_name == 'pull_request' ||
@@ -118,7 +117,7 @@ jobs:
               ;;
           esac
           python3 test/ci_system/ci_path_filter.py \
-            --runner-group gb10 \
+            --runner-group nvidia-arm \
             --event-name "${{ github.event_name }}" \
             --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
@@ -129,22 +128,16 @@ jobs:
         env:
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
-          # Model validation is temporarily disabled. Re-enable only after
-          # Qwen3.8-27B and Qwen3.6-35B-A3B CI tasks are available.
           for stage in \
-            unit:unit-test; do
+            unit:unit-test \
+            model:model-test; do
             output=${stage%%:*}
             workflow_stage=${stage#*:}
             matrix=$(python3 test/ci_system/pipeline.py scan \
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
-<<<<<<< HEAD
-              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-              --runner-group "gb10" \
-=======
               --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
               --runner-group "nvidia-arm" \
->>>>>>> 67a4e309 (ci: add post-submit trigger and use for mi35x Inkling eval (#2232))
               --workflow-stage "$workflow_stage" \
               --multi-node exclude)
             matrix=$(printf '%s' "$matrix" | python3 -c \

@@ -979,7 +979,11 @@ class ModelExecutor:
         """
         workspace_pool(self.device).freeze()
 
-        if not self.forward_step.disable:
+        # An embedding (pooling) model only ever runs extend forwards; it has
+        # no decode step, and a decode-shaped capture would call pool() without
+        # gather_ids. Skip the decode graph ladder for it (the prefill graph
+        # below still captures its extend path).
+        if not self.forward_step.disable and not self.config.is_embedding:
             self.forward_step.capture(entries=entries, observer=observer)
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(

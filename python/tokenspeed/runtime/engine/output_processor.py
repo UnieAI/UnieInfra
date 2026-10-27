@@ -135,8 +135,9 @@ class OutputProcessor:
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.engine.server_args.weight_version,
             }
-            logprobs_info = state.logprobs_info if not state.obj.stream else {}
-            if state.obj.stream and "cumulative_logprob" in state.logprobs_info:
+            streaming = bool(getattr(state.obj, "stream", False))
+            logprobs_info = state.logprobs_info if not streaming else {}
+            if streaming and "cumulative_logprob" in state.logprobs_info:
                 # Lists cover this frame; the scalar covers the whole request.
                 logprobs_info["cumulative_logprob"] = state.logprobs_info[
                     "cumulative_logprob"

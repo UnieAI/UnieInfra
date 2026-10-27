@@ -192,10 +192,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_loaded_names = None
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = None
-        # An embedding server pools instead of producing logits. The decision
-        # rides on the HF config (``ModelConfig`` sets ``pooling_config``)
-        # because the model class is constructed from that config alone, and
-        # it has to be known before the LM head is built below.
+
         self.pooler = self.resolve_pooler(config)
 
         self.encoder_only = encoder_only
@@ -209,14 +206,16 @@ class BaseCausalLM(nn.Module):
             self.logits_processor = None
         else:
             self.model = self.resolve_model(config, mapping, quant_config, prefix)
-            if mapping.is_last_pp_rank and self.pooler is None:
+            if self.pooler is not None:
+                # A pooling checkpoint has no lm_head (Qwen3-Embedding ships
+                # embed_tokens + layers.* only); pooling never uses logits.
+                self.lm_head = None
+                self.logits_processor = None
+            elif mapping.is_last_pp_rank:
                 self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
                 self.logits_processor = self.resolve_logits_processor(config)
             else:
-                # Mid-pipeline stages emit hidden states, never logits. A
-                # pooling checkpoint has no LM head to load (Qwen3-Embedding
-                # ships `embed_tokens`, `layers.*` and `norm` only), and its
-                # forward never reaches the logits processor.
+                # Mid-pipeline stages emit hidden states, never logits.
                 self.lm_head = None
                 self.logits_processor = None
         self.post_init()
@@ -361,14 +360,14 @@ class BaseCausalLM(nn.Module):
         if self.pooler is None:
             raise RuntimeError(
                 "get_embedding was requested but this model has no pooler; "
-                "serve a pooling checkpoint, or pass --is-embedding with "
-                "--pooling-type."
+                "start the server with --is-embedding on a pooling checkpoint."
             )
         if ctx.gather_ids is None:
             raise RuntimeError(
-                "pooling needs ForwardContext.gather_ids, which only an extend "
-                f"forward carries; got forward_mode={ctx.forward_mode} "
-                f"bs={ctx.bs} num_extends={ctx.num_extends}"
+                "pooling requires ForwardContext.gather_ids, which only an "
+                "extend forward carries. Got forward_mode="
+                f"{ctx.forward_mode} bs={ctx.bs} num_extends={ctx.num_extends} "
+                f"rows={hidden_states.shape[0]}"
             )
         return self.pooler(
             hidden_states,

@@ -931,7 +931,7 @@ class ModelExecutor:
         # The prefill role never decodes: a DECODE-shaped dummy would need the
         # verify scratch it does not allocate, and its ranks initialize lazy
         # collectives together on their first prefill round instead.
-        if self.config.enforce_eager and not self.config.prefill_only and not self.config.is_embedding:
+        if self.config.enforce_eager and not self.config.prefill_only:
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
@@ -979,11 +979,7 @@ class ModelExecutor:
         """
         workspace_pool(self.device).freeze()
 
-        # An embedding (pooling) model only ever runs extend forwards; it has
-        # no decode step, and a decode-shaped capture would call pool() without
-        # gather_ids. Skip the decode graph ladder for it (the prefill graph
-        # below still captures its extend path).
-        if not self.forward_step.disable and not self.config.is_embedding:
+        if not self.forward_step.disable:
             self.forward_step.capture(entries=entries, observer=observer)
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(
@@ -1080,7 +1076,7 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            if decode_only and not self.config.is_embedding:
+            if decode_only:
                 # No extend forward exists on this layout; the decode step
                 # reaches the target and, through the speculative forward,
                 # the draft.
@@ -1113,7 +1109,7 @@ class ModelExecutor:
                     )
                 if self.drafter is not None:
                     self._autotune_draft_experts(num_tokens)
-                if self.drafter is not None and not self.config.prefill_only and not self.config.is_embedding:
+                if self.drafter is not None and not self.config.prefill_only:
                     # Prefill-only roles do not allocate decode/verify scratch.
                     # The draft model is reached through the shared speculative
                     # forward, not model_runner.forward above. One request

@@ -28,3 +28,22 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _host_independent_nvls_probe(monkeypatch):
+    """Keep routing unit tests independent of the host's NVLS fabric.
+
+    ``nvls_multicast_mapping_usable`` probes the real driver (Fabric
+    ClusterUUID) and returns ``False`` on hosts whose multicast bind is
+    broken, which vetoes every multimem route before the tests' own
+    topology/fabric fakes are consulted. Report "inconclusive" (``None``),
+    the value that leaves routing to the faked topology; a test that wants
+    the broken-host verdict patches it back explicitly.
+    """
+    from tokenspeed.runtime.distributed import nvls_multicast
+
+    monkeypatch.setattr(nvls_multicast, "nvls_multicast_mapping_usable", lambda: None)

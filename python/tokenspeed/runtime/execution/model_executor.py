@@ -931,7 +931,7 @@ class ModelExecutor:
         # The prefill role never decodes: a DECODE-shaped dummy would need the
         # verify scratch it does not allocate, and its ranks initialize lazy
         # collectives together on their first prefill round instead.
-        if self.config.enforce_eager and not self.config.prefill_only:
+        if self.config.enforce_eager and not self.config.prefill_only and not self.config.is_embedding:
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
@@ -1076,7 +1076,7 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            if decode_only:
+            if decode_only and not self.config.is_embedding:
                 # No extend forward exists on this layout; the decode step
                 # reaches the target and, through the speculative forward,
                 # the draft.
@@ -1109,7 +1109,7 @@ class ModelExecutor:
                     )
                 if self.drafter is not None:
                     self._autotune_draft_experts(num_tokens)
-                if self.drafter is not None and not self.config.prefill_only:
+                if self.drafter is not None and not self.config.prefill_only and not self.config.is_embedding:
                     # Prefill-only roles do not allocate decode/verify scratch.
                     # The draft model is reached through the shared speculative
                     # forward, not model_runner.forward above. One request

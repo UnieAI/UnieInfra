@@ -540,6 +540,10 @@ def get_config(
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
+        "Gemma3ForConditionalGeneration",
+        "Gemma3Config",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4Config",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3NextN",
@@ -608,6 +612,9 @@ CONTEXT_LENGTH_KEYS = [
     "max_seq_len",
     "model_max_length",
     "max_position_embeddings",
+    # Encoder-decoder (Whisper): decoder position table length; last so any
+    # model that publishes a standard key is unaffected.
+    "max_target_positions",
 ]
 
 

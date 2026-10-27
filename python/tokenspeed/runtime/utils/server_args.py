@@ -695,6 +695,10 @@ class ServerArgs:
     # make the sharded o_proj / dense down_proj column-parallel on hidden so
     # no cross-rank reduction remains outside MoE (TP batch invariance).
     attn_head_tp_size: int | None = None
+    # Rows per rank the head-TP Lamport exchanges are prepared for. The
+    # scratch is allocated before graph capture, so larger forwards fall
+    # back to the generic all-to-all instead of growing it at runtime.
+    head_tp_exchange_max_rows: int = 256
     lm_head_tp_size: int | None = None
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
@@ -1195,6 +1199,8 @@ class ServerArgs:
         weights' quantization is checked once the checkpoint's is resolved
         (:meth:`validate_tp_batch_invariant_weights`).
         """
+        if self.head_tp_exchange_max_rows < 1:
+            raise ValueError("--head-tp-exchange-max-rows must be positive")
         attn = self.mapping.attn
         if attn.head_tp_serves_decode_only:
             # Head TP over attention-DP ranks serves absorbed decode rows
@@ -1738,6 +1744,19 @@ class ServerArgs:
                 f"{self.mapping.dense.tp_size!s}!",
             )
 
+        if (
+            self.all2all_backend == "deepep"
+            and self.deepep_mode == "normal"
+            and not self.enforce_eager
+        ):
+            # A decode graph captures the MoE's dispatch and combine. Only the
+            # low-latency legs replay; the normal dispatch reads its
+            # per-expert receive counts on the host, which a graph cannot
+            # capture (the prefill graph is off under DeepEP for the same
+            # reason).
+            self.enforce_eager = True
+            logger.info("CUDA graph is disabled under --deepep-mode normal")
+
     def resolve_numerics(self):
         """Fold the ``--numerics`` envelope into the individual switches.
 
@@ -1776,20 +1795,15 @@ class ServerArgs:
             self.enable_allreduce_fusion = False
             # The slot-order fold runs over the EP group inside the MoE leaf:
             # a K-split (MoE TP) down projection would need a second,
-            # rank-ordered fold after it, and DeepEP's all-to-all owns that
-            # exchange itself (and hands the leaf a NCCL group, not the EP
-            # device group the fold runs on).
+            # rank-ordered fold after it. Under --all2all-backend deepep the
+            # leaf must itself own the exchange and fold the routes in slot
+            # order: the MoE plan selects only a kernel declaring both traits
+            # and refuses the launch otherwise.
             if self.mapping.moe.tp_size != 1:
                 raise ValueError(
                     "--moe-combine-order slot needs MoE TP 1: a K-split down "
                     "projection would need a second, rank-ordered fold after "
                     f"the slot-order one (got --moe-tp-size {self.mapping.moe.tp_size})"
-                )
-            if self.all2all_backend == "deepep":
-                raise ValueError(
-                    "--moe-combine-order slot folds the routed outputs over the "
-                    "EP group inside the MoE leaf; --all2all-backend deepep "
-                    "performs that exchange itself and cannot be combined with it"
                 )
 
     def _resolve_rl_bitwise(self):
@@ -3645,6 +3659,16 @@ class ServerArgs:
             "the absorbed sparse prefill through the exchange). Defaults to the "
             "ranks holding the same rows: the attention TP size, or 1 "
             "(head-replicated) under --query-context-parallel-size.",
+        )
+        parser.add_argument(
+            "--head-tp-exchange-max-rows",
+            type=int,
+            default=ServerArgs.head_tp_exchange_max_rows,
+            help="Rows per rank the head-TP Lamport exchanges are prepared for "
+            "(the absorbed query, the latent attention output, and the TP-BI "
+            "o_proj rows). The symmetric-memory scratch is allocated before "
+            "graph capture; larger forwards fall back to the generic all-to-all. "
+            "Only used with --attn-head-tp-size > 1.",
         )
         parser.add_argument(
             "--lm-head-tp-size",

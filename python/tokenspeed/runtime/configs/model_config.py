@@ -1000,7 +1000,7 @@ class ModelConfig:
             attention_family.configure(self, server_args)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
             configure_mla_attention(self, server_args)
-        elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
+        elif "MiniCPM3ForCausalLM" in (getattr(self.hf_config, "architectures", None) or []):
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank

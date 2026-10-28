@@ -894,6 +894,7 @@ class ServerArgs:
                 "constrained decoding requests will be rejected. This override is "
                 "intended only for benchmarking."
             )
+
     @property
     def served_model_names(self) -> list[str]:
         """All served API ids (vLLM-style multi ``--served-model-name``)."""

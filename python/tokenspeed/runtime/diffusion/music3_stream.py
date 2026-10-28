@@ -116,7 +116,9 @@ def streaming_wav_header(
     )
 
 
-def pcm16le_bytes(waveform, *, native_sr: int, out_sr: int) -> tuple[bytes, int, int, int]:
+def pcm16le_bytes(
+    waveform, *, native_sr: int, out_sr: int
+) -> tuple[bytes, int, int, int]:
     """``waveform`` (channels, samples) float → (pcm_s16le, sr, samples, channels)."""
     import numpy as np
 
@@ -134,7 +136,12 @@ def pcm16le_bytes(waveform, *, native_sr: int, out_sr: int) -> tuple[bytes, int,
         pcm = resample_poly_pcm(pcm, sample_rate, int(out_sr))
         sample_rate = int(out_sr)
     pcm_i16 = (pcm * 32767.0).astype(np.int16)
-    return pcm_i16.tobytes(order="C"), sample_rate, int(pcm_i16.shape[0]), int(pcm_i16.shape[1])
+    return (
+        pcm_i16.tobytes(order="C"),
+        sample_rate,
+        int(pcm_i16.shape[0]),
+        int(pcm_i16.shape[1]),
+    )
 
 
 def resample_poly_pcm(pcm, src_sr: int, dst_sr: int):

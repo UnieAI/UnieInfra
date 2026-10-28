@@ -1837,7 +1837,9 @@ def qk_rmsnorm_rope_neox(
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     v: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """Per-head RMSNorm of q/k (+ optional weightless v) and neox RoPE on q/k.
 
     ``q``/``k``/``v`` are ``[tokens, heads, head_dim]`` (or flat last-dim)

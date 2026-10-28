@@ -141,9 +141,7 @@ def _transcribe(
     return engine.llm.generate(request)["text"]
 
 
-def create_app(
-    engine, processor, served_model_name: str | list[str]
-) -> FastAPI:
+def create_app(engine, processor, served_model_name: str | list[str]) -> FastAPI:
     app = FastAPI(title="TokenSpeed ASR server")
     app.state.engine = engine
     app.state.processor = processor

@@ -1209,8 +1209,6 @@ class ModelConfig:
             self.model_profile is not None and self.model_profile.request_token_history
         )
 
-
-
     def _clamp_prefill_budget_to_context(self, server_args: ServerArgs) -> None:
         """Cap the per-step prefill budget at what the request pool can hold.
 
@@ -1500,7 +1498,6 @@ def _get_and_verify_dtype(
             logger.warning(f"Casting {config_dtype!s} to {torch_dtype!s}.")
 
     return torch_dtype
-
 
 
 @dataclass(frozen=True)

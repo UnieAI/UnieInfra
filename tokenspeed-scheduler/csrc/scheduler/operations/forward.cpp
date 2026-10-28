@@ -650,7 +650,7 @@ std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
 // pin) do NOT redirect the choice; the caller waits for the chosen victim to
 // quiesce rather than sacrificing a worse-ranked request.
 Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates,
-                                                 bool drop_exempt_last_resort) const {
+                                                bool drop_exempt_last_resort) const {
     const auto retractable = [](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
                !request.ReserveCoversGeneration(kRetractionSafeSteps);
@@ -724,8 +724,7 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
             fallback = request;
         }
         if (request->ResultsInFlight() == 0 && !pdTransferInFlight(*request) &&
-            (fallback_quiescent == nullptr ||
-             request->RetractionCount() <= fallback_quiescent->RetractionCount())) {
+            (fallback_quiescent == nullptr || request->RetractionCount() <= fallback_quiescent->RetractionCount())) {
             fallback_quiescent = request;
         }
     }
@@ -751,12 +750,11 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
     // This O(residents x groups) scan runs only here -- the rare round with no
     // ordinary victim, a stuck-resident blocker, and no host room to image --
     // never on the steady decode path.
-    const bool any_resident_can_grow_in_place =
-        std::ranges::any_of(candidates, [this](const Request* request) {
-            return request->IsAnyOf<fsm::Decoding, fsm::PrefillDone>() &&
-                   canConsumeReservedTokensInPlace(coordinator_, request->BlockTablesRef(),
-                                                   config_.decode_input_tokens, request->NumComputedTokens());
-        });
+    const bool any_resident_can_grow_in_place = std::ranges::any_of(candidates, [this](const Request* request) {
+        return request->IsAnyOf<fsm::Decoding, fsm::PrefillDone>() &&
+               canConsumeReservedTokensInPlace(coordinator_, request->BlockTablesRef(), config_.decode_input_tokens,
+                                               request->NumComputedTokens());
+    });
     if (any_resident_can_grow_in_place) {
         return VictimChoice{.victim = nullptr, .image_fits = false};
     }
@@ -958,9 +956,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         // is gated; ordinary capacity retraction (blocker not a stuck
         // resident) never drops an exemption and is unaffected.
         if (blocker_is_stuck_resident &&
-            std::ranges::any_of(requests_, [](const std::unique_ptr<Request>& r) {
-                return r->Is<fsm::Restoring>();
-            })) {
+            std::ranges::any_of(requests_, [](const std::unique_ptr<Request>& r) { return r->Is<fsm::Restoring>(); })) {
             return;
         }
         const VictimChoice choice = chooseVictim(candidates, blocker_is_stuck_resident);
@@ -1296,8 +1292,8 @@ void Scheduler::capPrefillBesideDecodes(PlanBuild& build) const {
         return;
     }
     const std::int64_t share = static_cast<std::int64_t>(mixed_ref_chunk_) * mixed_decode_ref_ / decodes;
-    const std::int32_t cap = std::max({static_cast<std::int32_t>(share), mixed_prefill_floor_,
-                                       build.pending_prefill_reserve});
+    const std::int32_t cap =
+        std::max({static_cast<std::int32_t>(share), mixed_prefill_floor_, build.pending_prefill_reserve});
     build.token_budget = std::min(build.token_budget, cap);
 }
 
@@ -1310,8 +1306,7 @@ std::int32_t Scheduler::prefillBudgetFor(const Request& request, const PlanBuild
     if (mixed_long_chunk_ <= 0 || !build.pushed_decode) {
         return build.token_budget;
     }
-    const std::int32_t left =
-        request.Is<fsm::Submitted>() ? request.PrefillSize() : request.UnscheduledPrefillSize();
+    const std::int32_t left = request.Is<fsm::Submitted>() ? request.PrefillSize() : request.UnscheduledPrefillSize();
     if (left <= mixed_long_chunk_) {
         return build.token_budget;
     }
@@ -1337,8 +1332,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, prefillBudgetFor(*request, build),
-                                                         decode_reserve, build.load_backs, build.prefetches)) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, request, prefillBudgetFor(*request, build),
+                                             decode_reserve, build.load_backs, build.prefetches)) {
                 if (!admitted->operation) {
                     // Gone to prefetch its L3 prefix (Prefetching): it holds
                     // no head of line, so the prompts behind it go on.

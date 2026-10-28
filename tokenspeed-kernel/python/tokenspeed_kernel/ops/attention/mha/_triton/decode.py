@@ -97,9 +97,15 @@ _TRITON_DECODE_SPLIT_MIN_TOKENS = _env_pos_int(
 # Diagnostic/sweep knob: stage-1 CTAs to aim for, in multiples of the SM count.
 _TRITON_DECODE_TARGET_WAVES = _env_pos_int("TOKENSPEED_TRITON_DECODE_TARGET_WAVES", 2)
 # Grouped (GQA) stage-1 launch shape; 0 keeps the built-in choice. Sweep knobs.
-_GROUPED_BLOCK_N_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_BLOCK_N", "0") or 0)
-_GROUPED_WARPS_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_WARPS", "0") or 0)
-_GROUPED_STAGES_ENV = int(os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_STAGES", "0") or 0)
+_GROUPED_BLOCK_N_ENV = int(
+    os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_BLOCK_N", "0") or 0
+)
+_GROUPED_WARPS_ENV = int(
+    os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_WARPS", "0") or 0
+)
+_GROUPED_STAGES_ENV = int(
+    os.environ.get("TOKENSPEED_TRITON_DECODE_GROUPED_STAGES", "0") or 0
+)
 # Batch invariance: MAX no longer depends on batch size, so a request's split
 # count (hence its reduction order) depends only on its own length.
 _BATCH_INVARIANT = _env_truthy("VLLM_BATCH_INVARIANT")

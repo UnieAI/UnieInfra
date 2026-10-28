@@ -55,7 +55,6 @@ from tokenspeed.runtime.diffusion.music3_config import (
     frames_for_duration,
     resolve_music3_checkpoint,
 )
-from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.diffusion.music3_stream import (
     CROP_LEFT_LATENT,
     CROP_RIGHT_LATENT,
@@ -63,10 +62,16 @@ from tokenspeed.runtime.diffusion.music3_stream import (
     pcm16le_bytes,
     resample_poly_pcm,
 )
+from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-__all__ = ["Music3Pipeline", "Music3GenerateRequest", "Music3GenerateResult", "Music3StreamChunk"]
+__all__ = [
+    "Music3Pipeline",
+    "Music3GenerateRequest",
+    "Music3GenerateResult",
+    "Music3StreamChunk",
+]
 
 
 @dataclass
@@ -131,7 +136,6 @@ class Music3Pipeline:
             "float32": torch.float32,
         }.get(self.config.dtype.lower(), torch.bfloat16)
 
-
     def _load_kwargs(self, dtype) -> dict:
         """Kwargs for ``load_components`` (dtype + tokenizer regex fix).
 
@@ -188,7 +192,9 @@ class Music3Pipeline:
         if not self.config.enable_cpu_offload and device.startswith("cuda"):
             pipe.to(device)
         self._pipe = ("single", pipe)
-        self._sampling_rate = int(getattr(pipe, "sampling_rate", NATIVE_SAMPLE_RATE) or NATIVE_SAMPLE_RATE)
+        self._sampling_rate = int(
+            getattr(pipe, "sampling_rate", NATIVE_SAMPLE_RATE) or NATIVE_SAMPLE_RATE
+        )
         logger.info(
             "music3 load: single-pipeline on %s sampling_rate=%s",
             device,
@@ -335,7 +341,9 @@ class Music3Pipeline:
             raise RuntimeError(f"unexpected music3 audio shape: {tuple(tensor.shape)}")
 
         # (channels, samples) → write WAV
-        native_sr = int(getattr(pipe, "sampling_rate", self._sampling_rate) or NATIVE_SAMPLE_RATE)
+        native_sr = int(
+            getattr(pipe, "sampling_rate", self._sampling_rate) or NATIVE_SAMPLE_RATE
+        )
         out_sr = int(self.config.output_sample_rate or native_sr)
         if out_sr <= 0:
             out_sr = native_sr
@@ -353,7 +361,9 @@ class Music3Pipeline:
         )
 
     @staticmethod
-    def _encode_wav(tensor, *, native_sr: int, out_sr: int) -> tuple[bytes, int, int, int]:
+    def _encode_wav(
+        tensor, *, native_sr: int, out_sr: int
+    ) -> tuple[bytes, int, int, int]:
         """``tensor`` is (channels, samples) float in roughly [-1, 1]."""
         import numpy as np
 
@@ -383,7 +393,6 @@ class Music3Pipeline:
         sf.write(buf, pcm, sample_rate, format="WAV", subtype="PCM_16")
         data = buf.getvalue()
         return data, sample_rate, int(pcm.shape[0]), int(pcm.shape[1])
-
 
     def generate_stream(self, req: Music3GenerateRequest):
         """Yield progressive PCM windows after AR; real acoustic chunking.
@@ -508,7 +517,9 @@ class Music3Pipeline:
 
         hop = int(getattr(components, "latent_hop_length", 512) or 512)
         native_sr = int(
-            getattr(components, "sampling_rate", None) or self._sampling_rate or NATIVE_SAMPLE_RATE
+            getattr(components, "sampling_rate", None)
+            or self._sampling_rate
+            or NATIVE_SAMPLE_RATE
         )
         out_sr = int(self.config.output_sample_rate or native_sr)
         if out_sr <= 0:

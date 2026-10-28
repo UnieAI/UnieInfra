@@ -60,7 +60,12 @@ class VideoJob:
 
 
 class VideoJobQueue:
-    def __init__(self, generate_fn: Callable[[H3GenerateRequest], H3GenerateResult], *, max_queue: int = 8):
+    def __init__(
+        self,
+        generate_fn: Callable[[H3GenerateRequest], H3GenerateResult],
+        *,
+        max_queue: int = 8,
+    ):
         self._generate = generate_fn
         self._max_queue = max_queue
         self._jobs: dict[str, VideoJob] = {}
@@ -68,13 +73,17 @@ class VideoJobQueue:
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = False
-        self._worker = threading.Thread(target=self._loop, name="ts-h3-worker", daemon=True)
+        self._worker = threading.Thread(
+            target=self._loop, name="ts-h3-worker", daemon=True
+        )
         self._worker.start()
 
     def submit(self, request: H3GenerateRequest, *, model: str = "test") -> VideoJob:
         with self._lock:
             if len(self._pending) >= self._max_queue:
-                raise RuntimeError(f"video job queue full (max_queue={self._max_queue})")
+                raise RuntimeError(
+                    f"video job queue full (max_queue={self._max_queue})"
+                )
             job = VideoJob(id=f"video_{uuid.uuid4().hex}", request=request, model=model)
             job.progress_total = int(request.num_inference_steps or 0)
             self._jobs[job.id] = job
@@ -107,7 +116,9 @@ class VideoJobQueue:
                         job.result = result
                         job.status = JobStatus.completed
                         job.progress_step = job.progress_total
-                    logger.info("h3 job %s done bytes=%s", job_id, len(result.mp4_bytes))
+                    logger.info(
+                        "h3 job %s done bytes=%s", job_id, len(result.mp4_bytes)
+                    )
                 except Exception as exc:
                     logger.exception("h3 job %s failed", job_id)
                     with self._lock:
@@ -122,7 +133,10 @@ class VideoJobQueue:
         paths = extra.pop("_ts_staged_refs", None) if isinstance(extra, dict) else None
         if not paths:
             return
-        from tokenspeed.runtime.diffusion.references import ReferenceUpload, cleanup_staged
+        from tokenspeed.runtime.diffusion.references import (
+            ReferenceUpload,
+            cleanup_staged,
+        )
 
         staged = [ReferenceUpload(path=p, kind="image") for p in paths]
         cleanup_staged(staged)

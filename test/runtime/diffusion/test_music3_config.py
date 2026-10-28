@@ -132,9 +132,13 @@ def test_residency_auto_split():
     from tokenspeed.runtime.diffusion.music3_config import Music3Config
 
     assert Music3Config(model_path="x", num_gpus=1).resolve_residency() == "single"
-    assert Music3Config(model_path="x", num_gpus=2).resolve_residency() == "device_split"
+    assert (
+        Music3Config(model_path="x", num_gpus=2).resolve_residency() == "device_split"
+    )
     with pytest.raises(ValueError):
-        Music3Config(model_path="x", num_gpus=1, residency="device_split").resolve_residency()
+        Music3Config(
+            model_path="x", num_gpus=1, residency="device_split"
+        ).resolve_residency()
 
 
 def test_speech_stream_false_still_ok():

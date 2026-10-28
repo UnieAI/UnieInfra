@@ -85,10 +85,13 @@ def usp_world_size(ulysses_degree: int, ring_degree: int = 1) -> int:
 
 def is_usp_worker() -> bool:
     """True when this process is a non-leader torchrun worker."""
-    if usp_world_size(
-        int(os.environ.get("TOKENSPEED_H3_ULYSSES", "1")),
-        int(os.environ.get("TOKENSPEED_H3_RING", "1")),
-    ) <= 1:
+    if (
+        usp_world_size(
+            int(os.environ.get("TOKENSPEED_H3_ULYSSES", "1")),
+            int(os.environ.get("TOKENSPEED_H3_RING", "1")),
+        )
+        <= 1
+    ):
         return False
     try:
         import torch.distributed as dist
@@ -142,7 +145,9 @@ def _find_torchrun() -> str:
     )
 
 
-def init_ulysses_world(ulysses_degree: int, ring_degree: int = 1) -> UlyssesWorld | None:
+def init_ulysses_world(
+    ulysses_degree: int, ring_degree: int = 1
+) -> UlyssesWorld | None:
     """Initialize NCCL + return world metadata. ``None`` when degree product is 1."""
     world = usp_world_size(ulysses_degree, ring_degree)
     if world <= 1:
@@ -175,7 +180,9 @@ def init_ulysses_world(ulysses_degree: int, ring_degree: int = 1) -> UlyssesWorl
             f"ulysses_degree={ulysses_degree} * ring_degree={ring_degree} = {world}. "
             f"Launch with torchrun --nproc_per_node={world}."
         )
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count())))
+    local_rank = int(
+        os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count()))
+    )
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
@@ -217,7 +224,10 @@ def enable_dit_context_parallel(
     if world <= 1 or module is None:
         return 0
 
-    from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelConfig
+    from diffusers.models._modeling_parallel import (
+        ContextParallelConfig,
+        ParallelConfig,
+    )
 
     transformers = list(_iter_h3_transformers(module))
     if not transformers:
@@ -240,7 +250,9 @@ def enable_dit_context_parallel(
     cp = ContextParallelConfig(
         ulysses_degree=int(ulysses_degree),
         ring_degree=int(ring_degree),
-        ulysses_anything=bool(ulysses_anything and ulysses_degree > 1 and ring_degree == 1),
+        ulysses_anything=bool(
+            ulysses_anything and ulysses_degree > 1 and ring_degree == 1
+        ),
         ring_anything=bool(ring_degree > 1 and ulysses_degree == 1),
     )
     parallel = ParallelConfig(context_parallel_config=cp)
@@ -376,7 +388,6 @@ def barrier() -> None:
 
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         dist.barrier()
-
 
 
 def pipeline_state_to_payload(state: Any) -> dict[str, Any]:

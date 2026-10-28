@@ -40,11 +40,11 @@ from typing import ClassVar, TypeVar
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
-from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
     split_groups_to_equal_depth,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 

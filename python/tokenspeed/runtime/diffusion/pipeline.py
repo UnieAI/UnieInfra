@@ -44,9 +44,9 @@ from typing import Any
 
 from tokenspeed.runtime.diffusion.config import (
     AUDIO_SIGMA_SHIFT,
-    H3Config,
     SUPPORTED_FPS,
     VIDEO_SIGMA_SHIFT,
+    H3Config,
     frames_for_duration,
     resolve_diffusion_checkpoint,
 )
@@ -354,7 +354,9 @@ class H3Pipeline:
         task = (extra.pop("task", None) or req.task or "t2va").lower()
         duration = float(extra.pop("duration", req.duration))
         fps = int(extra.pop("fps", req.fps) or SUPPORTED_FPS)
-        num_frames = int(extra.pop("num_frames", 0) or frames_for_duration(duration, fps))
+        num_frames = int(
+            extra.pop("num_frames", 0) or frames_for_duration(duration, fps)
+        )
         steps = int(extra.pop("num_inference_steps", req.num_inference_steps))
         seed = req.seed if req.seed is not None else extra.pop("seed", None)
 
@@ -465,11 +467,23 @@ class H3Pipeline:
         audio = results["audio"]
         rate = int(results["sampling_rate"])
         video0 = videos[0] if isinstance(videos, (list, tuple)) else videos
-        audio0 = audio[0] if isinstance(audio, (list, tuple)) and hasattr(audio[0], "shape") else audio
+        audio0 = (
+            audio[0]
+            if isinstance(audio, (list, tuple)) and hasattr(audio[0], "shape")
+            else audio
+        )
 
         mp4 = self._mux_mp4(video0, audio0, rate, fps=req.fps or SUPPORTED_FPS)
-        height = int(getattr(video0, "shape", [0, 0, 0])[-3]) if hasattr(video0, "shape") else req.height
-        width = int(getattr(video0, "shape", [0, 0, 0])[-2]) if hasattr(video0, "shape") else req.width
+        height = (
+            int(getattr(video0, "shape", [0, 0, 0])[-3])
+            if hasattr(video0, "shape")
+            else req.height
+        )
+        width = (
+            int(getattr(video0, "shape", [0, 0, 0])[-2])
+            if hasattr(video0, "shape")
+            else req.width
+        )
         # PIL list fallback
         if isinstance(video0, list) and video0:
             im = video0[0]
@@ -573,7 +587,6 @@ class H3Pipeline:
         return results
 
     def request_payload(self, req: H3GenerateRequest) -> dict:
-
         """Picklable snapshot for USP broadcast (paths, not open handles)."""
         return {
             "prompt": req.prompt,

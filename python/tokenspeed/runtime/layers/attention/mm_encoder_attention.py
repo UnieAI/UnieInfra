@@ -273,7 +273,6 @@ def cross_attn_varlen(
     return result[0] if isinstance(result, tuple) else result
 
 
-
 def vision_attn_flashinfer_cudnn(
     q: torch.Tensor,
     k: torch.Tensor,

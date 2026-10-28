@@ -27,7 +27,7 @@ Request contract (JSON body, OpenAI speech-shaped):
 * ``instructions`` -- music description (genre / BPM / vocals / arrangement)
 * ``seed`` -- optional int
 * ``response_format`` -- ``wav`` only (mp3/opus rejected)
-* TokenSpeed extras: ``audio_duration`` (seconds upper bound), 
+* TokenSpeed extras: ``audio_duration`` (seconds upper bound),
   ``num_inference_steps``, ``max_new_tokens`` (AR frames at 25 fps)
 
 Unsupported TTS knobs (``voice``, ``speed``, ``temperature``) are rejected
@@ -110,7 +110,9 @@ def parse_music3_argv(argv: list[str]) -> argparse.Namespace:
         "set 44100 for Diffusers native)",
     )
     # Ignore video/H3-only flags so a shared launcher can pass a superset.
-    parser.add_argument("--task-type", "--model-variant", dest="task_type", default=None)
+    parser.add_argument(
+        "--task-type", "--model-variant", dest="task_type", default=None
+    )
     parser.add_argument("--ulysses-degree", "--usp", type=int, default=None)
     parser.add_argument("--ring", type=int, default=None)
     parser.add_argument("--text-encoder-tp-size", type=int, default=None)
@@ -186,7 +188,9 @@ def _request_from_body(body: dict[str, Any]) -> Music3GenerateRequest:
                 "MiniMax-Music3 streaming requires response_format 'wav' or 'pcm'"
             )
     elif fmt_l not in {"wav"}:
-        raise ValueError("MiniMax-Music3 only supports response_format='wav' when not streaming")
+        raise ValueError(
+            "MiniMax-Music3 only supports response_format='wav' when not streaming"
+        )
 
     audio_duration = body.get("audio_duration")
     max_new_tokens = body.get("max_new_tokens")
@@ -205,20 +209,38 @@ def _request_from_body(body: dict[str, Any]) -> Music3GenerateRequest:
     return Music3GenerateRequest(
         lyrics=lyrics,
         prompt=prompt,
-        audio_duration=float(audio_duration) if audio_duration is not None else DEFAULT_AUDIO_DURATION_S,
+        audio_duration=(
+            float(audio_duration)
+            if audio_duration is not None
+            else DEFAULT_AUDIO_DURATION_S
+        ),
         num_inference_steps=int(steps),
         seed=seed,
         max_new_tokens=int(max_new_tokens) if max_new_tokens is not None else None,
-        extra_params={k: v for k, v in body.items() if k not in {
-            "input", "instructions", "model", "response_format", "format",
-            "audio_duration", "num_inference_steps", "seed", "max_new_tokens",
-            "voice", "speed", "stream", "stream_format",
-        }},
+        extra_params={
+            k: v
+            for k, v in body.items()
+            if k
+            not in {
+                "input",
+                "instructions",
+                "model",
+                "response_format",
+                "format",
+                "audio_duration",
+                "num_inference_steps",
+                "seed",
+                "max_new_tokens",
+                "voice",
+                "speed",
+                "stream",
+                "stream_format",
+            }
+        },
         stream=want_stream,
         stream_format=stream_format,
         response_format=fmt_l,
     )
-
 
 
 def create_app(pipeline: Music3Pipeline, served_model_name: str) -> FastAPI:

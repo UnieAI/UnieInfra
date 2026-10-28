@@ -513,7 +513,13 @@ class PrefillGraph:
         self._engaged_logged: set[str] = set()
         # Replay/eager accounting for extend+mixed forwards, logged every
         # _STATS_EVERY forwards so graph coverage is visible in the server log.
-        self._stats = {"replay": 0, "mixed_replay": 0, "eager": 0, "real": 0, "padded": 0}
+        self._stats = {
+            "replay": 0,
+            "mixed_replay": 0,
+            "eager": 0,
+            "real": 0,
+            "padded": 0,
+        }
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
         # One owner for ordinary and attention-containing captures. None is the

@@ -61,7 +61,9 @@ def parse_diffusion_argv(argv: list[str]) -> argparse.Namespace:
     Unknown LLM-only flags are ignored so a shared launch script can pass a
     superset of knobs without failing closed.
     """
-    parser = argparse.ArgumentParser(prog="tokenspeed serve (diffusion)", add_help=False)
+    parser = argparse.ArgumentParser(
+        prog="tokenspeed serve (diffusion)", add_help=False
+    )
     parser.add_argument("model", nargs="?", default=None)
     parser.add_argument("--model", dest="model_flag", default=None)
     parser.add_argument("--served-model-name", default="test")
@@ -70,7 +72,9 @@ def parse_diffusion_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", "--tp", type=int, default=None)
     parser.add_argument("--num-gpus", type=int, default=None)
     parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument("--task-type", "--model-variant", dest="task_type", default="fl2va")
+    parser.add_argument(
+        "--task-type", "--model-variant", dest="task_type", default="fl2va"
+    )
     parser.add_argument("--trust-remote-code", action="store_true", default=False)
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
@@ -85,7 +89,9 @@ def parse_diffusion_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--memory-reserve-margin", default="12GB")
     args, unknown = parser.parse_known_args(argv)
     if unknown:
-        logger.info("diffusion serve: ignoring non-diffusion flags: %s", " ".join(unknown))
+        logger.info(
+            "diffusion serve: ignoring non-diffusion flags: %s", " ".join(unknown)
+        )
     model = args.model_flag or args.model
     if not model:
         raise SystemExit("tokenspeed serve <model> is required for diffusion")
@@ -93,7 +99,14 @@ def parse_diffusion_argv(argv: list[str]) -> argparse.Namespace:
     # TP size is the vLLM-shaped knob scripts already pass; map to num_gpus.
     if args.num_gpus is None:
         args.num_gpus = args.tensor_parallel_size or max(
-            1, len([x for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",") if x.strip()])
+            1,
+            len(
+                [
+                    x
+                    for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+                    if x.strip()
+                ]
+            ),
         )
     return args
 
@@ -215,7 +228,9 @@ def create_app(
                 os.close(fd)
                 try:
                     if os.path.isfile(audio_url):
-                        with open(audio_url, "rb") as src, open(audio_path, "wb") as dst:
+                        with open(audio_url, "rb") as src, open(
+                            audio_path, "wb"
+                        ) as dst:
                             dst.write(src.read())
                     else:
                         urllib.request.urlretrieve(audio_url, audio_path)
@@ -229,7 +244,9 @@ def create_app(
 
                 staged.append(
                     ReferenceUpload(
-                        path=audio_path, kind="audio", filename=os.path.basename(audio_path)
+                        path=audio_path,
+                        kind="audio",
+                        filename=os.path.basename(audio_path),
                     )
                 )
             validate_ref2va_counts([s.kind for s in staged])
@@ -238,7 +255,9 @@ def create_app(
             # FL2VA / T2VA: prefer repeated input_references as first/last keyframes.
             if multi:
                 if len(multi) > 2:
-                    raise ValueError("fl2va accepts at most two input_references (first, last)")
+                    raise ValueError(
+                        "fl2va accepts at most two input_references (first, last)"
+                    )
                 image_bytes = multi[0][0]
                 if len(multi) == 2:
                     last_bytes = multi[1][0]
@@ -481,7 +500,12 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
         ulysses,
         ring,
     )
-    app = create_app(pipeline, queue, served_model_name=config.served_model_name, generate_fn=_leader_generate)
+    app = create_app(
+        pipeline,
+        queue,
+        served_model_name=config.served_model_name,
+        generate_fn=_leader_generate,
+    )
 
     if usp_jobs is None:
         try:

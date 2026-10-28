@@ -209,7 +209,6 @@ class Music3Pipeline:
         consume them via ModularPipeline ``state=`` handoff (same pattern as
         H3 conditioner→rest). No vendored omni compose tree.
         """
-        import torch
         from diffusers import ComponentsManager, ModularPipeline
         from diffusers.modular_pipelines import SequentialPipelineBlocks
 
@@ -265,7 +264,6 @@ class Music3Pipeline:
         return float(req.audio_duration)
 
     def generate(self, req: Music3GenerateRequest) -> Music3GenerateResult:
-        import numpy as np
         import torch
 
         if not req.lyrics or not str(req.lyrics).strip():

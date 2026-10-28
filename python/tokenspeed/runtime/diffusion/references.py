@@ -35,8 +35,9 @@ from __future__ import annotations
 import mimetypes
 import os
 import tempfile
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any
 from urllib.parse import urlparse
 
 __all__ = [

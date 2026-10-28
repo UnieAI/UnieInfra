@@ -40,9 +40,11 @@ DiT weights across ranks (classic Ulysses), it does not shard Linear layers.
 from __future__ import annotations
 
 import os
-import pickle
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import torch
 
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -114,7 +116,6 @@ def maybe_reexec_torchrun(argv: list[str], world: int) -> None:
         return
     if os.environ.get("LOCAL_RANK") is not None or os.environ.get("RANK") is not None:
         return
-    import sys
 
     torchrun = _find_torchrun()
     cmd = [
@@ -339,7 +340,6 @@ def _ensure_cp_attention_backend(dit: Any) -> None:
     """Pick a Diffusers attention backend that supports context parallel."""
     try:
         from diffusers.models.attention_dispatch import (
-            AttentionBackendName,
             _AttentionBackendRegistry,
         )
     except Exception:

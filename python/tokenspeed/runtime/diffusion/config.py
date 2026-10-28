@@ -33,7 +33,6 @@ no timing number that would catch the bug).
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 

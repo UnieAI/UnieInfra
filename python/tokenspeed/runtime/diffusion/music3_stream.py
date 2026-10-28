@@ -34,8 +34,9 @@ from __future__ import annotations
 import base64
 import json
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
 __all__ = [
     "ACOUSTIC_CHUNK_FRAMES",

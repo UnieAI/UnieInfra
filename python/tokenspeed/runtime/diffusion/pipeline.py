@@ -36,7 +36,6 @@ Multi-GPU layouts (vLLM-flag-shaped knobs):
 from __future__ import annotations
 
 import io
-import json
 import os
 import tempfile
 from dataclasses import dataclass

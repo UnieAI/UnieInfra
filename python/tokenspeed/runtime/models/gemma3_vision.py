@@ -28,8 +28,6 @@ into the text embedding space. Designed for TokenSpeed's
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 

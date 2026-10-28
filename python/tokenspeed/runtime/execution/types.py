@@ -45,6 +45,7 @@ class DpForwardMetadata:
 
     global_num_tokens: list[int]
     global_batch_size: list[int]
+    global_num_decodes: list[int]
     global_forward_mode: list[int]
     all_decode_or_idle: bool
     all_extend: bool
@@ -261,11 +262,11 @@ class ForwardLogprobs:
 
 @dataclass
 class PoolerForwardResult:
-    """What a pooling forward returns in place of the sampled-token tuple.
+    """What a pooling forward returns in place of (tokens, lengths, logprobs).
 
     Kept as its own type rather than reusing the token tuple: an embedding
-    tensor passed through ``output_tokens`` would be clamped to the vocab range
-    and packed as int32 by the generative D2H path.
+    tensor smuggled through ``output_tokens`` would be silently clamped to the
+    vocab range and packed as int32 by the generative D2H path.
     """
 
     embeddings: torch.Tensor
@@ -299,6 +300,10 @@ class ModelExecutionResult:
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None
+    # Embedding serving only: one pooled vector per request, [bs, hidden].
+    # Mutually exclusive with output_tokens -- a pooling forward samples
+    # nothing, so output_tokens is empty when this is set.
+    output_embeddings: torch.Tensor | None = None
     # Prompt (input) logprobs of the rows ``input_logprob_plan`` named, flat
     # fp32 in plan order; None when the forward gathered none (no plan, or a
     # pipeline stage without logits). The plan rides along so the commit path
@@ -312,10 +317,6 @@ class ModelExecutionResult:
     input_top_logprobs_idx: torch.Tensor | None = None
     output_top_logprobs_val: torch.Tensor | None = None
     output_top_logprobs_idx: torch.Tensor | None = None
-    # Embedding serving only: one pooled vector per request, [bs, hidden].
-    # A pooling forward samples nothing, so output_tokens is empty when this
-    # is set.
-    output_embeddings: torch.Tensor | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:

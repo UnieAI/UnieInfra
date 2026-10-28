@@ -131,6 +131,7 @@ class CacheArena:
         # Tag as "kv_cache", no CPU backup: cache bytes are discarded on
         # sleep and rebuilt after wake (paging overwrites; clear() zeros the
         # remapped pages).
+        self._memory_saver = enable_memory_saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -146,11 +147,12 @@ class CacheArena:
         )
         if self.storage_plan != expected_storage:
             raise ValueError("cache physical binding does not match its memory plan")
-        if enable_memory_saver and not self.storage_plan.monolithic:
-            raise ValueError("mixed host/device cache does not support sleep/wake")
         self.offload_config = self.storage_plan.offload
         self.offload: SparseKVOffload | None = None
         self.regions: dict[str, torch.Tensor] = {}
+        # Only device regions live in the memory saver's pool; pinned Host
+        # regions (sparse offload history) are ordinary Host allocations and
+        # stay mapped across sleep. Wake zeroes both (clear()).
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             for region in self.storage_plan.regions:
                 host = region.placement == "host"
@@ -216,6 +218,21 @@ class CacheArena:
                 f"persistent_bytes={self.storage_plan.persistent_workspace_bytes}, "
                 f"temporary_budget_bytes={self.storage_plan.temporary_workspace_bytes}"
             )
+
+    def release(self) -> None:
+        """Return the arena's bytes to the allocator; the arena is dead after.
+
+        A boot that rebuilds the cache under a CUDA-graph reserve calls this on
+        the probe arena first: the rebuilt arena is sized from a profile taken
+        before the probe arena existed, so both cannot be resident at once.
+        Views elsewhere (pools, backends) may still reference the buffer, so
+        its storage is shrunk in place rather than waiting for the last
+        reference to drop. A memory-saver arena is left to its adapter.
+        """
+        if self._memory_saver:
+            return
+        self._fields.clear()
+        self.buffer.untyped_storage().resize_(0)
 
     @property
     def cache_group_specs(self) -> tuple[CacheGroupSpec, ...]:
@@ -573,12 +590,23 @@ class CacheArena:
             )
         return self.buffer
 
+    def synchronize(self) -> None:
+        """Wait for the arena's own copy streams (sparse KV offload).
+
+        A sleep release calls this before the device regions are unmapped, so
+        no prefetch or writeback still reads or writes them.
+        """
+        if self.offload is not None:
+            self.offload.synchronize()
+
     @torch.no_grad()
     def clear(self) -> None:
         """Zero the arena after sleep/wake remaps its storage.
 
         Exactly one owner, so callers may fan this out over every compute
-        view without double-clearing or needing a "views skip" rule.
+        view without double-clearing or needing a "views skip" rule. The
+        sparse offload's hot-pool tags and replacement state are reset with
+        it, and its Host history is zeroed like any other region.
         """
         if self.offload is not None:
             self.offload.synchronize()

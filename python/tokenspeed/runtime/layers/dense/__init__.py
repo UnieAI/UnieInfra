@@ -23,11 +23,13 @@ from tokenspeed.runtime.layers.dense.nvfp4 import (
     Nvfp4LinearMethod,
     Nvfp4W4A16LinearMethod,
 )
+from tokenspeed.runtime.layers.dense.torchao import TorchAOLinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.dense.w8a8_fp8 import W8A8Fp8LinearMethod
 
 __all__ = [
     "Fp8LinearMethod",
+    "TorchAOLinearMethod",
     "Mxfp4LinearMethod",
     "Nvfp4LinearMethod",
     "Nvfp4W4A16LinearMethod",

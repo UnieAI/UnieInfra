@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -93,8 +93,15 @@ class MHAExtendMetadata:
     extend_prefix_lens: torch.Tensor
     extend_seq_lens_cpu: list[int]
     cu_extend_seq_lens_cpu: list[int]
+    # Host mirror of seq_lens (prefix + extend) for sync-free FlashInfer plan.
+    cache_seqlens_cpu: list[int]
     max_extend_seq_len: int
+    # Mixed target queries are cache-backed even when the leading prefills
+    # have no prefix; the fresh-prefill path must not discard decode history.
+    is_mixed: bool
     max_extend_prefix_len: int = 0
+    # FlashInfer FA2 plan cache: lifecycle = one forward (cleared next init).
+    plan_cache: dict = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
@@ -128,17 +135,30 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.is_mxfp8
         )
+        # Triton (and flashinfer paged) read fp8 KV and upcast to the query
+        # dtype in-kernel. Casting Q to fp8 loses accuracy, forces an
+        # all-fp8 signature Triton does not declare, and with empty_like(q)
+        # would return e4m3 activations. Only fa3/fa4 need an fp8 query.
+        self.cast_query_to_fp8 = self.kernel_solution in ("fa3", "fa4")
+        self._plan_dtype = (
+            torch.float8_e4m3fn
+            if self.is_mxfp8
+            else (
+                self.kv_cache_dtype
+                if self.is_fp8 and self.cast_query_to_fp8
+                else self.qkv_dtype
+            )
+        )
+        # Legacy single-head_dim binder (tests / callers). Prefer _plan_for_layer.
         self.plan = partial(
             mha_plan,
-            dtype=(
-                torch.float8_e4m3fn
-                if self.is_mxfp8
-                else (self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype)
-            ),
+            dtype=self._plan_dtype,
             head_dim=self.head_dim,
             return_lse=False,
             solution=self.kernel_solution,
         )
+        # F3c: Gemma-4 mixes head_dim 256/512; cache plans per layer head_dim.
+        self._plan_by_head_dim: dict[tuple, dict] = {}
         # DFLASH draft: the whole block in one decode forward, with one
         # decode metadata entry per block position and uniform non-causal
         # seq_lens (block_decode_expansion).
@@ -146,11 +166,16 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+        # MIXED round: the decode requests that follow the extend requests.
+        # Their KV is already written by the prologue; they attend through the
+        # paged decode kernel over this eager (non-graph) view.
+        self.mixed_decode_metadata: MHADecodeMetadata | None = None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self.forward_decode_metadata = None
         self.forward_extend_metadata = None
+        self.mixed_decode_metadata = None
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         # Decode metadata exists only in decode rounds.
@@ -183,38 +208,79 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> None:
         reject_query_shard(query_shard, "MHAAttnBackend")
         del page_table_cpu
-        assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 "MHA decode metadata goes through refresh_decode_metadata; "
-                f"init_forward_metadata only serves extend ({forward_mode})"
+                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
+            )
+        is_mixed = forward_mode.is_mixed()
+        if is_mixed and self.is_draft and not self.draft_block_decode:
+            raise RuntimeError("MHA mixed draft metadata requires block decoding")
+        # Block drafters share the target's mixed metadata initialization.
+        # Before their model forward, they refresh decode metadata and publish
+        # a uniform block window starting at each request's accepted prefix.
+        # This does not enable a mixed forward for ordinary token drafters.
+        if is_mixed and not 0 < num_extends < bs:
+            raise ValueError(
+                "MHA mixed metadata requires both prefill and decode requests"
             )
 
+        if forward_mode.is_mixed() and num_extends < bs:
+            self.mixed_decode_metadata = MHADecodeMetadata(
+                page_table=page_table[num_extends:bs],
+                seq_lens=seq_lens[num_extends:bs],
+            )
+        else:
+            self.mixed_decode_metadata = None
+        if forward_mode.is_mixed():
+            # Extend metadata covers only the leading extend requests.
+            bs = num_extends
+        page_table = page_table[:bs]
         seq_lens = seq_lens[:bs]
-        extend_seq_lens = extend_seq_lens[:bs]
-        extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
+        prefill_prefix_lens = extend_prefix_lens[:num_extends]
+        query_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:num_extends].tolist()]
+        if is_mixed:
+            # The runner supplies extend lengths only for the leading prefill
+            # requests. Decode/verify queries follow them in request order and
+            # attend a causal suffix of each request's already-written cache.
+            query_lens = seq_lens.new_full((bs,), self.spec_num_tokens)
+            query_lens[:num_extends] = extend_seq_lens[:num_extends]
+            query_lens_cpu.extend([self.spec_num_tokens] * (bs - num_extends))
+            prefix_lens = seq_lens - query_lens
+        else:
+            query_lens = extend_seq_lens[:bs]
+            prefix_lens = prefill_prefix_lens
         cu_extend_seq_lens = torch.nn.functional.pad(
-            torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32),
+            torch.cumsum(query_lens, dim=0, dtype=torch.int32),
             (1, 0),
         )
         cu_extend_seq_lens_cpu = [0]
-        for length in extend_seq_lens_cpu:
+        for length in query_lens_cpu:
             cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
         cu_seqlens_kv = torch.nn.functional.pad(
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
             (1, 0),
         )
+        prefix_cpu = [int(x) for x in extend_prefix_lens_cpu[:bs].tolist()]
+        cache_seqlens_cpu = [prefix_cpu[i] + extend_seq_lens_cpu[i] for i in range(bs)]
         self.forward_extend_metadata = MHAExtendMetadata(
             page_table=page_table[:bs],
             seq_lens=seq_lens,
-            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens=query_lens,
             cu_extend_seq_lens=cu_extend_seq_lens,
             cu_seqlens_kv=cu_seqlens_kv,
-            extend_prefix_lens=extend_prefix_lens[:bs],
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens=prefix_lens,
+            extend_seq_lens_cpu=query_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
-            max_extend_seq_len=max(extend_seq_lens_cpu),
-            max_extend_prefix_len=int(extend_prefix_lens_cpu[:bs].max().item()),
+            cache_seqlens_cpu=cache_seqlens_cpu,
+            max_extend_seq_len=max(query_lens_cpu),
+            is_mixed=is_mixed,
+            # Only prefills have a host prefix mirror. Mixed batches always
+            # use cached attention, without reading decode lengths back to CPU.
+            max_extend_prefix_len=int(
+                extend_prefix_lens_cpu[:num_extends].max().item()
+            ),
+            plan_cache={},
         )
 
     def _decode_views(self, bs: int) -> MHADecodeMetadata:
@@ -264,6 +330,35 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
 
+    def _plan_for_layer(self, layer: PagedAttention, sinks) -> dict:
+        """Plan extend_mode using this layer's qk_head_dim (F3c).
+
+        Backend ``self.head_dim`` is the model default (often 256). Gemma-4
+        global layers use 512; planning with the layer dim lets sm90 pick
+        ``prewrite`` so those layers hit paged FA2 extend instead of Triton
+        ragged prefill.
+        """
+        head_dim = int(layer.qk_head_dim)
+        key = (
+            head_dim,
+            int(layer.sliding_window_size),
+            float(layer.logit_cap),
+            sinks is not None,
+        )
+        cached = self._plan_by_head_dim.get(key)
+        if cached is None:
+            cached = mha_plan(
+                dtype=self._plan_dtype,
+                head_dim=head_dim,
+                window_left=layer.sliding_window_size,
+                logit_cap=layer.logit_cap,
+                sinks=sinks,
+                return_lse=False,
+                solution=self.kernel_solution,
+            )
+            self._plan_by_head_dim[key] = cached
+        return cached
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -282,14 +377,28 @@ class MHAAttnBackend(PagedAttentionBackend):
         assert layer.qk_head_dim == layer.v_head_dim
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        metadata = self.forward_decode_metadata
+        return self._decode_rows(
+            q,
+            layer,
+            token_to_kv_pool,
+            self.forward_decode_metadata,
+            kwargs.get("sinks"),
+        )
 
+    def _decode_rows(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        metadata: MHADecodeMetadata,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
         scale_kwargs = {}
         if self.is_mxfp8:
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
             scale_kwargs = _fp8_scale_kwargs(layer)
 
@@ -303,7 +412,8 @@ class MHAAttnBackend(PagedAttentionBackend):
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
-            sinks=kwargs.get("sinks"),
+            softmax_scale=layer.scaling,
+            sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             solution=self.kernel_solution,
@@ -331,13 +441,38 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         metadata = self.forward_extend_metadata
         sinks = kwargs.get("sinks")
-        plan = self.plan(
-            window_left=layer.sliding_window_size,
-            logit_cap=layer.logit_cap,
-            sinks=sinks,
-        )
+        decode = self.mixed_decode_metadata
+        if decode is not None:
+            # MIXED: extend tokens first, then one token per decode request.
+            num_extend_tokens = metadata.cu_extend_seq_lens_cpu[-1]
+            num_decode = decode.seq_lens.shape[0]
+            extend_out = self._extend_rows(
+                q[:num_extend_tokens],
+                k[:num_extend_tokens],
+                v[:num_extend_tokens],
+                layer,
+                token_to_kv_pool,
+                metadata,
+                sinks,
+            )
+            decode_out = self._decode_rows(
+                q[num_extend_tokens : num_extend_tokens + num_decode],
+                layer,
+                token_to_kv_pool,
+                decode,
+                sinks,
+            )
+            return torch.cat((extend_out, decode_out))
+        return self._extend_rows(q, k, v, layer, token_to_kv_pool, metadata, sinks)
+
+    def _extend_rows(self, q, k, v, layer, token_to_kv_pool, metadata, sinks):
+        plan = self._plan_for_layer(layer, sinks)
         extend_mode = plan.get("extend_mode", "prewrite")
-        if metadata.max_extend_prefix_len == 0 and extend_mode == "postwrite":
+        if (
+            not metadata.is_mixed
+            and metadata.max_extend_prefix_len == 0
+            and extend_mode == "postwrite"
+        ):
             return self._forward_prefill(q, k, v, layer, metadata, sinks)
         return self._forward_extend(q, layer, token_to_kv_pool, metadata, sinks)
 
@@ -360,6 +495,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen=metadata.max_extend_seq_len,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             skip_softmax_threshold=self.skip_softmax_threshold,
             solution=self.kernel_solution,
@@ -381,7 +517,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif self.is_fp8:
+        elif self.is_fp8 and self.cast_query_to_fp8:
             q = q.to(self.kv_cache_dtype)
             scale_kwargs = _fp8_scale_kwargs(layer)
 
@@ -399,8 +535,14 @@ class MHAAttnBackend(PagedAttentionBackend):
             is_causal=True,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
+            softmax_scale=layer.scaling,
             sinks=sinks,
             solution=self.kernel_solution,
+            host_meta={
+                "cu_seqlens_q_cpu": metadata.cu_extend_seq_lens_cpu,
+                "cache_seqlens_cpu": metadata.cache_seqlens_cpu,
+                "plan_cache": metadata.plan_cache,
+            },
             **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)

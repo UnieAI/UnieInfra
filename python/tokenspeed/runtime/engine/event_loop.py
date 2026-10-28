@@ -35,6 +35,7 @@ from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -253,6 +254,11 @@ class EventLoop:
             disaggregation_mode=server_args.disaggregation_mode,
         )
         self.overlap_schedule_depth = int(self.use_overlap_schedule)
+        # TOKENSPEED_COMMIT_DISPATCHED_EXTEND=1 restores committing an extend
+        # forward in the same round it was dispatched (blocks on the prefill).
+        self._commit_dispatched_extend_now = (
+            os.environ.get("TOKENSPEED_COMMIT_DISPATCHED_EXTEND", "0") == "1"
+        )
         # In-flight depth of the unified event loop: how many dispatched
         # forwards may await commit at once. 0 = commit in the same iteration
         # (classic non-overlap); 1 = the overlap schedule (CPU post-processes
@@ -340,8 +346,8 @@ class EventLoop:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
             )
-            self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-            self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
+            self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+            self._dp_global_info = torch.zeros(mapping.world_size, 4, dtype=torch.int32)
         # The cache hooks gather over the TP CPU group, so the gather is sized
         # by that group, which --emulate-rank-zero backs with this process alone.
         cache_replica_tp_size = self.attn_tp_cpu_group.size()
@@ -391,8 +397,6 @@ class EventLoop:
                 unsupported.append(
                     f"{server_args.speculative_algorithm} layerwise transfer"
                 )
-            if server_args.enable_memory_saver:
-                unsupported.append("memory saver/release")
             # Prefill is forced onto the non-overlap loop by
             # should_use_overlap_schedule(). Decode uses the ordinary overlap
             # loop and the scheduler's one-step protected cache reservation.
@@ -518,38 +522,42 @@ class EventLoop:
         )
 
         # GPU-memory data plane (release/resume_memory_occupation). Reuses the
-        # pause controller's drain machinery; frees memory via the memory-saver
-        # adapter once the scheduler drains. See memory_occupation.py.
+        # pause controller's drain machinery; frees the memory regions once the
+        # scheduler drains. See memory_occupation.py.
         # Releasing KV is only safe if any prefix cache it backs can be cleared:
         # either prefix caching is off, or the scheduler exposes a clear. Decide
         # once here (static config) and let the controller reject unsafe releases.
         # A release is refused while an expert rebalance is in progress, and a
-        # drained release waits while chunk ops still write the weights.
+        # drained release waits while chunk ops still write the weights and
+        # while a PD transfer can still touch the cache.
         kv_cache_release_allowed = (
             not self.server_args.enable_prefix_caching
             or callable(getattr(self.scheduler, "clear_l1_cache", None))
         )
+        rebalance_refusal = rebalance_release_refusal(self._eplb)
         self._memory = MemoryOccupationController(
             send_func=self.send_to_tokenizer,
             pause_controller=self._pause,
-            adapter=TorchMemorySaverAdapter.create(
-                enable=self.server_args.enable_memory_saver
+            regions=self._pause_hooks.memory_regions(
+                TorchMemorySaverAdapter.create(
+                    enable=self.server_args.enable_memory_saver
+                ),
+                nccl_suspendable=nccl_suspend_supported(),
             ),
             enabled=self.server_args.enable_memory_saver,
             reset_caches_fn=self._pause_hooks.reset_caches_for_release,
-            kv_repair_fn=self._pause_hooks.kv_repair_after_wake,
+            transfers_idle_fn=self._pause_hooks.transfers_idle_for_release,
             kv_cache_release_allowed=kv_cache_release_allowed,
-            weights_release_refusal_fn=rebalance_release_refusal(self._eplb),
-            weights_busy_fn=(
-                (lambda: False)
-                if self._eplb is None
-                else (lambda: self._eplb.is_applying)
+            release_refusal_fn=(
+                lambda: self._pause_hooks.memory_release_refusal()
+                or rebalance_refusal()
             ),
+            weights_busy_fn=self._pause_hooks.weights_busy_for_release,
         )
 
         self.metrics = EngineMetrics(
             labels={
-                "model_name": server_args.served_model_name,
+                "model_name": server_args.canonical_served_model_name,
                 "app_key": server_args.app_key or "",
                 "dp_rank": str(dp_rank),
             },
@@ -811,7 +819,6 @@ class EventLoop:
             self.output_processor.mark_abort(request_id)
 
     def _process_new_requests(self):
-        self.request_handler.engine_busy = self._num_running() > 0
         recv_reqs = self.request_handler.recv_reqs()
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
@@ -881,6 +888,20 @@ class EventLoop:
                 raise ValueError(
                     "Cache-transfer PD request is missing bootstrap information"
                 )
+            if self.kv_transfer is not None and self._memory.is_releasing_or_released:
+                # Registering the transfer now would name the KV memory a
+                # release is about to unmap (and the decode node re-registers
+                # it under a new transfer session on wake), so the request
+                # could never complete: refuse it instead of buffering it.
+                state.set_finish_with_abort(
+                    "PD engine is releasing or has released its GPU memory; "
+                    "retry after resume_memory_occupation",
+                    notify_client=True,
+                )
+                self.output_processor.publish_finished_at_admission(
+                    spec.request_id, state
+                )
+                continue
             if self._device.role is DeviceRole.PD_DECODE:
                 # The prompt was computed on the prefill node.
                 state.computed_length = state.input_length
@@ -892,7 +913,7 @@ class EventLoop:
             if self._epd_hooks.try_stage(spec, state, bootstrap):
                 continue
             if self.kv_transfer is not None:
-                self.kv_transfer.register(spec.request_id, bootstrap)
+                self._pause_hooks.register_pd_admission(spec.request_id, bootstrap)
             admitted_specs.append(spec)
 
         if self._pause_hooks.withhold_admissions(admitted_specs, pause_blocked_before):
@@ -1022,6 +1043,9 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        self._dp_local_info[0, 3] = (
+            batch_size - forward_op.num_extends() if executes_model_forward else 0
+        )
         dist.all_gather_single(
             self._dp_global_info,
             self._dp_local_info,
@@ -1047,6 +1071,7 @@ class EventLoop:
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
             global_batch_size=global_batch_size,
+            global_num_decodes=self._dp_global_info[:, 3].tolist(),
             global_forward_mode=global_forward_mode,
             all_decode_or_idle=all_decode_or_idle,
             all_extend=all_extend,
@@ -1119,6 +1144,21 @@ class EventLoop:
         """
         return grammar_inputs is not None and self._uses_eager_grammar
 
+    def _should_commit_head(self, in_flight, effective_depth, forward_op) -> bool:
+        """Whether the oldest in-flight forward commits this round: past the
+        depth, or an extend head (it carries first tokens) dispatched in an
+        EARLIER round. The forward dispatched this round is never committed
+        early: that would block on the whole prefill and leave the GPU idle
+        while the next round is planned."""
+        if not in_flight:
+            return False
+        if len(in_flight) > effective_depth:
+            return True
+        head = in_flight[0][0]
+        return head.num_extends() > 0 and (
+            head is not forward_op or self._commit_dispatched_extend_now
+        )
+
     def event_loop(self):
         """The one scheduler loop, parameterized by in-flight depth.
 
@@ -1131,6 +1171,14 @@ class EventLoop:
         - pp_size: the prefill chunk pipeline — consecutive chunks occupy
           different pipeline stages; committing the queue head (join the
           forward thread, then its copy event) is the backpressure.
+
+        One refinement regardless of depth: a prefill/extend head commits as
+        soon as its forward has run, rather than waiting the depth-1 extra
+        round. That head carries a request's FIRST token, so deferring it adds
+        a full step to TTFT for no benefit (the head already ran on the GPU, so
+        the commit never blocks). Decode->decode keeps the one-step overlap.
+        This only orders a commit earlier, never later, so the depth stays a
+        pure performance knob.
 
         Correctness never depends on the depth: any dispatch whose inputs
         depend on a pending commit's side effects drains the queue first
@@ -1315,7 +1363,23 @@ class EventLoop:
                     # pipeline behind under PP). A round with no new work drains
                     # fully so results never wait on future traffic.
                     effective_depth = depth if forward_op is not None else 0
-                    while len(in_flight) > effective_depth:
+                    # TTFT: a prefill/extend forward carries a request's FIRST
+                    # token. The overlap schedule otherwise holds the head one
+                    # extra round, so that first token waits a full step before
+                    # it streams. The head always already ran on the GPU last
+                    # round, so committing it now never blocks (its result() is
+                    # ready) — commit a prefill head immediately and keep the
+                    # one-step overlap only for decode->decode. This is a commit
+                    # ordered earlier, never later, so the depth stays a perf
+                    # knob (event-loop.md Principle 4): correctness is unchanged.
+                    # Only an extend head dispatched in an EARLIER round is
+                    # committed early: committing the forward dispatched just
+                    # now would block this thread for the whole prefill and
+                    # leave the GPU idle while the next round is planned. A
+                    # round that dispatches nothing drains fully anyway.
+                    while self._should_commit_head(
+                        in_flight, effective_depth, forward_op
+                    ):
                         fo, res = in_flight.popleft()
                         request_changes.extend(self._commit_forward_results(fo, res))
 

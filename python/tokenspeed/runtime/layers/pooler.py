@@ -24,14 +24,16 @@ An embedding request is a single prefill whose output is one vector per
 request, not a token stream. This module owns the reduction from the
 per-token hidden states of that prefill to that vector.
 
-The model holds a ``Pooler`` (``BaseCausalLM.pooler``) and calls it where it
-would otherwise call the logits processor, but the reduction lives here, so
-changing the pooling strategy does not touch a model file.
+Where the four reference engines put this differs (see
+``unieinfra/xref/15-encoder-embedding.md`` §3.4): vLLM makes it a layer the
+runner calls, SGLang a layer the model calls, TRT-LLM hardcodes CLS inside
+the model. We follow vLLM: the model owns ``pooler`` but the reduction is
+here, so changing the pooling strategy does not touch a model file.
 
-LAST pooling reuses ``ForwardContext.gather_ids`` -- the same
+LAST pooling deliberately reuses ``ForwardContext.gather_ids`` -- the same
 last-token-per-request index the logits processor gathers with -- rather than
-recomputing boundaries, so there is one source of truth for where each
-request's last token lives.
+recomputing boundaries. One source of truth for "where does this request's
+last token live", and it is already on the context.
 """
 
 from __future__ import annotations

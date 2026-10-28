@@ -159,6 +159,8 @@ bool CacheCoordinator::ClearDeviceCache() {
     }
 
     pending_stores_.clear();
+    deferred_store_order_.clear();
+    deferred_store_keys_.clear();
     storage_keys_.clear();
     storage_key_order_.clear();
     for (const auto& [group_id, location] : cached_locations) {
@@ -229,6 +231,13 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
         // A replayable group never holds an entry, so it would keep every
         // boundary permanently partial.
         if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
+            continue;
+        }
+        // A State group has no token span: its two-slot table is not prefix-
+        // indexed by page, so it has no boundary pages to count here (and
+        // BlockGranularity() would assert). Boundary residency is a
+        // token-spanned-group question.
+        if (GroupIsState(group_index)) {
             continue;
         }
         const std::int32_t pages_per_prefix_hash =
@@ -341,8 +350,8 @@ const BlockPool& CacheCoordinator::tierPool() const {
 // per_group blocks are relative to the floor, num_common_tokens is the
 // absolute converged page boundary in TOKENS. num_prefix_pages bounds the walk
 // in prefix pages; each group key vector is expanded to that group's
-// block_granularity. State groups take no part here: their boundaries are
-// candidates of probeTier's candidate phase.
+// block_granularity. State groups take no part in this phase; probeTier
+// checks State and sliding-window requirements at each candidate boundary.
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
@@ -673,6 +682,48 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
     return out;
 }
 
+// L3 fetch coverage is not an admissible boundary: carry available checkpoints
+// and their windows, then let the ordinary Host candidate phase judge what lands.
+CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeStorageForPrefetch(
+    std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
+    std::int32_t num_prefix_pages, std::int32_t floor_tokens) const {
+    PrefixProbe::Tier out = probeTierWithKeys<CacheTier::kHost>(group_keys, match_order, num_prefix_pages, floor_tokens,
+                                                                /*with_storage_keys=*/true);
+    const BlockPool& pool = tierPool<CacheTier::kHost>();
+    const auto first_page = static_cast<std::size_t>(floor_tokens / prefix_granularity_);
+    const auto end_page = static_cast<std::size_t>(out.num_common_tokens / prefix_granularity_);
+    for (const std::size_t i : match_order) {
+        if (!GroupIsState(i)) {
+            continue;
+        }
+        auto& hits = out.per_group[i].hits;
+        hits.assign(end_page - first_page, 0);
+        // Sparse checkpoints must travel with KV without truncating it at a missing checkpoint.
+        for (std::size_t page = first_page; page < end_page; ++page) {
+            const CacheKey& key = group_keys[i][page];
+            hits[page - first_page] = groups_[i].Index().Contains(pool, key) || storage_keys_.contains(key);
+            if (hits[page - first_page] == 0) {
+                continue;
+            }
+            // An older checkpoint needs its own window, even when KV extends beyond it.
+            for (const std::size_t j : match_order) {
+                if (GroupIsState(j) || groups_[j].Matcher().IsPrefixClosed()) {
+                    continue;
+                }
+                const std::int32_t floor_blocks = floor_tokens / geometry_[j].BlockGranularity();
+                const BlockRange window = SlidingWindowBlocks(
+                    static_cast<std::int32_t>(j), static_cast<std::int32_t>(page + 1) * prefix_granularity_);
+                for (std::int32_t block = std::max(window.first, floor_blocks); block < window.past_end; ++block) {
+                    const CacheKey& window_key = group_keys[j][static_cast<std::size_t>(block)];
+                    out.per_group[j].hits[static_cast<std::size_t>(block - floor_blocks)] =
+                        PrefixKeyIsHit(groups_[j].Index(), pool, window_key, &storage_keys_);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const PromptPrefix& prompt,
                                                                      std::span<const std::size_t> match_order,
                                                                      bool claim_partial) const {
@@ -709,10 +760,10 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
         out.host.kv_tokens = out.device.kv_tokens;
     }
     if (enable_l3_storage_) {
-        out.storage = probeTierWithKeys<CacheTier::kHost>(
+        out.storage = probeStorageForPrefetch(
             out.group_keys, match_order,
             std::min(static_cast<std::int32_t>(prompt.prefix_hashes.size()), prompt.max_tokens / prefix_granularity_),
-            /*floor_tokens=*/out.host.full_page_tokens, /*with_storage_keys=*/true);
+            /*floor_tokens=*/out.host.full_page_tokens);
     }
     return out;
 }
@@ -882,6 +933,19 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
+    if (!deferred_store_keys_.empty()) {
+        // A Device hit is the second access the deferred write policy waits
+        // for: the hit pages are now worth a Host copy.
+        for (std::size_t i = 0; i < probe.device.per_group.size() && i < probe.group_keys.size(); ++i) {
+            const std::vector<std::uint8_t>& hits = probe.device.per_group[i].hits;
+            const std::vector<CacheKey>& keys = probe.group_keys[i];
+            for (std::size_t k = 0; k < hits.size() && k < keys.size(); ++k) {
+                if (hits[k] != 0) {
+                    promoteDeferredStore(keys[k]);
+                }
+            }
+        }
+    }
     AcquiredPrefix out;
     // The Host floor is the Device's full-page coverage: a Device tail exists
     // only when the Host tier adds nothing beyond it.
@@ -1037,10 +1101,25 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> co
         return;
     }
     for (const CacheGroup& group : groups_) {
+        // A State checkpoint is published by its natural point and keyed by the
+        // last page's chain hash, not by a slot that a later admission hits on
+        // the Device, so it has no reuse signal to defer against: a deferred
+        // State store would never flush. State groups therefore store eagerly
+        // regardless of the page write policy; only the ordinary page groups
+        // below honour the deferred (reuse / reuse_pressure) policy.
+        const bool is_state = group.Spec().attn_kind == AttnKind::kState;
         // A tail hash holds fewer blocks than a page; Contains filters.
         for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
-            if (group.Index().Contains(pool_, key)) {
+            if (!group.Index().Contains(pool_, key)) {
+                continue;
+            }
+            // A finished request's pages follow the write policy too: under a
+            // deferred policy they wait for a reuse hit (or pressure) instead of
+            // being copied the moment the request ends.
+            if (is_state || host_write_policy_ == HostWritePolicy::kEager) {
                 pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
+            } else {
+                deferStore(std::move(key));
             }
         }
     }
@@ -1114,10 +1193,81 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         if (!automatically_streams_to_host) {
             continue;
         }
-        pending_stores_.push_back(StoreCandidate{
-            .key = std::move(key),
-        });
+        if (host_write_policy_ == HostWritePolicy::kEager) {
+            pending_stores_.push_back(StoreCandidate{
+                .key = std::move(key),
+            });
+        } else {
+            deferStore(std::move(key));
+        }
     }
+}
+
+void CacheCoordinator::deferStore(CacheKey key) {
+    if (!deferred_store_keys_.insert(key).second) {
+        return;
+    }
+    deferred_store_order_.push_back(std::move(key));
+    // Bounded: a candidate older than a few Device pools' worth of pages has
+    // long been evicted (StartPendingStores would skip it anyway).
+    const std::size_t limit = static_cast<std::size_t>(std::max(pool_.NumLcmBlocks(), 1)) * 8;
+    while (deferred_store_keys_.size() > limit && !deferred_store_order_.empty()) {
+        deferred_store_keys_.erase(deferred_store_order_.front());
+        deferred_store_order_.pop_front();
+    }
+    compactDeferredStores();
+}
+
+void CacheCoordinator::promoteDeferredStore(const CacheKey& key) {
+    if (deferred_store_keys_.erase(key) > 0) {
+        pending_stores_.push_back(StoreCandidate{.key = key});
+    }
+}
+
+void CacheCoordinator::compactDeferredStores() {
+    // Promoted keys leave stale deque slots behind; rebuild once they dominate.
+    if (deferred_store_order_.size() <= 2 * deferred_store_keys_.size() + 1024) {
+        return;
+    }
+    std::deque<CacheKey> live;
+    std::unordered_set<CacheKey, CacheKeyHash> seen;
+    for (CacheKey& key : deferred_store_order_) {
+        if (deferred_store_keys_.contains(key) && seen.insert(key).second) {
+            live.push_back(std::move(key));
+        }
+    }
+    deferred_store_order_ = std::move(live);
+}
+
+void CacheCoordinator::promoteDeferredUnderPressure() {
+    if (host_write_policy_ != HostWritePolicy::kOnReuseOrPressure || deferred_store_keys_.empty()) {
+        return;
+    }
+    const std::int32_t total = pool_.NumLcmBlocks();
+    // Low watermark: under 1/16 of the Device pool empty means the next
+    // admissions evict, oldest entries first -- copy those out first.
+    if (pool_.NumEmptyLcmBlocks() * 16 >= total) {
+        return;
+    }
+    constexpr std::size_t kPerRound = 256;
+    std::size_t promoted = 0;
+    while (promoted < kPerRound && !deferred_store_order_.empty()) {
+        CacheKey key = std::move(deferred_store_order_.front());
+        deferred_store_order_.pop_front();
+        if (deferred_store_keys_.erase(key) == 0) {
+            continue;
+        }
+        if (!AcquireDeviceCachedBlock(key)) {
+            continue;  // already evicted: dropped, never copied
+        }
+        pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
+        ++promoted;
+    }
+}
+
+std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStores() {
+    promoteDeferredUnderPressure();
+    return std::exchange(pending_stores_, {});
 }
 
 CacheBlockRef CacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) const {
@@ -1826,7 +1976,7 @@ void CacheCoordinator::rememberStorageKey(const CacheKey& key) {
 }
 
 void CacheCoordinator::evictStorageKeysToLimit() {
-    compactStorageKeyOrder();
+    // Bulk removals compact the order themselves; a Host publication only appends.
     while (storage_keys_.size() > storage_key_limit_) {
         if (storage_key_order_.empty()) {
             break;

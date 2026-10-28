@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections import deque
 from collections.abc import Mapping
 from http import HTTPStatus
@@ -190,6 +189,18 @@ def _profile_rank_tag(attn_mapping) -> str:
     return "-".join(parts)
 
 
+def _all_thread_profile_config():
+    # The process-global flag also covers workers created before profiling.
+    if not isinstance(
+        getattr(torch.autograd.profiler, "_is_profiler_enabled", None), bool
+    ):
+        raise RuntimeError("missing process-global profiler state")
+    try:
+        return torch.profiler._ExperimentalConfig(profile_all_threads=True)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 class RequestHandler:
     """
     1. Recv Reqs from ZMQ
@@ -225,15 +236,6 @@ class RequestHandler:
         # data plane so it is ordered against forwards. The scheduler worker
         # passes the handle in; None elsewhere (e.g. unit tests).
         self._device = device
-
-        # Prefill coalescing (--prefill-coalesce-ms): the input rank holds new
-        # generate requests while others decode and releases them together.
-        # It decides before the broadcast, so every rank sees one stream.
-        self.prefill_coalesce_s = max(0.0, server_args.prefill_coalesce_ms) / 1000
-        self._held_reqs: list = []
-        self._held_since = 0.0
-        # Whether any request is decoding; the event loop sets it each round.
-        self.engine_busy = False
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -363,33 +365,10 @@ class RequestHandler:
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
-            if self.prefill_coalesce_s > 0:
-                recv_reqs = self._coalesce(recv_reqs)
         else:
             recv_reqs = None
 
         return recv_reqs
-
-    def _coalesce(self, recv_reqs: list) -> list:
-        """Hold new generate requests while others decode; release them together.
-
-        Held requests are released, in arrival order, once the oldest has
-        waited ``prefill_coalesce_s``, when nothing is decoding, or when any
-        other message arrives (an abort or a flush must not overtake them).
-        """
-        if not self._held_reqs and not recv_reqs:
-            return recv_reqs
-        if not self._held_reqs:
-            self._held_since = time.monotonic()
-        self._held_reqs.extend(recv_reqs)
-        if (
-            self.engine_busy
-            and all(isinstance(r, TokenizedGenerateReqInput) for r in recv_reqs)
-            and time.monotonic() - self._held_since < self.prefill_coalesce_s
-        ):
-            return []
-        released, self._held_reqs = self._held_reqs, []
-        return released
 
     def recv_reqs(self) -> list:
         if self.attn_tp_size == 1:
@@ -412,16 +391,15 @@ class RequestHandler:
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
         pending_flush_outputs = 0
         for recv_req in recv_reqs:
-            if isinstance(recv_req, TokenizedGenerateReqInput):
-                req_spec, req_state, bootstrap_info = self.handle_generate_request(
+            if isinstance(recv_req, TokenizedEmbeddingReqInput):
+                req_spec, req_state, bootstrap_info = self.handle_embedding_request(
                     recv_req
                 )
-
                 new_req_specs.append(req_spec)
                 req_states.append(req_state)
                 bootstrap_infos.append(bootstrap_info)
-            elif isinstance(recv_req, TokenizedEmbeddingReqInput):
-                req_spec, req_state, bootstrap_info = self.handle_embedding_request(
+            elif isinstance(recv_req, TokenizedGenerateReqInput):
+                req_spec, req_state, bootstrap_info = self.handle_generate_request(
                     recv_req
                 )
 
@@ -471,7 +449,14 @@ class RequestHandler:
                 # rendezvous blocks this thread too.
                 self._pending_weight_ops.append(recv_req)
             elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
-                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                refusal = (
+                    self.memory_controller.refuse_weight_load()
+                    if self.memory_controller is not None
+                    else None
+                )
+                ok, msg = (False, refusal) if refusal is not None else (True, "")
+                if ok:
+                    ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:
@@ -506,6 +491,11 @@ class RequestHandler:
     # ------------------------------------------------------------------
     # Internal control ops (online expert rebalance)
     # ------------------------------------------------------------------
+
+    @property
+    def has_pending_weight_ops(self) -> bool:
+        """Whether a queued frontend/internal op can still touch model memory."""
+        return bool(self._pending_weight_ops or self._pending_internal_ops)
 
     def set_internal_op_completer(self, completer: InternalOpCompleter) -> None:
         """Install the owner of the internal ops (once, at startup)."""
@@ -815,23 +805,32 @@ class RequestHandler:
     ):
         """Admit a pooling request: one prefill, one vector, then finished.
 
-        Not routed through ``handle_generate_request``: that path reads PD
-        bootstrap fields, session params and prompt-logprob options a pooling
-        request does not carry. The request is admitted with a zero-token
-        generation budget, so the scheduler reserves no decode room for it.
+        Built directly rather than via ``from_recv_req``: an embedding request
+        does not carry generate-only fields (return_logprob, multimodal, ...).
+        Prefix-cache claim is forced to 0 — pooling needs every prompt
+        position's hidden state, and embedding servers disable prefix caching.
         """
-        req_state = RequestState.from_embedding_req(
-            recv_req,
-            tokenizer=self.tokenizer,
-            eos_token_ids=self.hf_eos_token_id,
-        )
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
-            max_cached_prefix_tokens=UNBOUNDED_CACHED_PREFIX_TOKENS,
+            max_cached_prefix_tokens=0,
+            max_new_tokens=0,
         )
+        req_state = RequestState(
+            prompt_input_ids=recv_req.input_ids,
+            sampling_params=recv_req.sampling_params,
+            stream=False,
+            tokenizer=self.tokenizer,
+            computes_prompt_logprobs=False,
+            eos_token_ids=self.hf_eos_token_id,
+            created_time=recv_req.created_time,
+        )
+        req_state.embedding = None
+        if getattr(recv_req, "validation_error", None):
+            req_state.finished_reason = FINISH_ABORT(
+                f"Invalid request: {recv_req.validation_error}"
+            )
         req_state.sampling_params.max_new_tokens = 0
-        req_spec.max_new_tokens = 0
         return req_spec, req_state, BootstrapInfo(None, None, None)
 
     def handle_generate_request(
@@ -1051,6 +1050,15 @@ class RequestHandler:
                     "the server with --expert-distribution-recorder-mode stat.",
                 )
 
+        if {"CPU", "GPU"} & set(activities):
+            try:
+                _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
+
         self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
@@ -1098,10 +1106,18 @@ class RequestHandler:
         ]
 
         if torchprof_activities:
+            try:
+                experimental_config = _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
+                experimental_config=experimental_config,
             )
             self.torch_profiler.start()
 

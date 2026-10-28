@@ -85,6 +85,7 @@ from tokenspeed.runtime.sampling.utils import (
     top_token_logprobs,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = get_colorful_logger(__name__)
@@ -138,6 +139,32 @@ def _force_deterministic_rsag() -> bool:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+
+# Intra-node interconnect topologies that back a symmetric-memory multicast
+# pointer (``multimem.*`` PTX). A PCIe or single-GPU topology has none, so the
+# multimem gather must not be selected there.
+_MULTICAST_TOPOLOGIES = frozenset({"nvlink_pairs", "nvlink_full", "nvswitch"})
+
+
+def _intra_node_multicast_capable() -> bool:
+    """Whether this host's GPU interconnect provides NVLink/NVSwitch multicast.
+
+    The symmetric-memory gather's ``multimem.st``/``multimem.ld`` instructions
+    require an NVLink domain. ``current_platform().interconnect.topology`` is
+    detected once at startup (NVML P2P/NVLink probe); only the NVLink and
+    NVSwitch topologies expose a multicast object. A ``pcie`` or ``single_gpu``
+    topology -- e.g. the RTX PRO 6000 (sm_120) workstation pair, which carries
+    no NVLink -- returns False so the caller falls back to the NCCL all-gather.
+    An unknown/undetected interconnect (``None``) is treated as no multicast:
+    guessing wrong here is an illegal memory access, not a slow path.
+    """
+    interconnect = current_platform().interconnect
+    if interconnect is None:
+        return False
+    if interconnect.nvswitch_present:
+        return True
+    return interconnect.topology in _MULTICAST_TOPOLOGIES
 
 
 def _dist_argmax_vetoed() -> bool:
@@ -472,11 +499,23 @@ class LogitsProcessor(nn.Module):
     def _tp_group_multicast_reachable(self) -> bool:
         """Whether the gather's symmetric buffer can map multicast here.
 
-        Topology now only admits: an NVLink domain can span hosts, so a
-        host-spread group is asked of the fabric rather than refused outright,
-        and without fabric the rendezvous hangs rather than failing over. The
-        rank count cannot stand in for the topology test -- a strided group can
-        be smaller than one host's device count while living on two.
+        The gather kernel issues ``multimem.st`` / ``multimem.ld`` PTX against
+        a symmetric-memory multicast pointer, which only exists inside an
+        NVLink domain (NVLink pairs/full or an NVSwitch fabric). On a
+        PCIe-only interconnect there is no multicast object, and the
+        instruction faults with an illegal memory access rather than failing
+        the rendezvous -- so the intra-node interconnect must be checked, not
+        assumed. ``comms:symmetric_memory`` being importable is NOT sufficient:
+        PyTorch exposes the symmetric-memory API on any CUDA host, including
+        the PCIe-only RTX PRO 6000 (sm_120) pair this gates, where the
+        multicast handle is unbacked.
+
+        Topology also admits a cross-host case: an NVLink domain can span
+        hosts, so a host-spread group is asked of the fabric (the IMEX/MNNVL
+        probe) rather than refused outright, and without fabric the rendezvous
+        would hang rather than failing over. The rank count cannot stand in
+        for either test -- a strided group can be smaller than one host's
+        device count while living on two hosts.
 
         The world fabric map is gathered during distributed initialization, so
         the group verdict is a local lookup with no dispatch-time collective.
@@ -488,16 +527,28 @@ class LogitsProcessor(nn.Module):
             group_has_fabric,
         )
 
+        from tokenspeed.runtime.distributed.nvls_multicast import (
+            nvls_multicast_mapping_usable,
+        )
         from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # Hosts that advertise multicast but fail cuMulticastBindMem leave a
+        # null multicast_ptr; multimem.st/ld then illegal-memory-access.
+        if nvls_multicast_mapping_usable() is False:
+            return False
 
         mapping = global_server_args_dict.get("mapping")
         nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
         spans_hosts = bool(nprocs_per_node) and (
             len({rank // nprocs_per_node for rank in self.tp_group}) > 1
         )
-        if not spans_hosts:
-            return True
-        return group_has_fabric(self.tp_group)
+        if spans_hosts:
+            return group_has_fabric(self.tp_group)
+        # Single-node group: multicast is available only when the intra-node
+        # interconnect is an NVLink domain. A PCIe or single-GPU topology has
+        # no multicast pointer, so the multimem gather would issue an illegal
+        # access; fall back (return False) to the NCCL all-gather instead.
+        return _intra_node_multicast_capable()
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
@@ -510,7 +561,8 @@ class LogitsProcessor(nn.Module):
         ):
             return None
 
-        vocab_padded = lm_head.weight.size(0) * self.tp_size
+        # A quantized head may keep its weight transposed, so read the shard width, not its rows.
+        vocab_padded = lm_head.num_embeddings_per_partition * self.tp_size
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
@@ -562,7 +614,7 @@ class LogitsProcessor(nn.Module):
         device = lm_head.weight.device
         key = (
             self.tp_group,
-            lm_head.weight.size(0),
+            lm_head.num_embeddings_per_partition,
             max_M,
             skip_ping_pong,
             dtype,
@@ -570,10 +622,10 @@ class LogitsProcessor(nn.Module):
         )
         if key in self._LOGITS_DIST_ARGMAX_STATES:
             return self._LOGITS_DIST_ARGMAX_STATES[key]
-        if torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(device):
             return None  # never rendezvous inside capture; warmup probes first
 
-        group = pg_manager.get_process_group("nccl", self.tp_group)
+        group = pg_manager.get_device_process_group(self.tp_group)
         if self._agree_across_tp(
             current_platform().is_nvidia and dist_argmax_available(), group, device
         ):
@@ -592,7 +644,9 @@ class LogitsProcessor(nn.Module):
         self._LOGITS_DIST_ARGMAX_STATES[key] = state
         return state
 
-    def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
+    def _init_dist_argmax_state(
+        self, lm_head: VocabParallelEmbedding, logits_dtype: torch.dtype
+    ):
         if _dist_argmax_vetoed():
             return None
         if not 2 <= self.tp_size <= 32:
@@ -600,20 +654,19 @@ class LogitsProcessor(nn.Module):
         if self.skip_all_gather or self.dp_sampling_enabled:
             return None
 
-        vocab_per_rank = lm_head.weight.size(0)
+        # A quantized head may keep its weight transposed or packed, so take the shard width and logits dtype instead.
+        vocab_per_rank = lm_head.num_embeddings_per_partition
         if vocab_per_rank * self.tp_size != self.config.vocab_size:
             return None  # padded vocab: sharded argmax could pick a pad column
         state = None
-        if supports_dist_argmax_shape(
-            vocab_per_rank, lm_head.weight.dtype, self.tp_size
-        ):
+        if supports_dist_argmax_shape(vocab_per_rank, logits_dtype, self.tp_size):
             state = self.acquire_dist_argmax_state(
                 lm_head,
                 max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
                 skip_ping_pong=True,
-                dtype=lm_head.weight.dtype,
+                dtype=logits_dtype,
             )
-        if state is None and not torch.cuda.is_current_stream_capturing():
+        if state is None and not is_current_stream_capturing(lm_head.weight.device):
             state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
         return state
 
@@ -977,7 +1030,7 @@ class LogitsProcessor(nn.Module):
             return dp_group_row_counts(
                 table, self.tp_group, self.tp_group[self.tp_rank], rows
             )
-        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(hidden_states.device):
             return [rows] * self.tp_size
         counts = torch.tensor([rows], dtype=torch.int64, device=hidden_states.device)
         return all_gather(counts, self.tp_group, dim=0).tolist()
@@ -1040,10 +1093,24 @@ class LogitsProcessor(nn.Module):
             from tokenspeed.runtime.utils.env import global_server_args_dict
 
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-                logits = kernel_mm(
-                    hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
-                    override="aok",
+                # The weight owner plans with its actual dtype, padding and TP
+                # geometry during construction. The processor must not guess
+                # that geometry or select from the first runtime batch.
+                from tokenspeed.runtime.layers.dense.unquant import (
+                    UnquantizedLinearMethod,
+                )
+                from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+                    UnquantizedEmbeddingMethod,
+                )
+
+                if not isinstance(
+                    quant_method, (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
+                ):
+                    raise ValueError(
+                        "Batch-invariant dense logits require a planned unquantized LM-head method"
+                    )
+                logits = quant_method.apply(
+                    lm_head, hidden_states.to(lm_head.weight.dtype), embedding_bias
                 )
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
@@ -1077,9 +1144,11 @@ class LogitsProcessor(nn.Module):
             if self.do_argmax and not require_full_vocab:
                 if (
                     self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
-                    and not torch.cuda.is_current_stream_capturing()
+                    and not is_current_stream_capturing(logits.device)
                 ):
-                    self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
+                    self._dist_argmax_state = self._init_dist_argmax_state(
+                        lm_head, logits.dtype
+                    )
 
                 if (
                     self._dist_argmax_state
@@ -1099,7 +1168,7 @@ class LogitsProcessor(nn.Module):
             )
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
-                if torch.cuda.is_current_stream_capturing():
+                if is_current_stream_capturing(logits.device):
                     state = None
                 else:
                     state = self._all_gather_state = self._init_all_gather_state(
@@ -1137,11 +1206,12 @@ class LogitsProcessor(nn.Module):
                     device=logits.device,
                 )
                 all_gather_single(gathered_logits, logits, self.tp_group)
-                logits = (
-                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
-                    .transpose(0, 1)
-                    .contiguous()
-                    .view(num_rows, local_vocab_size * self.tp_size)
+                # Copies whole shard rows, several times faster than a transpose copy.
+                logits = torch.cat(
+                    gathered_logits.view(
+                        self.tp_size, num_rows, local_vocab_size
+                    ).unbind(0),
+                    dim=1,
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()

@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import tokenspeed_kernel.ops.layernorm._triton.weightless  # noqa: F401
+import tokenspeed_kernel.ops.layernorm.gluon  # noqa: F401
 
 # Registers the ``layernorm.qk_rmsnorm_ssmax`` kernels at package import (the
 # module itself imports ``tokenspeed_kernel.ops.layernorm.triton``). The package
@@ -48,7 +49,9 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     nvfp4_copy_supported,
+    qk_rmsnorm_rope_neox,
     reference_rmsnorm,
+    rmsnorm_residual_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
@@ -296,8 +299,10 @@ __all__ = [
     "grouped_rmsnorm",
     "nvfp4_copy_supported",
     "qk_rmsnorm",
+    "qk_rmsnorm_rope_neox",
     "reference_rmsnorm",
     "rmsnorm",
+    "rmsnorm_residual_rmsnorm",
     "weightless_qk_rmsnorm",
     "weightless_rmsnorm",
     "weightless_rmsnorm_gated_sigmoid",

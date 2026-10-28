@@ -89,7 +89,13 @@ def _ack_write_backs(scheduler, plan, host_rows: dict[str, int]) -> None:
             _ack(scheduler, event)
 
 
-def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks() -> None:
+def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     scheduler = ts.Scheduler(_make_config())
     request_ids = ("a", "b", "c", "d")
     # a: two full pages plus a one-token tail; the others one page each.
@@ -219,7 +225,13 @@ def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks() -> None:
     assert len(set(row)) == len(row)
 
 
-def test_finish_while_retracted_releases_the_pins_at_the_acks() -> None:
+def test_finish_while_retracted_releases_the_pins_at_the_acks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     scheduler = ts.Scheduler(_make_config())
     request_ids = ("a", "b", "c", "d")
     scheduler.submit_requests(
@@ -265,3 +277,50 @@ def test_finish_while_retracted_releases_the_pins_at_the_acks() -> None:
     assert scheduler.host_pool_pinned_blocks() == 0
     assert scheduler.snapshot_pool_free_blocks() == 8
     assert scheduler.decoding_size() == 3
+
+
+def test_snapshot_slots_stay_inside_the_executor_arena() -> None:
+    # Regression: the SnapshotSlotAllocator hands out slots 1..N, while the
+    # runtime's retraction snapshot arena is sized max_retracted_requests and
+    # indexed [0, max_retracted_requests). A slot == max_retracted_requests is
+    # out of range and crashes the data plane (observed as
+    # "IndexError: snapshot slot 452" once the capacity-deadlock fallback drove
+    # retractions to the limit). Every emitted slot must stay below the bound.
+    config = _make_config()
+    bound = config.max_retracted_requests
+    scheduler = ts.Scheduler(config)
+    request_ids = ("a", "b", "c", "d")
+    scheduler.submit_requests(
+        [_spec("a", [1, 2, 3, 4, 5]), _spec("b", [11, 12, 13, 14, 15])]
+        + [_spec(r, [100 * i + 1, 100 * i + 2]) for i, r in enumerate(("c", "d"), 1)]
+    )
+    plan = scheduler.next_execution_plan()
+    host_rows: dict[str, int] = {}
+    _ack_write_backs(scheduler, plan, host_rows)
+    for index, request_id in enumerate(request_ids):
+        _advance(scheduler, request_id, [1000 + index])
+
+    # Decode growth retracts the largest residents one after another; collect
+    # every slot the scheduler assigns while the arena fills toward its top.
+    emitted: list[int] = []
+    next_token = 2000
+    for _ in range(32):
+        plan = scheduler.next_execution_plan()
+        for snapshot in _ops(plan, ts.Cache.SnapshotOp):
+            emitted.extend(int(slot) for slot in snapshot.snapshot_slots)
+        _ack_write_backs(scheduler, plan, host_rows)
+        op = _find_forward_op(plan)
+        if op is None:
+            break
+        for request_id in op.request_ids:
+            _advance(scheduler, request_id, [next_token])
+            next_token += 1
+        if scheduler.retracted_size() >= bound:
+            break
+
+    assert emitted, "no retraction was driven; the test exercised nothing"
+    for slot in emitted:
+        assert 1 <= slot < bound, (
+            f"snapshot slot {slot} outside the arena [0, {bound}); "
+            "the allocator must stay one below max_retracted_requests"
+        )

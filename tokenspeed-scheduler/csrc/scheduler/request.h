@@ -69,6 +69,7 @@ public:
         return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
     }
     void NoteRetracted() { ++retraction_count_; }
+    std::int32_t RetractionCount() const { return retraction_count_; }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
@@ -96,6 +97,18 @@ public:
     // The submitted prompt plus the declared budget.
     std::int64_t TokenLimit() const { return std::int64_t{submitted_prompt_size_} + max_new_tokens_; }
     bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
+    // True when the forwards still in flight already cover every token this
+    // request may generate: another decode step could only produce output
+    // past its declared budget. An undeclared budget (max_new_tokens == 0)
+    // is never covered.
+    bool DeclaredBudgetCoveredByInFlight() const {
+        // Requires at least one forward in flight: with nothing out, no future
+        // token is covered, so a request whose remaining budget is zero still
+        // needs one step to emit its final token and release its pages (a
+        // just-restored request at its last step, remaining == 0, in flight ==
+        // 0). The <= handles the overlap case where several forwards are out.
+        return max_new_tokens_ > 0 && ResultsInFlight() > 0 && RemainingNewTokens() <= ResultsInFlight();
+    }
     // The budget that was still open when the current admission was granted:
     // stamped by the admission events (a first chunk, a restore), frozen for
     // the admission's whole life where RemainingNewTokens() shrinks with

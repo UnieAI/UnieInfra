@@ -40,7 +40,10 @@ from typing import ClassVar, TypeVar
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+    split_groups_to_equal_depth,
+)
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
@@ -85,16 +88,27 @@ def resolve_cache_layer_types(
     full-history group whatever compute mask its layers apply: the label
     vector says so explicitly instead of losing the labels.
     """
+    # Gemma3ForConditionalGeneration keeps layer_types / cache_layer_types on
+    # ``text_config``, not the multimodal wrapper. Prefer top-level, then text.
+    text_config = getattr(hf_config, "text_config", None)
+
+    def _layer_types_from(cfg):
+        if cfg is None:
+            return None
+        return getattr(cfg, "cache_layer_types", None) or getattr(
+            cfg, "layer_types", None
+        )
+
     layer_types = tuple(
-        getattr(hf_config, "cache_layer_types", None)
-        or getattr(hf_config, "layer_types", None)
-        or ()
+        _layer_types_from(hf_config) or _layer_types_from(text_config) or ()
     )
     if draft_block_decode:
         return (FULL_ATTENTION,) * num_layers
     if is_draft and layer_types and len(layer_types) != num_layers:
         return ()
-    return layer_types
+    # Gemma 3 / Inkling unequal sliding:full depths -> sliding_attention_<k>
+    # sub-groups so hybrid packing stays within max_padding_fraction.
+    return split_groups_to_equal_depth(layer_types)
 
 
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
@@ -195,6 +209,10 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # --enable-mixed-batch: forwards may carry extend and decode rows together.
+    # Leaves without mixed support reject it at construction (startup), not
+    # on the first mixed round.
+    mixed_batch_enabled: bool = False
     # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
     # of attention TP): one topology for target and continuation/MTP views;
     # KVP does not add ranks. Decode attends the owned pages and merges the
@@ -218,6 +236,8 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.kv_cache_dtype == torch.int8:
+            raise ValueError("INT8 KV cache is not supported by the runtime")
         if self.qcp_size > 1:
             softmax = softmax_components[0]
             # The gathered-history extend arm exists on the GPU DSA leaf only;
@@ -262,6 +282,9 @@ class AttnConfig:
                 # composing the hybrid components, and validates it before
                 # cache allocation. The composite name is not a capability.
                 pass
+            elif softmax.backend_name == "deepseek_v41":
+                if self.is_draft:
+                    raise ValueError("V4.1 KVP requires the target attention backend")
             else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
@@ -312,6 +335,7 @@ def model_wide_kwargs(
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+        mixed_batch_enabled=bool(getattr(server_args, "enable_mixed_batch", False)),
     )
     attn_mapping = server_args.mapping.attn
     kwargs.update(

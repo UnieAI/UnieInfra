@@ -187,7 +187,23 @@ def test_compressed_tensors_keeps_v2_loader(monkeypatch, kind):
 
 @pytest.mark.parametrize("kind", ["column", "row"])
 @pytest.mark.parametrize(
-    "method_name", ["unquant", "w8a8", "nvfp4", "nvfp4_w4a16", "mxfp4"]
+    "method_name",
+    [
+        "unquant",
+        "w8a8",
+        "nvfp4",
+        pytest.param(
+            "nvfp4_w4a16",
+            marks=pytest.mark.skipif(
+                not (
+                    torch.cuda.is_available()
+                    and torch.cuda.get_device_capability()[0] == 10
+                ),
+                reason="NVFP4 W4A16 requires SM100/SM103",
+            ),
+        ),
+        "mxfp4",
+    ],
 )
 def test_other_methods_keep_legacy_checkpoint_loading(kind, method_name):
     from tokenspeed.runtime.layers.dense import (

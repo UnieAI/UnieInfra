@@ -218,9 +218,7 @@ class Engine(EngineBase):
     ) -> dict | list[dict]:
         """Embed one prompt or a batch; returns ``{"embedding": [...], ...}``.
 
-        The pooling counterpart of :meth:`generate` and the entry point of an
-        embedding server: ``generate`` is refused on an embedding server and
-        ``encode`` on a generative one.
+        The pooling counterpart of :meth:`generate`.
         """
         obj = EmbeddingReqInput(text=prompt, input_ids=input_ids)
         return self.llm.generate(obj)

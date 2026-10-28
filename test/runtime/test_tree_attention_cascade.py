@@ -62,6 +62,15 @@ pytestmark = pytest.mark.skipif(
     reason="needs an NVIDIA GPU",
 )
 
+
+def _require_sm10x(backend: str) -> None:
+    # Tree verify needs the TRT-LLM-gen kernels: elsewhere FlashInfer falls
+    # back to XQA, which has no LSE output and no multi-token MLA queries, and
+    # the TokenSpeed MLA prefill is built for SM100 only.
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip(f"{backend} tree attention needs SM100/SM103 kernels")
+
+
 PAGE = 64
 HQ, HKV, D = 16, 4, 128
 
@@ -90,6 +99,7 @@ def _backend(
         is_draft=is_draft,
         components=(spec,),
     )
+    _require_sm10x("TRT-LLM MHA")
     backend = TRTLLMMHAAttnBackend(cfg, spec, kernel_page_size=PAGE)
     backend.init_cuda_graph_state(max_bs)
     return backend
@@ -258,6 +268,7 @@ def _mla_backend(cls, num_draft_tokens, max_bs, is_draft, kv_dtype):
         is_draft=is_draft,
         components=(spec,),
     )
+    _require_sm10x(cls.__name__)
     backend = cls(cfg, spec, kernel_page_size=PAGE)
     backend.init_cuda_graph_state(max_bs)
     return backend

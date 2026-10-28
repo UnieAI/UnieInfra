@@ -165,7 +165,8 @@ public:
             std::vector<GroupPrefixProbe> per_group;
         };
         struct Tier {
-            // The boundary T this tier resumes at, in tokens.
+            // Device/Host: the resume boundary T. Storage: the aligned fetch
+            // coverage, which is not eligible for admission until it lands.
             std::int32_t num_common_tokens{0};
             // The full pages below it: num_common_tokens less the tail.
             std::int32_t full_page_tokens{0};
@@ -190,11 +191,10 @@ public:
         // Entries the Host tier holds beyond the Device hit. Admission loads
         // these; nothing an admission touches can miss.
         Tier host;
-        // L3 only: the prefix the storage shadow (keys known to exist in the
-        // remote store) extends beyond the Host hit, matched by the same
-        // matchers over "Host-cached or registered". Never admitted directly:
-        // PlanPrefetch turns it into a pre-admission Host fill, after which
-        // it is an ordinary Host hit. Empty without L3.
+        // L3 only: token-spanned fetch coverage beyond the Host hit, over
+        // Host-cached or registered keys. Hits also carry available State
+        // checkpoints and their windows. PlanPrefetch fills Host; the ordinary
+        // Host candidate phase then chooses a resume boundary. Empty without L3.
         Tier storage;
     };
     struct AdmissionResult {
@@ -411,7 +411,23 @@ public:
     // content hashes (chain hashes and tail hashes alike) for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
-    std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+    // Queue the newest already-published Device checkpoint from each state group.
+    void QueueLatestSnapshotBlocksForStore(std::span<const std::string> content_hashes);
+    // When newly published Device pages are copied to the Host tier.
+    //   kEager: every published page is queued for a store as it completes.
+    //   kOnReuse: a page is held as a deferred candidate and queued only when
+    //     a later admission hits it on the Device (second access); a page
+    //     evicted before that is dropped, never copied.
+    //   kOnReuseOrPressure: kOnReuse, plus the oldest deferred candidates are
+    //     queued while the Device pool runs low on empty blocks, so pages
+    //     about to be evicted still reach the Host tier.
+    // Explicit QueueCachedBlocksForStore / QueueLatestSnapshotBlocksForStore
+    // requests are always queued immediately.
+    enum class HostWritePolicy : std::uint8_t { kEager, kOnReuse, kOnReuseOrPressure };
+    void SetHostWritePolicy(HostWritePolicy policy) { host_write_policy_ = policy; }
+    HostWritePolicy GetHostWritePolicy() const noexcept { return host_write_policy_; }
+    std::size_t NumDeferredStores() const noexcept { return deferred_store_keys_.size(); }
+    std::vector<StoreCandidate> TakePendingStores();
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     // One Host block per (group, bucket) entry, in the bucket of the Device
     // block it will mirror -- under page-cyclic sharding the owner of a Host
@@ -522,8 +538,8 @@ private:
     BlockPool& tierPool();
     template <CacheTier Tier>
     const BlockPool& tierPool() const;
-    // with_storage_keys treats the L3 shadow's keys as hits beside the tier's
-    // entries (the Host tier only): the storage probe of ProbePrefix.
+    // Aligned matching over token-spanned groups; no State checkpoint hits.
+    // with_storage_keys also counts registered L3 keys (the Host tier only).
     template <CacheTier Tier>
     PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
@@ -548,6 +564,11 @@ private:
     PrefixProbe::Tier probeTier(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
                                 std::span<const std::size_t> match_order, std::int32_t floor_tokens,
                                 bool claim_partial) const;
+    // Extends aligned fetch hits with State checkpoints and their windows;
+    // unlike probeTier, does not choose an admissible resume boundary.
+    PrefixProbe::Tier probeStorageForPrefetch(std::span<const std::vector<CacheKey>> group_keys,
+                                              std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
+                                              std::int32_t floor_tokens) const;
     std::vector<CacheKey> tailKeysForGroup(std::size_t i, const ContentHash& hash, std::int32_t tail_tokens) const;
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
                                      bool claim_partial) const;
@@ -624,6 +645,15 @@ private:
     std::uint64_t next_access_epoch_{0};
     TailTable tails_;
     std::vector<StoreCandidate> pending_stores_;
+    HostWritePolicy host_write_policy_{HostWritePolicy::kEager};
+    // Deferred (not yet queued) store candidates, oldest first. The deque may
+    // hold keys already promoted or dropped; the set is the membership truth.
+    std::deque<CacheKey> deferred_store_order_;
+    std::unordered_set<CacheKey, CacheKeyHash> deferred_store_keys_;
+    void deferStore(CacheKey key);
+    void promoteDeferredStore(const CacheKey& key);
+    void promoteDeferredUnderPressure();
+    void compactDeferredStores();
     std::unordered_set<CacheKey, CacheKeyHash> storage_keys_;
     std::deque<CacheKey> storage_key_order_;
     std::size_t storage_key_limit_{0};

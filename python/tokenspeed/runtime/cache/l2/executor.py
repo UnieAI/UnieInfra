@@ -53,6 +53,8 @@ so under KVP each rank copies exactly the blocks it owns.
 
 from __future__ import annotations
 
+import collections
+import os
 import threading
 import time
 from collections import deque
@@ -107,6 +109,24 @@ logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
+
+
+def _writeback_slice_blocks() -> int:
+    """Blocks per paced pinned write-back slice; 0 submits each batch whole."""
+    return max(int(os.environ.get("TOKENSPEED_L2_WRITEBACK_SLICE_BLOCKS", "64")), 0)
+
+
+class _PacedWrite:
+    """A pinned write-back batch still being fed to the write stream in slices."""
+
+    __slots__ = ("op_ids", "transfers", "pages", "ready", "cursor")
+
+    def __init__(self, op_ids, transfers, pages, ready) -> None:
+        self.op_ids = op_ids
+        self.transfers = transfers
+        self.pages = pages
+        self.ready = ready
+        self.cursor = 0
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
@@ -204,16 +224,21 @@ class _BackupStats:
 
 class _PrefetchJob:
     """One in-flight L3 prefetch on the lane: the op, its pages by prefix page,
-    and the future that resolves to the pages landed (a prefix length). A
-    failed future is reported once (``failure_logged``), not on every poll
-    until the replica converges."""
+    the absolute ``deadline`` counted from submission, and the future that
+    resolves to the pages landed (a prefix length). A queued job whose deadline
+    expires may be cancelled and reported as landing nothing. A failed future
+    is reported once (``failure_logged``), not on every poll until the replica
+    converges."""
 
-    __slots__ = ("request_id", "num_pages", "future", "failure_logged")
+    __slots__ = ("request_id", "num_pages", "future", "failure_logged", "deadline")
 
-    def __init__(self, request_id: str, num_pages: int, future: Future) -> None:
+    def __init__(
+        self, request_id: str, num_pages: int, future: Future, deadline: float
+    ) -> None:
         self.request_id = request_id
         self.num_pages = num_pages
         self.future = future
+        self.deadline = deadline
         self.failure_logged = False
 
 
@@ -253,6 +278,12 @@ def allocate_blob_arena(rows: int, nbytes: int) -> torch.Tensor:
 
 class HostCacheExecutor:
     """Execute group-aware D2H/H2D operations against the two compact Host tiers."""
+
+    # Pacing state; ``__init__`` replaces these. The class defaults leave
+    # pacing off for an executor built without it.
+    _paced_writes: collections.deque | tuple = ()
+    _paced_inflight = None
+    _paced_slice_blocks = 0
 
     def __init__(
         self,
@@ -525,6 +556,12 @@ class HostCacheExecutor:
         # released from ``_ready_load_acks``; the lock covers it and the L3
         # backup futures.
         self._completions = CompletionQueue()
+        # Pinned write-backs are paced: one slice in flight on the write
+        # stream at a time, so the copy engine never holds seconds of queued
+        # D2H in front of the forward's own small result copies.
+        self._paced_writes: collections.deque[_PacedWrite] = collections.deque()
+        self._paced_inflight = None
+        self._paced_slice_blocks = _writeback_slice_blocks()
         self._ack_lock = threading.Lock()
         self._load_poisoned = False
         self._ready_load_acks: list[int] = []
@@ -564,13 +601,13 @@ class HostCacheExecutor:
             rank: This rank's position in the L3 key.
             prefix_for_weight_version: Builds the namespace of a weight version.
             prefetch_timeout_base_s: A prefetch op's deadline is
-                ``base + per_page * pages`` seconds after it starts on the
+                ``base + per_page * pages`` seconds after submission to the
                 lane (``--kvstore-prefetch-timeout-base-s``); a batch is not
                 started past the deadline and the op lands what it has. The
                 deadline bounds nothing else: ``batch_get_into`` has no
                 timeout, so a batch already issued runs to completion and a
-                hung store holds the single-thread lane -- later prefetches,
-                the namespace delete and shutdown wait behind it.
+                hung store holds the active pages, namespace delete and
+                shutdown. Queued jobs may expire only before their worker starts.
             prefetch_timeout_per_page_s: The per-page term of that deadline
                 (``--kvstore-prefetch-timeout-per-page-s``).
             prefetch_batch_pages: Prefix pages per ``batch_get_into``
@@ -635,7 +672,8 @@ class HostCacheExecutor:
         with self._ack_lock:
             jobs = list(self._prefetch_jobs.values())
         for job in jobs:
-            job.future.exception()
+            if not job.future.cancelled():
+                job.future.exception()
 
     # ------------------------------------------------------------------
     # Submission (forward thread)
@@ -725,13 +763,104 @@ class HostCacheExecutor:
             raise
         if fence is not None:
             fence_stream.wait_event(fence)
-        self._start_writing(
+        self._queue_pinned_writes(
             pinned_op_ids,
             pinned_transfers,
             pinned_pages,
-            lane=self._pinned_write_lane,
             prerequisite_stream=prerequisite_stream,
         )
+
+    def _queue_pinned_writes(
+        self,
+        op_ids: Sequence[int],
+        transfers: Sequence[tuple[int, int, int]],
+        pages: Sequence[StoragePage],
+        *,
+        prerequisite_stream,
+    ) -> None:
+        """Submit a pinned write-back, sliced and paced when it is large.
+
+        A pinned op's sources stay unevictable until its ACK, so deferring the
+        tail of its copy is safe; the ACK rides the last slice's event. The
+        slices wait on an event recorded now on ``prerequisite_stream`` rather
+        than on that stream at launch time, so a later slice does not couple
+        to forwards queued after the ones that wrote its pages.
+        """
+        if not op_ids:
+            return
+        limit = self._paced_slice_blocks
+        if limit <= 0 or (
+            len(transfers) <= limit
+            and not self._paced_writes
+            and self._paced_inflight is None
+        ):
+            self._start_writing(
+                op_ids,
+                transfers,
+                pages,
+                lane=self._pinned_write_lane,
+                prerequisite_stream=prerequisite_stream,
+            )
+            return
+        ready = None
+        if prerequisite_stream is not None:
+            ready = device_module.Event()
+            ready.record(prerequisite_stream)
+        self._paced_writes.append(
+            _PacedWrite(_ordered_unique(op_ids), list(transfers), list(pages), ready)
+        )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                f"[L2] writeback queued: operations={len(op_ids):d} "
+                f"blocks={len(transfers):d} slice={limit:d}"
+            )
+        self._pump_paced_writes()
+
+    def has_paced_writes(self) -> bool:
+        """Whether a paced write-back still has slices to launch."""
+        return bool(self._paced_writes)
+
+    def pump_paced_writes(self) -> None:
+        """Launch the next paced slice if the previous one is done; data plane only."""
+        self._pump_paced_writes()
+
+    def _pump_paced_writes(self, *, drain: bool = False) -> None:
+        """Launch the next slice once the previous one has left the stream.
+
+        Runs on the data-plane thread: a slice launch allocates and enqueues
+        device work.
+        """
+        while self._paced_writes:
+            inflight = self._paced_inflight
+            if inflight is not None and not drain and not inflight.query():
+                return
+            entry = self._paced_writes[0]
+            limit = self._paced_slice_blocks
+            end = len(entry.transfers) if drain else entry.cursor + limit
+            chunk = entry.transfers[entry.cursor : end]
+            entry.cursor += len(chunk)
+            if entry.ready is not None:
+                self.write_stream.wait_event(entry.ready)
+            finish = self._pinned_write_lane.start_d2h(
+                chunk,
+                device_buffers=self.layout.buffers,
+                host_buffer=self.host_storage.host_buffer,
+                geometry=self._transfer_geometry,
+                stream=self.write_stream,
+                prerequisite_stream=None,
+                backend=self.transfer_backend,
+            )
+            self._paced_inflight = finish
+            if entry.cursor >= len(entry.transfers):
+                self._paced_writes.popleft()
+                self._completions.push(
+                    finish,
+                    _Ack(
+                        kind=_AckKind.WRITE_BACK,
+                        op_ids=entry.op_ids,
+                        backup_pages=entry.pages,
+                    ),
+                )
 
     def submit_load_backs(self, cache_ops: Sequence, *, prerequisite_stream) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
@@ -869,6 +998,7 @@ class HostCacheExecutor:
                     self._l3_prefetch_timeout_base_s
                     + self._l3_prefetch_timeout_per_page_s * len(pages)
                 )
+                deadline = time.monotonic() + deadline_s
                 self._prefetch_jobs[int(op.op_id)] = _PrefetchJob(
                     request_id=str(op.request_id),
                     num_pages=len(pages),
@@ -877,8 +1007,9 @@ class HostCacheExecutor:
                         int(op.op_id),
                         str(op.request_id),
                         pages,
-                        deadline_s,
+                        deadline,
                     ),
+                    deadline=deadline,
                 )
         if self.attn_tp_rank == 0:
             logger.info(
@@ -891,7 +1022,7 @@ class HostCacheExecutor:
         op_id: int,
         request_id: str,
         pages: list[list[StoragePage]],
-        deadline_s: float,
+        deadline: float,
     ) -> int:
         """The lane's job: fetch ``pages`` in prefix order; return the pages landed.
 
@@ -907,7 +1038,6 @@ class HostCacheExecutor:
         l3_store = self.l3_store
         if l3_store is None:
             raise RuntimeError("L3 prefetch ran without a storage backend")
-        deadline = time.monotonic() + deadline_s
         landed = 0
         batch = self._l3_prefetch_batch_pages
         for start in range(0, len(pages), batch):
@@ -968,7 +1098,19 @@ class HostCacheExecutor:
         progress: dict[int, tuple[bool, int]] = {}
         for op_id, job in jobs.items():
             if not job.future.done():
+                if time.monotonic() > job.deadline and job.future.cancel():
+                    # Cancellation succeeds only before the worker starts;
+                    # active I/O must retire before its Host pages can be reused.
+                    logger.warning(
+                        f"[L3] prefetch {op_id} ({job.request_id}) expired before "
+                        f"its worker started; landing 0/{job.num_pages} pages"
+                    )
+                    progress[op_id] = (True, 0)
+                    continue
                 progress[op_id] = (False, 0)
+                continue
+            if job.future.cancelled():
+                progress[op_id] = (True, 0)
                 continue
             failed = job.future.exception()
             if failed is not None:
@@ -1838,6 +1980,7 @@ class HostCacheExecutor:
     def shutdown(self) -> None:
         # The fences and start events live on streams the callers named per
         # submission; the whole device covers them and the transfer streams.
+        self._pump_paced_writes(drain=True)
         device_module.synchronize()
         pending = self._completions.drop_all()
         with self._ack_lock:

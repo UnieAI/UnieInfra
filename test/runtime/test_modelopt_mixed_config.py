@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -251,14 +252,24 @@ _FP8_PB_WO_LAYERS = {
 
 
 @pytest.mark.parametrize("algo", ["FP8_PB_WO", "FP8_BLOCK_SCALES"])
-def test_from_config_accepts_fp8_pb_wo_aliases(algo: str):
+@pytest.mark.parametrize("hf_algo", ["FP8_PB_WO", "FP8_BLOCK_SCALES"])
+def test_config_sources_accept_fp8_pb_wo_aliases(algo: str, hf_algo: str):
+    from tokenspeed.runtime.model_loader.weight_utils import with_hf_quant_layers
+
     config = ModelOptMixedConfig.from_config(
-        {
-            "quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {
-                "mtp.layers.0.mlp.experts": {"quant_algo": algo},
+        with_hf_quant_layers(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "mtp.layers.0.mlp.experts": {"quant_algo": algo},
+                },
             },
-        }
+            {
+                "quantized_layers": {
+                    "mtp.layers.0.mlp.experts": {"quant_algo": hf_algo},
+                },
+            },
+        )
     )
     assert config.quantized_layers == {
         "mtp.layers.0.mlp.experts": "FP8_PB_WO",
@@ -664,3 +675,75 @@ def test_minimax_m3_quant_rename_table_matches_module_prefixes():
         name = name.replace(old, new)
     # Construction prefixes keep the checkpoint module tree.
     assert name == "model.layers.3.self_attn.index_q_proj"
+
+
+def test_config_json_layers_are_completed_from_hf_quant_config():
+    """Nemotron 3.5 Super VL's config.json copy leaves out its MTP experts."""
+    from tokenspeed.runtime.model_loader.weight_utils import with_hf_quant_layers
+
+    nvfp4 = {"quant_algo": "NVFP4", "group_size": 16}
+    config_json = {
+        "quant_method": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {"backbone.layers.1.mixer.experts": nvfp4},
+        "ignore": ["mtp.layers.0.eh_proj"],
+    }
+    hf_quant = {
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "backbone.layers.1.mixer.experts": nvfp4,
+            "mtp.layers.1.mixer.experts": nvfp4,
+        },
+        "exclude_modules": ["mtp.layers.0.eh_proj"],
+    }
+    merged = with_hf_quant_layers(config_json, hf_quant)
+    assert set(merged["quantized_layers"]) == set(hf_quant["quantized_layers"])
+    assert config_json["quantized_layers"].keys() == {"backbone.layers.1.mixer.experts"}
+    assert ModelOptMixedConfig.from_config(merged).is_quantized_layer(
+        "mtp.layers.1.mixer.experts"
+    )
+    complete = {**config_json, "quantized_layers": hf_quant["quantized_layers"]}
+    assert with_hf_quant_layers(complete, hf_quant) is complete
+    conflicting = {
+        **hf_quant,
+        "quantized_layers": {"backbone.layers.1.mixer.experts": {"quant_algo": "FP8"}},
+    }
+    with pytest.raises(ValueError, match="backbone.layers.1.mixer.experts"):
+        with_hf_quant_layers(config_json, conflicting)
+
+
+def test_quant_config_takes_layers_only_hf_quant_config_lists(tmp_path):
+    from tokenspeed.runtime.configs.load_config import LoadConfig
+    from tokenspeed.runtime.model_loader.weight_utils import get_quant_config
+
+    nvfp4 = {"quant_algo": "NVFP4", "group_size": 16}
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.experts": nvfp4,
+                        "mtp.layers.0.mlp.experts": nvfp4,
+                    },
+                    "exclude_modules": [],
+                }
+            }
+        )
+    )
+    model_config = SimpleNamespace(
+        quantization="modelopt_mixed",
+        model_path=str(tmp_path),
+        revision=None,
+        hf_config=SimpleNamespace(
+            quantization_config={
+                "quant_method": "modelopt_mixed",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {"model.layers.0.mlp.experts": nvfp4},
+                "ignore": [],
+            },
+            text_config=None,
+        ),
+    )
+    quant_config = get_quant_config(model_config, LoadConfig())
+    assert quant_config.is_quantized_layer("mtp.layers.0.mlp.experts")

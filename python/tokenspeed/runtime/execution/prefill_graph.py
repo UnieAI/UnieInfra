@@ -421,7 +421,18 @@ class PrefillGraph:
         self.text_model, self.inner_model = text_and_inner_model(model)
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
         # read a static input-embeds buffer instead of gathering from input_ids.
-        self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
+        #
+        # Prefer the model's ``get_input_embeddings(input_ids) -> Tensor`` when it
+        # exists AND returns a tensor: some models (Gemma 3's sqrt(hidden) scale,
+        # Qwen's ``scale_emb``) apply an embedding scale there that a raw
+        # ``embed_tokens`` lookup omits. Capturing/replaying the inner stack on
+        # UNSCALED embeddings corrupts every hidden state (Gemma 3: ~sqrt(5376)x
+        # too small) -- the residual carries the unscaled embeds while RMSNorm
+        # hides the scale on the normed branch, so layer 0 looks fine and layer 1
+        # onward diverges. Fall back to raw ``embed_tokens`` for models whose
+        # ``get_input_embeddings`` returns an ``nn.Module`` (no scale to apply).
+        self._raw_embed_tokens = getattr(self.inner_model, "embed_tokens", None)
+        self._embed_tokens = self._resolve_embed_fn()
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -500,6 +511,15 @@ class PrefillGraph:
         self._encoder_handoff_storage: dict[HandoffSlot, torch.Tensor] = {}
         self._outputs: list[torch.Tensor] | None = None
         self._engaged_logged: set[str] = set()
+        # Replay/eager accounting for extend+mixed forwards, logged every
+        # _STATS_EVERY forwards so graph coverage is visible in the server log.
+        self._stats = {
+            "replay": 0,
+            "mixed_replay": 0,
+            "eager": 0,
+            "real": 0,
+            "padded": 0,
+        }
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
         # One owner for ordinary and attention-containing captures. None is the
@@ -515,6 +535,34 @@ class PrefillGraph:
     # ------------------------------------------------------------------
     # Graph capture
     # ------------------------------------------------------------------
+
+    def _resolve_embed_fn(self):
+        """Return a callable ``input_ids -> embeds`` that matches the eager path.
+
+        Uses the inner model's ``get_input_embeddings`` when it is the
+        tensor-returning (scale-applying) kind, probed by a one-token call; else
+        falls back to the raw ``embed_tokens`` module. The probe is on CPU-free
+        device tensors but is cheap (one token) and runs once at setup.
+        """
+        raw = getattr(self, "_raw_embed_tokens", None)
+        getter = getattr(self.inner_model, "get_input_embeddings", None)
+        if getter is None or raw is None:
+            return raw
+        try:
+            import inspect
+
+            params = [
+                prm
+                for prm in inspect.signature(getter).parameters.values()
+                if prm.name != "self"
+            ]
+        except (TypeError, ValueError):
+            params = []
+        if not params:
+            # Zero-arg: returns an nn.Module (no scale). Use raw lookup.
+            return raw
+        # Takes input_ids and returns a tensor (possibly scaled). Use it.
+        return getter
 
     def capture(
         self,
@@ -551,7 +599,8 @@ class PrefillGraph:
         """
         if self.disable:
             return
-        weight = self._embed_tokens.weight
+        raw = getattr(self, "_raw_embed_tokens", None)
+        weight = (raw if raw is not None else self._embed_tokens).weight
         self._input_embeds_buf = torch.zeros(
             max(self.capture_buckets),
             weight.shape[1],
@@ -1021,7 +1070,7 @@ class PrefillGraph:
 
     def _dummy_group_tables(self, bs: int) -> dict[str, "torch.Tensor"]:
         """Build the capture batch's group tables: one row per fabricated
-        request, one width per group, row ``i`` holding block ``i + 1``.
+        request, one width per group, and disjoint parents across groups.
 
         A history group's width is ``ceil(physical_context_len / grain)``,
         whatever its retention. The physical extent is the quantity every
@@ -1064,8 +1113,16 @@ class PrefillGraph:
         # Built on the host: make_dummy_batch's only use of these is
         # ``.cpu().numpy()`` for the contract packer, so a device tensor here
         # would be allocated and copied straight back off per group per bucket.
-        first_block = torch.arange(1, bs + 1, dtype=torch.int32)
+        parent_offset = 0
         for spec in self.token_to_kv_pool.arena.cache_group_specs:
+            packing = self.token_to_kv_pool.arena.runtime_contract.virtual_packing[
+                spec.group_id
+            ]
+            # Groups share byte planes, so each must own separate physical parents.
+            first_block = (
+                torch.arange(1, bs + 1, dtype=torch.int32) + parent_offset * packing
+            )
+            parent_offset += -(-bs // packing)
             if spec.attn_kind == "state":
                 rows = torch.zeros((bs, STATE_TABLE_SLOTS), dtype=torch.int32)
                 rows[:, STATE_LIVE_SLOT] = first_block
@@ -1258,6 +1315,7 @@ class PrefillGraph:
         assert bucket is not None, "replay() called without can_run()"
         self._log_engaged_once(bucket, ctx, multimodal_context is not None)
         num_tokens = ctx.input_num_tokens
+        self._note_forward(ctx, bucket)
         input_embeds = None
         if multimodal_context is not None:
             input_embeds = self._multimodal_input_embeds(
@@ -1507,6 +1565,32 @@ class PrefillGraph:
                 yield
         finally:
             ctx.input_num_tokens, ctx.global_num_tokens, ctx.global_bs = saved
+
+    _STATS_EVERY = 512
+
+    def note_eager(self, ctx: ForwardContext) -> None:
+        """Count an extend/mixed forward that ran eager (no fitting bucket)."""
+        if not self.disable:
+            self._note_forward(ctx, None)
+
+    def _note_forward(self, ctx: ForwardContext, bucket: int | None) -> None:
+        stats = self._stats
+        if bucket is None:
+            stats["eager"] += 1
+        else:
+            stats["replay"] += 1
+            if ctx.forward_mode is not None and ctx.forward_mode.is_mixed():
+                stats["mixed_replay"] += 1
+            stats["real"] += int(ctx.input_num_tokens)
+            stats["padded"] += int(bucket)
+        total = stats["replay"] + stats["eager"]
+        if total % self._STATS_EVERY == 0:
+            waste = 1.0 - stats["real"] / stats["padded"] if stats["padded"] else 0.0
+            logger.info(
+                f"prefill graph stats: {stats['replay']:d} replayed "
+                f"({stats['mixed_replay']:d} mixed), {stats['eager']:d} eager, "
+                f"padding {100.0 * waste:.1f}% of replayed tokens"
+            )
 
     def _log_engaged_once(
         self, bucket: int, ctx: ForwardContext, is_multimodal: bool

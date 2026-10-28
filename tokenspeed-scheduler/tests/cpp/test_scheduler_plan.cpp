@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <cstdlib>
 #include "integration_test_helper.h"
 
 #include <algorithm>
@@ -235,6 +236,263 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsReproducibleAcrossMirroredSch
 
     ASSERT_FALSE(ids_a.empty());
     EXPECT_EQ(ids_a, ids_b);
+}
+
+class LengthAwareAdmissionSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 512;
+        cfg.host_allocator.total_pages = 512;
+        cfg.cache_groups[0].total_pages = 512;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    static std::vector<std::string> ForwardIds(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
+                return fwd->request_ids;
+            }
+        }
+        return {};
+    }
+};
+
+TEST_F(LengthAwareAdmissionSuite, ShortPromptIsAdmittedAheadOfALongChunkedPrefill) {
+    // 200 tokens with a 64-token budget: the long prompt is chunked and, by
+    // FIFO alone, would hold the head of line for three more rounds.
+    Submit(MakeRequestSpec("long", /*num_pages=*/100, /*start=*/1));
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first), std::vector<std::string>{"long"});
+    SendForwardDone("long");
+
+    Submit(MakeRequestSpec("short", /*num_pages=*/4, /*start=*/1000));
+    auto second = PlanOnce();
+    const auto ids = ForwardIds(second);
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_EQ(ids[0], "short") << "the short prompt rides this round, ahead of the long chunk";
+    EXPECT_EQ(ids[1], "long") << "the long prefill keeps the rest of the budget";
+}
+
+class MixedLongChunkSuite : public LengthAwareAdmissionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = LengthAwareAdmissionSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        return cfg;
+    }
+};
+
+TEST_F(MixedLongChunkSuite, LongPrefillBesideDecodesTakesAtMostHalfAChunk) {
+    Submit(MakeRequestSpec("d", /*num_pages=*/2, /*start=*/1));
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first), std::vector<std::string>{"d"});
+    SendForwardDone("d", {7});
+
+    Submit(MakeRequestSpec("long", /*num_pages=*/100, /*start=*/1000));
+    auto second = PlanOnce();
+    const ForwardBatch* fwd = nullptr;
+    for (const auto& op : second.Operations()) {
+        if (auto* f = std::get_if<ForwardBatch>(&op)) {
+            fwd = f;
+        }
+    }
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 2u);
+    std::int32_t long_tokens = -1;
+    for (std::size_t i = 0; i < fwd->request_ids.size(); ++i) {
+        if (fwd->request_ids[i] == "long") {
+            long_tokens = fwd->input_lengths[i];
+        }
+    }
+    EXPECT_GT(long_tokens, 0);
+    EXPECT_LE(long_tokens, Config().max_scheduled_tokens / 2) << "decodes ride this round: the long chunk is capped";
+}
+
+class MixedDecodeRefSuite : public MixedLongChunkSuite {
+protected:
+    void SetUp() override {
+        ::setenv("TOKENSPEED_MIXED_DECODE_REF", "1", 1);
+        ::setenv("TOKENSPEED_LONG_PREFILL_FLOOR", "0", 1);
+        ::setenv("TOKENSPEED_MIXED_PREFILL_FLOOR", "0", 1);
+        MixedLongChunkSuite::SetUp();
+    }
+    void TearDown() override {
+        MixedLongChunkSuite::TearDown();
+        ::unsetenv("TOKENSPEED_MIXED_DECODE_REF");
+        ::unsetenv("TOKENSPEED_LONG_PREFILL_FLOOR");
+        ::unsetenv("TOKENSPEED_MIXED_PREFILL_FLOOR");
+    }
+    std::int32_t TokensOf(const ExecutionPlan& plan, const std::string& id) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<ForwardBatch>(&op)) {
+                for (std::size_t i = 0; i < f->request_ids.size(); ++i) {
+                    if (f->request_ids[i] == id) {
+                        return f->input_lengths[i];
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+};
+
+TEST_F(MixedDecodeRefSuite, PrefillShareShrinksWithTheDecodeCount) {
+    for (const char* id : {"d0", "d1", "d2"}) {
+        Submit(MakeRequestSpec(id, /*num_pages=*/2, /*start=*/std::string(id) == "d0" ? 1 : (id[1] - '0') * 100));
+    }
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first).size(), 3u);
+    for (const char* id : {"d0", "d1", "d2"}) {
+        SendForwardDone(id, {7});
+    }
+    Submit(MakeRequestSpec("p", /*num_pages=*/100, /*start=*/1000));
+    auto second = PlanOnce();
+    const std::int32_t p_tokens = TokensOf(second, "p");
+    EXPECT_GT(p_tokens, 0) << "the prompt still advances beside the decodes";
+    EXPECT_LE(p_tokens, Config().max_scheduled_tokens / 3) << "ref=1 with 3 decodes: a third of the chunk";
+}
+
+class MixedPrefillFloorSuite : public MixedDecodeRefSuite {
+protected:
+    void SetUp() override { MixedDecodeRefSuite::SetUp(); }
+    SchedulerConfig MakeConfig() override {
+        // Floor at half a chunk, applied before the scheduler reads it.
+        ::setenv("TOKENSPEED_MIXED_PREFILL_FLOOR",
+                 std::to_string(MixedDecodeRefSuite::MakeConfig().max_scheduled_tokens / 2).c_str(), 1);
+        return MixedDecodeRefSuite::MakeConfig();
+    }
+};
+
+TEST_F(MixedPrefillFloorSuite, ShrunkShareNeverDropsBelowTheMixedFloor) {
+    for (const char* id : {"d0", "d1", "d2"}) {
+        Submit(MakeRequestSpec(id, /*num_pages=*/2, /*start=*/std::string(id) == "d0" ? 1 : (id[1] - '0') * 100));
+    }
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first).size(), 3u);
+    for (const char* id : {"d0", "d1", "d2"}) {
+        SendForwardDone(id, {7});
+    }
+    Submit(MakeRequestSpec("p", /*num_pages=*/100, /*start=*/1000));
+    auto second = PlanOnce();
+    EXPECT_GT(TokensOf(second, "p"), Config().max_scheduled_tokens / 3)
+        << "ref=1 with 3 decodes would give a third; the floor keeps half";
+}
+
+// A prefill budget above the mixed reference chunk (here 64 over 32) only
+// widens rounds without decodes; rounds that carry decodes keep the reference.
+class MixedRefChunkSuite : public MixedDecodeRefSuite {
+protected:
+    void SetUp() override {
+        ::setenv("TOKENSPEED_MIXED_REF_CHUNK", "32", 1);
+        ::unsetenv("TOKENSPEED_MIXED_DECODE_REF");
+        ::unsetenv("TOKENSPEED_LONG_PREFILL_FLOOR");
+        ::unsetenv("TOKENSPEED_MIXED_PREFILL_FLOOR");
+        MixedLongChunkSuite::SetUp();
+    }
+    void TearDown() override {
+        MixedLongChunkSuite::TearDown();
+        ::unsetenv("TOKENSPEED_MIXED_REF_CHUNK");
+    }
+    std::int32_t PrefillTokens(const ExecutionPlan& plan, const std::string& skip) {
+        std::int32_t total = 0;
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<ForwardBatch>(&op)) {
+                for (std::size_t i = 0; i < f->request_ids.size(); ++i) {
+                    if (f->request_ids[i] != skip) {
+                        total += f->input_lengths[i];
+                    }
+                }
+            }
+        }
+        return total;
+    }
+    void SubmitBurst() {
+        for (int i = 0; i < 10; ++i) {
+            Submit(MakeRequestSpec("p" + std::to_string(i), /*num_pages=*/4, /*start=*/1000 + i * 100));
+        }
+    }
+};
+
+TEST_F(MixedRefChunkSuite, RoundWithoutDecodesUsesTheWholeBudget) {
+    SubmitBurst();
+    auto plan = PlanOnce();
+    EXPECT_GT(PrefillTokens(plan, ""), 32) << "no decodes: the burst prefills past the reference chunk";
+    EXPECT_LE(PrefillTokens(plan, ""), Config().max_scheduled_tokens);
+}
+
+TEST_F(MixedRefChunkSuite, RoundWithDecodesIsHeldToTheReferenceChunk) {
+    Submit(MakeRequestSpec("d", /*num_pages=*/2, /*start=*/1));
+    auto first = PlanOnce();
+    ASSERT_EQ(ForwardIds(first), std::vector<std::string>{"d"});
+    SendForwardDone("d", {7});
+    SubmitBurst();
+    auto second = PlanOnce();
+    EXPECT_GT(PrefillTokens(second, "d"), 0);
+    EXPECT_LE(PrefillTokens(second, "d"), 32) << "a decode rides this round: the reference chunk bounds the prefill";
+}
+
+// Under the overlap schedule the next decode is planned before the previous
+// result lands. A request whose declared budget the forwards in flight already
+// cover must not get another step: it would run on the GPU after the request is
+// done and the next prompt would queue behind it.
+class OverlapBudgetSuite : public LengthAwareAdmissionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = LengthAwareAdmissionSuite::MakeConfig();
+        cfg.overlap_schedule_depth = 1;
+        return cfg;
+    }
+    RequestSpec Spec(const std::string& id, std::int32_t max_new_tokens) {
+        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/2, /*start=*/1);
+        spec.max_new_tokens = max_new_tokens;
+        return spec;
+    }
+    // Prefill and land its first token: the request is now decoding.
+    void StartDecoding(const std::string& id, std::int32_t max_new_tokens) {
+        Submit(Spec(id, max_new_tokens));
+        ASSERT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{id});
+        SendForwardDone(id, {7});
+    }
+};
+
+TEST_F(OverlapBudgetSuite, DecodeRunsAheadOfTheResultWhileBudgetRemains) {
+    StartDecoding("d", /*max_new_tokens=*/4);  // 1 token landed, 3 to go
+    // First decode, then a second planned before the first result lands: with a
+    // budget of 4 both are needed (tokens 2 and 3), the overlap is kept.
+    EXPECT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"d"});
+    EXPECT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"d"});
+}
+
+TEST_F(OverlapBudgetSuite, DecodeIsNotPlannedPastTheBudgetCoveredByInFlightSteps) {
+    StartDecoding("d", /*max_new_tokens=*/3);  // 1 landed; decode 1 yields #2, decode 2 yields #3
+    EXPECT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"d"});
+    EXPECT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"d"});
+    // Two steps in flight cover the remaining two tokens: a third would only
+    // produce a token past the budget.
+    EXPECT_TRUE(ForwardIds(PlanOnce()).empty()) << "no decode past the declared budget";
+}
+
+TEST_F(OverlapBudgetSuite, UndeclaredBudgetKeepsDecoding) {
+    StartDecoding("d", /*max_new_tokens=*/0);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"d"}) << "step " << i;
+    }
+}
+
+TEST_F(OverlapBudgetSuite, EmptyPlanWithResultsInFlightStillCommitsAndAdmitsTheNextPrompt) {
+    StartDecoding("d", /*max_new_tokens=*/3);
+    ASSERT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"d"});
+    ASSERT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"d"});
+    ASSERT_TRUE(ForwardIds(PlanOnce()).empty());
+    // The in-flight results still land and complete the request.
+    SendForwardDone("d", {8});
+    SendForwardDone("d", {9});
+    SendFinish("d");
+    // The next prompt is admitted at once: no wasted step sits ahead of it.
+    Submit(MakeRequestSpec("next", /*num_pages=*/2, /*start=*/500));
+    EXPECT_EQ(ForwardIds(PlanOnce()), std::vector<std::string>{"next"});
 }
 
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {

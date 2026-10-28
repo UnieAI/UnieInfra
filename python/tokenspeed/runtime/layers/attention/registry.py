@@ -289,6 +289,8 @@ _HYBRID_MAMBA2_ARCHITECTURES = {
     "NemotronHForCausalLM",
     "NemotronHForCausalLMNextN",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3NextN",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
@@ -1236,8 +1238,13 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
-    if config.kvp_size > 1 and (
-        model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+    if (
+        config.kvp_size > 1
+        # V4.1 validates KVP in its config and specialized recipe.
+        and softmax_attn.backend_name != "deepseek_v41"
+        and (
+            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+        )
     ):
         _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch
@@ -1287,6 +1294,27 @@ def create_attn_components(
         draft_cache_family,
         draft_family_declared=draft_profile is not None,
     )
+    # F3: FA2 paged-extend float workspace + JIT must land before KV budgeting
+    # so the ~256 MiB scratch is not stolen from the cache pool at first request.
+    try:
+        from tokenspeed_kernel.ops.attention.mha._flashinfer.paged_extend import (
+            fa2_extend_mode,
+            warmup_fa2_extend,
+        )
+
+        if fa2_extend_mode() != "off":
+            warmup_fa2_extend(config.device)
+    except Exception as exc:  # noqa: BLE001 — never block server start
+        logger.warning("FlashInfer FA2 extend warmup skipped: %s", exc)
+    try:
+        from tokenspeed_kernel.ops.attention.mha.fa4_sm90_hd512 import (
+            warmup_fa4_sm90_hd512,
+        )
+
+        warmup_fa4_sm90_hd512(config.device)
+    except Exception as exc:  # noqa: BLE001 — never block server start
+        logger.warning("fa4_sm90 hd512 extend warmup skipped: %s", exc)
+
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:
         profiled_cache_bytes = profile_available_cache_memory_bytes(

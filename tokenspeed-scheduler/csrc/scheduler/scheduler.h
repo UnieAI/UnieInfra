@@ -378,8 +378,13 @@ private:
         Request* victim{nullptr};
         bool image_fits{false};
     };
-    // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
-    VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
+    // `drop_exempt_last_resort`: allow the reserve-exempt last resort (abort or
+    // reversible host-retraction of the newest resident) only when a resident
+    // stuck on its own next page is the blocker; a waiting prompt is the
+    // blocker where admission back-pressure (not a sacrifice) is the correct
+    // response. No default: the two paths differ in whether a covered request
+    // may be aborted.
+    VictimChoice chooseVictim(std::span<Request* const> candidates, bool drop_exempt_last_resort) const;
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
@@ -431,6 +436,29 @@ private:
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+    // Length-aware prefill admission (see scheduleShortPromptsAhead): prompts
+    // of at most short_prompt_tokens_ may be admitted ahead of a resident
+    // chunked prefill with more than that left, as long as the round keeps at
+    // least long_prefill_floor_ tokens for it. 0 disables.
+    void scheduleShortPromptsAhead(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                   std::int32_t decode_reserve);
+    std::int32_t short_prompt_tokens_{0};
+    std::int32_t long_prefill_floor_{0};
+    // Mixed mode: a prefill with more than this many tokens left takes at most
+    // this many per round while decodes ride the same round, which bounds the
+    // decode step time (ITL) behind a long prompt. 0 disables.
+    std::int32_t mixed_long_chunk_{0};
+    std::int32_t mixed_prefill_floor_{0};
+    // Chunk the mixed-mode limits above and below are sized from (at most
+    // max_scheduled_tokens); rounds with decodes never prefill more than this.
+    std::int32_t mixed_ref_chunk_{0};
+    // Mixed mode: with more than this many decodes in a round, the prefill
+    // tokens riding beside them are held to mixed_ref_chunk_ * ref / D
+    // (never below long_prefill_floor_), so a burst of new prompts cannot
+    // stretch every decode's step. 0 disables.
+    std::int32_t mixed_decode_ref_{0};
+    void capPrefillBesideDecodes(PlanBuild& build) const;
+    std::int32_t prefillBudgetFor(const Request& request, const PlanBuild& build) const;
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;

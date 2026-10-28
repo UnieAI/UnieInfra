@@ -48,10 +48,7 @@ from tokenspeed.runtime.execution.types import StopCriteria
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.engine.io_struct import (
-        TokenizedEmbeddingReqInput,
-        TokenizedGenerateReqInput,
-    )
+    from tokenspeed.runtime.engine.io_struct import TokenizedGenerateReqInput
     from tokenspeed.runtime.execution.types import ModelExecutionResult
     from tokenspeed.runtime.metrics.collector import EngineMetrics
     from tokenspeed.runtime.grammar.base_grammar_backend import (
@@ -142,9 +139,7 @@ class RequestState:
 
         # --- generation state (updated with forward step) ---
         self.output_ids: list[int] = []
-        # Embedding serving only: the pooled vector, set when the request's
-        # single forward commits.
-        self.embedding: list[float] | None = None
+        self.embedding = None  # set by pooling forward
         self.finished_reason: BaseFinishReason | None = None
         self.cached_tokens: int = 0
         self.prefix_len: int = 0
@@ -280,7 +275,7 @@ class RequestState:
         return cls(
             prompt_input_ids=recv_req.input_ids,
             sampling_params=recv_req.sampling_params,
-            stream=recv_req.stream,
+            stream=getattr(recv_req, "stream", False),
             tokenizer=tokenizer,
             computes_prompt_logprobs=computes_prompt_logprobs,
             eos_token_ids=eos_token_ids,
@@ -290,28 +285,6 @@ class RequestState:
             token_ids_logprob=recv_req.token_ids_logprob,
             multimodal_inputs=recv_req.multimodal_inputs,
             prompt_input_ids_unpadded=recv_req.input_ids_unpadded,
-            created_time=recv_req.created_time,
-        )
-
-    @classmethod
-    def from_embedding_req(
-        cls,
-        recv_req: TokenizedEmbeddingReqInput,
-        tokenizer,
-        eos_token_ids: list[int],
-    ) -> RequestState:
-        """Build the state for an admitted pooling request.
-
-        A pooled vector is one value, never a stream, and a pooling forward
-        scores no prompt rows, so there are no logprobs to accumulate.
-        """
-        return cls(
-            prompt_input_ids=recv_req.input_ids,
-            sampling_params=recv_req.sampling_params,
-            stream=False,
-            tokenizer=tokenizer,
-            computes_prompt_logprobs=False,
-            eos_token_ids=eos_token_ids,
             created_time=recv_req.created_time,
         )
 
@@ -437,9 +410,6 @@ class RequestState:
             self.input_top_logprobs_idx = [None] + [top[1] for top in tops]
             self.input_top_logprobs = None
 
-    def add_computed_length(self, incr: int):
-        self.computed_length += incr
-
     def has_pending_multimodal_features(self) -> bool:
         mm = self.multimodal_inputs
         return (
@@ -453,19 +423,33 @@ class RequestState:
         if mm is not None and hasattr(mm, "release_shm_features"):
             mm.release_shm_features()
 
-    def init_incremental_detokenize(self):
-        """Return (all_ids_from_surr_offset, read_offset_relative_to_surr)."""
+    def take_unsent_decode_ids(self) -> tuple[list[int], int]:
+        """Return the detokenizer ids not sent yet and the read offset.
+
+        The detokenizer's ids are the prompt from the surrounding offset on
+        followed by the output; this returns the part past
+        ``send_decode_id_offset`` and advances it, slicing only that tail
+        instead of copying the whole output on every frame. The read offset
+        is relative to the surrounding offset.
+        """
         if self._surr_offset is None or self._read_offset is None:
             self._read_offset = len(self.prompt_input_ids_unpadded)
             self._surr_offset = max(
                 self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-        # Slice before concatenating: decode needs only the surrounding prompt
-        # suffix, not a copy of the entire cached prompt on every output token.
         prompt = self.prompt_input_ids_unpadded
         offset = self._surr_offset
-        decode_ids = prompt[offset:] + self.output_ids[max(offset - len(prompt), 0) :]
-        return decode_ids, self._read_offset - offset
+        output_start = max(offset - len(prompt), 0)
+        prompt_part = max(len(prompt) - offset, 0)
+        sent = self.send_decode_id_offset
+        unsent = (
+            prompt[offset + sent :]
+            + self.output_ids[output_start + max(sent - prompt_part, 0) :]
+        )
+        self.send_decode_id_offset = prompt_part + max(
+            len(self.output_ids) - output_start, 0
+        )
+        return unsent, self._read_offset - offset
 
     def check_finished(self, skip_grammar_termination: bool = False):
 
@@ -758,17 +742,6 @@ class OutputProcesser:
                     break
         completion.terminated_at = terminated_at
 
-    def add_computed_length(self, rids, input_lengths, extend_prefix_lens):
-        for i, rid in enumerate(rids):
-            if rid not in self.rid_to_state:
-                continue
-            if i < len(extend_prefix_lens):
-                self.rid_to_state[rid].computed_length = (
-                    input_lengths[i] + extend_prefix_lens[i]
-                )  # Avoid accumulation here so chunked prefill does not distort the value.
-            else:
-                self.rid_to_state[rid].add_computed_length(input_lengths[i])
-
     @staticmethod
     def _aggregate_spec_decode_step(
         *,
@@ -779,12 +752,15 @@ class OutputProcesser:
         n_ext = forward_op.num_extends()
         accepted = 0
         num_slots = 0
-        for i in range(n_ext, len(forward_op.request_ids)):
-            rid = forward_op.request_ids[i]
+        # One read: each read of a scheduler-binding vector copies all of it.
+        request_ids = forward_op.request_ids
+        lengths = output_lengths.tolist()
+        for i in range(n_ext, len(request_ids)):
+            rid = request_ids[i]
             rs = rid_to_state.get(rid)
             if rs is None or not rs.prefill_finished:
                 continue
-            out_len = int(output_lengths[i].item())
+            out_len = lengths[i]
             accepted += max(0, out_len - 1)
             num_slots += 1
         return num_slots, accepted
@@ -827,55 +803,40 @@ class OutputProcesser:
     def post_process_embedding_forward_op(self, forward_op, results):
         """Commit a pooling forward: one vector per request, then finished.
 
-        Kept separate from the token path rather than folded into it. The
-        token loop is built around "how many tokens did this slot produce and
-        is the request finished yet"; for pooling both answers are fixed (none,
-        and yes), and every branch in that loop -- grammar, spec verify,
-        logprobs, NaN sanitisation, chunked-prefill continuation -- is dead.
-
-        Emits ExtendResult with an empty token list (a no-op append that still
-        clears the scheduler's pending forward result) followed by Finish.
-        ``results`` arrives already synced by ``PendingExecution.result()``.
+        ``results`` is already synced by ``PendingExecution.result()`` (nctu6
+        exactly-once sync gate); do not call ``results.sync()`` again.
         """
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,
             forward_op.extend_replay_lens,
         )
-        self.add_computed_length(
-            forward_op.request_ids,
-            forward_op.input_lengths,
-            forward_op.extend_prefix_lens,
-        )
-
         request_changes = []
         stream_out_rids = []
         stream_out_states = []
-        embeddings = results.output_embeddings
-        stats_now = time.time() if self.enable_log_request_stats else 0.0
+        embeddings = getattr(results, "output_embeddings", None)
+        input_lengths = forward_op.input_lengths
+        extend_prefix_lens = forward_op.extend_prefix_lens
         for i, rid in enumerate(forward_op.request_ids):
             request_state: RequestState = self.rid_to_state.get(rid)
             if request_state is None:
                 continue
-            # Embedding servers open the prefill chunk budget to the context
-            # length at startup, so a slot that is not prefill-finished means
-            # the batch was built by a path that ignored that.
+            # Whole-prompt prefill: the computed length is the prompt (an
+            # extend sets it, it does not accumulate), as the generative
+            # commit path sets it inline.
+            request_state.computed_length = input_lengths[i] + extend_prefix_lens[i]
             if not request_state.prefill_finished:
                 raise RuntimeError(
                     f"pooling request {rid} was scheduled as a partial prefill; "
                     "embedding models require whole-prompt prefill"
                 )
 
+            request_state.embedding = embeddings[i].tolist()
+            request_state.finished_reason = FINISH_LENGTH(length=0)
             request_changes.append(make_extend_result_event(rid))
             request_changes.append(make_finish_event(rid))
-            if not request_state.to_abort:
-                # A client abort already tore down the tokenizer-side state,
-                # so only a live request ships its vector.
-                request_state.embedding = embeddings[i].tolist()
-                request_state.finished_reason = FINISH_LENGTH(length=0)
-                stream_out_rids.append(rid)
-                stream_out_states.append(request_state)
-            self._log_request_stats(rid, request_state, stats_now)
+            stream_out_rids.append(rid)
+            stream_out_states.append(request_state)
             self.rid_to_state.pop(rid)
 
         self.stream_embedding_output(stream_out_rids, stream_out_states)
@@ -904,14 +865,19 @@ class OutputProcesser:
         model_execution_results: ModelExecutionResult,
         is_prefill_instance: bool,
     ):
-        if model_execution_results.output_embeddings is not None:
+        # Embedding (pooling) serving: the forward produced vectors, not
+        # tokens -- route to the embedding post-processing (one pooled vector
+        # per request) before any token/logprob path reads `output_tokens`.
+        if getattr(model_execution_results, "output_embeddings", None) is not None:
             return self.post_process_embedding_forward_op(
                 forward_op, model_execution_results
             )
+        # Each read of a scheduler-binding vector copies all of it; read once.
+        request_ids = forward_op.request_ids
+        input_lengths = forward_op.input_lengths
+        extend_prefix_lens = forward_op.extend_prefix_lens
         self.add_cached_tokens(
-            forward_op.request_ids,
-            forward_op.extend_prefix_lens,
-            forward_op.extend_replay_lens,
+            request_ids, extend_prefix_lens, forward_op.extend_replay_lens
         )
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
@@ -930,11 +896,6 @@ class OutputProcesser:
                         grammar_completion.event.set()
             grammar_terminated_at = grammar_completion.terminated_at
         self.log_cnt += 1
-        self.add_computed_length(
-            forward_op.request_ids,
-            forward_op.input_lengths,
-            forward_op.extend_prefix_lens,
-        )
         num_extends = forward_op.num_extends()
 
         # per-request stats timing (host-side, only when --enable-log-request-stats)
@@ -981,8 +942,9 @@ class OutputProcesser:
         # is prefetched before admission, so no path extends the window past
         # the prompt.
         prefill_lengths = forward_op.prefill_lengths
+        num_prefix_lens = len(extend_prefix_lens)
         pt = 0
-        for i, rid in enumerate(forward_op.request_ids):
+        for i, rid in enumerate(request_ids):
             output_length = output_lengths_list[i]
             model_output_ids = output_tokens_list[pt : pt + output_length]
             model_output_logprobs = (
@@ -1011,11 +973,11 @@ class OutputProcesser:
             # no token and the sampled one is garbage.
             mid_chunk = (
                 not is_decode_slot
-                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
-                < prefill_lengths[i]
+                and extend_prefix_lens[i] + input_lengths[i] < prefill_lengths[i]
             )
 
-            if rid not in self.rid_to_state:
+            request_state: RequestState | None = self.rid_to_state.get(rid)
+            if request_state is None:
                 # The request finished (or was aborted) on an earlier result
                 # while this forward was already dispatched. Its output goes
                 # nowhere, but the forward landed: the scheduler counts it
@@ -1029,7 +991,11 @@ class OutputProcesser:
                 )
                 continue
 
-            request_state: RequestState = self.rid_to_state[rid]
+            # An extend sets the computed length rather than adding to it, so a chunked prefill cannot distort it.
+            if i < num_prefix_lens:
+                request_state.computed_length = input_lengths[i] + extend_prefix_lens[i]
+            else:
+                request_state.computed_length += input_lengths[i]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             if mid_chunk:
@@ -1295,10 +1261,11 @@ class OutputProcesser:
             top_values = model_execution_results.input_top_logprobs_val.tolist()
             top_ids = model_execution_results.input_top_logprobs_idx.tolist()
         cursor = 0
+        request_ids = forward_op.request_ids
         for i, count in enumerate(plan.counts):
             if count == 0:
                 continue
-            state = self.rid_to_state.get(forward_op.request_ids[i])
+            state = self.rid_to_state.get(request_ids[i])
             if state is not None and state.input_token_logprobs is not None:
                 state.record_input_token_logprobs(
                     plan.position_starts[i],
@@ -1565,9 +1532,8 @@ class OutputProcesser:
             )
             decoded_texts.append(rs.decoded_text)
 
-            decode_ids, read_offset = rs.init_incremental_detokenize()
-            decode_ids_list.append(decode_ids[rs.send_decode_id_offset :])
-            rs.send_decode_id_offset = len(decode_ids)
+            unsent_decode_ids, read_offset = rs.take_unsent_decode_ids()
+            decode_ids_list.append(unsent_decode_ids)
 
             read_offsets.append(read_offset)
             output_ids.append(rs.output_ids[send_token_offset:])

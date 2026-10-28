@@ -216,6 +216,64 @@ def test_zero_page_fields_matches_host_expansion_without_recompiling(
         )
 
 
+@pytest.mark.parametrize("page_dtype", [torch.int32, torch.int64])
+def test_zero_page_fields_small_grid_strides_pages_and_fields(
+    device: str, page_dtype: torch.dtype
+) -> None:
+    fields = [(3, 32, 7), (257, 192, 137), (2049, 64, 33)]
+    page_ids = [5, 0, 3, 1]
+    expected = torch.full((2600,), 173, dtype=torch.uint8)
+    backing = expected.to(device)
+    for page in page_ids:
+        for base, stride, size in fields:
+            expected[base + page * stride : base + page * stride + size] = 0
+
+    # Two programs must cover twelve ranges, crossing both pages and fields.
+    # Two byte tiles must also loop for the largest field, including its
+    # partial final tile.
+    _zero_page_fields_kernel[(2, 2)](
+        backing,
+        torch.tensor(page_ids, dtype=page_dtype, device=device),
+        torch.tensor(fields, dtype=torch.int64, device=device),
+        len(fields),
+        len(page_ids) * len(fields),
+        BLOCK_SIZE=32,
+        num_warps=4,
+    )
+
+    # Check all bytes, including unselected pages, payload tails and guards.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
+def test_zero_page_fields_large_admission_preserves_unselected_bytes(
+    device: str,
+) -> None:
+    # 1025 pages x 12 fields x 32 tiles exceeded Ascend's 65535 launch limit.
+    capacity = 1100
+    selected = torch.randperm(capacity, generator=torch.Generator().manual_seed(42))[
+        :1025
+    ]
+    fields = []
+    offset = 64
+    for size in [65537, *range(17, 28)]:
+        stride = ((size + 31) // 32 + 1) * 32
+        fields.append((offset, stride, size))
+        offset += capacity * stride + 64
+    expected = torch.full((offset,), 173, dtype=torch.uint8)
+    backing = expected.to(device)
+    for base, stride, size in fields:
+        view = expected[base : base + capacity * stride].view(capacity, stride)
+        view[selected, :size] = 0
+    zero_page_fields(
+        backing,
+        selected.to(device=device, dtype=torch.int32),
+        torch.tensor(fields, dtype=torch.int64, device=device),
+        max_field_bytes=65537,
+    )
+    # Includes fields, padding bytes, guard gaps and the 75 untouched pages.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
 def test_copy_page_fields_matches_host_expansion_without_recompiling(
     device: str,
 ) -> None:
@@ -1229,3 +1287,91 @@ def test_index_k_scatter_mask_preserves_dummy_page(device):
     scale[1, [1, 3]] = scales[[1, 3]]
     assert torch.equal(cache, expected)
     assert torch.equal(cache[:64], before[:64])
+
+
+def test_merge_contiguous_ranges_coalesces_runs_on_both_sides():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import merge_contiguous_ranges
+
+    ranges = [
+        (0, 200, 1200, 100),  # out of order: sorted before merging
+        (0, 0, 1000, 100),
+        (0, 100, 1100, 100),  # device and host contiguous -> merged
+        (0, 300, 5000, 100),  # device contiguous, host jumps -> new range
+        (1, 400, 5100, 100),  # other device buffer -> new range
+        (0, 500, 9000, 0),  # empty -> dropped
+    ]
+    assert merge_contiguous_ranges(ranges) == [
+        (0, 0, 1000, 300),
+        (0, 300, 5000, 100),
+        (1, 400, 5100, 100),
+    ]
+
+
+def test_dma_transfer_matches_per_range_copy_after_merging():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import _transfer_dma
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    dev = torch.arange(4096, dtype=torch.int32, device="cuda").view(torch.uint8)
+    host = torch.zeros(dev.numel() * 2, dtype=torch.uint8, pin_memory=True)
+    ranges = [(0, i * 512, 1024 + i * 512, 512) for i in (3, 0, 1, 2, 5)]
+    _transfer_dma("d2h", (dev,), host, ranges)
+    torch.cuda.synchronize()
+    ref = dev.cpu()
+    for _, d, h, n in ranges:
+        assert torch.equal(host[h : h + n], ref[d : d + n])
+    back = torch.zeros_like(dev)
+    _transfer_dma("h2d", (back,), host, ranges)
+    torch.cuda.synchronize()
+    for _, d, h, n in ranges:
+        assert torch.equal(back[d : d + n].cpu(), ref[d : d + n])
+
+
+def test_strided_runs_group_device_contiguous_evenly_spaced_host_rows():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import strided_runs
+
+    # Field A of blocks 0..3: Device back to back, Host every 1000 bytes.
+    field_a = [(0, i * 100, 5000 + i * 1000, 100) for i in range(4)]
+    # Field B of the same blocks, interleaved 100 bytes after field A.
+    field_b = [(1, i * 100, 5100 + i * 1000, 100) for i in range(4)]
+    # A Host gap breaks the run: block 4 lands out of stride.
+    tail = [(0, 400, 20000, 100)]
+    runs = strided_runs(list(reversed(field_a + field_b + tail)))
+    assert runs == [
+        (0, 0, 5000, 100, 4, 1000),
+        (0, 400, 20000, 100, 1, 100),
+        (1, 0, 5100, 100, 4, 1000),
+    ]
+    covered = sum(width * height for _, _, _, width, height, _ in runs)
+    assert covered == 900
+
+
+def test_strided_dma_round_trip_with_interleaved_host_layout():
+    from tokenspeed_kernel.ops.kvcache.host_transfer import _transfer_dma
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    width, blocks, pitch = 256, 6, 1024
+    fields = [
+        torch.randint(0, 255, (blocks * width,), dtype=torch.uint8, device="cuda")
+        for _ in range(2)
+    ]
+    host = torch.zeros(blocks * pitch + 4096, dtype=torch.uint8, pin_memory=True)
+    ranges = [
+        (f, b * width, 64 + b * pitch + f * width, width)
+        for f in range(2)
+        for b in range(blocks)
+        if b != 3  # a hole keeps two runs per field
+    ]
+    _transfer_dma("d2h", fields, host, ranges)
+    torch.cuda.synchronize()
+    refs = [x.cpu() for x in fields]
+    for f, d, h, n in ranges:
+        assert torch.equal(host[h : h + n], refs[f][d : d + n])
+    back = [torch.zeros_like(x) for x in fields]
+    _transfer_dma("h2d", back, host, ranges)
+    torch.cuda.synchronize()
+    for f, d, h, n in ranges:
+        assert torch.equal(back[f][d : d + n].cpu(), refs[f][d : d + n])
+    # Bytes outside the ranges were never written.
+    assert torch.count_nonzero(back[0][3 * width : 4 * width]) == 0

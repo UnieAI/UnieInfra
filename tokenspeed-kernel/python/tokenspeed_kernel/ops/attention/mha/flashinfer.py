@@ -98,6 +98,10 @@ def _untuned_with_lse(function):
 
 
 if platform.is_nvidia:
+    # FA2 paged-extend for large head_dim (gemma-4 global layers, 512) on
+    # sm90 / sm12x; on by default for 512 (TOKENSPEED_FLASHINFER_FA2_EXTEND=off
+    # opts out).
+    import tokenspeed_kernel.ops.attention.mha._flashinfer.paged_extend  # noqa: F401
     from flashinfer.decode import (
         BatchDecodeWithPagedKVCacheWrapper,
     )
@@ -169,8 +173,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
         "mha_extend_with_kvcache",
         name="flashinfer_trtllm_mha_extend_with_kvcache",
         solution="flashinfer",
+        # trtllm-gen MHA cubins ship for sm100/sm103 only; cap at 10.3 so
+        # sm120 (RTX PRO 6000) never selects them while B300/GB300 still do.
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_TRTLLM_GEN_SIGNATURES,
@@ -249,8 +256,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
         "mha_decode_with_kvcache",
         name="flashinfer_trtllm_mha_decode_with_kvcache",
         solution="flashinfer",
+        # trtllm-gen MHA cubins ship for sm100/sm103 only; cap at 10.3 so
+        # sm120 (RTX PRO 6000) never selects them while B300/GB300 still do.
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_TRTLLM_GEN_SIGNATURES,

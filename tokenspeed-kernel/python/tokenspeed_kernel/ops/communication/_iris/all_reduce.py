@@ -20,6 +20,7 @@
 
 """Iris all-reduce protocols and the synchronization used by its fusions."""
 
+import dataclasses
 import math
 
 import torch
@@ -33,12 +34,59 @@ from tokenspeed_kernel.ops.communication.iris import (
     _use_two_stage_producer_direct,
     producer_direct_all_reduce_can_run,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
-_SUBGROUP_SIZE = 64
+hip_utils = triton.language.extra.hip.utils
+
 _PULL_MAX_PROGRAMS = 84
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class PullAllReduceArchConfig:
+    """Per-architecture code generation for the pull all-reduce protocols.
+
+    Attributes:
+        peer_load_cache: Cache modifier for loads of peer symmetric memory;
+            empty selects the default.
+        remote_store_cache: Cache modifier for stores into peer symmetric
+            memory; empty selects the default.
+    """
+
+    peer_load_cache: str
+    remote_store_cache: str
+
+
+_PULL_ALL_REDUCE_ARCH_CONFIGS = {
+    ArchVersion(9, 5): PullAllReduceArchConfig(
+        peer_load_cache=".cg",
+        remote_store_cache=".wt",
+    ),
+    # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
+    # partially read sector over the fabric, and ".wt" peer stores are an order
+    # of magnitude slower than plain ones.
+    ArchVersion(12, 5): PullAllReduceArchConfig(
+        peer_load_cache="",
+        remote_store_cache="",
+    ),
+}
+
+
+def pull_all_reduce_arch_config(
+    arch: ArchVersion | None = None,
+) -> PullAllReduceArchConfig:
+    """Return the configuration for ``arch``, or for the current device.
+
+    Raises:
+        ValueError: ``arch`` has no pull all-reduce configuration.
+    """
+    if arch is None:
+        arch = current_platform().arch_version
+    config = _PULL_ALL_REDUCE_ARCH_CONFIGS.get(arch)
+    if config is None:
+        raise ValueError(f"Iris pull all-reduce has no configuration for {arch}")
+    return config
 
 
 def _pull_scratch_numel(max_numel: int, world_size: int) -> int:
@@ -146,6 +194,7 @@ class StagedPullOneShot:
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
+            PEER_LOAD_CACHE=pull_all_reduce_arch_config().peer_load_cache,
             num_warps=self.num_subgroups,
         )
 
@@ -158,12 +207,16 @@ def _launch_pull_twoshot(
     out: torch.Tensor,
     *,
     exit_barrier: bool,
+    hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
+    arch = pull_all_reduce_arch_config()
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
-    partition_words = out.numel() // peers.world_size // elements_per_word
+    numel = out.numel() if hc_post is None else out.numel() // 4
+    partition_words = numel // peers.world_size // elements_per_word
+    subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * _SUBGROUP_SIZE
+        * subgroup_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )
@@ -182,13 +235,31 @@ def _launch_pull_twoshot(
         NUM_PROGRAMS=num_programs,
         NUM_TILES=num_tiles,
         NUM_WARPS=_TWO_SHOT_NUM_SUBGROUPS,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
         WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
+        PEER_LOAD_CACHE=arch.peer_load_cache,
+        REMOTE_STORE_CACHE=arch.remote_store_cache,
+        **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
+
+
+def _hc_post_args(
+    hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    elements_per_word: int,
+) -> dict:
+    if hc_post is None:
+        return {}
+    residual, post, comb = hc_post
+    return {
+        "residual": residual,
+        "post": post,
+        "comb": comb,
+        "HIDDEN_WORDS": residual.shape[-1] // elements_per_word,
+        "HC_POST": True,
+    }
 
 
 class StagedPullTwoShot:
@@ -279,16 +350,33 @@ class ProducerPull:
             data.numel() * data.element_size(),
         )
 
-    def run(self, out: torch.Tensor) -> None:
+    def run(
+        self,
+        out: torch.Tensor,
+        hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        """Reduce the producer outputs into out.
+
+        With hc_post = (residual [T,4,H], post [T,4], comb [T,4,4]), out is the
+        new BF16 residual [T,4,H]: the mHC post of the reduced [T,H] rows.
+        """
         peers = self.producer.peers
         inputs = self.producer.data
-        if _use_two_stage_producer_direct(peers.world_size, out.numel(), inputs.dtype):
+        numel = out.numel() if hc_post is None else out.numel() // 4
+        if _use_two_stage_producer_direct(peers.world_size, numel, inputs.dtype):
             assert self.scratch is not None
             _launch_pull_twoshot(
-                peers, inputs, self.scratch, self.ready_flags, out, exit_barrier=False
+                peers,
+                inputs,
+                self.scratch,
+                self.ready_flags,
+                out,
+                exit_barrier=False,
+                hc_post=hc_post,
             )
             return
-        num_tiles = triton.cdiv(out.numel(), self.BLOCK_SIZE)
+        arch = pull_all_reduce_arch_config()
+        num_tiles = triton.cdiv(numel, self.BLOCK_SIZE)
         num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
         iris_pull_oneshot[(num_programs,)](
             inputs,
@@ -297,16 +385,18 @@ class ProducerPull:
             *peers.addresses,
             RANK=peers.rank,
             WORLD_SIZE=peers.world_size,
-            TOTAL_NUMEL=out.numel(),
+            TOTAL_NUMEL=numel,
             BLOCK_SIZE=self.BLOCK_SIZE,
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
             NUM_WARPS=self.NUM_SUBGROUPS,
-            SUBGROUP_SIZE=_SUBGROUP_SIZE,
             WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
             ELEMENTS_PER_WORD=_PACKED_WORD_BYTES // inputs.element_size(),
+            PEER_LOAD_CACHE=arch.peer_load_cache,
+            REMOTE_STORE_CACHE=arch.remote_store_cache,
+            **_hc_post_args(hc_post, _PACKED_WORD_BYTES // inputs.element_size()),
             num_warps=self.NUM_SUBGROUPS,
         )
 
@@ -443,6 +533,7 @@ def iris_pull_oneshot_staged(
     BLOCK_SIZE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
+    PEER_LOAD_CACHE: tl.constexpr,
 ):
     """One-shot all-reduce over rotating staging slots.
 
@@ -515,7 +606,7 @@ def iris_pull_oneshot_staged(
                 heap_bases,
                 mask=mask,
                 other=0.0,
-                cache_modifier=".cg",
+                cache_modifier=PEER_LOAD_CACHE,
                 hint=BLOCK_SIZE,
             ).to(tl.float32)
     tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
@@ -799,6 +890,7 @@ def _iris_sync_rank_epoch(
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
     PUBLISH: gl.constexpr,
+    REMOTE_STORE_CACHE: gl.constexpr,
 ):
     """Wait until each peer's workgroup counter reaches the requested epoch.
 
@@ -829,7 +921,7 @@ def _iris_sync_rank_epoch(
             remote_flags,
             epoch,
             mask=peer_mask,
-            cache_modifier=".wt",
+            cache_modifier=REMOTE_STORE_CACHE,
         )
         wait_flags = ready_flags + block_id * WORLD_SIZE + peer_ids
     else:
@@ -914,6 +1006,63 @@ def _pack_word(
 
 
 @gluon.jit
+def _mhc_post_words(
+    x_0,
+    x_1,
+    x_2,
+    x_3,
+    word,
+    mask,
+    residual,
+    post,
+    comb,
+    out,
+    HIDDEN_WORDS: gl.constexpr,
+):
+    """Store the hc=4 mHC post of reduced BF16 words into the new residual.
+
+    ``word`` indexes four consecutive hidden values of one token in the
+    reduced [tokens, hidden] output. Residual and output are packed
+    [tokens, 4, hidden] streams; ``post`` is FP32 [tokens, 4] and ``comb``
+    FP32 [tokens, 4 input, 4 output]. The arithmetic follows
+    gluon_mhc_post_gfx950: post * x first, then input streams 0..3.
+    """
+    token = word // HIDDEN_WORDS
+    base = token * (4 * HIDDEN_WORDS) + word % HIDDEN_WORDS
+    words = tl.cast(residual, gl.pointer_type(gl.uint64))
+    r0 = _unpack_16bitx4(gl.load(words + base, mask=mask, other=0), gl.bfloat16)
+    r1 = _unpack_16bitx4(
+        gl.load(words + base + HIDDEN_WORDS, mask=mask, other=0), gl.bfloat16
+    )
+    r2 = _unpack_16bitx4(
+        gl.load(words + base + 2 * HIDDEN_WORDS, mask=mask, other=0), gl.bfloat16
+    )
+    r3 = _unpack_16bitx4(
+        gl.load(words + base + 3 * HIDDEN_WORDS, mask=mask, other=0), gl.bfloat16
+    )
+    x = (x_0, x_1, x_2, x_3)
+    for j in gl.static_range(4):
+        p = gl.load(post + token * 4 + j, mask=mask, other=0.0)
+        c0 = gl.load(comb + token * 16 + j, mask=mask, other=0.0)
+        c1 = gl.load(comb + token * 16 + 4 + j, mask=mask, other=0.0)
+        c2 = gl.load(comb + token * 16 + 8 + j, mask=mask, other=0.0)
+        c3 = gl.load(comb + token * 16 + 12 + j, mask=mask, other=0.0)
+        values = ()
+        for k in gl.static_range(4):
+            value = p * x[k].to(gl.float32)
+            value += c0 * r0[k].to(gl.float32)
+            value += c1 * r1[k].to(gl.float32)
+            value += c2 * r2[k].to(gl.float32)
+            value += c3 * r3[k].to(gl.float32)
+            values = values + (value,)
+        gl.store(
+            tl.cast(out, gl.pointer_type(gl.uint64)) + base + j * HIDDEN_WORDS,
+            _pack_16bitx4(values[0], values[1], values[2], values[3], gl.bfloat16),
+            mask=mask,
+        )
+
+
+@gluon.jit
 def iris_pull_oneshot(
     input_sym_ptr,
     output_ptr,
@@ -935,19 +1084,29 @@ def iris_pull_oneshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    PEER_LOAD_CACHE: gl.constexpr,
+    REMOTE_STORE_CACHE: gl.constexpr,
+    residual=None,
+    post=None,
+    comb=None,
+    HIDDEN_WORDS: gl.constexpr = 0,
+    HC_POST: gl.constexpr = False,
 ):
     """Pull every rank's contributions and write the full reduced output locally.
+
+    With HC_POST, output_ptr instead receives the BF16 hc=4 mHC post of the
+    reduced rows (see _mhc_post_words).
 
     input_sym_ptr holds consecutive producer outputs; output_ptr receives their
     FP32 sum rounded to ELEMENT_DTYPE. ready_flags coordinate input publication
     and completion. All peer reads finish before the next producer can reuse
     the symmetric input; PUBLISH_READY selects how those counters are exchanged.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -980,6 +1139,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -1022,7 +1182,7 @@ def iris_pull_oneshot(
                     packed_offset.to(gl.int32),
                     mask=mask,
                     other=0,
-                    cache=".cg",
+                    cache=PEER_LOAD_CACHE,
                 )
                 peer_0, peer_1, peer_2, peer_3 = _unpack_word(
                     peer_packed, ELEMENT_DTYPE, ELEMENTS_PER_WORD
@@ -1040,12 +1200,28 @@ def iris_pull_oneshot(
             ELEMENT_DTYPE,
             ELEMENTS_PER_WORD,
         )
-        gl.amd.cdna4.buffer_store(
-            packed_output,
-            tl.cast(output_ptr, gl.pointer_type(gl.uint64)),
-            packed_offset.to(gl.int32),
-            mask=mask,
-        )
+        if HC_POST:
+            x_0, x_1, x_2, x_3 = _unpack_16bitx4(packed_output, gl.bfloat16)
+            _mhc_post_words(
+                x_0,
+                x_1,
+                x_2,
+                x_3,
+                packed_offset,
+                mask,
+                residual,
+                post,
+                comb,
+                output_ptr,
+                HIDDEN_WORDS,
+            )
+        else:
+            gl.amd.cdna4.buffer_store(
+                packed_output,
+                tl.cast(output_ptr, gl.pointer_type(gl.uint64)),
+                packed_offset.to(gl.int32),
+                mask=mask,
+            )
         tile_id += NUM_PROGRAMS
 
     # Do not return while a peer program can still be reading this rank's
@@ -1069,6 +1245,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
 
@@ -1095,13 +1272,22 @@ def iris_pull_twoshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
+    PEER_LOAD_CACHE: gl.constexpr,
+    REMOTE_STORE_CACHE: gl.constexpr,
+    residual=None,
+    post=None,
+    comb=None,
+    HIDDEN_WORDS: gl.constexpr = 0,
+    HC_POST: gl.constexpr = False,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions.
+
+    With HC_POST, output_ptr instead receives the BF16 hc=4 mHC post of the
+    gathered rows (see _mhc_post_words).
 
     Sum this rank's consecutive input partition in FP32 and store it in
     scratch_sym_ptr at the input dtype. Pull all peers' reduced partitions into
@@ -1109,6 +1295,7 @@ def iris_pull_twoshot(
     EXIT_BARRIER adds a final peer wait for callers that stage inputs before
     launch. Both communication phases run in this one kernel.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -1141,6 +1328,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -1197,7 +1385,7 @@ def iris_pull_twoshot(
             peer_inputs + gl.expand_dims(input_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_LOAD_CACHE,
         )
         peer_values.store(values)
 
@@ -1241,6 +1429,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
     # Gather one reduced partition from every rank into the local output.
@@ -1252,16 +1441,32 @@ def iris_pull_twoshot(
             peer_scratch + gl.expand_dims(partition_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_LOAD_CACHE,
         )
         output_offset = gl.expand_dims(peer_ids * PARTITION_WORDS, 1) + gl.expand_dims(
             partition_offset, 0
         )
-        gl.store(
-            tl.cast(output_ptr, gl.pointer_type(gl.uint64)) + output_offset,
-            values,
-            mask=gl.expand_dims(mask, 0),
-        )
+        if HC_POST:
+            x_0, x_1, x_2, x_3 = _unpack_16bitx4(values, gl.bfloat16)
+            _mhc_post_words(
+                x_0,
+                x_1,
+                x_2,
+                x_3,
+                output_offset,
+                gl.expand_dims(mask, 0) & (output_offset >= 0),
+                residual,
+                post,
+                comb,
+                output_ptr,
+                HIDDEN_WORDS,
+            )
+        else:
+            gl.store(
+                tl.cast(output_ptr, gl.pointer_type(gl.uint64)) + output_offset,
+                values,
+                mask=gl.expand_dims(mask, 0),
+            )
         tile_id += NUM_PROGRAMS
 
     if EXIT_BARRIER:
@@ -1291,6 +1496,7 @@ def iris_pull_twoshot(
             NUM_WARPS,
             SUBGROUP_SIZE,
             PUBLISH=True,
+            REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
         )
 
 

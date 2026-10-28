@@ -310,6 +310,10 @@ def _mixed_precision_config() -> "ModelOptMixedConfig":
     return config
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="NVFP4 MoE experts need SM100+ kernels",
+)
 def test_minimax_m3_mixed_precision_quant_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

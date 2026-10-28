@@ -94,6 +94,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
     int32_t const k = top_k_arr[b];
     float const p = top_p_arr[b];
     bool const topp_active = (k > max_topk);
+    // P >= 1 keeps the whole support: the apply kernel ignores the radix
+    // threshold for such rows, so do not run the radix passes over the vocab.
+    bool const topp_radix = topp_active && (p < 1.0f);
 
     // Set topk counter fields (thread 0). The radix kernels reset most fields
     // themselves between passes — only `skip` matters for short-circuiting.
@@ -115,9 +118,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
         auto* tpc = topp_counters + b;
         tpc->in = probs + static_cast<size_t>(b) * vocab_size;
         tpc->oriLen = vocab_size;
-        tpc->len = topp_active ? vocab_size : 0;
+        tpc->len = topp_radix ? vocab_size : 0;
         tpc->previousLen = vocab_size;
-        tpc->p = topp_active ? p : 0.0f;
+        tpc->p = topp_radix ? p : 0.0f;
         tpc->totalSum = 0.0f;
         tpc->sum = 0;
         tpc->kthValueBits = 0;
@@ -344,7 +347,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     float* __restrict__ out_probs,
     int32_t vocab_size,
     int32_t max_k,
-    bool enable_pdl) {
+    bool enable_pdl,
+    bool skip_identity_rows) {
     // PDL: wait for preceding stream work before reading top-k outputs.
     if (enable_pdl) {
         cudaGridDependencySynchronize();
@@ -354,6 +358,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     const int b = blockIdx.x;
     const int32_t k_raw = top_ks[b];
     const float p = top_ps[b];
+    // Identity row (no top-k, P >= 1): the renormalized row equals the input.
+    // Callers that read `probs` for such rows ask us not to rewrite it.
+    if (skip_identity_rows && k_raw > max_k && p >= 1.0f) return;
 
     // Packed (val ↓, idx ↑) uint64 sort. Upper 32 bits = twiddle_in(val, false)
     // so ascending uint order == descending val order; lower 32 bits = idx so
@@ -625,7 +632,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
 void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float const* topPs,
                         float* outProbs, void* workspace, SizeType32 batchSize,
                         SizeType32 vocabSize, cudaStream_t mainStream,
-                        cudaStream_t memsetStream, bool enable_pdl) {
+                        cudaStream_t memsetStream, bool enable_pdl,
+                        bool skipIdentityRows) {
     // ── Workspace partitioning ──────────────────────────────────────────────
     size_t airTopkWS = airTopKWorkspaceBytes(batchSize, vocabSize);
     std::vector<size_t> sizes = {
@@ -745,7 +753,7 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     auto applyFn = rowsAligned ? applyKernel<128, 1, true> : applyKernel<128, 1, false>;
     launchKernel(enable_pdl, applyFn, dim3(batchSize), dim3(128), 0, mainStream,
                  probs, topKVals, topKIdx, topKs, topPs, toppCounters, outProbs, vocabSize,
-                 K_TOPK_MAX, enable_pdl);
+                 K_TOPK_MAX, enable_pdl, skipIdentityRows);
 }
 
 }  // namespace fused_topk_topp

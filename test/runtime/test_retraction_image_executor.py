@@ -1028,7 +1028,8 @@ def test_a_lane_completes_a_zero_row_copy_without_touching_the_transport(backend
     assert lane.workspace.commit_block_transfers.call_count == (
         1 if backend == "auto" else 0
     )
-    assert lane.metadata_done is (events[2] if backend == "auto" else None)
+    # The non-empty copy's completion event guards its slot's reuse.
+    assert lane._last.payload_done is events[2]
 
 
 def test_completion_queue_releases_in_order_and_drops_on_reset():
@@ -1209,3 +1210,13 @@ def _round_trip_two_ranks(io_backend, executors):
         assert bool(slot_states[rank].flag[3]) and not bool(slot_states[rank].flag[1])
         assert slot_states[rank].table[0].tolist() == [200 + rank] * 5
         assert not bool(slot_states[rank].flag[0])
+
+
+def test_bulk_auto_transfers_route_to_copy_engine_dma():
+    """Large ``auto`` submissions use DMA; small ones keep the SM copy kernel."""
+    threshold = lanes_module._DMA_MIN_BLOCKS
+    assert lanes_module._copy_backend_for("auto", threshold) == "dma"
+    assert lanes_module._copy_backend_for("auto", threshold - 1) == "auto"
+    # An explicit transport is never rewritten.
+    assert lanes_module._copy_backend_for("dma", 1) == "dma"
+    assert lanes_module._copy_backend_for("triton", threshold * 10) == "triton"

@@ -212,6 +212,46 @@ def test_l3_register_storage_keys_emits_a_prefetch_before_admission() -> None:
     assert scheduler.host_pool_pinned_blocks() == 0
 
 
+@pytest.mark.parametrize("with_swa,checkpoint_page", [(False, 3), (True, 1)])
+def test_l3_hybrid_prefetch_restores_state_before_admission(
+    with_swa: bool, checkpoint_page: int
+) -> None:
+    cfg = _l3_config(
+        num_device_pages=32, num_host_pages=32, with_swa=with_swa, min_prefetch_pages=1
+    )
+    state_group = len(cfg.cache_groups)
+    cfg.cache_groups = list(cfg.cache_groups) + [
+        ts.CacheGroupConfig(
+            group_id="state",
+            block_granularity=0,
+            total_pages=cfg.num_device_pages,
+            attn_kind=ts.AttnKind.State,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    tokens = list(range(1, 10))
+    hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    groups, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    keys = [
+        (group, content_hash, offset)
+        for group, content_hash, offset in zip(groups, expanded, offsets)
+        if group != state_group or content_hash == hashes[checkpoint_page]
+    ]
+    scheduler.register_storage_keys(*map(list, zip(*keys)))
+    scheduler.submit_requests([_spec("hybrid", tokens)])
+    prefetch = _find_op(scheduler.next_execution_plan(), ts.Cache.PrefetchOp)
+    assert prefetch is not None
+    assert set(prefetch.group_ids[0]) == set(range(state_group + 1))
+    _ack_prefetch(scheduler, prefetch.op_ids[0], len(hashes))
+    admit = scheduler.next_execution_plan()
+    assert list(admit.forward[0].extend_prefix_lens) == [2 * (checkpoint_page + 1)]
+    load = _find_op(admit, ts.Cache.LoadBackOp)
+    assert load is not None
+    assert set(load.group_ids[0]) == set(range(state_group + 1))
+    _ack_load_back(scheduler, load.op_ids[0])
+    assert scheduler.host_pool_pinned_blocks() == 0
+
+
 def test_l3_partial_landing_admits_on_the_landed_prefix() -> None:
     scheduler = ts.Scheduler(
         _l3_config(
@@ -360,7 +400,11 @@ def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
     assert _find_op(plan, ts.Cache.LoadBackOp) is None
 
 
-def test_l3_writeback_carries_object_keys() -> None:
+def test_l3_writeback_carries_object_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     scheduler = ts.Scheduler(
         _l3_config(
             num_device_pages=32, num_host_pages=32, with_swa=True, min_prefetch_pages=1
@@ -382,7 +426,13 @@ def test_l3_writeback_carries_object_keys() -> None:
     scheduler.next_execution_plan()
 
 
-def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
+def test_l3_host_eviction_still_prefetches_registered_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # nctu6 94963a34 made the host write policy on-reuse by default; this
+    # test exercises the eager write-back/image path, so select it
+    # explicitly (previously implicit when eager was the default).
+    monkeypatch.setenv("TOKENSPEED_KVSTORE_WRITE_POLICY", "eager")
     """Host eviction keeps Mooncake objects; submit-time register restores the shadow."""
 
     cfg = _l3_config(

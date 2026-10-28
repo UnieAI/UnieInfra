@@ -127,15 +127,14 @@ class InputProcessor:
     def validate_request(self, obj: GenerateReqInput | EmbeddingReqInput) -> None:
         """Reject cross-type requests before any other processing.
 
-        An ``EmbeddingReqInput`` arriving at a generation engine, or a
-        ``GenerateReqInput`` arriving at an embedding engine, is a
-        configuration mistake, not a runtime condition, so we raise eagerly
-        instead of letting it reach tokenization.
+        An ``EmbeddingReqInput`` arriving at a generation-only engine
+        is a configuration mistake, not a runtime condition, so we
+        raise eagerly instead of letting it reach tokenization.
         """
         if isinstance(obj, EmbeddingReqInput) and self.engine.is_generation:
             raise ValueError(
-                "This server serves a generative model; embedding requests need "
-                "a pooling checkpoint (or --is-embedding with --pooling-type)."
+                "This server serves a generative model; /v1/embeddings needs a "
+                "pooling checkpoint (or --is-embedding with --pooling-type)."
             )
         if isinstance(obj, GenerateReqInput) and not self.engine.is_generation:
             raise ValueError(

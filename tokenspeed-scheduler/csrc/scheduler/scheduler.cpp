@@ -92,7 +92,15 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
-      snapshot_slots_{config_.max_retracted_requests},
+      // ReqPoolAllocator reserves slot 0 and hands out 1..size, but the
+      // retraction snapshot arena on the executor is sized exactly
+      // max_retracted_requests and indexed [0, max_retracted_requests), so a
+      // slot == max_retracted_requests (emitted when size == that value) is
+      // out of range and crashes the data plane. Size the allocator one lower
+      // so its highest slot is max_retracted_requests - 1, inside the arena.
+      // (Only reachable once this many requests are retracted at once, which
+      // the capacity-deadlock fallback can now drive to the limit.)
+      snapshot_slots_{std::max(1, config_.max_retracted_requests - 1)},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
       snapshot_pool_{snapshotPoolBlocks(config_), slotsPerParentByGroup(config_)},
@@ -112,6 +120,57 @@ Scheduler::Scheduler(SchedulerConfig config)
         coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
             markKvEventBoundaryForReconcile(eventKey(key));
         });
+    }
+
+    // TOKENSPEED_KVSTORE_WRITE_POLICY: "reuse" (default), "reuse_pressure" or
+    // "eager" -- see CacheCoordinator::HostWritePolicy.
+    {
+        const char* policy = std::getenv("TOKENSPEED_KVSTORE_WRITE_POLICY");
+        const std::string name = policy != nullptr ? policy : "reuse";
+        if (name == "eager") {
+            coordinator_.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kEager);
+        } else if (name == "reuse_pressure") {
+            coordinator_.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kOnReuseOrPressure);
+        } else {
+            _assert(name == "reuse", "TOKENSPEED_KVSTORE_WRITE_POLICY must be eager, reuse or reuse_pressure");
+            coordinator_.SetHostWritePolicy(CacheCoordinator::HostWritePolicy::kOnReuse);
+        }
+    }
+
+    // TOKENSPEED_SHORT_PROMPT_TOKENS (default: one chunk) and
+    // TOKENSPEED_LONG_PREFILL_FLOOR (default: a quarter chunk): length-aware
+    // prefill admission. A short prompt no longer waits for a long chunked
+    // prefill to finish all its chunks. 0 disables.
+    {
+        const auto env_int = [](const char* name, std::int32_t fallback) {
+            const char* value = std::getenv(name);
+            return value != nullptr ? static_cast<std::int32_t>(std::atoi(value)) : fallback;
+        };
+        // Mixed-mode (prefill beside decodes) defaults are anchored to a
+        // reference chunk, not to the whole prefill budget: a large budget
+        // (8192) lets decode-free rounds, such as a burst of short prompts,
+        // prefill in one forward, while rounds that carry decodes keep the
+        // step time they have at the reference chunk (4096). A budget below
+        // the reference keeps the budget itself.
+        mixed_ref_chunk_ = std::max<std::int32_t>(
+            1, std::min(config_.max_scheduled_tokens, env_int("TOKENSPEED_MIXED_REF_CHUNK", 4096)));
+        short_prompt_tokens_ = std::max(0, env_int("TOKENSPEED_SHORT_PROMPT_TOKENS", config_.max_scheduled_tokens));
+        long_prefill_floor_ = std::max(0, env_int("TOKENSPEED_LONG_PREFILL_FLOOR", mixed_ref_chunk_ / 4));
+        // TOKENSPEED_MIXED_LONG_CHUNK (default: half a reference chunk, mixed mode only).
+        mixed_long_chunk_ = config_.enable_mixed_prefill_decode
+                                ? std::max(0, env_int("TOKENSPEED_MIXED_LONG_CHUNK", mixed_ref_chunk_ / 2))
+                                : 0;
+        // TOKENSPEED_MIXED_DECODE_REF (default 4, mixed mode only): beside more
+        // than this many decodes a round's prefill share shrinks as ref/decodes.
+        mixed_decode_ref_ =
+            config_.enable_mixed_prefill_decode ? std::max(0, env_int("TOKENSPEED_MIXED_DECODE_REF", 4)) : 0;
+        // TOKENSPEED_MIXED_PREFILL_FLOOR (default: an eighth of a reference
+        // chunk): the least prefill a shrunk mixed round keeps. It is separate
+        // from the admission floor above: at a quarter chunk it pinned 32
+        // decodes beside 1024 prefill tokens, so ref no longer mattered (Gemma 4
+        // 1K C32 P99 ITL 155 ms); an eighth halves that step while long prompts
+        // beside few decodes (128K C4) never reach the cap.
+        mixed_prefill_floor_ = std::max(0, env_int("TOKENSPEED_MIXED_PREFILL_FLOOR", mixed_ref_chunk_ / 8));
     }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
@@ -258,6 +317,13 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
     _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
 
     KvEventHashProgress& progress = kv_event_hash_progress_[request.Id()];
+    // A retracted request resumes from a prefix no longer than before, but
+    // block_hashes only ever grows here. Drop any stale tail beyond the
+    // current prefix so the chain matches prefix_hashes; the retained leading
+    // pages hash the same unchanged tokens, so they stay valid.
+    if (progress.block_hashes.size() > prefix_hashes.size()) {
+        progress.block_hashes.resize(prefix_hashes.size());
+    }
     for (std::size_t i = progress.block_hashes.size(); i < prefix_hashes.size(); ++i) {
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};

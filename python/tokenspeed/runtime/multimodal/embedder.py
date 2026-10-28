@@ -52,8 +52,9 @@ recomputing it), and a later request with the same content encodes anew.
 
 Within a single forward batch we still de-duplicate by modality and
 ``item.hash``: if two requests reference the same media content using
-the same modality, only the first item is fed to the encoder; the second
-request's scatter ranges read from the first item's ``encoded`` tensor.
+the same modality, only the first item still holding its raw feature is
+fed to the encoder; the second request's scatter ranges read from the
+first item's ``encoded`` tensor.
 """
 
 from __future__ import annotations
@@ -304,6 +305,21 @@ def _assign_encoder_items(
 # ---------------------------------------------------------------------------
 
 
+def _fit_encoder_rows(output: torch.Tensor, expected: int) -> torch.Tensor:
+    """Truncate or zero-pad encoder rows to the placeholder count.
+
+    Gemma4 pan-and-scan (multi-view) can emit a couple of extra pooled soft
+    tokens vs SMG's n_valid//k^2 estimate used for prompt offsets; the split
+    below must match the already-expanded placeholders.
+    """
+    if output.shape[0] > expected:
+        return output[:expected]
+    if output.shape[0] < expected:
+        pad = output.new_zeros((expected - output.shape[0], output.shape[-1]))
+        return torch.cat([output, pad], dim=0)
+    return output
+
+
 class MultimodalEmbedder:
     """Multimodal input embedding pipeline for one model executor."""
 
@@ -447,7 +463,9 @@ class MultimodalEmbedder:
         # Walk the FULL batch (including text-only / decode requests)
         # so base offsets line up with the flat input_ids tensor that
         # the caller hands us. Requests without mm input contribute
-        # nothing but still advance ``base``.
+        # nothing but still advance ``base``. DeepSeek V4.1 derives its
+        # image routing mask from the same walk (_image_mask_from_spans);
+        # change the two together.
         base = 0
         for req_idx, mm_inputs in enumerate(ctx.mm_inputs):
             if req_idx >= len(ctx.extend_seq_lens) or req_idx >= len(
@@ -476,7 +494,10 @@ class MultimodalEmbedder:
                     canonical = canonical_by_key[(item.modality, item.hash)]
                 else:
                     canonical = item
-                    if item.hash is not None:
+                    # An item whose raw feature is gone cannot encode for aliases.
+                    if item.hash is not None and (
+                        item.feature is not None or item.feature_shm is not None
+                    ):
                         canonical_by_key[(item.modality, item.hash)] = item
 
                 if canonical is not item:
@@ -553,11 +574,12 @@ class MultimodalEmbedder:
                 for group in pack_encoder_batches_in_order(
                     per_item_lens, max_tokens=max_tokens
                 ):
+                    group_lens = [per_item_lens[i] for i in group]
                     output = self._run_encoder([items[i] for i in group], spec, device)
-                    output = output.reshape(-1, output.shape[-1])
-                    per_item_embs.extend(
-                        torch.split(output, [per_item_lens[i] for i in group], dim=0)
+                    output = _fit_encoder_rows(
+                        output.reshape(-1, output.shape[-1]), sum(group_lens)
                     )
+                    per_item_embs.extend(torch.split(output, group_lens, dim=0))
 
             self._store_encoder_outputs(items, per_item_embs, spec, multimodal_model)
 
@@ -594,9 +616,11 @@ class MultimodalEmbedder:
         groups = pack_encoder_batches_in_order(local_lens, max_tokens=max_tokens)
         if len(groups) == 1:
             local_output = self._run_encoder(local_items, spec, device)
-            local_output = local_output.reshape(local_rows, output_width).to(
-                device=device, dtype=output_dtype
-            )
+            # Same row fit as the single-rank path: the gather sizes below are
+            # the placeholder counts, not whatever the encoder emitted.
+            local_output = _fit_encoder_rows(
+                local_output.reshape(-1, output_width), local_rows
+            ).to(device=device, dtype=output_dtype)
         else:
             # Zero or several calls fill one buffer, so the gather sends one tensor.
             local_output = torch.empty(
@@ -605,9 +629,12 @@ class MultimodalEmbedder:
             row = 0
             for group in groups:
                 rows = sum(local_lens[i] for i in group)
-                local_output[row : row + rows] = self._run_encoder(
-                    [local_items[i] for i in group], spec, device
-                ).reshape(rows, output_width)
+                local_output[row : row + rows] = _fit_encoder_rows(
+                    self._run_encoder(
+                        [local_items[i] for i in group], spec, device
+                    ).reshape(-1, output_width),
+                    rows,
+                )
                 row += rows
 
         gathered = self._gather_encoder_outputs(

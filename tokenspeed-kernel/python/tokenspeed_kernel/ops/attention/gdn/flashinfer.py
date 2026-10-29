@@ -82,7 +82,7 @@ def is_available() -> bool:
     """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     # FlashInfer provides separate SM90 and Blackwell prefill kernels.
-    return (platform.is_hopper or platform.is_blackwell) and cuda_major >= 13
+    return (platform.is_hopper or platform.is_blackwell_plus) and cuda_major >= 13
 
 
 def is_supported(
@@ -118,7 +118,7 @@ if is_available():
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(12, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),

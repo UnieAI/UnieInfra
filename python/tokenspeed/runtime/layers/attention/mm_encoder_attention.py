@@ -254,6 +254,7 @@ def vision_attn_sdpa(
         output = F.scaled_dot_product_attention(qb, kb, vb, scale=softmax_scale)
     return output.transpose(1, 2).reshape(bsz * seq_len, heads, head_dim)
 
+
 def vision_attn_flashinfer_cudnn(
     q: torch.Tensor,
     k: torch.Tensor,

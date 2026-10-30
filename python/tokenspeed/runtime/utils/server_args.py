@@ -4171,6 +4171,8 @@ class ServerArgs:
             "fa4",
             "triton_attn",
             "flashinfer_cudnn",
+            # Equal-length batches only (e.g. Whisper's fixed audio window).
+            "sdpa",
         ]
         parser.add_argument(
             "--mm-attention-backend",

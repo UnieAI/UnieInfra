@@ -56,6 +56,7 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from tokenspeed.runtime.diffusion.music3_config import (
@@ -102,6 +103,21 @@ def parse_music3_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-cpu-offload", action="store_true", default=False)
     parser.add_argument("--memory-reserve-margin", default="8GB")
     parser.add_argument("--residency", default="auto")
+    parser.add_argument(
+        "--acoustic-dtype",
+        required=True,
+        choices=("float32", "bfloat16"),
+        help="flow-matching DiT / vocoder precision (float32 = fp32 + TF32, the reference)",
+    )
+    parser.add_argument("--ar-kv-cache-gib", type=float, default=24.0)
+    parser.add_argument("--max-batch-songs", type=int, default=16)
+    parser.add_argument("--max-window-batch", type=int, default=4)
+    parser.add_argument(
+        "--no-acoustic-on-ar-device",
+        action="store_true",
+        default=False,
+        help="do not run an overflow acoustic replica on the AR GPU",
+    )
     parser.add_argument(
         "--output-sample-rate",
         type=int,
@@ -341,7 +357,9 @@ def create_app(pipeline: Music3Pipeline, served_model_name: str) -> FastAPI:
             )
 
         try:
-            result = pipeline.generate(req)
+            # Blocking (engine job or the single-layout Diffusers call): keep
+            # it off the event loop so other requests and /health proceed.
+            result = await run_in_threadpool(pipeline.generate, req)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:
@@ -378,6 +396,12 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
         enable_cpu_offload=not args.no_cpu_offload,
         residency=args.residency,
         output_sample_rate=int(args.output_sample_rate),
+        acoustic_dtype=args.acoustic_dtype,
+        ar_kv_cache_gib=float(args.ar_kv_cache_gib),
+        max_batch_songs=int(args.max_batch_songs),
+        max_window_batch=int(args.max_window_batch),
+        enforce_eager=bool(args.enforce_eager),
+        acoustic_on_ar_device=not args.no_acoustic_on_ar_device,
     )
     # Fail closed early on bad residency knobs.
     residency = config.resolve_residency()

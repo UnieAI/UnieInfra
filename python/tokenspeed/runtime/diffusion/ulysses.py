@@ -434,6 +434,7 @@ def barrier(group: Any) -> None:
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         dist.barrier(group=group)
 
+
 def pipeline_state_to_payload(state: Any) -> dict[str, Any]:
     """Pickle-friendly snapshot of a Diffusers ``PipelineState`` (tensors on CPU)."""
     import torch

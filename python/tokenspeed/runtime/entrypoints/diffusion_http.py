@@ -410,9 +410,13 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
     import uvicorn
 
     from tokenspeed.runtime.diffusion.family import detect_diffusion_family
+    from tokenspeed.runtime.diffusion.job import (
+        DISPATCH_GATHER_WINDOW_S,
+        PendingRequest,
+        next_dispatch,
+    )
     from tokenspeed.runtime.diffusion.ulysses import (
         CMD_SHUTDOWN,
-        barrier,
         init_ulysses_world,
         leader_signal,
         maybe_reexec_torchrun,
@@ -465,55 +469,56 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
     pipeline = H3Pipeline(config, usp_world=usp_world)
 
     if usp_world is not None and not usp_world.is_leader:
-        # Non-leader ranks only join DiT collectives; no HTTP bind.
-        def _worker_generate(payload):
-            pipeline.generate_from_payload(payload)
-
+        # Non-leader ranks run the dispatches rank 0 publishes; no HTTP bind.
         try:
-            worker_loop(_worker_generate)
+            worker_loop(pipeline.run_worker_dispatch, group=usp_world.control_group)
         finally:
             pipeline.shutdown()
         return
 
-    # USP collectives must run on the main thread (same thread that inited NCCL).
-    # HTTP (uvicorn) and VideoJobQueue otherwise call generate from other threads
-    # and deadlock against the worker ranks. Bridge via a handoff queue.
-    usp_jobs: queue_mod.Queue | None = None
-    if usp_world is not None:
-        usp_jobs = queue_mod.Queue()
+    # One serialized generate path for every residency. Every request (sync
+    # route and async job queue) is handed to a single dispatcher thread, which
+    # runs 1 request, or up to `data_parallel_width` waiting requests at once
+    # on the ulysses layout. For ulysses the dispatcher is the main thread
+    # (the thread that initialized the process groups).
+    pending: queue_mod.Queue = queue_mod.Queue()
+    width = pipeline.data_parallel_width
 
-    def _leader_generate(req: H3GenerateRequest):
-        if usp_jobs is None:
-            return pipeline.generate(req)
+    def _submit(req: H3GenerateRequest):
         fut: Future = Future()
-        usp_jobs.put(("generate", req, fut))
+        pending.put(PendingRequest(request=req, future=fut))
         return fut.result()
 
-    queue = VideoJobQueue(_leader_generate)
+    # The async job queue may run `width` jobs at a time; they meet the sync
+    # requests in `pending`, which is what actually serializes the GPUs.
+    queue = VideoJobQueue(_submit, num_runners=width)
     logger.info(
-        "diffusion server: model=%s served=%s workflow=%s gpus=%s residency=%s usp=%s ring=%s",
-        config.model_path,
-        config.served_model_name,
-        config.workflow,
-        config.num_gpus,
-        residency,
-        ulysses,
-        ring,
+        f"diffusion server: model={config.model_path} served={config.served_model_name} "
+        f"workflow={config.workflow} gpus={config.num_gpus} residency={residency} "
+        f"usp={ulysses} ring={ring} dispatch_width={width}"
     )
     app = create_app(
-        pipeline,
-        queue,
-        served_model_name=config.served_model_name,
-        generate_fn=_leader_generate,
+        pipeline, queue, served_model_name=config.served_model_name, generate_fn=_submit
     )
 
-    if usp_jobs is None:
+    def _run(batch: list[PendingRequest]) -> None:
+        if usp_world is None:
+            item = batch[0]
+            try:
+                item.future.set_result(pipeline.generate(item.request))
+            except Exception as exc:  # noqa: BLE001 - surfaced to the HTTP caller
+                item.future.set_exception(exc)
+            return
         try:
-            uvicorn.run(app, host=host, port=port, log_level="info")
-        finally:
-            queue.shutdown()
-            pipeline.shutdown()
-        return
+            outcomes = pipeline.generate_batch([item.request for item in batch])
+        except Exception as exc:  # noqa: BLE001 - surfaced to the HTTP callers
+            logger.exception("h3 dispatch failed")
+            outcomes = [exc] * len(batch)
+        for item, outcome in zip(batch, outcomes):
+            if isinstance(outcome, Exception):
+                item.future.set_exception(outcome)
+            else:
+                item.future.set_result(outcome)
 
     http_thread = threading.Thread(
         target=lambda: uvicorn.run(app, host=host, port=port, log_level="info"),
@@ -521,31 +526,21 @@ def serve(argv: list[str], *, host: str | None = None, port: int | None = None) 
         daemon=True,
     )
     http_thread.start()
-    logger.info("h3 usp: HTTP on background thread; main thread owns NCCL generate")
+    logger.info("h3 serve: HTTP on a background thread; main thread dispatches")
     try:
         while True:
-            item = usp_jobs.get()
-            kind = item[0]
-            if kind == "shutdown":
-                try:
-                    leader_signal(CMD_SHUTDOWN)
-                except Exception:
-                    logger.exception("usp shutdown signal failed")
+            batch = next_dispatch(
+                pending, width=width, gather_window_s=DISPATCH_GATHER_WINDOW_S
+            )
+            if batch is None:
                 break
-            _, req, fut = item
-            try:
-                payload = pipeline.request_payload(req)
-                leader_signal("generate", payload)
-                result = pipeline.generate(req)
-                barrier()
-                fut.set_result(result)
-            except Exception as exc:
-                fut.set_exception(exc)
-                try:
-                    barrier()
-                except Exception:
-                    pass
+            _run(batch)
     finally:
+        if usp_world is not None:
+            try:
+                leader_signal(CMD_SHUTDOWN, None, group=usp_world.control_group)
+            except Exception:
+                logger.exception("usp shutdown signal failed")
         queue.shutdown()
         pipeline.shutdown()
 

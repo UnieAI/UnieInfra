@@ -375,8 +375,11 @@ class ServerArgs:
     max_model_len: int | None = None
     device: str = "cuda"
     # vLLM parity: one or more API ids for the same weights/process.
-    # CLI ``nargs="+"``; first name is canonical for metrics / gRPC.
+    # CLI ``nargs="+"`` passes a list; after __post_init__ this holds only the
+    # first (canonical) name as a str, used for metrics / gRPC GetModelInfo.
     served_model_name: str | list[str] | None = None
+    # The remaining --served-model-name values (aliases), in CLI order.
+    extra_served_model_names: list[str] = dataclasses.field(default_factory=list)
     revision: str | None = None
     language_model_only: bool = False
 
@@ -824,28 +827,31 @@ class ServerArgs:
         if self.tokenizer is None:
             self.tokenizer = self.model
 
+        # The CLI (nargs="+") hands in a list. Keep the first name in
+        # served_model_name as a plain str, which is what the gRPC servicer,
+        # metrics and the PD connector read, and the rest in
+        # extra_served_model_names. Re-running this on an already-normalized
+        # instance (ServerArgs(**asdict(args))) yields the same split.
         if self.served_model_name is None:
-            self.served_model_name = [self.model]
+            requested: list[str] = []
         elif isinstance(self.served_model_name, str):
-            self.served_model_name = [self.served_model_name]
+            requested = [self.served_model_name]
         elif isinstance(self.served_model_name, list):
-            if not self.served_model_name:
-                self.served_model_name = [self.model]
-            else:
-                # Drop empties; keep order; dedupe while preserving first wins.
-                seen: set[str] = set()
-                names: list[str] = []
-                for name in self.served_model_name:
-                    if not name or name in seen:
-                        continue
-                    seen.add(name)
-                    names.append(name)
-                self.served_model_name = names or [self.model]
+            requested = list(self.served_model_name)
         else:
             raise TypeError(
                 "served_model_name must be str | list[str] | None, "
                 f"got {type(self.served_model_name).__name__}"
             )
+        # Drop empties; keep order; dedupe while preserving first wins.
+        names: list[str] = []
+        for name in [*requested, *self.extra_served_model_names]:
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            names = [self.model]
+        self.served_model_name = names[0]
+        self.extra_served_model_names = names[1:]
 
         if self.seed is None:
             self.seed = random.randint(0, 1 << 30)
@@ -898,17 +904,15 @@ class ServerArgs:
     @property
     def served_model_names(self) -> list[str]:
         """All served API ids (vLLM-style multi ``--served-model-name``)."""
-        names = self.served_model_name
-        if names is None:
-            return [self.model]
-        if isinstance(names, str):
-            return [names]
-        return list(names)
+        return [self.canonical_served_model_name, *self.extra_served_model_names]
 
     @property
     def canonical_served_model_name(self) -> str:
         """First served name — metrics / gRPC GetModelInfo canonical id."""
-        return self.served_model_names[0]
+        assert isinstance(
+            self.served_model_name, str
+        ), "served_model_name is normalized to a str in resolve_basic_defaults"
+        return self.served_model_name
 
     def resolve_config_aliases(self):
         # Whether the block-drafter widths were given rather than defaulted.

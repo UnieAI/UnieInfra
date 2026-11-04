@@ -1085,7 +1085,9 @@ class TestCLIConfigCompat:
         assert (sa.model) == ("deepseek-ai/DeepSeek-V3.1")
         assert (sa.attn_tp_size) == (8)
         assert sa.enable_expert_parallel
-        assert (sa.served_model_name) == ("ds31")
+        # Raw CLI value (__post_init__ is patched out): --served-model-name is
+        # nargs="+"; the normalized str is covered by test_served_model_name_multi.
+        assert (sa.served_model_name) == (["ds31"])
 
     def test_data_parallel_size_arg(self):
         args = self._parse_args(["--model", "test/model", "--data-parallel-size", "2"])

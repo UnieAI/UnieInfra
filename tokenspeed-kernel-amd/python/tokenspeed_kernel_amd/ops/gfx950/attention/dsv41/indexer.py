@@ -30,13 +30,10 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.indexer import (
-    _BLOCK_N,
-    _CHUNK_N,
     _HEADS_PER_MFMA,
     _PACKED_DIM,
     _PAGE_SIZE,
     _SCALE_DIM,
-    _indexer_mfma_layouts,
     _load_query_group,
 )
 
@@ -46,6 +43,40 @@ __all__ = [
 ]
 
 _MFMA_HEADS = 32
+# One wave scores a 16-row key tile per step: on MI350P (128 CUs) this beats
+# 32-row tiles over two waves at every decode and prefill shape measured
+# (96 rows x 75K history: 617 -> 434 us at a 256-row score chunk).
+_BLOCK_N = gl.constexpr(16)
+_NUM_WARPS = 1
+# Score-chunk buckets (rows per CTA). Longer chunks amortize the per-CTA query
+# load over more key tiles; shorter ones keep enough CTAs when the work is
+# small. Picked by scored rows (queries x width) so only three variants compile.
+_SCORE_CHUNKS = ((1 << 19, 256), (1 << 21, 512))
+_MAX_SCORE_CHUNK = 1024
+
+
+def _score_chunk(queries: int, width: int, bound: int) -> int:
+    """Rows per CTA for a [queries, width] logits launch, at most ``bound``."""
+    work = queries * width
+    chunk = next(
+        (size for limit, size in _SCORE_CHUNKS if work < limit), _MAX_SCORE_CHUNK
+    )
+    return min(chunk, bound)
+
+
+@gluon.constexpr_function
+def _indexer_mfma_layouts(NUM_WARPS):
+    mfma = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 128],
+        transposed=True,
+        warps_per_cta=[1, NUM_WARPS],
+    )
+    dot_a = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=16)
+    dot_b = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=16)
+    a_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_a, [_HEADS_PER_MFMA, _SCALE_DIM])
+    b_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_b, [_BLOCK_N, _SCALE_DIM])
+    return mfma, dot_a, dot_b, a_scale, b_scale
 
 
 @gluon.jit
@@ -390,7 +421,8 @@ def dsv41_index_logits_gfx950(
         visible: Visible logical row counts shaped [T].
         candidates: Optional candidate block IDs shaped [T, blocks].
         logits: FP32 destination shaped [T, scored_rows], initialized to -inf.
-        score_chunk_size: Positive multiple-of-eight upper bound on rows per CTA.
+        score_chunk_size: Positive multiple-of-eight upper bound on rows per
+            CTA; the launch picks a chunk up to it from the logits shape.
 
     Returns:
         None. ``logits`` is mutated in place.
@@ -398,9 +430,9 @@ def dsv41_index_logits_gfx950(
     score_chunk_size = int(score_chunk_size)
     if score_chunk_size < 8 or score_chunk_size % 8:
         raise ValueError("score_chunk_size must be a positive multiple of 8")
-    score_chunk_size = min(score_chunk_size, _CHUNK_N)
-    chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     queries, width = logits.shape
+    score_chunk_size = _score_chunk(queries, width, score_chunk_size)
+    chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     cand = table if candidates is None else candidates
     scale_dim = 4
     gluon_dsv41_index_topk_gfx950[(queries, triton.cdiv(width, score_chunk_size))](
@@ -429,10 +461,10 @@ def dsv41_index_logits_gfx950(
         table_width=int(table.shape[1]),
         CANDIDATES=-1 if candidates is None else int(candidates.shape[1]),
         SCORE_CHUNK=score_chunk_size,
-        BLOCK_N=32,
+        BLOCK_N=_BLOCK_N,
         CHUNK_N=chunk_n,
-        NUM_WARPS=2,
-        num_warps=2,
+        NUM_WARPS=_NUM_WARPS,
+        num_warps=_NUM_WARPS,
         # The scorer is latency-bound on gathered key loads; more resident
         # waves hide it (96 decode rows x 75K history: 2 -> 8 cut 926 -> 617 us).
         waves_per_eu=8,

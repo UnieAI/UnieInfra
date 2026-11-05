@@ -47,6 +47,9 @@ V41_INDEX_HEAD_DIM = 128
 V41_WINDOW_SIZE = 128
 # Shared caller/recipe bound for native prefill query and output scratch.
 V41_PREFILL_QUERY_TILE = 2048
+# Upper bound on index-score rows per CTA passed to dsv41.index_topk. Kernels
+# pick their own chunk up to it (gfx950 uses up to 1024 at long histories).
+V41_INDEX_SCORE_CHUNK = 1024
 V41_TAIL_ROWS = 2
 
 # (physical rows per page, raw tokens per row). Table columns remain absolute

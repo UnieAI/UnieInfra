@@ -195,9 +195,29 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
 
 
 @pytest.mark.parametrize(
+    ("queries", "width", "bound", "expected"),
+    [
+        # Small scoring work keeps short chunks so enough CTAs stay resident.
+        (6, 4096, 1024, 256),
+        (96, 8192, 1024, 512),
+        # Long histories take the longest chunk the caller allows.
+        (96, 75_008, 1024, 1024),
+        (16, 300_032, 1024, 1024),
+        (96, 75_008, 256, 256),
+        (96, 75_008, 64, 64),
+    ],
+)
+def test_gfx950_index_score_chunk_follows_work(queries, width, bound, expected):
+    module = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer"
+    )
+    assert module._score_chunk(queries, width, bound) == expected
+
+
+@pytest.mark.parametrize(
     ("arch", "entry_name", "kernel_name", "tile_n"),
     [
-        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950", 32),
+        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950", 16),
         ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250", 64),
     ],
 )

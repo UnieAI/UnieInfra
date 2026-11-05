@@ -88,10 +88,7 @@ def _csa2_page_rows(
 
 
 @gluon.jit
-def _score_csa2_group(
-    query,
-    query_scales,
-    head_weights,
+def _load_csa2_key_tile(
     index_k_cache,
     page_table,
     candidates,
@@ -103,13 +100,13 @@ def _score_csa2_group(
     page_stride_bytes,
     num_pages,
     visible,
-    mfma_layout: gl.constexpr,
     dot_b_layout: gl.constexpr,
     b_scale_layout: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     table_width,
     CANDIDATES: gl.constexpr,
 ):
+    """Load one BLOCK_N-row MXFP4 key tile and its E8M0 scales."""
     packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[
         :, None
     ]
@@ -168,6 +165,19 @@ def _score_csa2_group(
         mask=scale_valid,
         other=127,
     )
+    return key, key_scales
+
+
+@gluon.jit
+def _score_csa2_group(
+    query,
+    query_scales,
+    head_weights,
+    key,
+    key_scales,
+    mfma_layout: gl.constexpr,
+):
+    """Score one 16-head query group against a loaded key tile."""
     accumulator = gl.zeros(
         [_HEADS_PER_MFMA, _BLOCK_N], dtype=gl.float32, layout=mfma_layout
     )
@@ -203,6 +213,10 @@ def _index_launch_metadata(grid, kernel, args):
 
 @gluon.jit(
     launch_metadata=_index_launch_metadata,
+    # page_stride_bytes stays specializable: its divisible-by-16 attribute lets
+    # the key-tile loads vectorize (runtime arenas align index pages to 256 B,
+    # and the stride is fixed per server, so it never recompiles while serving).
+    # Without it every key byte is a separate load (about 3x slower).
     do_not_specialize=(
         "stride_q_token",
         "stride_q_head",
@@ -214,7 +228,6 @@ def _index_launch_metadata(grid, kernel, args):
         "table_width",
         "cand_stride",
         "logits_stride",
-        "page_stride_bytes",
         "num_pages",
     ),
 )
@@ -306,10 +319,9 @@ def gluon_dsv41_index_topk_gfx950(
     output_columns = gl.arange(0, BLOCK_N, layout=output_layout)
     for tile_offset in range(0, CHUNK_N, BLOCK_N):
         tile_start = candidate_start + tile_offset
-        scores = _score_csa2_group(
-            query_0,
-            query_scale_0,
-            weight_0,
+        # Both 16-head groups score the same key rows: load the tile (page
+        # lookups, packed keys, scales) once and feed it to both MFMAs.
+        key, key_scales = _load_csa2_key_tile(
             index_k_cache,
             page_table,
             candidates,
@@ -321,34 +333,17 @@ def gluon_dsv41_index_topk_gfx950(
             page_stride_bytes,
             num_pages,
             vis,
-            mfma_layout,
             dot_b_layout,
             b_scale_layout,
             PAGE_SIZE,
             table_width,
             CANDIDATES,
         )
+        scores = _score_csa2_group(
+            query_0, query_scale_0, weight_0, key, key_scales, mfma_layout
+        )
         scores += _score_csa2_group(
-            query_1,
-            query_scale_1,
-            weight_1,
-            index_k_cache,
-            page_table,
-            candidates,
-            token,
-            tile_start,
-            candidate_end,
-            table_stride,
-            cand_stride,
-            page_stride_bytes,
-            num_pages,
-            vis,
-            mfma_layout,
-            dot_b_layout,
-            b_scale_layout,
-            PAGE_SIZE,
-            table_width,
-            CANDIDATES,
+            query_1, query_scale_1, weight_1, key, key_scales, mfma_layout
         )
         positions = tile_start + output_columns
         live = positions < candidate_end
@@ -438,7 +433,9 @@ def dsv41_index_logits_gfx950(
         CHUNK_N=chunk_n,
         NUM_WARPS=2,
         num_warps=2,
-        waves_per_eu=2,
+        # The scorer is latency-bound on gathered key loads; more resident
+        # waves hide it (96 decode rows x 75K history: 2 -> 8 cut 926 -> 617 us).
+        waves_per_eu=8,
     )
 
 

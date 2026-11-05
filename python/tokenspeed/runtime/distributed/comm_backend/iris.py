@@ -27,6 +27,7 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.amd_fabric import local_gpus_pcie_only
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -39,6 +40,10 @@ if TYPE_CHECKING:
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
 _DEFAULT_ALL_REDUCE_MAX_BYTES = 512 * 1024
+# On PCIe-only hosts Iris also beats RCCL on prefill activations (see
+# amd_fabric), so both paths cover a whole chunked-prefill all-reduce:
+# 16384 tokens x 7168 hidden in BF16 is 235 MB.
+_PCIE_ALL_REDUCE_MAX_BYTES = 256 * 1024 * 1024
 
 
 class IrisBackend(CommBackend):
@@ -47,15 +52,30 @@ class IrisBackend(CommBackend):
     def __init__(
         self,
         fallback: CommBackend,
-        producer_direct_max_bytes: int = _DEFAULT_PRODUCER_DIRECT_MAX_BYTES,
+        producer_direct_max_bytes: int | None = None,
     ):
+        """Args:
+        fallback: Backend for collectives Iris does not serve.
+        producer_direct_max_bytes: Producer-direct all-reduce capacity, or
+            None for the host default (larger on PCIe-only AMD hosts).
+        """
+        pcie_only = current_platform().is_amd and local_gpus_pcie_only()
+        all_reduce_max_bytes = (
+            _PCIE_ALL_REDUCE_MAX_BYTES if pcie_only else _DEFAULT_ALL_REDUCE_MAX_BYTES
+        )
+        if producer_direct_max_bytes is None:
+            producer_direct_max_bytes = (
+                _PCIE_ALL_REDUCE_MAX_BYTES
+                if pcie_only
+                else _DEFAULT_PRODUCER_DIRECT_MAX_BYTES
+            )
         self._fallback = fallback
         self._instances: dict[tuple[Group, torch.dtype], IrisAllReduce] = {}
         self._gathers: dict[tuple[Group, torch.dtype], IrisAllGather] = {}
         self._broadcasts: dict[Group, IrisBroadcast] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
-            min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
+            min(producer_direct_max_bytes, all_reduce_max_bytes)
             // torch.bfloat16.itemsize
         )
 

@@ -31,9 +31,13 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
 
 _MFMA_HEADS = 32
 _PAGE_SIZE = 64
-# Match the native paged scorer's transient score budget. Heads are gathered
-# once per API chunk; only score/selection work is split at wider histories.
-_LOGITS_BUDGET_BYTES = 32 << 20
+# Transient FP32 score budget per query tile, the same 512 MiB default as
+# --deepseek-v4-indexer-prefill-max-logits-mb. Heads are gathered once per API
+# chunk; only score/selection work is split at wider histories. A smaller
+# budget makes the tile count per chunk grow with history length (32 MiB gave
+# ~7x more launches at a 400K-token history), which slows long-context prefill
+# and deepens the host launch queue enough to hit a ROCm runtime race.
+_LOGITS_BUDGET_BYTES = 512 << 20
 _FP32_BYTES = 4
 
 

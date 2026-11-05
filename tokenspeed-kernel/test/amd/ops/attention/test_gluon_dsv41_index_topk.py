@@ -80,11 +80,13 @@ def test_gluon_index_topk_is_selected_on_supported_amd():
 
 @pytest.mark.parametrize(
     ("width", "expected"),
-    [(32768, 256), (131072, 64), (1048576, 8)],
+    # Up to a 512K-row history (1M tokens at compress ratio 2) one tile holds a
+    # whole 256-query API chunk, so launches per chunk don't grow with context.
+    [(32768, 256), (131072, 256), (524288, 256), (1048576, 128)],
 )
 def test_gluon_index_topk_query_tile_bounds_logits(width, expected):
     assert gluon_indexer._score_query_tile(256, width) == expected
-    assert expected * width * torch.float32.itemsize <= 32 << 20
+    assert expected * width * torch.float32.itemsize <= 512 << 20
 
 
 @pytest.fixture

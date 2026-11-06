@@ -236,6 +236,12 @@ public:
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
     // Full pages only: a probe that enumerates no tails.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+    // Ranking only (cache-aware admission): the full-page tokens the Device
+    // tier would hit for these chain hashes, up to max_tokens. Device alone,
+    // no tails, no Host/L3 walk. Strictly read-only like ProbePromptPrefix:
+    // no pin, no LRU touch, no access epoch, no tail-cap touch -- those
+    // happen only in Admit, so ranking a queue never changes eviction order.
+    std::int32_t ProbeDeviceFullPageTokens(std::span<const std::string> prefix_hashes, std::int32_t max_tokens) const;
 
     // One L3 object to fetch into a Host block, in prefix order. page_index
     // is the prompt's prefix page the row belongs to, so the runtime can turn

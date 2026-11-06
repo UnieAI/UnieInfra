@@ -780,6 +780,18 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std:
     });
 }
 
+std::int32_t CacheCoordinator::ProbeDeviceFullPageTokens(std::span<const std::string> prefix_hashes,
+                                                         std::int32_t max_tokens) const {
+    if (prefix_hashes.empty() || max_tokens < prefix_granularity_) {
+        return 0;
+    }
+    const PromptPrefix prompt{.prefix_hashes = prefix_hashes, .tokens = {}, .max_tokens = max_tokens};
+    const std::vector<std::vector<CacheKey>> group_keys = buildGroupKeys(prefix_hashes);
+    return probeTier<CacheTier::kDevice>(prompt, group_keys, match_order_, /*floor_tokens=*/0,
+                                         /*claim_partial=*/false)
+        .full_page_tokens;
+}
+
 std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(const PrefixProbe& probe,
                                                                              std::int32_t min_pages) {
     _assert(min_pages >= 1, "a prefetch below one page is no prefetch");

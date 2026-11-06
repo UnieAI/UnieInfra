@@ -462,6 +462,42 @@ private:
     // 0 disables). prefill_rounds_since_decode_ counts the current streak.
     std::int32_t decode_every_prefill_rounds_{0};
     std::int32_t prefill_rounds_since_decode_{0};
+
+    // Cache-aware admission (TOKENSPEED_CACHE_AWARE_ADMISSION, see the
+    // constructor): the Submitted pass of scheduleLocalPrefillWork walks the
+    // waiting prompts longest-Device-cached-prefix first instead of FIFO.
+    // Everything here is a function of the submission batches and the cache
+    // state, never of wall time, so mirrored schedulers stay identical.
+    struct CacheAwareEntry {
+        // The prompt's candidate prefix-page chain hashes (the same pages
+        // matchPrefixAtAdmission probes); they depend on the tokens alone.
+        std::vector<std::string> prefix_hashes;
+        std::int32_t prefill_size{0};
+        // The probe bound (tokens) the admission would use.
+        std::int32_t max_cacheable_tokens{0};
+        // Device-resident full-page hit from the last ranking probe.
+        std::int32_t device_hit_tokens{0};
+        std::int64_t probed_round{-1};
+        // Later-submitted prompts admitted ahead of this one; at
+        // cache_aware_max_overtakes_ it ages into the FIFO-first class.
+        std::int32_t overtakes{0};
+    };
+    bool cache_aware_admission_{false};
+    std::int32_t cache_aware_max_overtakes_{64};
+    std::int32_t cache_aware_refresh_rounds_{8};
+    std::int32_t cache_aware_probe_limit_{256};
+    std::unordered_map<std::string, CacheAwareEntry> cache_aware_entries_;
+    // The candidate prefix pages an admission probe hashes and the bound it
+    // probes to (shared by matchPrefixAtAdmission and the ranking).
+    std::int32_t candidatePrefixPages(const Request& request) const;
+    std::int32_t maxCacheableTokens(const Request& request) const;
+    CacheAwareEntry& cacheAwareEntry(Request& request);
+    // The Submitted, not-yet-scheduled candidates in cache-aware order: aged
+    // ones first (FIFO), then by cached Device prefix (longest first, ties
+    // FIFO).
+    std::vector<Request*> cacheAwareSubmittedOrder(std::span<Request* const> candidates, const PlanBuild& build);
+    // `admitted` went ahead of every earlier Submitted prompt still waiting.
+    void noteCacheAwareOvertakes(const Request& admitted, std::span<Request* const> candidates, const PlanBuild& build);
     void capPrefillBesideDecodes(PlanBuild& build) const;
     std::int32_t prefillBudgetFor(const Request& request, const PlanBuild& build) const;
 

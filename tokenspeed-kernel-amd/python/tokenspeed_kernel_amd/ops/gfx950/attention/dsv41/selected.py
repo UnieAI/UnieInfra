@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import math
 
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
@@ -51,7 +52,7 @@ _BLOCK_H = 16
 _TILE_K = 64
 # The main kernel keeps one workgroup per CU (VGPR-bound occupancy), so rows
 # are split over workgroups only while the grid still fits the 256 CUs once.
-_TARGET_CTAS = 256
+_TARGET_CTAS = num_cus()
 _MAX_SPLITS = 16
 # The reduce splits head dims over workgroups too: one workgroup per token and
 # 16-head group alone is too few to stream a small batch's partials.

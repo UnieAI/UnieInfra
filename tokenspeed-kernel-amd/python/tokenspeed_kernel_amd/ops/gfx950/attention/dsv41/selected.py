@@ -954,6 +954,33 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
         out = _output(out, q.shape, q.dtype, q.device)
+        width = prefill_indices.shape[-1]
+        if q.shape[1] in (64, 128) and width > 64 and width % 64:
+            # Widths off the 64-row grid (DSpark draft: SWA window + block,
+            # e.g. 134) have no tuned dsv4_prefill kernel and fell back to the
+            # portable Triton one (~4.5x slower). Pad with ignored -1 entries
+            # and run the sparse kernel, which then masks non-compact indices.
+            from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.sparse_prefill import (
+                gluon_dsv4_sparse_prefill_gfx950,
+            )
+
+            padded = max(128, -(-width // 64) * 64)
+            indices = torch.nn.functional.pad(
+                prefill_indices, (0, padded - width), value=-1
+            ).contiguous()
+            lengths = torch.full(
+                (q.shape[0],), padded, dtype=torch.int32, device=q.device
+            )
+            return gluon_dsv4_sparse_prefill_gfx950(
+                q=q.contiguous(),
+                kv=prefill_kv,
+                indices=indices,
+                lens=lengths,
+                attn_sink=attn_sink.contiguous(),
+                softmax_scale=float(softmax_scale),
+                out=out,
+                assume_compact_indices=False,
+            )
         lengths = torch.full(
             (q.shape[0],),
             prefill_indices.shape[-1],

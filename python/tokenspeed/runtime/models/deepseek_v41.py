@@ -673,6 +673,31 @@ def _all_reduce_output(
     return acquire_all_reduce_outputs((shape,), like, group)[0]
 
 
+# Prefill FFN communication overlap: rows of a prefill chunk split into this
+# many pieces so one piece's all-reduces run on a side stream while another
+# piece's mHC + MoE compute (1 = off). Iris's pull kernel saturates PCIe with
+# 32 programs, which leaves the compute stream most of the CUs.
+_FFN_OVERLAP_CHUNKS = int(os.environ.get("TS_EXP_FFN_OVERLAP_CHUNKS", "1"))
+_FFN_OVERLAP_MIN_ROWS = int(os.environ.get("TS_EXP_FFN_OVERLAP_MIN_ROWS", "4096"))
+_FFN_OVERLAP_IRIS_PROGRAMS = int(os.environ.get("TS_EXP_FFN_OVERLAP_IRIS_PROGRAMS", "32"))
+if _FFN_OVERLAP_CHUNKS > 1:
+    import tokenspeed_kernel.ops.communication._iris.all_reduce as _iris_all_reduce_impl
+
+    _iris_all_reduce_impl._PULL_MAX_PROGRAMS = min(
+        _iris_all_reduce_impl._PULL_MAX_PROGRAMS, _FFN_OVERLAP_IRIS_PROGRAMS
+    )
+_prefill_comm_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def _prefill_comm_stream(device: torch.device) -> torch.cuda.Stream:
+    """The side stream overlapped prefill all-reduces run on, one per device."""
+    stream = _prefill_comm_streams.get(device.index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _prefill_comm_streams[device.index] = stream
+    return stream
+
+
 def _reduce_hc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1652,13 +1677,15 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        hidden_states = _reduce_hc_post(
-            x,
-            residual,
-            post,
-            comb,
-            self.attn.mapping.attn.tp_group if self.attn.mapping.attn.has_tp else None,
+        attn_group = (
+            self.attn.mapping.attn.tp_group if self.attn.mapping.attn.has_tp else None
         )
+        chunks = self._ffn_overlap_chunks(x, ctx, attn_group)
+        if chunks > 1:
+            return self._forward_ffn_overlapped(
+                x, residual, post, comb, attn_pre, image_mask, attn_group, chunks
+            )
+        hidden_states = _reduce_hc_post(x, residual, post, comb, attn_group)
         residual = hidden_states
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
@@ -1679,6 +1706,94 @@ class DeepseekV41DecoderLayer(nn.Module):
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
             x, group = self._forward_ffn(x, image_mask, ctx, True)
         return _reduce_hc_post(x, residual, post, comb, group), ffn_pre
+
+    def _ffn_overlap_chunks(self, x, ctx, attn_group) -> int:
+        """Row pieces for the overlapped prefill FFN, or 1 to run it whole."""
+        if (
+            _FFN_OVERLAP_CHUNKS <= 1
+            or not x.is_cuda
+            or torch.cuda.is_current_stream_capturing()
+            or ctx.forward_mode is None
+            or ctx.forward_mode.is_decode()
+            or x.shape[0] < _FFN_OVERLAP_MIN_ROWS
+            or attn_group is None
+            or self.ffn.owns_ep_communication
+            or not self.comm_manager.moe_output_all_reduced(ctx)
+            or tuple(self.comm_manager.mapping.moe.tp_ep_group) != tuple(attn_group)
+        ):
+            return 1
+        return _FFN_OVERLAP_CHUNKS
+
+    def _forward_ffn_overlapped(
+        self, x, residual, post, comb, attn_pre, image_mask, group, chunks
+    ):
+        """The FFN half of a prefill layer, in row pieces with hidden comms.
+
+        Everything from the attention all-reduce to the FFN all-reduce is
+        row-local. The side stream reduces every piece's attention output in
+        order, then each piece's FFN output as soon as it is computed, so piece
+        i's mHC + MoE overlaps piece i+1's attention all-reduce and piece
+        i-1's FFN all-reduce. All side-stream work is joined before return, so
+        the next layer's all-reduces never share Iris buffers with it.
+        """
+        compute = torch.cuda.current_stream()
+        comm = _prefill_comm_stream(x.device)
+        rows = x.shape[0]
+        step = -(-rows // chunks)
+        bounds = [(a, min(a + step, rows)) for a in range(0, rows, step)]
+        comm.wait_stream(compute)
+        x.record_stream(comm)
+        attn_ready = []
+        with torch.cuda.stream(comm):
+            for a, b in bounds:
+                reduced = all_reduce(
+                    x[a:b], group=group, backend=None, op=torch.distributed.ReduceOp.SUM
+                )
+                reduced.record_stream(compute)
+                event = torch.cuda.Event()
+                event.record(comm)
+                attn_ready.append((reduced, event))
+        pending = []
+        for (a, b), (reduced, ready) in zip(bounds, attn_ready):
+            compute.wait_event(ready)
+            hidden = v41_hc_post(reduced, residual[a:b], post[a:b], comb[a:b])
+            ffn_pre, post_i, comb_i = v41_hc_mixes(
+                hidden,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.norm_eps,
+                self.hc_eps,
+                self.hc_sinkhorn_iters,
+            )
+            y = self.ffn(
+                _v41_hc_input(hidden, attn_pre[a:b], self.ffn_norm),
+                None if image_mask is None else image_mask[a:b],
+                b - a,
+                b - a,
+                ctx=None,
+                comm_manager=None,
+                out=None,
+            )
+            computed = torch.cuda.Event()
+            computed.record(compute)
+            y.record_stream(comm)
+            with torch.cuda.stream(comm):
+                comm.wait_event(computed)
+                y = all_reduce(
+                    y, group=group, backend=None, op=torch.distributed.ReduceOp.SUM
+                )
+                y.record_stream(compute)
+                done = torch.cuda.Event()
+                done.record(comm)
+            pending.append((y, hidden, post_i, comb_i, ffn_pre, done))
+        outputs, pres = [], []
+        for y, hidden, post_i, comb_i, ffn_pre, done in pending:
+            compute.wait_event(done)
+            outputs.append(v41_hc_post(y, hidden, post_i, comb_i))
+            pres.append(ffn_pre)
+        compute.wait_stream(comm)
+        return torch.cat(outputs), torch.cat(pres)
 
     def _forward_ffn(self, x, image_mask, ctx, defer_reduce):
         """MoE output after its communication.

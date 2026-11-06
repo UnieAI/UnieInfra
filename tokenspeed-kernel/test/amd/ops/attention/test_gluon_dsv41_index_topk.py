@@ -255,19 +255,17 @@ def test_indexer_score_chunk_bound(
     table = torch.empty((tokens, 5), dtype=torch.int32)
     visible = torch.empty((tokens,), dtype=torch.int32)
     logits = torch.empty((tokens, width), dtype=torch.float32)
-    # gfx950 Full mode takes the row-block kernel; candidates keep the
-    # per-row scorer whose chunking this checks.
-    candidates = (
-        torch.empty((tokens, 33), dtype=torch.int32) if arch == "gfx950" else None
-    )
-    getattr(module, entry_name)(
+    # gfx950 sends chunks of 64+ rows to the row-block and candidate kernels;
+    # this checks the per-row scorer's chunking directly.
+    entry = module._launch_per_row if arch == "gfx950" else getattr(module, entry_name)
+    entry(
         torch.empty((tokens, 32, 64), dtype=torch.uint8),
         torch.empty((tokens, 32), dtype=torch.int32),
         weights,
         cache,
         table,
         visible,
-        candidates,
+        None,
         logits,
         requested_chunk,
     )

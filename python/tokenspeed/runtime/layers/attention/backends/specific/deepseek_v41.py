@@ -1500,7 +1500,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Query tiling bounds both score scratch and replicated table rows. Do
         # not index_select the table for the entire prefill (T * context pages).
         canonical_prefill = window is not None
-        query_tile = 1024 if canonical_prefill else 256
+        # 240 decode rows (not 256) keep each request's speculative rows in one
+        # tile for next_n dividing 240, so the AMD indexer shares their key loads.
+        query_tile = 1024 if canonical_prefill else 240
         windows = (
             [
                 (span.offset, span.offset + span.count, span)

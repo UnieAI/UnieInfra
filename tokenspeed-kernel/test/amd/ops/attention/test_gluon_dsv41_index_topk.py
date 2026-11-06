@@ -82,7 +82,8 @@ def test_gluon_index_topk_is_selected_on_supported_amd():
     ("width", "expected"),
     # Up to a 512K-row history (1M tokens at compress ratio 2) one tile holds a
     # whole 256-query API chunk, so launches per chunk don't grow with context.
-    [(32768, 256), (131072, 256), (524288, 256), (1048576, 128)],
+    # A split tile keeps a multiple of 120 rows so speculative rows stay whole.
+    [(32768, 256), (131072, 256), (524288, 256), (1048576, 120)],
 )
 def test_gluon_index_topk_query_tile_bounds_logits(width, expected):
     assert gluon_indexer._score_query_tile(256, width) == expected
@@ -254,6 +255,11 @@ def test_indexer_score_chunk_bound(
     table = torch.empty((tokens, 5), dtype=torch.int32)
     visible = torch.empty((tokens,), dtype=torch.int32)
     logits = torch.empty((tokens, width), dtype=torch.float32)
+    # gfx950 Full mode takes the row-block kernel; candidates keep the
+    # per-row scorer whose chunking this checks.
+    candidates = (
+        torch.empty((tokens, 33), dtype=torch.int32) if arch == "gfx950" else None
+    )
     getattr(module, entry_name)(
         torch.empty((tokens, 32, 64), dtype=torch.uint8),
         torch.empty((tokens, 32), dtype=torch.int32),
@@ -261,7 +267,7 @@ def test_indexer_score_chunk_bound(
         cache,
         table,
         visible,
-        None,
+        candidates,
         logits,
         requested_chunk,
     )

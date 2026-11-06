@@ -758,6 +758,22 @@ not a multiple of 32 masks its last tile. The gfx1250 scorer follows the
 same steps with E2M1 scaled wave32 WMMA: all 32 heads form one WMMA tile, and
 its four warps split each 64-column key tile, so no warp loads another's keys.
 
+Full mode (no candidates) on gfx950 runs `gluon_dsv41_index_topk_rows_gfx950`
+instead, after the paged MQA-logits design of aiter's gfx950 kernel. One
+single-wave CTA scores six consecutive query rows over a split of at most
+`min(64, score_chunk // 64)` 64-row pages; the grid is (row blocks, splits),
+split to fill four SIMDs x two waves per CU. The CTA reads its split's page
+ids once (one page per lane). When all six rows have the same page ids there
+(a request's speculative rows, or a prefill chunk), each page's keys load
+once into registers, one page ahead of the MFMAs, and serve all six rows;
+otherwise every row loads its own pages. Scores use the 32x32x64 scaled MFMA
+with the 32 heads on M, so each lane holds 16 heads of one key column: ReLU is
+one `v_maximum3_f32` per score and the weighted head sum is unpacked
+`v_fma_f32` (packed FP32 does not co-issue with MFMA) plus one cross-lane swap.
+Query and key E8M0 scales load as one 32-bit word per head or key. The
+adapter starts query chunks and tiles at multiples of 120 rows so a request's
+rows (next_n dividing 120) never straddle launches.
+
 The gfx950 selector runs one workgroup per query in a single launch,
 replacing `torch.topk`, a sort and about ten elementwise kernels. A
 three-pass MSD radix select (11+11+10 key bits, LDS-atomic histograms) finds

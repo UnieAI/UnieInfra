@@ -21,8 +21,10 @@
 """GFX950 DeepSeek V4.1 CSA2 indexer.
 
 Scores page-planar MXFP4 index-K with the V4 ``mfma_scaled`` e2m1 tile.
-The tokenspeed-kernel adapter owns query packing, bounded query tiling, and
-selection.
+Full mode uses a row-block scorer that shares key loads across query rows with
+matching page tables (speculative decode, prefill); candidate mode scores one
+row per CTA. The tokenspeed-kernel adapter owns query packing, bounded query
+tiling, and selection.
 """
 
 from __future__ import annotations
@@ -399,6 +401,574 @@ def gluon_dsv41_index_topk_gfx950(
         )
 
 
+# Row-block scorer: one CTA scores BLOCK_M consecutive query rows over one KV
+# split. A speculative-decode request's next_n rows (and a prefill chunk's
+# rows) share one page table, so each 64-key page is loaded into registers once
+# and reused by every row of the block. Uses the 32x32x64 scaled MFMA with
+# heads on M (not transposed): a lane holds 16 of the 32 heads of one key in
+# registers, so the head sum is in-register FMAs plus one cross-lane step.
+_ROWS_HEADS = gl.constexpr(32)
+_ROWS_PAGE_SIZE = gl.constexpr(_PAGE_SIZE)
+_ROWS_BLOCK_KV = 64
+_ROWS_BLOCK_M = 6
+_ROWS_WAVES_PER_EU = 2
+# Splits fill the machine (4 SIMDs per CU x resident waves) but stay at least
+# this many tiles long so the per-CTA query load is amortized, and at most the
+# cap so a long history still spreads over many CTAs.
+_ROWS_MIN_TILES = 4
+_ROWS_MAX_TILES = 64
+
+
+@gluon.constexpr_function
+def _rows_mfma_layouts(BLOCK_KV):
+    mfma = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[32, 32, 64],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot_a = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=16)
+    dot_b = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=16)
+    a_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_a, [_MFMA_HEADS, _SCALE_DIM])
+    b_scale = gl.amd.cdna4.get_mfma_scale_layout(dot_b, [BLOCK_KV, _SCALE_DIM])
+    return mfma, dot_a, dot_b, a_scale, b_scale
+
+
+@gluon.jit
+def _rows_scale_bytes(words, scale_layout: gl.constexpr):
+    """Expand per-row int32 words into the [rows, 4] E8M0 byte operand."""
+    shifts = gl.arange(0, _SCALE_DIM, layout=gl.SliceLayout(0, scale_layout)) * 8
+    return ((words[:, None] >> shifts[None, :]) & 0xFF).to(gl.uint8)
+
+
+@gluon.jit
+def _rows_load_query(
+    q,
+    q_scales,
+    weights,
+    row,
+    mfma_layout: gl.constexpr,
+    dot_a_layout: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+):
+    heads = gl.arange(0, _ROWS_HEADS, layout=gl.SliceLayout(1, dot_a_layout))[:, None]
+    dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
+    values = gl.amd.cdna4.buffer_load(
+        ptr=q + row.to(gl.int64) * (_ROWS_HEADS * _PACKED_DIM),
+        offsets=heads * _PACKED_DIM + dims,
+    )
+    # A lane needs two of a head's four E8M0 bytes: load the head's int32 word
+    # once and pick the bytes in registers instead of four byte loads.
+    scale_heads = gl.arange(0, _ROWS_HEADS, layout=gl.SliceLayout(1, a_scale_layout))
+    words = gl.amd.cdna4.buffer_load(
+        ptr=q_scales + row.to(gl.int64) * _ROWS_HEADS, offsets=scale_heads
+    )
+    scales = _rows_scale_bytes(words, a_scale_layout)
+    weight_heads = gl.arange(0, _ROWS_HEADS, layout=gl.SliceLayout(1, mfma_layout))
+    head_weights = gl.amd.cdna4.buffer_load(
+        ptr=weights + row.to(gl.int64) * _ROWS_HEADS,
+        offsets=weight_heads,
+    ).to(gl.float32)
+    return values, scales, head_weights
+
+
+@gluon.jit
+def _rows_load_page_tile(
+    index_k_cache,
+    page,
+    page_row,
+    page_stride_bytes,
+    enabled,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+):
+    """Load BLOCK_KV keys starting at ``page_row`` of physical ``page``.
+
+    ``enabled`` False masks every lane: no memory traffic, zero operands.
+    """
+    base = index_k_cache + page.to(gl.int64) * page_stride_bytes
+    dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    keys = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    key = gl.amd.cdna4.buffer_load(
+        ptr=base,
+        offsets=(page_row + keys) * _PACKED_DIM + dims,
+        mask=(keys >= 0) & enabled,
+        other=0,
+    )
+    scale_keys = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(1, b_scale_layout))
+    words = gl.amd.cdna4.buffer_load(
+        ptr=base.to(gl.pointer_type(gl.int32)),
+        offsets=_ROWS_PAGE_SIZE * _PACKED_DIM // 4 + page_row + scale_keys,
+        mask=(scale_keys >= 0) & enabled,
+        other=0x7F7F7F7F,
+    )
+    key_scales = _rows_scale_bytes(words, b_scale_layout)
+    return key, key_scales
+
+
+@gluon.constexpr_function
+def _rows_fold_plan(linear_layout, num_heads, block_kv):
+    """Reshape plan that moves the in-register head bits to the last axes.
+
+    Head bits a lane holds in registers fold with FMAs; the rest live across
+    lanes and are summed once at the end (after aiter's pa_mqa_logits fold).
+    Returns (split shape, permutation, folded shape, folded bit count).
+    """
+    head_bits = num_heads.bit_length() - 1
+    reg_bases = [tuple(b) for b in linear_layout.reg_bases]
+    summed, folded = [], []
+    for bit in range(head_bits):
+        stride = 1 << (head_bits - 1 - bit)
+        (folded if (stride, 0) in reg_bases else summed).append(bit)
+    return (
+        tuple([2] * head_bits + [block_kv]),
+        tuple(summed + [head_bits] + folded),
+        tuple([1 << len(summed), block_kv] + [2] * len(folded)),
+        len(folded),
+    )
+
+
+@gluon.jit
+def _rows_leaf(x, INDEX: gl.constexpr, DEPTH: gl.constexpr):
+    for bit in gl.static_range(0, DEPTH):
+        low, high = x.split()
+        x = low if (INDEX // (2**bit)) % 2 == 0 else high
+    return x
+
+
+@gluon.jit
+def _rows_fma(a, b, c):
+    # One v_fma_f32: packed FP32 math does not co-issue with MFMA on gfx950,
+    # and the packed add would also lose the free |x| source modifier.
+    return gl.inline_asm_elementwise(
+        "v_fma_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        [a, b, c],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _rows_score(
+    query,
+    query_scales,
+    head_weights,
+    key,
+    key_scales,
+    mfma_layout: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+):
+    accumulator = gl.zeros(
+        [_ROWS_HEADS, BLOCK_KV], dtype=gl.float32, layout=mfma_layout
+    )
+    scores = gl.amd.cdna4.mfma_scaled(
+        a=query,
+        a_scale=query_scales,
+        a_format="e2m1",
+        b=key,
+        b_scale=key_scales,
+        b_format="e2m1",
+        acc=accumulator,
+    )
+    # One v_maximum3_f32 per score (no packed FP32 max exists to vectorize
+    # into); NaN propagates as in the per-row scorer.
+    scores = gl.maximum(scores, 0.0, propagate_nan=tl.PropagateNan.ALL)
+    linear: gl.constexpr = gl.to_linear_layout(mfma_layout, [_ROWS_HEADS, BLOCK_KV])
+    plan: gl.constexpr = _rows_fold_plan(linear, _ROWS_HEADS.value, BLOCK_KV)
+    split_shape: gl.constexpr = plan[0]
+    order: gl.constexpr = plan[1]
+    folded_shape: gl.constexpr = plan[2]
+    DEPTH: gl.constexpr = plan[3]
+    weights = head_weights[:, None].broadcast_to([_ROWS_HEADS, BLOCK_KV])
+    scores = scores.reshape(split_shape).permute(order).reshape(folded_shape)
+    weights = weights.reshape(split_shape).permute(order).reshape(folded_shape)
+    total = _rows_leaf(scores, 0, DEPTH) * _rows_leaf(weights, 0, DEPTH)
+    for i in gl.static_range(1, 2**DEPTH):
+        total = _rows_fma(
+            _rows_leaf(scores, i, DEPTH), _rows_leaf(weights, i, DEPTH), total
+        )
+    return gl.convert_layout(gl.sum(total, axis=0), gl.SliceLayout(0, mfma_layout))
+
+
+@gluon.jit
+def _rows_lane_page(lane_pages, lanes, tile, page_lo, TILES_PER_PAGE: gl.constexpr):
+    """The page id lane ``tile // TILES_PER_PAGE - page_lo`` holds."""
+    pick = lanes == tile // TILES_PER_PAGE - page_lo
+    return gl.max(gl.where(pick, lane_pages, -1), axis=0)
+
+
+@gluon.jit
+def _rows_safe_page(page, num_pages):
+    return gl.where((page >= 0) & (page < num_pages), page, 0)
+
+
+@gluon.jit
+def _rows_store(logits, row, logits_stride, scores, positions, end, page, num_pages):
+    live = (positions < end) & (page >= 0) & (page < num_pages)
+    gl.amd.cdna4.buffer_store(
+        scores,
+        ptr=logits + row.to(gl.int64) * logits_stride,
+        offsets=positions,
+        mask=live,
+    )
+
+
+@gluon.jit
+def _rows_walk_shared(
+    index_k_cache,
+    logits,
+    logits_stride,
+    page_stride_bytes,
+    num_pages,
+    rows,
+    ends,
+    qs,
+    qss,
+    ws,
+    pages,
+    lanes,
+    page_lo,
+    tile_lo,
+    tile_hi,
+    columns,
+    mfma_layout: gl.constexpr,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    TILES_PER_PAGE: gl.constexpr,
+):
+    """Every row of the block reads the same pages: one key tile per step.
+
+    Software pipeline: the next tile's keys load while this tile is scored;
+    the tail re-reads the last tile instead of branching.
+    """
+    last = tile_hi - 1
+    page = _rows_lane_page(pages, lanes, tile_lo, page_lo, TILES_PER_PAGE)
+    key, key_scales = _rows_load_page_tile(
+        index_k_cache,
+        _rows_safe_page(page, num_pages),
+        (tile_lo % TILES_PER_PAGE) * BLOCK_KV,
+        page_stride_bytes,
+        True,
+        dot_b_layout,
+        b_scale_layout,
+        BLOCK_KV,
+    )
+    for tile in range(tile_lo, tile_hi):
+        following = gl.minimum(tile + 1, last)
+        next_page = _rows_lane_page(pages, lanes, following, page_lo, TILES_PER_PAGE)
+        next_key, next_key_scales = _rows_load_page_tile(
+            index_k_cache,
+            _rows_safe_page(next_page, num_pages),
+            (following % TILES_PER_PAGE) * BLOCK_KV,
+            page_stride_bytes,
+            True,
+            dot_b_layout,
+            b_scale_layout,
+            BLOCK_KV,
+        )
+        positions = tile * BLOCK_KV + columns
+        for r in gl.static_range(0, BLOCK_M):
+            scores = _rows_score(
+                qs[r], qss[r], ws[r], key, key_scales, mfma_layout, BLOCK_KV
+            )
+            _rows_store(
+                logits,
+                rows[r],
+                logits_stride,
+                scores,
+                positions,
+                ends[r],
+                page,
+                num_pages,
+            )
+        page = next_page
+        key = next_key
+        key_scales = next_key_scales
+
+
+@gluon.jit
+def _rows_walk_each(
+    index_k_cache,
+    logits,
+    logits_stride,
+    page_stride_bytes,
+    num_pages,
+    rows,
+    ends,
+    qs,
+    qss,
+    ws,
+    row_pages,
+    lanes,
+    page_lo,
+    tile_lo,
+    tile_hi,
+    columns,
+    mfma_layout: gl.constexpr,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    TILES_PER_PAGE: gl.constexpr,
+):
+    """Fallback for blocks spanning three or more page tables: per-row keys."""
+    for tile in range(tile_lo, tile_hi):
+        positions = tile * BLOCK_KV + columns
+        page_row = (tile % TILES_PER_PAGE) * BLOCK_KV
+        for r in gl.static_range(0, BLOCK_M):
+            page = _rows_lane_page(row_pages[r], lanes, tile, page_lo, TILES_PER_PAGE)
+            key, key_scales = _rows_load_page_tile(
+                index_k_cache,
+                _rows_safe_page(page, num_pages),
+                page_row,
+                page_stride_bytes,
+                True,
+                dot_b_layout,
+                b_scale_layout,
+                BLOCK_KV,
+            )
+            scores = _rows_score(
+                qs[r], qss[r], ws[r], key, key_scales, mfma_layout, BLOCK_KV
+            )
+            _rows_store(
+                logits,
+                rows[r],
+                logits_stride,
+                scores,
+                positions,
+                ends[r],
+                page,
+                num_pages,
+            )
+
+
+def _rows_launch_metadata(grid, kernel, args):
+    queries, width = args["logits"].shape
+    block_m = args["BLOCK_M"]
+    return {
+        "name": kernel.name,
+        "flops4": 2 * queries * _MFMA_HEADS * width * 128,
+        "bytes": triton.cdiv(queries, block_m) * width * 68
+        + args["q"].numel() * args["q"].element_size() * grid[1]
+        + args["logits"].numel() * args["logits"].element_size(),
+    }
+
+
+@gluon.jit(
+    launch_metadata=_rows_launch_metadata,
+    # page_stride_bytes stays specializable (see gluon_dsv41_index_topk_gfx950).
+    do_not_specialize=(
+        "queries",
+        "table_stride",
+        "table_width",
+        "logits_stride",
+        "num_pages",
+        "max_candidates",
+        "tiles_per_split",
+    ),
+)
+def gluon_dsv41_index_topk_rows_gfx950(
+    q,
+    q_scales,
+    weights,
+    index_k_cache,
+    visible,
+    page_table,
+    logits,
+    queries,
+    table_stride,
+    table_width,
+    logits_stride,
+    page_stride_bytes,
+    num_pages,
+    max_candidates,
+    tiles_per_split,
+    BLOCK_M: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+):
+    gl.static_assert(_ROWS_PAGE_SIZE % BLOCK_KV == 0, "a key tile must not span pages")
+    layouts: gl.constexpr = _rows_mfma_layouts(BLOCK_KV)
+    mfma_layout: gl.constexpr = layouts[0]
+    dot_a_layout: gl.constexpr = layouts[1]
+    dot_b_layout: gl.constexpr = layouts[2]
+    a_scale_layout: gl.constexpr = layouts[3]
+    b_scale_layout: gl.constexpr = layouts[4]
+    TILES_PER_PAGE: gl.constexpr = _ROWS_PAGE_SIZE // BLOCK_KV
+
+    row0 = gl.program_id(0) * BLOCK_M
+    split = gl.program_id(1)
+    capacity = gl.minimum(table_width * _ROWS_PAGE_SIZE, max_candidates)
+
+    # Rows past the launch repeat the last row's query and store nothing.
+    rows = ()
+    ends = ()
+    block_end = 0
+    for r in gl.static_range(0, BLOCK_M):
+        row = gl.minimum(row0 + r, queries - 1)
+        end = gl.minimum(gl.maximum(gl.load(visible + row).to(gl.int32), 0), capacity)
+        end = gl.where(row0 + r < queries, end, 0)
+        rows = rows + (row,)
+        ends = ends + (end,)
+        block_end = gl.maximum(block_end, end)
+
+    tile_lo = split * tiles_per_split
+    tile_hi = gl.minimum(
+        tile_lo + tiles_per_split, (block_end + BLOCK_KV - 1) // BLOCK_KV
+    )
+    if tile_lo >= tile_hi:
+        return
+
+    qs = ()
+    qss = ()
+    ws = ()
+    for r in gl.static_range(0, BLOCK_M):
+        value, scale, weight = _rows_load_query(
+            q,
+            q_scales,
+            weights,
+            rows[r],
+            mfma_layout,
+            dot_a_layout,
+            a_scale_layout,
+        )
+        qs = qs + (value,)
+        qss = qss + (scale,)
+        ws = ws + (weight,)
+
+    columns = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
+    # Page ids of the split, one logical page per lane, read once up front:
+    # the walk extracts them with a cross-lane reduce instead of a dependent
+    # global load per tile.
+    lane_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    lanes = gl.arange(0, 64, layout=lane_layout)
+    page_lo = tile_lo // TILES_PER_PAGE
+    page_live = page_lo + lanes <= (tile_hi - 1) // TILES_PER_PAGE
+    logical_pages = gl.minimum(page_lo + lanes, table_width - 1)
+    row_pages = ()
+    for r in gl.static_range(0, BLOCK_M):
+        row_pages = row_pages + (
+            gl.load(
+                page_table + rows[r].to(gl.int64) * table_stride + logical_pages,
+                mask=page_live,
+                other=-1,
+            ),
+        )
+    # Rows of one request share its page table: when the whole block does,
+    # each key tile is loaded once for all its rows.
+    shared = True
+    for r in gl.static_range(1, BLOCK_M):
+        shared = shared & (
+            gl.min((row_pages[r] == row_pages[0]).to(gl.int32), axis=0) > 0
+        )
+    if shared:
+        _rows_walk_shared(
+            index_k_cache,
+            logits,
+            logits_stride,
+            page_stride_bytes,
+            num_pages,
+            rows,
+            ends,
+            qs,
+            qss,
+            ws,
+            row_pages[0],
+            lanes,
+            page_lo,
+            tile_lo,
+            tile_hi,
+            columns,
+            mfma_layout,
+            dot_b_layout,
+            b_scale_layout,
+            BLOCK_M,
+            BLOCK_KV,
+            TILES_PER_PAGE,
+        )
+    else:
+        _rows_walk_each(
+            index_k_cache,
+            logits,
+            logits_stride,
+            page_stride_bytes,
+            num_pages,
+            rows,
+            ends,
+            qs,
+            qss,
+            ws,
+            row_pages,
+            lanes,
+            page_lo,
+            tile_lo,
+            tile_hi,
+            columns,
+            mfma_layout,
+            dot_b_layout,
+            b_scale_layout,
+            BLOCK_M,
+            BLOCK_KV,
+            TILES_PER_PAGE,
+        )
+
+
+def _rows_splits(groups: int, width: int, max_tiles: int, device) -> tuple[int, int]:
+    """(splits, tiles per split) for a row-block launch over ``width`` keys."""
+    tiles = triton.cdiv(width, _ROWS_BLOCK_KV)
+    target = 4 * _num_cus(device) * _ROWS_WAVES_PER_EU
+    splits = max(triton.cdiv(target, groups), triton.cdiv(tiles, max_tiles))
+    per = max(triton.cdiv(tiles, splits), _ROWS_MIN_TILES)
+    per = min(per, max_tiles)
+    return triton.cdiv(tiles, per), per
+
+
+_CU_COUNTS: dict[int, int] = {}
+
+
+def _num_cus(device: torch.device) -> int:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _CU_COUNTS:
+        _CU_COUNTS[index] = torch.cuda.get_device_properties(
+            index
+        ).multi_processor_count
+    return _CU_COUNTS[index]
+
+
+def _launch_rows(values, scales, w, cache_2d, table, visible, logits, max_tiles):
+    """Score Full-mode logits with the row-block kernel, ``max_tiles`` per CTA."""
+    queries, width = logits.shape
+    groups = triton.cdiv(queries, _ROWS_BLOCK_M)
+    splits, per = _rows_splits(groups, width, max_tiles, logits.device)
+    gluon_dsv41_index_topk_rows_gfx950[(groups, splits)](
+        values.contiguous(),
+        scales.contiguous(),
+        w.float().contiguous(),
+        cache_2d,
+        visible,
+        table,
+        logits,
+        queries,
+        table.stride(0),
+        int(table.shape[1]),
+        logits.stride(0),
+        int(cache_2d.stride(0)),
+        int(cache_2d.shape[0]),
+        width,
+        per,
+        BLOCK_M=_ROWS_BLOCK_M,
+        BLOCK_KV=_ROWS_BLOCK_KV,
+        num_warps=1,
+        # Six rows of queries and weights stay in registers; two waves per
+        # SIMD is the most that fits them without spilling.
+        waves_per_eu=_ROWS_WAVES_PER_EU,
+    )
+
+
 def dsv41_index_logits_gfx950(
     values,
     scales,
@@ -424,12 +994,48 @@ def dsv41_index_logits_gfx950(
         score_chunk_size: Positive multiple-of-eight upper bound on rows per
             CTA; the launch picks a chunk up to it from the logits shape.
 
+    Full mode (no candidates) with a chunk of at least 64 rows uses the
+    row-block kernel: each CTA scores six consecutive query rows and, when
+    their page-table rows match over its split (a request's speculative rows,
+    or a prefill chunk), loads every key page once for all six.
+
     Returns:
         None. ``logits`` is mutated in place.
     """
     score_chunk_size = int(score_chunk_size)
     if score_chunk_size < 8 or score_chunk_size % 8:
         raise ValueError("score_chunk_size must be a positive multiple of 8")
+    if candidates is None and score_chunk_size >= _ROWS_BLOCK_KV:
+        queries, width = logits.shape
+        if queries and width and cache_2d.shape[0]:
+            _launch_rows(
+                values,
+                scales,
+                w,
+                cache_2d,
+                table,
+                visible,
+                logits,
+                min(_ROWS_MAX_TILES, score_chunk_size // _ROWS_BLOCK_KV),
+            )
+        return
+    _launch_per_row(
+        values,
+        scales,
+        w,
+        cache_2d,
+        table,
+        visible,
+        candidates,
+        logits,
+        score_chunk_size,
+    )
+
+
+def _launch_per_row(
+    values, scales, w, cache_2d, table, visible, candidates, logits, score_chunk_size
+):
+    """One CTA per (query row, score chunk); handles candidates and any chunk."""
     queries, width = logits.shape
     score_chunk_size = _score_chunk(queries, width, score_chunk_size)
     chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N

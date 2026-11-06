@@ -714,6 +714,16 @@ builder, readable top to bottom. A round schedules each request at most once
 (`PlanBuild::Scheduled`), whatever states it moves through while the phases
 run.
 
+One opt-in exception: `TOKENSPEED_CACHE_AWARE_ADMISSION=1` reorders the
+local prefill phase's Submitted pass longest-Device-cached-prefix first
+(SGLang's "lpm"), so under KV pressure a session whose history is still
+cached is admitted before LRU evicts it. The ranking probe is read-only (no
+pin, no LRU touch) and the order depends only on submissions and cache
+state, never on wall time, so mirrored ranks still agree; a prompt passed
+over by `TOKENSPEED_CACHE_AWARE_MAX_OVERTAKES` later ones ages back ahead in
+FIFO order. Every other rule of the pass (head of line, back-pressure) is
+unchanged.
+
 A pass's mutable state is split in two on a layer boundary. `PlanBuild` — the
 output plan, the batch under construction, budgets, and the composition flags —
 is held by the role grammars alone, and every operation enters the batch

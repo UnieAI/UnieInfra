@@ -181,6 +181,28 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 
 }  // namespace
 
+std::int32_t Scheduler::maxCacheableTokens(const Request& request) const {
+    // The final prompt token is always recomputed to produce logits. Some
+    // consumers additionally require a larger prompt tail (for example, to
+    // rebuild request-persistent state that is not stored in the KV cache).
+    // Limit the probe itself so excluded hit pages are never claimed: admission
+    // will allocate private writable pages for the replayed suffix. A request
+    // may tighten the bound further (RequestSpec::max_cached_prefix_tokens) so
+    // the positions it needs logits for are recomputed rather than matched.
+    // The bound is in tokens: a hit may end at it exactly.
+    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
+    return std::max(std::min(request.PrefillSize() - replay_tokens, request.MaxCachedPrefixTokens()), 0);
+}
+
+std::int32_t Scheduler::candidatePrefixPages(const Request& request) const {
+    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
+    // The last token is recomputed, so a page the prompt fills exactly can
+    // never be hit -- except on the D role, whose prompt-end state check
+    // needs the prompt's last page hashed when the prompt ends on it.
+    return config_.role == Role::kD ? request.PrefillSize() / prefix_granularity
+                                    : std::max((request.PrefillSize() - 1) / prefix_granularity, 0);
+}
+
 Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
@@ -192,26 +214,18 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return coordinator_.ProbePromptPrefix(prompt);
     };
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
-    // The final prompt token is always recomputed to produce logits. Some
-    // consumers additionally require a larger prompt tail (for example, to
-    // rebuild request-persistent state that is not stored in the KV cache).
-    // Limit the probe itself so excluded hit pages are never claimed: admission
-    // will allocate private writable pages for the replayed suffix. A request
-    // may tighten the bound further (RequestSpec::max_cached_prefix_tokens) so
-    // the positions it needs logits for are recomputed rather than matched.
-    // The bound is in tokens: a hit may end at it exactly.
-    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
-    const std::int32_t max_cacheable_tokens =
-        std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
-    // The last token is recomputed, so a page the prompt fills exactly can
-    // never be hit -- except on the D role, whose prompt-end state check
-    // needs the prompt's last page hashed when the prompt ends on it.
-    const std::int32_t candidate_prefix_pages = config_.role == Role::kD
-                                                    ? request->PrefillSize() / prefix_granularity
-                                                    : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
-    std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
-    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");
+    const std::int32_t max_cacheable_tokens = maxCacheableTokens(*request);
+    const std::int32_t candidate_prefix_pages = candidatePrefixPages(*request);
+    std::vector<std::string> hashes;
+    // Cache-aware admission already hashed this prompt for its ranking.
+    const auto cached = cache_aware_entries_.find(request->Id());
+    if (cached != cache_aware_entries_.end() && cached->second.prefill_size == request->PrefillSize()) {
+        hashes = cached->second.prefix_hashes;
+    } else {
+        std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
+        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+        hashes = ComputePrefixHashes(prefix_pages, "");
+    }
 
     AdmissionMatch match;
     match.candidate_prefix_hashes = hashes;
@@ -1256,6 +1270,89 @@ std::int32_t Scheduler::prefillBudgetFor(const Request& request, const PlanBuild
     return std::min(build.token_budget, std::max(mixed_long_chunk_, build.pending_prefill_reserve));
 }
 
+Scheduler::CacheAwareEntry& Scheduler::cacheAwareEntry(Request& request) {
+    auto [it, inserted] = cache_aware_entries_.try_emplace(request.Id());
+    CacheAwareEntry& entry = it->second;
+    if (inserted || entry.prefill_size != request.PrefillSize()) {
+        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(false);
+        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidatePrefixPages(request))));
+        entry.prefix_hashes = ComputePrefixHashes(prefix_pages, "");
+        entry.prefill_size = request.PrefillSize();
+        entry.max_cacheable_tokens = maxCacheableTokens(request);
+        entry.device_hit_tokens = 0;
+        entry.probed_round = -1;
+    }
+    return entry;
+}
+
+std::vector<Request*> Scheduler::cacheAwareSubmittedOrder(std::span<Request* const> candidates,
+                                                          const PlanBuild& build) {
+    // Entries live while their request waits (Submitted, or Prefetching an L3
+    // prefix it comes back from); anything else has been admitted or is gone.
+    std::erase_if(cache_aware_entries_, [this](const auto& item) {
+        const auto it = requests_by_id_.find(item.first);
+        return it == requests_by_id_.end() || !it->second->template IsAnyOf<fsm::Submitted, fsm::Prefetching>();
+    });
+    struct Ranked {
+        Request* request;
+        bool aged;
+        std::int32_t hit;
+        std::size_t fifo;
+    };
+    std::vector<Ranked> ranked;
+    std::int32_t probed = 0;
+    for (Request* request : candidates) {
+        if (!request->Is<fsm::Submitted>() || build.Scheduled(*request)) {
+            continue;
+        }
+        CacheAwareEntry& entry = cacheAwareEntry(*request);
+        // The ranking probe is the Device tier's read-only walk: it pins
+        // nothing and touches no LRU recency, so ranking the whole queue every
+        // few rounds leaves eviction order exactly as FIFO would.
+        if (!config_.disable_prefix_cache && probed < cache_aware_probe_limit_ &&
+            (entry.probed_round < 0 || plan_calls_ - entry.probed_round >= cache_aware_refresh_rounds_)) {
+            entry.device_hit_tokens =
+                coordinator_.ProbeDeviceFullPageTokens(entry.prefix_hashes, entry.max_cacheable_tokens);
+            entry.probed_round = plan_calls_;
+        }
+        ++probed;
+        ranked.push_back(Ranked{.request = request,
+                                .aged = entry.overtakes >= cache_aware_max_overtakes_,
+                                .hit = entry.device_hit_tokens,
+                                .fifo = ranked.size()});
+    }
+    std::ranges::sort(ranked, [](const Ranked& a, const Ranked& b) {
+        if (a.aged != b.aged) {
+            return a.aged;
+        }
+        if (!a.aged && a.hit != b.hit) {
+            return a.hit > b.hit;
+        }
+        return a.fifo < b.fifo;
+    });
+    std::vector<Request*> order;
+    order.reserve(ranked.size());
+    for (const Ranked& r : ranked) {
+        order.push_back(r.request);
+    }
+    return order;
+}
+
+void Scheduler::noteCacheAwareOvertakes(const Request& admitted, std::span<Request* const> candidates,
+                                        const PlanBuild& build) {
+    for (Request* request : candidates) {
+        if (request == &admitted) {
+            return;  // candidates are FIFO: only the earlier ones were overtaken
+        }
+        if (!request->Is<fsm::Submitted>() || build.Scheduled(*request)) {
+            continue;
+        }
+        if (const auto it = cache_aware_entries_.find(request->Id()); it != cache_aware_entries_.end()) {
+            ++it->second.overtakes;
+        }
+    }
+}
+
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
@@ -1266,7 +1363,14 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
         if (!resident && new_prompts_sealed) {
             return;
         }
-        for (Request* request : candidates) {
+        // Cache-aware admission reorders the Submitted pass alone; every
+        // rule below (head of line, back-pressure, batch cap) is unchanged.
+        const bool cache_aware = !resident && cache_aware_admission_;
+        std::vector<Request*> ordered;
+        if (cache_aware) {
+            ordered = cacheAwareSubmittedOrder(candidates, build);
+        }
+        for (Request* request : cache_aware ? std::span<Request* const>(ordered) : candidates) {
             if (build.Full(config_.max_batch_size)) {
                 return;
             }
@@ -1278,6 +1382,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             if (auto admitted =
                     schedulePrefillCandidate(build.plan, feedback, request, prefillBudgetFor(*request, build),
                                              decode_reserve, build.load_backs, build.prefetches)) {
+                if (cache_aware) {
+                    noteCacheAwareOvertakes(*request, candidates, build);
+                }
                 if (!admitted->operation) {
                     // Gone to prefetch its L3 prefix (Prefetching): it holds
                     // no head of line, so the prompts behind it go on.
@@ -1293,7 +1400,8 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 feedback.NoteCapacityBlocked(request);
                 // Capacity back-pressure: once a prompt cannot be admitted for
                 // capacity, stop. The resident pass has always returned here;
-                // the Submitted pass now does too. Candidates are FIFO, so a
+                // the Submitted pass now does too. Candidates are FIFO (or,
+                // with cache-aware admission, in its ranked order), so a
                 // later waiting prompt admitted over this blocked one would be
                 // unfair, and with the pool full it cannot fit either -- yet
                 // probing it still pays the full prefix-match cost
@@ -1464,12 +1572,11 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
     // prompts) would keep every round on prefill and starve resident decodes
     // forever. After decode_every_prefill_rounds_ prefill rounds in a row,
     // a round that has decodes waiting runs them instead.
-    const bool force_decode =
-        !config_.enable_mixed_prefill_decode && decode_every_prefill_rounds_ > 0 &&
-        prefill_rounds_since_decode_ >= decode_every_prefill_rounds_ &&
-        std::ranges::any_of(candidates, [](const Request* request) {
-            return request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>();
-        });
+    const bool force_decode = !config_.enable_mixed_prefill_decode && decode_every_prefill_rounds_ > 0 &&
+                              prefill_rounds_since_decode_ >= decode_every_prefill_rounds_ &&
+                              std::ranges::any_of(candidates, [](const Request* request) {
+                                  return request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>();
+                              });
     if (!force_decode) {
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
     }

@@ -173,6 +173,28 @@ Scheduler::Scheduler(SchedulerConfig config)
         mixed_prefill_floor_ = std::max(0, env_int("TOKENSPEED_MIXED_PREFILL_FLOOR", mixed_ref_chunk_ / 8));
         // TOKENSPEED_DECODE_EVERY_PREFILL_ROUNDS (default 0 = off, non-mixed mode only).
         decode_every_prefill_rounds_ = std::max(0, env_int("TOKENSPEED_DECODE_EVERY_PREFILL_ROUNDS", 0));
+        // TOKENSPEED_CACHE_AWARE_ADMISSION (default 0 = FIFO): SGLang-"lpm"-style
+        // admission. The Submitted pass of scheduleLocalPrefillWork tries the
+        // waiting prompts with the longest Device-resident cached prefix
+        // first (ties FIFO), so under KV pressure the sessions whose history
+        // is still cached run before LRU evicts it, instead of the FIFO head
+        // whose prefix was evicted longest ago. Head-of-line, capacity
+        // back-pressure, max_batch_size and the short-prompts path are
+        // unchanged; only the order of that one pass changes.
+        //   TOKENSPEED_CACHE_AWARE_MAX_OVERTAKES (default 64): a prompt that
+        //     this many later-submitted prompts were admitted ahead of goes
+        //     before every non-aged one (aged ones FIFO), so none starves. It
+        //     counts admissions, not wall time: mirrored schedulers must make
+        //     identical plans, and a clock would differ between ranks.
+        //   TOKENSPEED_CACHE_AWARE_REFRESH_ROUNDS (default 8): a prompt's
+        //     ranking probe (read-only: no pin, no LRU touch) is reused for
+        //     this many rounds; its prefix hashes are computed once.
+        //   TOKENSPEED_CACHE_AWARE_PROBE_LIMIT (default 256): only the first
+        //     this many waiting prompts (FIFO) are probed in a round.
+        cache_aware_admission_ = env_int("TOKENSPEED_CACHE_AWARE_ADMISSION", 0) != 0;
+        cache_aware_max_overtakes_ = std::max(1, env_int("TOKENSPEED_CACHE_AWARE_MAX_OVERTAKES", 64));
+        cache_aware_refresh_rounds_ = std::max(1, env_int("TOKENSPEED_CACHE_AWARE_REFRESH_ROUNDS", 8));
+        cache_aware_probe_limit_ = std::max(0, env_int("TOKENSPEED_CACHE_AWARE_PROBE_LIMIT", 256));
     }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {

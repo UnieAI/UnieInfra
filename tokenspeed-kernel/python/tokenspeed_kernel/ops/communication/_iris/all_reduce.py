@@ -23,6 +23,8 @@
 import dataclasses
 import math
 
+import os
+
 import torch
 from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes, iris
@@ -38,7 +40,11 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 hip_utils = triton.language.extra.hip.utils
 
-_PULL_MAX_PROGRAMS = 84
+# Pull kernels' program cap. On PCIe-only gfx950 hosts 32 programs move the
+# same bytes as 84 (prefill 84 MB: 2.55 vs 2.61 ms) and are much faster on
+# decode-sized messages inside CUDA graphs (1 MB: 70 vs 150 us; 4 MB: 159 vs
+# 200 us), since fewer workgroups spin on the cross-GPU flags.
+_PULL_MAX_PROGRAMS = int(os.environ.get("TOKENSPEED_IRIS_PULL_MAX_PROGRAMS", "84"))
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
 

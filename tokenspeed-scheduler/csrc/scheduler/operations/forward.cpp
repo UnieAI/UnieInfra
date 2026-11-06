@@ -1460,11 +1460,24 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         capPrefillBesideDecodes(build);
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    // Outside mixed mode a queue that never drains (many clients with long
+    // prompts) would keep every round on prefill and starve resident decodes
+    // forever. After decode_every_prefill_rounds_ prefill rounds in a row,
+    // a round that has decodes waiting runs them instead.
+    const bool force_decode =
+        !config_.enable_mixed_prefill_decode && decode_every_prefill_rounds_ > 0 &&
+        prefill_rounds_since_decode_ >= decode_every_prefill_rounds_ &&
+        std::ranges::any_of(candidates, [](const Request* request) {
+            return request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>();
+        });
+    if (!force_decode) {
+        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    }
 
     if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
         scheduleDecodeBatch(feedback, build, candidates);
     }
+    prefill_rounds_since_decode_ = build.pushed_prefill ? prefill_rounds_since_decode_ + 1 : 0;
 
     maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
 }

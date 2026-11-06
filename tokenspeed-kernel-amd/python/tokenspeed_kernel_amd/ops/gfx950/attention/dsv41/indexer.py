@@ -22,14 +22,15 @@
 
 Scores page-planar MXFP4 index-K with the V4 ``mfma_scaled`` e2m1 tile.
 Full mode uses a row-block scorer that shares key loads across query rows with
-matching page tables (speculative decode, prefill); candidate mode scores one
-row per CTA. The tokenspeed-kernel adapter owns query packing, bounded query
+matching page tables (speculative decode, prefill); candidate (Reindex) mode
+gathers each row's candidate blocks into the same 32x32x64 MFMA tiles. The tokenspeed-kernel adapter owns query packing, bounded query
 tiling, and selection.
 """
 
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.indexer import (
     _HEADS_PER_MFMA,
@@ -917,33 +918,23 @@ def gluon_dsv41_index_topk_rows_gfx950(
         )
 
 
-def _rows_splits(groups: int, width: int, max_tiles: int, device) -> tuple[int, int]:
-    """(splits, tiles per split) for a row-block launch over ``width`` keys."""
+def _rows_splits(
+    groups: int, width: int, max_tiles: int, waves_per_eu: int
+) -> tuple[int, int]:
+    """(splits, tiles per split) for a launch of ``groups`` CTAs per split."""
     tiles = triton.cdiv(width, _ROWS_BLOCK_KV)
-    target = 4 * _num_cus(device) * _ROWS_WAVES_PER_EU
+    target = 4 * num_cus() * waves_per_eu
     splits = max(triton.cdiv(target, groups), triton.cdiv(tiles, max_tiles))
     per = max(triton.cdiv(tiles, splits), _ROWS_MIN_TILES)
     per = min(per, max_tiles)
     return triton.cdiv(tiles, per), per
 
 
-_CU_COUNTS: dict[int, int] = {}
-
-
-def _num_cus(device: torch.device) -> int:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    if index not in _CU_COUNTS:
-        _CU_COUNTS[index] = torch.cuda.get_device_properties(
-            index
-        ).multi_processor_count
-    return _CU_COUNTS[index]
-
-
 def _launch_rows(values, scales, w, cache_2d, table, visible, logits, max_tiles):
     """Score Full-mode logits with the row-block kernel, ``max_tiles`` per CTA."""
     queries, width = logits.shape
     groups = triton.cdiv(queries, _ROWS_BLOCK_M)
-    splits, per = _rows_splits(groups, width, max_tiles, logits.device)
+    splits, per = _rows_splits(groups, width, max_tiles, _ROWS_WAVES_PER_EU)
     gluon_dsv41_index_topk_rows_gfx950[(groups, splits)](
         values.contiguous(),
         scales.contiguous(),
@@ -966,6 +957,309 @@ def _launch_rows(values, scales, w, cache_2d, table, visible, logits, max_tiles)
         # Six rows of queries and weights stay in registers; two waves per
         # SIMD is the most that fits them without spilling.
         waves_per_eu=_ROWS_WAVES_PER_EU,
+    )
+
+
+# Candidate (Reindex) scorer: one row per CTA; rows of a request pick
+# different candidate blocks, so there is no key tile to share.
+_CAND_BLOCK_M = 1
+_CAND_WAVES_PER_EU = 4
+
+
+@gluon.jit
+def _cand_blocks(candidates, row, cand_stride, columns, end):
+    """Candidate block id of each logits column (-1 past the row's width)."""
+    return gl.load(
+        candidates + row.to(gl.int64) * cand_stride + columns // 8,
+        mask=columns < end,
+        other=-1,
+    ).to(gl.int32)
+
+
+@gluon.jit
+def _cand_resolve(
+    block,
+    page_table,
+    row,
+    table_stride,
+    table_width,
+    num_pages,
+    columns,
+    visible,
+    page_stride_bytes,
+):
+    """Candidate blocks -> (key byte offset, scale byte offset, live)."""
+    logical = gl.where(block >= 0, block * 8 + columns % 8, -1)
+    live = (logical >= 0) & (logical < visible)
+    logical = gl.where(live, logical, 0)
+    page = gl.load(
+        page_table
+        + row.to(gl.int64) * table_stride
+        + gl.minimum(logical // _ROWS_PAGE_SIZE, table_width - 1),
+        mask=live,
+        other=-1,
+    )
+    live = live & (page >= 0) & (page < num_pages)
+    base = gl.where(live, page, 0).to(gl.int64) * page_stride_bytes
+    page_row = (logical % _ROWS_PAGE_SIZE).to(gl.int64)
+    offset = base + page_row * _PACKED_DIM
+    scale_offset = base + _ROWS_PAGE_SIZE * _PACKED_DIM + page_row * _SCALE_DIM
+    return offset, scale_offset, live
+
+
+@gluon.jit
+def _cand_load_keys(
+    index_k_cache,
+    offset,
+    scale_offset,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+):
+    dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[:, None]
+    key_offset = gl.convert_layout(offset, gl.SliceLayout(0, dot_b_layout))
+    key = gl.load(index_k_cache + key_offset[None, :] + dims)
+    words = gl.load(
+        (
+            index_k_cache
+            + gl.convert_layout(scale_offset, gl.SliceLayout(1, b_scale_layout))
+        ).to(gl.pointer_type(gl.int32))
+    )
+    return key, _rows_scale_bytes(words, b_scale_layout)
+
+
+def _cand_launch_metadata(grid, kernel, args):
+    queries, width = args["logits"].shape
+    return {
+        "name": kernel.name,
+        "flops4": 2 * queries * _MFMA_HEADS * width * 128,
+        "bytes": queries * width * (68 + 4 + 4)
+        + args["q"].numel() * args["q"].element_size() * grid[1]
+        + args["logits"].numel() * args["logits"].element_size(),
+    }
+
+
+@gluon.jit(
+    launch_metadata=_cand_launch_metadata,
+    # page_stride_bytes stays specializable (see gluon_dsv41_index_topk_gfx950).
+    do_not_specialize=(
+        "queries",
+        "table_stride",
+        "table_width",
+        "cand_stride",
+        "candidate_blocks",
+        "logits_stride",
+        "num_pages",
+        "max_candidates",
+        "tiles_per_split",
+    ),
+)
+def gluon_dsv41_index_topk_candidates_gfx950(
+    q,
+    q_scales,
+    weights,
+    index_k_cache,
+    visible,
+    page_table,
+    candidates,
+    logits,
+    queries,
+    table_stride,
+    table_width,
+    cand_stride,
+    candidate_blocks,
+    logits_stride,
+    page_stride_bytes,
+    num_pages,
+    max_candidates,
+    tiles_per_split,
+    BLOCK_M: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+):
+    """Reindex scoring: column c of row q is key candidates[q, c // 8] * 8 + c % 8.
+
+    Each row gathers its own candidate keys (rows of one request pick
+    different blocks); BLOCK_M rows per CTA keep several independent gather
+    chains in flight, and each row's MFMA tile covers eight 8-key blocks.
+    """
+    layouts: gl.constexpr = _rows_mfma_layouts(BLOCK_KV)
+    mfma_layout: gl.constexpr = layouts[0]
+    dot_a_layout: gl.constexpr = layouts[1]
+    dot_b_layout: gl.constexpr = layouts[2]
+    a_scale_layout: gl.constexpr = layouts[3]
+    b_scale_layout: gl.constexpr = layouts[4]
+
+    row0 = gl.program_id(0) * BLOCK_M
+    split = gl.program_id(1)
+    width = gl.minimum(candidate_blocks * 8, max_candidates)
+    rows = ()
+    ends = ()
+    visibles = ()
+    for r in gl.static_range(0, BLOCK_M):
+        row = gl.minimum(row0 + r, queries - 1)
+        vis = gl.minimum(
+            gl.maximum(gl.load(visible + row).to(gl.int32), 0),
+            table_width * _ROWS_PAGE_SIZE,
+        )
+        end = gl.where((row0 + r < queries) & (vis > 0), width, 0)
+        rows = rows + (row,)
+        ends = ends + (end,)
+        visibles = visibles + (vis,)
+    block_end = ends[0]
+    for r in gl.static_range(1, BLOCK_M):
+        block_end = gl.maximum(block_end, ends[r])
+
+    tile_lo = split * tiles_per_split
+    tile_hi = gl.minimum(
+        tile_lo + tiles_per_split, (block_end + BLOCK_KV - 1) // BLOCK_KV
+    )
+    if tile_lo >= tile_hi:
+        return
+
+    qs = ()
+    qss = ()
+    ws = ()
+    for r in gl.static_range(0, BLOCK_M):
+        value, scale, weight = _rows_load_query(
+            q, q_scales, weights, rows[r], mfma_layout, dot_a_layout, a_scale_layout
+        )
+        qs = qs + (value,)
+        qss = qss + (scale,)
+        ws = ws + (weight,)
+
+    columns = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
+    # Three-stage software pipeline per row: block ids two tiles ahead, their
+    # page ids one tile ahead, then the keys, so no dependent load waits in
+    # the tile that consumes it. The tail re-reads the last tile.
+    last = tile_hi - 1
+    first = tile_lo * BLOCK_KV + columns
+    second = gl.minimum(tile_lo + 1, last) * BLOCK_KV + columns
+    resolved = ()
+    loaded = ()
+    blocks = ()
+    for r in gl.static_range(0, BLOCK_M):
+        here = _cand_resolve(
+            _cand_blocks(candidates, rows[r], cand_stride, first, ends[r]),
+            page_table,
+            rows[r],
+            table_stride,
+            table_width,
+            num_pages,
+            first,
+            visibles[r],
+            page_stride_bytes,
+        )
+        loaded = loaded + (
+            _cand_load_keys(
+                index_k_cache, here[0], here[1], dot_b_layout, b_scale_layout
+            ),
+        )
+        resolved = resolved + (
+            _cand_resolve(
+                _cand_blocks(candidates, rows[r], cand_stride, second, ends[r]),
+                page_table,
+                rows[r],
+                table_stride,
+                table_width,
+                num_pages,
+                second,
+                visibles[r],
+                page_stride_bytes,
+            ),
+        )
+        blocks = blocks + (here[2],)
+    lives = blocks
+    blocks = ()
+    for r in gl.static_range(0, BLOCK_M):
+        third = gl.minimum(tile_lo + 2, last) * BLOCK_KV + columns
+        blocks = blocks + (
+            _cand_blocks(candidates, rows[r], cand_stride, third, ends[r]),
+        )
+    for tile in range(tile_lo, tile_hi):
+        positions = tile * BLOCK_KV + columns
+        next_positions = gl.minimum(tile + 1, last) * BLOCK_KV + columns
+        after_positions = gl.minimum(tile + 2, last) * BLOCK_KV + columns
+        later_positions = gl.minimum(tile + 3, last) * BLOCK_KV + columns
+        next_loaded = ()
+        next_resolved = ()
+        next_blocks = ()
+        for r in gl.static_range(0, BLOCK_M):
+            next_loaded = next_loaded + (
+                _cand_load_keys(
+                    index_k_cache,
+                    resolved[r][0],
+                    resolved[r][1],
+                    dot_b_layout,
+                    b_scale_layout,
+                ),
+            )
+            next_resolved = next_resolved + (
+                _cand_resolve(
+                    blocks[r],
+                    page_table,
+                    rows[r],
+                    table_stride,
+                    table_width,
+                    num_pages,
+                    after_positions,
+                    visibles[r],
+                    page_stride_bytes,
+                ),
+            )
+            next_blocks = next_blocks + (
+                _cand_blocks(
+                    candidates, rows[r], cand_stride, later_positions, ends[r]
+                ),
+            )
+        next_lives = ()
+        for r in gl.static_range(0, BLOCK_M):
+            scores = _rows_score(
+                qs[r], qss[r], ws[r], loaded[r][0], loaded[r][1], mfma_layout, BLOCK_KV
+            )
+            gl.amd.cdna4.buffer_store(
+                scores,
+                ptr=logits + rows[r].to(gl.int64) * logits_stride,
+                offsets=positions,
+                mask=lives[r] & (positions < ends[r]),
+            )
+            next_lives = next_lives + (resolved[r][2],)
+        loaded = next_loaded
+        lives = next_lives
+        resolved = next_resolved
+        blocks = next_blocks
+
+
+def _launch_candidates(
+    values, scales, w, cache_2d, table, visible, candidates, logits, max_tiles
+):
+    """Score Reindex logits with the candidate kernel, ``max_tiles`` per CTA."""
+    queries, width = logits.shape
+    groups = triton.cdiv(queries, _CAND_BLOCK_M)
+    splits, per = _rows_splits(groups, width, max_tiles, _CAND_WAVES_PER_EU)
+    gluon_dsv41_index_topk_candidates_gfx950[(groups, splits)](
+        values.contiguous(),
+        scales.contiguous(),
+        w.float().contiguous(),
+        cache_2d,
+        visible,
+        table,
+        candidates,
+        logits,
+        queries,
+        table.stride(0),
+        int(table.shape[1]),
+        candidates.stride(0),
+        int(candidates.shape[1]),
+        logits.stride(0),
+        int(cache_2d.stride(0)),
+        int(cache_2d.shape[0]),
+        width,
+        per,
+        BLOCK_M=_CAND_BLOCK_M,
+        BLOCK_KV=_ROWS_BLOCK_KV,
+        num_warps=1,
+        # One row's query and two key tiles leave room for four waves per
+        # SIMD, which hide the candidate -> page -> key gather chain.
+        waves_per_eu=_CAND_WAVES_PER_EU,
     )
 
 
@@ -994,10 +1288,13 @@ def dsv41_index_logits_gfx950(
         score_chunk_size: Positive multiple-of-eight upper bound on rows per
             CTA; the launch picks a chunk up to it from the logits shape.
 
-    Full mode (no candidates) with a chunk of at least 64 rows uses the
+    With a chunk of at least 64 rows, Full mode (no candidates) uses the
     row-block kernel: each CTA scores six consecutive query rows and, when
     their page-table rows match over its split (a request's speculative rows,
-    or a prefill chunk), loads every key page once for all six.
+    or a prefill chunk), loads every key page once for all six. Reindex mode
+    (candidates) uses the candidate kernel: one row per CTA, its 8-row
+    candidate blocks gathered in 64-column MFMA tiles through a pipelined
+    candidate -> page -> key chain. Smaller chunks use the per-row scorer.
 
     Returns:
         None. ``logits`` is mutated in place.
@@ -1005,18 +1302,24 @@ def dsv41_index_logits_gfx950(
     score_chunk_size = int(score_chunk_size)
     if score_chunk_size < 8 or score_chunk_size % 8:
         raise ValueError("score_chunk_size must be a positive multiple of 8")
-    if candidates is None and score_chunk_size >= _ROWS_BLOCK_KV:
+    if score_chunk_size >= _ROWS_BLOCK_KV:
         queries, width = logits.shape
-        if queries and width and cache_2d.shape[0]:
-            _launch_rows(
+        if not (queries and width and cache_2d.shape[0]):
+            return
+        max_tiles = min(_ROWS_MAX_TILES, score_chunk_size // _ROWS_BLOCK_KV)
+        if candidates is None:
+            _launch_rows(values, scales, w, cache_2d, table, visible, logits, max_tiles)
+        else:
+            _launch_candidates(
                 values,
                 scales,
                 w,
                 cache_2d,
                 table,
                 visible,
+                candidates,
                 logits,
-                min(_ROWS_MAX_TILES, score_chunk_size // _ROWS_BLOCK_KV),
+                max_tiles,
             )
         return
     _launch_per_row(

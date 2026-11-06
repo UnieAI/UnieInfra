@@ -774,6 +774,14 @@ Query and key E8M0 scales load as one 32-bit word per head or key. The
 adapter starts query chunks and tiles at multiples of 120 rows so a request's
 rows (next_n dividing 120) never straddle launches.
 
+Reindex mode (candidates) on gfx950 runs `gluon_dsv41_index_topk_candidates_gfx950`
+with the same MFMA tile and head fold: one row per CTA (four waves per SIMD),
+splits sized as above. Each row selects its own candidate blocks, so keys are
+not shared across rows. A 64-column tile covers eight 8-row blocks; its key
+rows are gathered through a three-stage pipeline (block ids two tiles ahead,
+page ids one ahead, then keys). Chunk bounds below 64 rows keep the per-row
+scorer.
+
 The gfx950 selector runs one workgroup per query in a single launch,
 replacing `torch.topk`, a sort and about ten elementwise kernels. A
 three-pass MSD radix select (11+11+10 key bits, LDS-atomic histograms) finds

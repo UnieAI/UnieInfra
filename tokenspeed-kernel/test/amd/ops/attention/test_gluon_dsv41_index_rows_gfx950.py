@@ -87,16 +87,32 @@ def _random_inputs(requests, next_n, keys, seed, page_pad=0):
     return values, scales, weights, cache, table, visible, pages * 64
 
 
-def _both(values, scales, weights, cache, table, visible, width):
+def _both(values, scales, weights, cache, table, visible, width, candidates=None):
     new = torch.full((values.shape[0], width), -torch.inf, device=DEVICE)
     old = torch.full_like(new, -torch.inf)
     module.dsv41_index_logits_gfx950(
-        values, scales, weights, cache, table, visible, None, new, SCORE_CHUNK
+        values, scales, weights, cache, table, visible, candidates, new, SCORE_CHUNK
     )
     module._launch_per_row(
-        values, scales, weights, cache, table, visible, None, old, SCORE_CHUNK
+        values, scales, weights, cache, table, visible, candidates, old, SCORE_CHUNK
     )
     return new, old
+
+
+def _random_candidates(rows, next_n, keys, blocks, shared, seed):
+    """Ascending candidate block ids per row, as the block selector emits."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    total = keys // 8
+    picks = rows // next_n if shared else rows
+    ids = torch.stack(
+        [
+            torch.randperm(total, device=DEVICE, generator=g)[:blocks]
+            for _ in range(picks)
+        ]
+    )
+    if shared:
+        ids = ids.repeat_interleave(next_n, 0)
+    return ids.sort(1).values.int().contiguous()
 
 
 def _assert_matches_per_row(new, old):
@@ -120,6 +136,48 @@ def _assert_matches_per_row(new, old):
 def test_rows_match_per_row_scorer(requests, next_n, keys):
     *inputs, width = _random_inputs(requests, next_n, keys, seed=requests + keys)
     _assert_matches_per_row(*_both(*inputs, width))
+
+
+@pytest.mark.parametrize(
+    ("requests", "next_n", "keys", "blocks", "shared"),
+    [
+        (16, 6, 131072, 2048, False),  # DSpark Reindex decode at 130K
+        (64, 6, 131072, 2048, False),
+        (16, 6, 131072, 2048, True),  # rows of a request with one list
+        (1, 512, 32768, 2048, False),  # prefill chunk
+        (8, 6, 4096, 300, False),  # partial last tile
+    ],
+)
+def test_candidates_match_per_row_scorer(requests, next_n, keys, blocks, shared):
+    *inputs, _ = _random_inputs(requests, next_n, keys, seed=blocks + requests)
+    candidates = _random_candidates(
+        requests * next_n, next_n, keys, blocks, shared, seed=keys
+    )
+    _assert_matches_per_row(*_both(*inputs, blocks * 8, candidates))
+
+
+def test_candidates_mask_like_per_row_scorer():
+    values, scales, weights, cache, table, visible, _ = _random_inputs(
+        5, 6, 4096, seed=3, page_pad=48
+    )
+    table = table.clone()
+    visible = visible.clone()
+    candidates = _random_candidates(30, 6, 4096, 96, False, seed=4)
+    # Padding, blocks past the visible history, a missing page, unsorted and
+    # repeated ids, an empty row, and a logits width narrower than the list.
+    candidates[0, 50:] = -1
+    candidates[1, 10] = 4096 // 8 + 7
+    candidates[2] = candidates[2].flip(0)
+    candidates[3, 5:9] = candidates[3, 4]
+    table[6:12, 2] = -1
+    visible[7] = 0
+    visible[8] = 100
+    new, old = _both(
+        values, scales, weights, cache, table, visible, 96 * 8 - 40, candidates
+    )
+    _assert_matches_per_row(new, old)
+    assert torch.isneginf(new[7]).all()
+    assert torch.isneginf(new[0, 50 * 8 :]).all()
 
 
 def test_rows_masks_like_per_row_scorer():
@@ -212,8 +270,27 @@ def test_rows_batch_shapes_do_not_recompile():
             SCORE_CHUNK,
         )
 
+    def run_candidates(rows, blocks):
+        candidates = _random_candidates(rows, 1, 16384, blocks, False, seed=rows)
+        logits = torch.full((rows, blocks * 8), -torch.inf, device=DEVICE)
+        module.dsv41_index_logits_gfx950(
+            values[:rows],
+            scales[:rows],
+            weights[:rows],
+            cache,
+            table[:rows],
+            visible[:rows],
+            candidates,
+            logits,
+            SCORE_CHUNK,
+        )
+
     run(96, 8192, 128)
-    with assert_no_triton_compile(module.gluon_dsv41_index_topk_rows_gfx950):
+    run_candidates(96, 256)
+    with assert_no_triton_compile(
+        module.gluon_dsv41_index_topk_rows_gfx950,
+        module.gluon_dsv41_index_topk_candidates_gfx950,
+    ):
         for rows, keys, table_width in [
             (1, 64, 1),
             (17, 4096, 65),
@@ -222,6 +299,8 @@ def test_rows_batch_shapes_do_not_recompile():
             (37, 12345, 200),
         ]:
             run(rows, keys, table_width)
+        for rows, blocks in [(1, 1), (17, 2048), (240, 100), (37, 33)]:
+            run_candidates(rows, blocks)
 
 
 def test_rows_launch_metadata():
@@ -242,4 +321,23 @@ def test_rows_launch_metadata():
     assert (
         module.gluon_dsv41_index_topk_rows_gfx950.launch_metadata
         is module._rows_launch_metadata
+    )
+
+
+def test_candidates_launch_metadata():
+    args = {
+        "q": torch.empty((12, 32, 64), dtype=torch.uint8),
+        "logits": torch.empty((12, 512), dtype=torch.float32),
+    }
+
+    class Kernel:
+        name = "index_candidates"
+
+    metadata = module._cand_launch_metadata((12, 2, 1), Kernel(), args)
+    assert metadata["flops4"] == 2 * 12 * 32 * 512 * 128
+    # Each column gathers its key row plus a block id and a page id.
+    assert metadata["bytes"] == 12 * 512 * 76 + 12 * 32 * 64 * 2 + 12 * 512 * 4
+    assert (
+        module.gluon_dsv41_index_topk_candidates_gfx950.launch_metadata
+        is module._cand_launch_metadata
     )

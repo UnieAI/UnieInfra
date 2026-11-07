@@ -1768,7 +1768,10 @@ def _rope_pad_query(
 @_register_rope("dsv41_rope_pad_query")
 def rope_pad_query(values, positions, cache):
     n, h, _ = values.shape
-    hp = 64 if h <= 64 else 128
+    # FlashMLA (NVIDIA) consumes 64/128-head queries; the gfx950 selected
+    # attention takes any multiple of its 16-head MFMA block, so padding to
+    # 64 would only add zero heads it must still multiply and write.
+    hp = -(-h // 16) * 16 if torch.version.hip else (64 if h <= 64 else 128)
     output = torch.empty((n, hp, 512), dtype=values.dtype, device=values.device)
     return _launch_query(values, positions, cache, output, hp)
 

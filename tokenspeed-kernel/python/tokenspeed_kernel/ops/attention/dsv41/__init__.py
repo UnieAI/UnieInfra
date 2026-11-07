@@ -872,7 +872,7 @@ def rope_pad_query(
     cos_sin_cache: torch.Tensor,
     solution: str | None,
 ) -> torch.Tensor:
-    """Rotate compact queries while fully writing the FlashMLA 64/128-head input.
+    """Rotate compact queries while fully writing the padded decode-attention input.
 
     Args:
         values: BF16/FP16 [tokens,real_heads,512], 1..128 heads, strided rows/heads.
@@ -881,7 +881,9 @@ def rope_pad_query(
         solution: Optional registered implementation restriction.
 
     Returns:
-        Fresh contiguous [tokens,64 or128,512] queries. Every padded head is zero;
+        Fresh contiguous [tokens,padded_heads,512] queries: 64 or 128 heads for
+        FlashMLA on NVIDIA, the next multiple of 16 on ROCm (the gfx950
+        selected-attention head block). Every padded head is zero;
         input storage is unchanged. This is forward/graph-owned scratch, never
         persistent KV or a request-indexed state buffer.
     """

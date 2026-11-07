@@ -577,12 +577,13 @@ def _compressor_tail_scatter_kernel(
     # Rows the destination holds; it follows the buffer's size, which can
     # track the batch, so it stays a runtime bound.
     CAPACITY,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(0)
     slot = tl.load(Slots + row * LS).to(tl.int64)
     if slot >= 0 and slot < CAPACITY:
         d = tl.arange(0, 512)
-        base = Tail + slot // 2 * TP + slot % 2 * TR + d * TD
+        base = Tail + slot // ROWS * TP + slot % ROWS * TR + d * TD
         tl.store(base, tl.load(Content + row * CS0 + d * CS1))
         tl.store(base + TK, tl.load(Scores + row * SS0 + d * SS1))
 
@@ -604,11 +605,11 @@ def compressor_tail_scatter(content, scores, tail, slots):
         or content.dtype != torch.float32
         or scores.dtype != torch.float32
         or tail.ndim != 4
-        or tail.shape[1:] != (2, 2, 512)
+        or tail.shape[2:] != (2, 512)
         or tail.dtype != torch.float32
     ):
         raise ValueError(
-            "require FP32 content/scores [T, 512] and tail [pages, 2, 2, 512]"
+            "require FP32 content/scores [T, 512] and tail [pages, rows, 2, 512]"
         )
     _same_device(content, (scores, tail, slots))
     _integers(slots, (content.shape[0],), "slots")
@@ -622,7 +623,8 @@ def compressor_tail_scatter(content, scores, tail, slots):
             *scores.stride(),
             *tail.stride(),
             slots.stride(0),
-            CAPACITY=tail.shape[0] * 2,
+            CAPACITY=tail.shape[0] * tail.shape[1],
+            ROWS=tail.shape[1],
             num_warps=4,
         )
 
@@ -1353,6 +1355,7 @@ def _compressor_pool(
     O0: tl.constexpr,
     O1: tl.constexpr,
     PAGES: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(0)
     channels = tl.arange(0, 512)
@@ -1360,10 +1363,10 @@ def _compressor_pool(
     previous = tl.load(PREVIOUS + row * P0)
     slot = tl.load(SLOTS + row * S0)
     in_current = live & (previous >= 0) & (previous < N)
-    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES * 2)
+    in_tail = live & (previous < 0) & (slot >= ROWS) & (slot < PAGES * ROWS)
     old_content = tl.load(CONTENT + previous * C0 + channels * C1, in_current, 0.0)
     old_scores = tl.load(SCORES + previous * G0 + channels * G1, in_current, 0.0)
-    tail_offset = slot // 2 * T0 + slot % 2 * T1 + channels * T3
+    tail_offset = slot // ROWS * T0 + slot % ROWS * T1 + channels * T3
     tail_content = tl.load(TAIL + tail_offset, in_tail, 0.0)
     tail_scores = tl.load(TAIL + tail_offset + T2, in_tail, 0.0)
     old_content = tl.where(in_current, old_content, tail_content)
@@ -1407,11 +1410,11 @@ def compressor_pool(
         or content.dtype != torch.float32
         or scores.dtype != torch.float32
         or tail.ndim != 4
-        or tail.shape[1:] != (2, 2, 512)
+        or tail.shape[2:] != (2, 512)
         or tail.dtype != torch.float32
     ):
         raise ValueError(
-            "Compressor pooling requires FP32 [N,512] and [pages,2,2,512] tail"
+            "Compressor pooling requires FP32 [N,512] and [pages,rows,2,512] tail"
         )
     count = content.shape[0]
     for value in (previous, tail_slots):
@@ -1464,6 +1467,7 @@ def compressor_pool(
             *tail.stride(),
             *out.stride(),
             tail.shape[0],
+            tail.shape[1],
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -3103,6 +3107,7 @@ def _compressor_metadata(
     TS1,
     PAGES: tl.constexpr,
     BLOCK: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     position = tl.load(Positions + row * P0, row < N, -1).to(tl.int64)
@@ -3122,10 +3127,10 @@ def _compressor_metadata(
         -1,
     )
     read_slot = resolve_group_slot(
-        Table, pair, pair_request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
+        Table, pair, pair_request, TR, TC, TS0, TS1, ROWS, 1, 1, PAGES
     )
     write_slot = resolve_group_slot(
-        Table, position, request, TR, TC, TS0, TS1, 2, 1, 1, PAGES
+        Table, position, request, TR, TC, TS0, TS1, ROWS, 1, 1, PAGES
     )
     tl.store(Active + row, active, row < N)
     tl.store(PairPositions + row, pair, row < N)
@@ -3155,6 +3160,7 @@ def compressor_metadata(
     previous,
     read_slots,
     write_slots,
+    rows=2,
 ):
     """Fill a ratio-2 plan for consecutive rows within each request in O(N)."""
     n = positions.numel()
@@ -3188,6 +3194,7 @@ def compressor_metadata(
             *table.stride(),
             pages,
             BLOCK=256,
+            ROWS=rows,
             num_warps=4,
         )
 

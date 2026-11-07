@@ -30,8 +30,11 @@ Every row width is a property of the cache format the caller selects through
 which.
 """
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+
+import torch
 
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V41_GLOBAL_ROWS,
@@ -50,7 +53,14 @@ V41_PREFILL_QUERY_TILE = 2048
 # Upper bound on index-score rows per CTA passed to dsv41.index_topk. Kernels
 # pick their own chunk up to it (gfx950 uses up to 1024 at long histories).
 V41_INDEX_SCORE_CHUNK = 1024
-V41_TAIL_ROWS = 2
+# ROCm packs 32 tail rows per page so the tail table is 16x narrower: its
+# per-step host pack/upload scaled with the full history at 2 rows. The v4
+# (Hopper) packings below only fit 2-row pages.
+V41_TAIL_ROWS = (
+    int(os.environ.get("TOKENSPEED_V41_TAIL_ROWS", "32")) if torch.version.hip else 2
+)
+if V41_TAIL_ROWS not in (2, 32):
+    raise ValueError("TOKENSPEED_V41_TAIL_ROWS must be 2 or 32")
 
 # (physical rows per page, raw tokens per row). Table columns remain absolute
 # even when the scheduler releases expired SWA/tail blocks into null holes.
@@ -115,7 +125,7 @@ V41_CACHE_FORMATS: Mapping[str, V41CacheFormat] = {
             V41_SWA_GROUP_ID: 1,
             V41_GLOBAL_R2_GROUP_ID: 20,
             V41_GLOBAL_R1_GROUP_ID: 60,
-            V41_COMPRESSOR_TAIL_GROUP_ID: 54,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 54 if V41_TAIL_ROWS == 2 else 3,
         },
         lcm_block_bytes=1_382_400,
         # With three DSpark stages, two SWA pages are the smallest packing
@@ -125,7 +135,7 @@ V41_CACHE_FORMATS: Mapping[str, V41CacheFormat] = {
             V41_SWA_GROUP_ID: 2,
             V41_GLOBAL_R2_GROUP_ID: 45,
             V41_GLOBAL_R1_GROUP_ID: 140,
-            V41_COMPRESSOR_TAIL_GROUP_ID: 126,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 126 if V41_TAIL_ROWS == 2 else 8,
         },
         dspark_lcm_block_bytes=3_225_600,
     ),

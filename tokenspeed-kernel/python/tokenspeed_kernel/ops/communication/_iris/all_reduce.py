@@ -45,6 +45,16 @@ hip_utils = triton.language.extra.hip.utils
 # decode-sized messages inside CUDA graphs (1 MB: 70 vs 150 us; 4 MB: 159 vs
 # 200 us), since fewer workgroups spin on the cross-GPU flags.
 _PULL_MAX_PROGRAMS = int(os.environ.get("TOKENSPEED_IRIS_PULL_MAX_PROGRAMS", "84"))
+# Small decode two-shot messages (<= 2 MB) run up to 2x faster with 32
+# programs, while large prefill messages keep the full cap (a global 32 cost
+# 155K prefill 5.6 -> 6.8 s). Every rank sees the same size, so all ranks
+# launch the same blocks and the per-block epochs stay in step.
+_PULL_SMALL_PROGRAMS = min(
+    _PULL_MAX_PROGRAMS, int(os.environ.get("TOKENSPEED_IRIS_PULL_SMALL_PROGRAMS", "32"))
+)
+_PULL_SMALL_MAX_BYTES = int(
+    os.environ.get("TOKENSPEED_IRIS_PULL_SMALL_MAX_BYTES", str(2 << 20))
+)
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
 
@@ -227,7 +237,12 @@ def _launch_pull_twoshot(
         // peers.world_size
     )
     num_tiles = triton.cdiv(partition_words, block_words)
-    num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
+    cap = (
+        _PULL_SMALL_PROGRAMS
+        if numel * inputs.element_size() <= _PULL_SMALL_MAX_BYTES
+        else _PULL_MAX_PROGRAMS
+    )
+    num_programs = min(num_tiles, cap)
     iris_pull_twoshot[(num_programs,)](
         inputs,
         scratch,

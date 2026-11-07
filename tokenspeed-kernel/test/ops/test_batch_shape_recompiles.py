@@ -513,7 +513,7 @@ def test_dsv41_page_table_geometry():
                 torch.int64,
             )
         )
-        dsv41.compressor_metadata(positions, requests, table, 8, *compressor)
+        dsv41.compressor_metadata(positions, requests, table, 8, *compressor, rows=2)
         selection, lengths = dsv41.selection_table(positions, requests, table, 4)
         assert (selection[:, 4:] == -1).all()
         return (

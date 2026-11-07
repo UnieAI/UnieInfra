@@ -383,11 +383,21 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("source_tiers", &tokenspeed::SnapshotRestoreBatch::source_tiers);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
-        nb::list result;
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<tokenspeed::ForwardBatch>(&op)) {
-                result.append(nb::cast(*f, nb::rv_policy::copy));
+        // The value copies (block tables of long requests run to megabytes)
+        // are made with the GIL released, so the forward thread keeps
+        // preparing and launching while the control plane copies.
+        std::vector<tokenspeed::ForwardBatch> copies;
+        {
+            nb::gil_scoped_release release;
+            for (const auto& op : plan.Operations()) {
+                if (auto* f = std::get_if<tokenspeed::ForwardBatch>(&op)) {
+                    copies.push_back(*f);
+                }
             }
+        }
+        nb::list result;
+        for (auto& f : copies) {
+            result.append(nb::cast(std::move(f), nb::rv_policy::move));
         }
         return result;
     };
@@ -502,9 +512,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count RemotePrefilling requests; these are also included in prefilling_size().")
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
              "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
-        .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
-        .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
-        .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
+        .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("snapshot_pool_free_blocks", &tokenspeed::Scheduler::SnapshotPoolFreeBlocks,
              "Empty parents of the request-private snapshot pool (a leak check: every block belongs to some "
              "suspended request's image).")

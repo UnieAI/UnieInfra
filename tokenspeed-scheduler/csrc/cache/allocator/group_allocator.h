@@ -115,7 +115,8 @@ public:
             }
         }
         if (plan.suffix_start < 0) {
-            table.blocks_.reserve(table.blocks_.size() + block_refs.size());
+            // No exact reserve: it would reallocate (and move every held ref)
+            // on each decode-step append, quadratic in the table length.
             for (CacheBlockRef& block_ref : block_refs) {
                 table.blocks_.push_back(std::move(block_ref));
             }

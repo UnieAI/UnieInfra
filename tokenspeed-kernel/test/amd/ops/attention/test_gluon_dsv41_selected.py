@@ -141,6 +141,56 @@ def test_fused_selected_attention_matches_gather_softmax(heads, with_global):
     assert torch.count_nonzero(out[[1, 4]]).item() == 0
 
 
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_unsplit_matches_split_kernel(with_rope):
+    """Rows covered by the unsplit kernel (one workgroup per row, FP16 global
+    tiles) match the split kernel that small batches still take."""
+    platform = current_platform()
+    if not platform.is_cdna4:
+        pytest.skip("gfx950 unsplit decode kernel")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+    device = torch.device("cuda:0")
+    tokens = 256
+    segments = _decode_inputs(tokens, device, 21)
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    q, sink = _padded_query(tokens, 16, 64, device, 23)
+    positions = torch.arange(tokens, dtype=torch.int64, device=device) + 5
+    angles = torch.randn((tokens + 5, 32), dtype=torch.float32, device=device)
+    cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
+
+    def run(rows):
+        rope = (
+            {"rope_positions": positions[rows], "rope_cos_sin": cos_sin}
+            if with_rope
+            else {}
+        )
+        return selected.launch_gluon_dsv41_selected_attention_gfx950(
+            q[rows],
+            swa,
+            swa_slots[rows],
+            swa_lens[rows],
+            glob,
+            global_slots[rows],
+            global_lens[rows],
+            sink,
+            512**-0.5,
+            None,
+            256,
+            None,
+            None,
+            None,
+            **rope,
+        )
+
+    unsplit = run(slice(0, tokens))
+    for start in range(0, tokens, 16):
+        split = run(slice(start, start + 16))
+        torch.testing.assert_close(
+            unsplit[start : start + 16], split, rtol=0.008, atol=0.002
+        )
+
+
 def _arena_cache(rows, fmt, page_pad):
     """Page-planar cache view with an arena-style padded page stride."""
     width = {"swa": 528, "global": 288}[fmt]
@@ -216,11 +266,14 @@ def _padded_query(tokens, real_heads, heads, device, seed):
         (192, 16, 64),
         (192, 64, 64),
         (6, 16, 128),
+        (130, 16, 64),
+        (130, 16, 128),
+        (384, 16, 64),
     ],
 )
 @pytest.mark.parametrize("with_rope", [False, True])
 def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads, with_rope):
-    """Split (6, 24, 48 rows) and single-workgroup (192 rows) decode paths.
+    """Split (6, 24, 48 rows) and single-workgroup (130+ rows) decode paths.
 
     On gfx1250 the 6/24/48-row cases launch one, two and four 16-head groups
     per workgroup, and 192 rows launch four groups without a split.
@@ -299,6 +352,7 @@ def test_fused_selected_attention_no_recompile_across_rows(with_rope):
         kernels = (
             selected.gluon_dsv41_selected_attention_gfx950,
             selected.gluon_dsv41_selected_attention_reduce_gfx950,
+            selected.gluon_dsv41_selected_attention_rows_gfx950,
         )
     elif platform.is_cdna5:
         from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import selected
@@ -346,6 +400,6 @@ def test_fused_selected_attention_no_recompile_across_rows(with_rope):
     for tokens in (1, 24, 96, 192):
         run(tokens)
     with assert_no_triton_compile(*kernels):
-        for tokens in (2, 5, 16, 17, 32, 33, 64, 150, 191):
+        for tokens in (2, 5, 16, 17, 32, 33, 64, 128, 129, 150, 191):
             run(tokens)
     torch.cuda.synchronize()

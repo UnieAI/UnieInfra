@@ -608,12 +608,14 @@ def _rows_safe_page(page, num_pages):
 
 @gluon.jit
 def _rows_store(logits, row, logits_stride, scores, positions, end, page, num_pages):
-    live = (positions < end) & (page >= 0) & (page < num_pages)
+    # Every visible column is written (-inf off the resident pages), so the
+    # caller need not pre-fill the logits.
+    live = (page >= 0) & (page < num_pages)
     gl.amd.cdna4.buffer_store(
-        scores,
+        gl.where(live, scores, -float("inf")),
         ptr=logits + row.to(gl.int64) * logits_stride,
         offsets=positions,
-        mask=live,
+        mask=positions < end,
     )
 
 
@@ -1333,6 +1335,15 @@ def dsv41_index_logits_gfx950(
         logits,
         score_chunk_size,
     )
+
+
+def writes_visible_rows(candidates, score_chunk_size) -> bool:
+    """Whether a launch writes every column below each row's visible length.
+
+    The full-mode rows kernel does, so its caller may skip the -inf pre-fill
+    of the logits when the consumers read only visible columns.
+    """
+    return candidates is None and int(score_chunk_size) >= _ROWS_BLOCK_KV
 
 
 def _launch_per_row(

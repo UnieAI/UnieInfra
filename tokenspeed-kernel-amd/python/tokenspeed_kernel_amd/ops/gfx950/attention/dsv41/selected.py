@@ -1713,7 +1713,9 @@ def launch_gluon_dsv41_selected_attention_gfx950(
     if not math.isfinite(scale):
         raise ValueError("softmax_scale must be finite")
 
-    q = q.contiguous()
+    # Both kernels take row and head strides; only head dims must be dense.
+    if q.stride(2) != 1:
+        q = q.contiguous()
     sink = attn_sink.contiguous()
     swa_slots_i = swa_slots.to(torch.int32).contiguous()
     swa_lens_i = swa_lens.to(torch.int32).contiguous()
@@ -1750,7 +1752,9 @@ def launch_gluon_dsv41_selected_attention_gfx950(
             _TARGET_CTAS // (tokens * head_blocks),
         ),
     )
-    if splits == 1:
+    # Up to one workgroup per CU the one-wave unsplit main kernel is faster;
+    # past that the rows kernel's two workgroups per CU win.
+    if tokens * head_blocks > _TARGET_CTAS:
         gluon_dsv41_selected_attention_rows_gfx950[(tokens * head_blocks,)](
             q,
             swa_cache,

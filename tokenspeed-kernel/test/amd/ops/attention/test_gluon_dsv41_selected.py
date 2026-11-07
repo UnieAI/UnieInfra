@@ -184,6 +184,25 @@ def test_unsplit_matches_split_kernel(with_rope):
         )
 
     unsplit = run(slice(0, tokens))
+    # A head-strided query view (the real heads of a padded query) matches.
+    real = selected.launch_gluon_dsv41_selected_attention_gfx950(
+        q[:, :16],
+        swa,
+        swa_slots,
+        swa_lens,
+        glob,
+        global_slots,
+        global_lens,
+        sink[:16],
+        512**-0.5,
+        None,
+        256,
+        None,
+        None,
+        None,
+        **({"rope_positions": positions, "rope_cos_sin": cos_sin} if with_rope else {}),
+    )
+    torch.testing.assert_close(real, unsplit[:, :16], rtol=0, atol=0)
     for start in range(0, tokens, 16):
         split = run(slice(start, start + 16))
         torch.testing.assert_close(
@@ -267,6 +286,7 @@ def _padded_query(tokens, real_heads, heads, device, seed):
         (192, 64, 64),
         (6, 16, 128),
         (130, 16, 64),
+        (128, 16, 64),
         (130, 16, 128),
         (384, 16, 64),
     ],

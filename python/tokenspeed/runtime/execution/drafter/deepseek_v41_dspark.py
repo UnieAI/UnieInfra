@@ -220,7 +220,10 @@ class DeepseekV41DSpark(BaseDrafter):
             self.partials,
             self.draft_tokens_buf[:num_decodes],
         )
-        next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])
+        # The block always drafts block_size tokens; verify the leading ones.
+        next_tokens[num_extends:, 1:].copy_(
+            self.draft_tokens_buf[:num_decodes, : self.spec_num_tokens - 1]
+        )
 
     @nvtx_range("drafter:dspark", color="purple")
     def run(

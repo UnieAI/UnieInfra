@@ -835,7 +835,7 @@ group whose query is all zero scores exactly zero, so its output is
 such groups skip the score and PV passes, and one all-ones MFMA per tile
 accumulates the V row sum for all of them.
 
-Once `tokens * head_blocks` reaches the CU count (speculative decode: 64
+Once `tokens * head_blocks` exceeds the CU count (speculative decode: 64
 users x 6 rows = 384 rows), `gluon_dsv41_selected_attention_rows_gfx950`
 takes over: one workgroup per (row, head block) over all of the row's tiles,
 no partials. Its four waves split the head dims instead of the tile rows

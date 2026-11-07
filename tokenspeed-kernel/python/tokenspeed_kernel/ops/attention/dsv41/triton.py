@@ -3700,21 +3700,18 @@ def _clean_logits_output(
 
 
 @triton.jit
-def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr):
+def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr, seen):
     # Order-preserving uint32 keys of 8-row block maxima. The newest visible
-    # block with a finite score is forced in.
+    # block with a finite score is forced in. Columns past the visible length
+    # ``seen`` are masked, so they need not hold -inf.
     idx = start + tl.arange(0, BLOCK)
-    in_range = idx < n
+    cols = idx[:, None] * 8 + tl.arange(0, 8)[None, :]
     x = tl.max(
-        tl.load(
-            row + idx[:, None] * 8 + tl.arange(0, 8)[None, :],
-            mask=in_range[:, None],
-            other=-float("inf"),
-        ),
+        tl.load(row + cols, mask=(idx < n)[:, None] & (cols < seen), other=-float("inf")),
         axis=1,
     )
     x = tl.where((idx == latest) & (x > -float("inf")), float("inf"), x)
-    valid = in_range & (x > -float("inf"))
+    valid = (idx < n) & (x > -float("inf"))
     bits = x.to(tl.uint32, bitcast=True)
     key = tl.where((bits >> 31) != 0, ~bits, bits | 0x80000000)
     return idx, key, valid
@@ -3750,7 +3747,7 @@ def _index_block_select_kernel(
     for p in tl.static_range(4):
         hist = tl.zeros([256], dtype=tl.int32)
         for start in range(0, n, BLOCK):
-            _, key, valid = _block_select_keys(row, start, n, latest, BLOCK)
+            _, key, valid = _block_select_keys(row, start, n, latest, BLOCK, seen)
             match = valid & ((key & high) == prefix)
             bucket = ((key >> (24 - 8 * p)) & 255).to(tl.int32)
             hist += tl.histogram(bucket, 256, mask=match)
@@ -3769,7 +3766,7 @@ def _index_block_select_kernel(
     selected = 0
     ties = 0
     for start in range(0, n, BLOCK):
-        idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK)
+        idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK, seen)
         equal = (valid & (key == prefix)).to(tl.int32)
         tie_rank = ties + tl.cumsum(equal, 0) - equal
         take = valid & ((key > prefix) | ((equal != 0) & (tie_rank < remaining)))
@@ -3825,7 +3822,7 @@ def _block_keys_pass(
         return
     latest = tl.where(seen > 0, (seen - 1) // 8, -1)
     row = logits + query.to(tl.int64) * stride_logits
-    idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK)
+    idx, key, valid = _block_select_keys(row, start, n, latest, BLOCK, seen)
     key = tl.where(valid, key, 0)
     tl.store(
         keys + query.to(tl.int64) * n_blocks + idx,

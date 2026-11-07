@@ -219,12 +219,22 @@ def run_dsv41_csa2_index_topk(
             )
             tile_visible = visible[query_begin:query_end]
             tile_queries = query_end - query_begin
-            logits = torch.full(
-                (tile_queries, width),
-                -float("inf"),
-                dtype=torch.float32,
-                device=q.device,
-            )
+            # Consumers read only visible columns in full mode; a scorer that
+            # writes all of them leaves nothing for an -inf pre-fill to do.
+            writes_visible = getattr(launch_logits, "writes_visible_rows", None)
+            if writes_visible is not None and writes_visible(
+                tile_candidates, score_chunk_size
+            ):
+                logits = torch.empty(
+                    (tile_queries, width), dtype=torch.float32, device=q.device
+                )
+            else:
+                logits = torch.full(
+                    (tile_queries, width),
+                    -float("inf"),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
             launch_logits(
                 q[query_begin:query_end],
                 w[query_begin:query_end],
@@ -275,6 +285,17 @@ def launch_gfx950_logits(
         logits,
         score_chunk_size,
     )
+
+
+def _gfx950_writes_visible_rows(candidates, score_chunk_size):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+        writes_visible_rows,
+    )
+
+    return writes_visible_rows(candidates, score_chunk_size)
+
+
+launch_gfx950_logits.writes_visible_rows = _gfx950_writes_visible_rows
 
 
 def launch_gfx1250_logits(

@@ -274,6 +274,37 @@ arrival counter, and a reduction in split order by the last arrival, so
 results are deterministic and the launch is HIP-graph safe. An XCD remap
 keeps the M tiles that share a weight tile on one XCD's L2.
 
+### gfx950 MXFP8 block32 projection
+
+`triton_mm_mxfp8_block32_gfx950` (`gfx950/gemm/mxfp8/block32.py`, adapted from
+vLLM's `rocm_block32_gemm.py` and ROCm/aiter#5750) serves the DeepSeek V4.1
+TP4 dense MXFP8 projections at the `(N, K, M)` ranges listed in its tuned
+table, where it measured faster than both kernels above on MI350P. Automatic
+selection ranks it above them and its problem filter admits only those
+ranges, so every other shape and row count keeps the decode or prefill kernel.
+
+#### Contract
+
+- Same operands as the decode projection: E4M3 `[M, K]` / `[N, K]` with unit
+  inner strides, canonical uint8 UE8M0 scales `[M, K/32]` / `[N, K/32]`, an
+  explicit `[1, 32]` scale block, BF16 or FP16 output with unit inner stride.
+- `M` and `N` are runtime arguments (`M` is not specialized); `K` and the tile
+  configuration are compile-time. Ragged `N` clamps weight rows, a `K` tail is
+  masked.
+- Products use the native scaled E4M3 MFMA (`tl.dot_scaled`) with FP32
+  accumulation, like the prefill kernel, not the decode kernel's exact BF16
+  path.
+
+#### Algorithm
+
+A tiled Triton kernel computes one `BLOCK_M x BLOCK_N` tile per program. For
+small `M` a packed variant fills the MFMA rows with `K_PACK` K panels per token
+and keeps only the block-diagonal products. Either may split K: the splits of a
+tile get program ids congruent mod 8, so they land on one XCD; each writes an
+FP32 partial, and the last arrival (CTA-scope counter in that XCD's L2) sums
+them in split order and re-arms the counter, so results are deterministic and
+HIP-graph safe.
+
 ### gfx950 dense MXFP4 linear (dynamic MXFP4 activations)
 
 `gluon_mxfp4_linear_gfx950` and `gluon_mxfp4_swiglu_linear_gfx950` run the

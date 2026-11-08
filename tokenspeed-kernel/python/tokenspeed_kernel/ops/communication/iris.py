@@ -28,6 +28,8 @@ Fusions can explicitly reuse those buffers when their execution is ordered.
 import logging
 from typing import TYPE_CHECKING, Tuple
 
+import os
+
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel._triton import gl, triton
@@ -128,6 +130,21 @@ def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
     return 0.0
 
 
+# Opt-in INT8 (group-128) two-shot for large producer-direct reductions.
+_Q8_ENABLED = os.environ.get("TOKENSPEED_IRIS_Q8_ALLREDUCE", "0") == "1"
+_Q8_MIN_BYTES = int(os.environ.get("TOKENSPEED_IRIS_Q8_MIN_BYTES", str(8 << 20)))
+
+
+def _q8_capacity(max_numel: int, world_size: int, dtype: torch.dtype) -> int:
+    """Elements the 8-bit two-shot is prepared for (0 when disabled)."""
+    if not _Q8_ENABLED or dtype != torch.bfloat16 or not max_numel:
+        return 0
+    from tokenspeed_kernel.ops.communication._iris.all_reduce_q8 import Q8_GROUP
+
+    unit = world_size * Q8_GROUP
+    return max_numel // unit * unit
+
+
 class IrisAllReduce:
     """Own one group's prepared staged and producer-direct all-reduce storage."""
 
@@ -143,9 +160,17 @@ class IrisAllReduce:
             all_reduce_heap_bytes,
         )
 
-        return all_reduce_heap_bytes(
+        total = all_reduce_heap_bytes(
             staged_max_numel, producer_direct_max_numel, world_size, dtype
         )
+        q8_numel = _q8_capacity(producer_direct_max_numel, world_size, dtype)
+        if q8_numel:
+            from tokenspeed_kernel.ops.communication._iris.all_reduce_q8 import (
+                IrisQ8AllReduce,
+            )
+
+            total += IrisQ8AllReduce.heap_bytes(q8_numel, world_size)
+        return total
 
     def __init__(
         self,
@@ -204,6 +229,14 @@ class IrisAllReduce:
             if staged_max_numel and StagedPullTwoShot.supported(peers.world_size, dtype)
             else None
         )
+        q8_numel = _q8_capacity(producer_direct_max_numel, peers.world_size, dtype)
+        self.q8 = None
+        if q8_numel:
+            from tokenspeed_kernel.ops.communication._iris.all_reduce_q8 import (
+                IrisQ8AllReduce,
+            )
+
+            self.q8 = IrisQ8AllReduce(peers, q8_numel, fp8=False)
 
     def all_reduce(
         self, tensor: torch.Tensor, op=None, safe: bool = True, async_op: bool = False
@@ -303,6 +336,19 @@ class IrisAllReduce:
         """
         if not self.can_reduce_mhc_post(tensor, residual, post, comb):
             raise RuntimeError("Iris producer reduction cannot fuse these operands")
+        if (
+            self.q8 is not None
+            and tensor.numel() * tensor.element_size() >= _Q8_MIN_BYTES
+            and self.q8.can_run(tensor)
+        ):
+            # Large (prefill) messages are PCIe-bound: an 8-bit payload moves
+            # half the bytes (168 MB: 5.1 -> 2.8 ms); the mHC post then runs
+            # on the reduced rows as its own kernel.
+            from tokenspeed_kernel.ops.residual import mhc_post
+
+            reduced = torch.empty_like(tensor)
+            self.q8.run(tensor, reduced)
+            return mhc_post(reduced, residual, post.unsqueeze(-1), comb)
         out = torch.empty_like(residual)
         self.producer_pull.run(out, (residual, post, comb))
         return out

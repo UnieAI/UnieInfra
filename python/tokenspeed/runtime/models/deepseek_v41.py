@@ -679,7 +679,9 @@ def _all_reduce_output(
 # 32 programs, which leaves the compute stream most of the CUs.
 _FFN_OVERLAP_CHUNKS = int(os.environ.get("TS_EXP_FFN_OVERLAP_CHUNKS", "1"))
 _FFN_OVERLAP_MIN_ROWS = int(os.environ.get("TS_EXP_FFN_OVERLAP_MIN_ROWS", "4096"))
-_FFN_OVERLAP_IRIS_PROGRAMS = int(os.environ.get("TS_EXP_FFN_OVERLAP_IRIS_PROGRAMS", "32"))
+_FFN_OVERLAP_IRIS_PROGRAMS = int(
+    os.environ.get("TS_EXP_FFN_OVERLAP_IRIS_PROGRAMS", "32")
+)
 if _FFN_OVERLAP_CHUNKS > 1:
     import tokenspeed_kernel.ops.communication._iris.all_reduce as _iris_all_reduce_impl
 

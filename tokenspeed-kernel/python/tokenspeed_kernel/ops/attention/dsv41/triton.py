@@ -3707,7 +3707,9 @@ def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr, seen):
     idx = start + tl.arange(0, BLOCK)
     cols = idx[:, None] * 8 + tl.arange(0, 8)[None, :]
     x = tl.max(
-        tl.load(row + cols, mask=(idx < n)[:, None] & (cols < seen), other=-float("inf")),
+        tl.load(
+            row + cols, mask=(idx < n)[:, None] & (cols < seen), other=-float("inf")
+        ),
         axis=1,
     )
     x = tl.where((idx == latest) & (x > -float("inf")), float("inf"), x)

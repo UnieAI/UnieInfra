@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import os
 
-from tokenspeed_kernel_amd._device import num_cus, num_xcds
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
     RaggedTensorMetadata,
 )

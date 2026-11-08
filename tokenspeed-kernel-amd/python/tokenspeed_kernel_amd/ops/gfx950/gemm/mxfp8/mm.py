@@ -37,8 +37,8 @@ See the ops README for the contract and routing.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._device import num_cus, num_xcds
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 cdna4 = gl.amd.cdna4

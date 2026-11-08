@@ -30,8 +30,8 @@ validated DeepSeek-V4 prefill shapes: B=1, D=512, H in {64, 128}, topk>=128.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._device import num_xcds as _num_xcds
 import torch
+from tokenspeed_kernel_amd._device import num_xcds as _num_xcds
 from tokenspeed_kernel_amd._triton import cdna4_async_copy as cdna4_async
 from tokenspeed_kernel_amd._triton import (
     gl,

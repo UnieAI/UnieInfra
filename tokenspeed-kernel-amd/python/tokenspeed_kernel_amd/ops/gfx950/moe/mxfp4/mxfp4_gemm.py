@@ -51,8 +51,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tokenspeed_kernel_amd._device import num_cus, num_xcds
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import gluon_moe_sorting
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (

@@ -26,9 +26,8 @@ Fusions can explicitly reuse those buffers when their execution is ordered.
 """
 
 import logging
-from typing import TYPE_CHECKING, Tuple
-
 import os
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.distributed as dist

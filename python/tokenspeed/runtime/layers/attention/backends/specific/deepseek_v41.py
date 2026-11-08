@@ -1095,8 +1095,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             dsv41.compressor_tail_scatter(content, scores, tail, slots)
         else:
             live = slots >= 0
-            tail[slots[live] // V41_TAIL_ROWS, slots[live] % V41_TAIL_ROWS, 0] = content[live].float()
-            tail[slots[live] // V41_TAIL_ROWS, slots[live] % V41_TAIL_ROWS, 1] = scores[live].float()
+            tail[slots[live] // V41_TAIL_ROWS, slots[live] % V41_TAIL_ROWS, 0] = (
+                content[live].float()
+            )
+            tail[slots[live] // V41_TAIL_ROWS, slots[live] % V41_TAIL_ROWS, 1] = scores[
+                live
+            ].float()
 
     def compress(
         self,
@@ -1179,8 +1183,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
         else:
             live = write_slots >= 0
-            tail[write_slots[live] // V41_TAIL_ROWS, write_slots[live] % V41_TAIL_ROWS, 0] = content[live]
-            tail[write_slots[live] // V41_TAIL_ROWS, write_slots[live] % V41_TAIL_ROWS, 1] = scores[live]
+            tail[
+                write_slots[live] // V41_TAIL_ROWS, write_slots[live] % V41_TAIL_ROWS, 0
+            ] = content[live]
+            tail[
+                write_slots[live] // V41_TAIL_ROWS, write_slots[live] % V41_TAIL_ROWS, 1
+            ] = scores[live]
         return pooled, pair_positions, pair_requests
 
     def write_global(

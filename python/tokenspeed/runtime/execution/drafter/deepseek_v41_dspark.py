@@ -32,6 +32,7 @@ transfer and L2 therefore carry the draft state with the KV.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -51,6 +52,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
     dspark_greedy_workspace,
     sample_dspark_block_greedy,
 )
+from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
@@ -63,6 +65,18 @@ if TYPE_CHECKING:
 
 
 logger = get_colorful_logger(__name__)
+
+# Draw each block step with the verifier's own Gumbel noise (coupled drafting)
+# instead of greedily; needs a Gumbel-pool sampling backend (triton, triton_full).
+COUPLED_DRAFT = os.environ.get("TOKENSPEED_DSPARK_COUPLED_DRAFT", "0") == "1"
+# Calibration offset added to the derived Philox position of the block draws.
+COUPLED_POSITION_SHIFT = int(os.environ.get("TOKENSPEED_DSPARK_COUPLED_SHIFT", "0"))
+# The draft samples at the request's temperature times this scale. Only the
+# proposal changes (the verifier's sample is still the output), so any value is
+# lossless; it moves how often the draft and target argmaxes agree.
+COUPLED_TEMPERATURE_SCALE = float(
+    os.environ.get("TOKENSPEED_DSPARK_COUPLED_TEMP_SCALE", "1.0")
+)
 
 
 class DeepseekV41DSpark(BaseDrafter):
@@ -116,6 +130,14 @@ class DeepseekV41DSpark(BaseDrafter):
             int(self.model.markov_projection.num_embeddings_per_partition),
             self.device,
         )
+        # Set by bind_sampling_backend when the block is drawn with the
+        # verifier's Gumbel noise instead of greedily.
+        self.coupled_pools: SpeculativeSamplingPools | None = None
+
+    def bind_sampling_backend(self, sampling_backend) -> None:
+        super().bind_sampling_backend(sampling_backend)
+        if COUPLED_DRAFT:
+            self.coupled_pools = sampling_backend.coupled_draft_pools()
 
     def idle_forward_global_num_tokens(
         self,
@@ -208,6 +230,21 @@ class DeepseekV41DSpark(BaseDrafter):
                 "DSpark base logits do not span the Markov projection's local "
                 f"vocabulary: {local_logits.shape[-1]} != {markov_vocab}"
             )
+        sampling = None
+        if self.coupled_pools is not None:
+            # Block step s proposes the token at position start_pos + 2 + s:
+            # the next verify's row s samples that position with the stream
+            # keyed by (seed, position), because its offset is the committed
+            # length (start_pos + 1) plus one plus s.
+            slots = self.input_buffers.req_pool_indices_buf[
+                num_extends : num_extends + num_decodes
+            ]
+            sampling = (
+                self.coupled_pools.seed.index_select(0, slots),
+                self.coupled_pools.temperature.index_select(0, slots)
+                * COUPLED_TEMPERATURE_SCALE,
+                start_pos + (2 + COUPLED_POSITION_SHIFT),
+            )
         sample_dspark_block_greedy(
             local_logits,
             bonus,
@@ -219,6 +256,7 @@ class DeepseekV41DSpark(BaseDrafter):
             self.candidates,
             self.partials,
             self.draft_tokens_buf[:num_decodes],
+            sampling,
         )
         # The block always drafts block_size tokens; verify the leading ones.
         next_tokens[num_extends:, 1:].copy_(

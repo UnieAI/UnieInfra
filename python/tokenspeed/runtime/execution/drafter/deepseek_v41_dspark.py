@@ -53,6 +53,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
+from tokenspeed.runtime.sampling.block_verify import DSparkBlockVerifyState
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
@@ -77,6 +78,11 @@ COUPLED_POSITION_SHIFT = int(os.environ.get("TOKENSPEED_DSPARK_COUPLED_SHIFT", "
 COUPLED_TEMPERATURE_SCALE = float(
     os.environ.get("TOKENSPEED_DSPARK_COUPLED_TEMP_SCALE", "1.0")
 )
+
+
+# Verify the block jointly (Sun et al., block verification) instead of token by
+# token; needs the draft's logits, kept per request slot between steps.
+BLOCK_VERIFY = os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY", "0") == "1"
 
 
 class DeepseekV41DSpark(BaseDrafter):
@@ -133,11 +139,36 @@ class DeepseekV41DSpark(BaseDrafter):
         # Set by bind_sampling_backend when the block is drawn with the
         # verifier's Gumbel noise instead of greedily.
         self.coupled_pools: SpeculativeSamplingPools | None = None
+        self.block_verify_state: DSparkBlockVerifyState | None = None
 
     def bind_sampling_backend(self, sampling_backend) -> None:
         super().bind_sampling_backend(sampling_backend)
-        if COUPLED_DRAFT:
+        if COUPLED_DRAFT or BLOCK_VERIFY:
             self.coupled_pools = sampling_backend.coupled_draft_pools()
+        if BLOCK_VERIFY:
+            if COUPLED_TEMPERATURE_SCALE != 1.0:
+                raise ValueError(
+                    "TOKENSPEED_DSPARK_BLOCK_VERIFY needs the draft sampled at the "
+                    "request temperature (COUPLED_TEMP_SCALE=1)"
+                )
+            projection = self.model.markov_projection
+            self.block_verify_state = DSparkBlockVerifyState(
+                pool=torch.zeros(
+                    (
+                        int(self.coupled_pools.seed.shape[0]),
+                        self.spec_num_tokens - 1,
+                        int(projection.num_embeddings_per_partition),
+                    ),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                embedding=self.model.markov_head.embedding.weight,
+                projection=projection.weight,
+                num_valid=int(projection.shard_indices.num_org_elements),
+                tp_size=int(self.draft_model.mapping.attn.tp_size),
+                tp_group=None,  # set in wire_target
+            )
+            sampling_backend.bind_block_verify(self.block_verify_state)
 
     def idle_forward_global_num_tokens(
         self,
@@ -156,6 +187,8 @@ class DeepseekV41DSpark(BaseDrafter):
         self.target_model = target_model
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
+        if self.block_verify_state is not None:
+            self.block_verify_state.tp_group = self.tp_group
 
     def prepare_request_state(
         self,
@@ -258,6 +291,13 @@ class DeepseekV41DSpark(BaseDrafter):
             self.draft_tokens_buf[:num_decodes],
             sampling,
         )
+        if self.block_verify_state is not None:
+            verify_slots = self.input_buffers.req_pool_indices_buf[
+                num_extends : num_extends + num_decodes
+            ]
+            self.block_verify_state.pool.index_copy_(
+                0, verify_slots, local_logits[:, : self.spec_num_tokens - 1]
+            )
         # The block always drafts block_size tokens; verify the leading ones.
         next_tokens[num_extends:, 1:].copy_(
             self.draft_tokens_buf[:num_decodes, : self.spec_num_tokens - 1]

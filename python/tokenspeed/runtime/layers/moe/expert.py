@@ -20,7 +20,9 @@
 
 
 import logging
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 
 import torch
@@ -61,9 +63,51 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
 )
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 logger = logging.getLogger(__name__)
+
+# What ``max_split_size_mb`` restores to when nothing set it: the allocator's
+# default, every block splittable (the value is capped at SIZE_MAX / MiB).
+_UNLIMITED_SPLIT_MB = 1 << 44
+
+
+@contextmanager
+def _unsplit_large_blocks(module: torch.nn.Module) -> Iterator[None]:
+    """Run a load-time weight preprocessor without fragmenting the device cache.
+
+    A preprocessor that pads or shuffles the whole expert stack (AITER MXFP4:
+    w13 ``[E, 2I, H/2]`` padded 576 -> 640 per rank, then permuted) frees
+    GB-sized temporaries next to the weights it keeps. Under the caching
+    allocator's default policy the smaller outputs that follow (scale stacks,
+    ``w2``) are carved out of those freed blocks, so each segment stays pinned
+    by a live tensor and no ``empty_cache`` returns it. On DeepSeek-V4.1-Flash
+    TP4 that strands ~13.7 GB per GPU (reserved, never allocated), which the KV
+    budget, sized from driver free memory, then loses. Capping the split size
+    while the preprocessor runs keeps large blocks whole, so a freed
+    temporary is either reused by an equal-size request or released here.
+    """
+    max_split_mb = envs.TOKENSPEED_MOE_PREPROCESS_MAX_SPLIT_MB.get()
+    param = next(module.parameters(), None)
+    if (
+        max_split_mb <= 0
+        or param is None
+        or param.device.type != "cuda"
+        or not hasattr(torch._C, "_accelerator_setAllocatorSettings")
+    ):
+        yield
+        return
+    previous = re.search(
+        r"max_split_size_mb:(\d+)", torch._C._accelerator_getAllocatorSettings()
+    )
+    torch.cuda.empty_cache()
+    torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{max_split_mb}")
+    try:
+        yield
+    finally:
+        restore = previous.group(1) if previous else _UNLIMITED_SPLIT_MB
+        torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
+        torch.cuda.empty_cache()
 
 
 class MoELayer(torch.nn.Module):
@@ -599,7 +643,11 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
-        kernel_moe_process_weights(self.plan, module)
+        if self.plan.get("weight_preprocessor") is None:
+            kernel_moe_process_weights(self.plan, module)
+        else:
+            with _unsplit_large_blocks(module):
+                kernel_moe_process_weights(self.plan, module)
         self._weights_processed = True
 
     @property

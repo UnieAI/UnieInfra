@@ -351,6 +351,10 @@ class Envs:
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
+    # Largest caching-allocator block (MiB) split while an MoE weight
+    # preprocessor runs; 0 leaves the allocator alone. See
+    # layers/moe/expert.py:_unsplit_large_blocks.
+    TOKENSPEED_MOE_PREPROCESS_MAX_SPLIT_MB = EnvInt(32)
     # "uniform" routes each token to a fixed random set of experts, so dummy
     # weights spread MoE traffic like a trained router does.
     TOKENSPEED_MOE_ROUTING_SIMULATION = EnvStr("")

@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.execution.forward_thread import ForwardThread
+from tokenspeed.runtime.execution.forward_thread import ForwardThread, LaunchGate
 from tokenspeed.runtime.execution.types import (
     ModelExecutionResult,
     PendingExecution,
@@ -104,3 +104,48 @@ def test_sync_requires_a_copy_event():
     results = ModelExecutionResult(output_tokens=torch.tensor([7], dtype=torch.int32))
     with pytest.raises(RuntimeError, match="copy_event is required"):
         results.sync()
+
+
+def test_launch_gate_releases_waiter_at_replay_not_at_forward_end(thread):
+    gate = LaunchGate()
+    first, second = gate.next_seq(), gate.next_seq()
+    replay_entered = threading.Event()
+    finish = threading.Event()
+
+    def forward(seq):
+        gate.begin(seq)
+        try:
+            gate.mark_launching()  # the replay site
+            replay_entered.set()
+            finish.wait(timeout=5)  # the blocking launch
+        finally:
+            gate.end(seq)
+
+    thread.submit(lambda: forward(first))
+    assert gate.wait_launched(first, timeout_s=5)
+    assert replay_entered.is_set() and not finish.is_set()
+    # The second forward has not started: its waiter times out.
+    assert not gate.wait_launched(second, timeout_s=0.05)
+    finish.set()
+    thread.submit(lambda: forward(second))
+    assert gate.wait_launched(second, timeout_s=5)
+
+
+def test_launch_gate_marks_a_forward_that_raises_before_launch(thread):
+    gate = LaunchGate()
+    seq = gate.next_seq()
+
+    def failing_forward():
+        gate.begin(seq)
+        try:
+            raise RuntimeError("before launch")
+        finally:
+            gate.end(seq)
+
+    future = thread.submit(failing_forward)
+    assert gate.wait_launched(seq, timeout_s=5)
+    with pytest.raises(RuntimeError, match="before launch"):
+        future.result()
+    # Outside a gated forward (capture, warmup) the replay site is a no-op.
+    gate.mark_launching()
+    assert not gate.wait_launched(gate.next_seq(), timeout_s=0.01)

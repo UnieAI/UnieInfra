@@ -123,6 +123,78 @@ from typing import Any
 import torch
 
 
+class LaunchGate:
+    """Tells the control plane when the forward thread has gone GIL-free.
+
+    On a host-bound decode the forward thread is free only between graph
+    launches: ``hipGraphLaunch`` blocks it for about one GPU step, so the
+    next step's launches, H2D copies and metadata kernels all run in the
+    gap after it returns. That gap is exactly when the control plane wakes
+    up (the previous forward's result just resolved) and runs commit
+    post-processing, receive and the next plan -- all Python, all holding
+    the GIL -- so the forward thread spends much of the gap waiting for the
+    interpreter instead of launching. A commit that first waits here until
+    the next forward is inside its replay (which releases the GIL) moves
+    that work into the window the control plane would spend idle anyway.
+
+    Sequence numbers are assigned on the control plane at submit
+    (``next_seq``); the forward thread opens a forward with ``begin`` and
+    marks it launched either just before its graph replay
+    (``mark_launching``) or, at the latest, when it ends (``end``), so a
+    waiter is never stranded by an eager or failed forward.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._next_seq = 0
+        self._launched_seq = -1
+        self._current_seq: int | None = None
+
+    def next_seq(self) -> int:
+        """Reserve the sequence number of the forward being submitted."""
+        seq = self._next_seq
+        self._next_seq += 1
+        return seq
+
+    def begin(self, seq: int) -> None:
+        """Forward thread: forward ``seq`` starts running."""
+        self._current_seq = seq
+
+    def mark_launching(self) -> None:
+        """Forward thread: the running forward is about to block in a replay."""
+        seq = self._current_seq
+        if seq is not None:
+            self._mark(seq)
+
+    def end(self, seq: int) -> None:
+        """Forward thread: forward ``seq`` finished (or raised)."""
+        self._current_seq = None
+        self._mark(seq)
+
+    def _mark(self, seq: int) -> None:
+        with self._cond:
+            if seq > self._launched_seq:
+                self._launched_seq = seq
+                self._cond.notify_all()
+
+    def wait_launched(self, seq: int, timeout_s: float) -> bool:
+        """Control plane: block until forward ``seq`` launched, or timeout.
+
+        Returns:
+            Whether the forward was marked within ``timeout_s``.
+        """
+        with self._cond:
+            return self._cond.wait_for(
+                lambda: self._launched_seq >= seq, timeout=timeout_s
+            )
+
+
+# One forward thread per rank process, so one gate: the replay site in
+# ``ForwardStepRunner`` reaches it without threading a handle through the
+# executor, and it is a no-op outside a gated forward (capture, warmup).
+DECODE_LAUNCH_GATE = LaunchGate()
+
+
 class ForwardThread:
     """Single consumer thread executing submitted GPU work in FIFO order.
 

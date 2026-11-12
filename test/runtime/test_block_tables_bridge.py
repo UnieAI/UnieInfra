@@ -141,6 +141,54 @@ class TestBlockTablesBridgeTest:
                 max_page_ids={"full": 8},
             )
 
+    def test_staged_then_uploaded_matches_one_shot_pack(self):
+        # The control plane stages, the forward thread uploads: the split
+        # must yield the same tables, order and shared storage as the
+        # one-shot pack, including a zero-width group kept out of the pack.
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            packed_block_tables_from_forward_op,
+            stage_block_tables_from_forward_op,
+            upload_staged_block_tables,
+        )
+
+        op = self._make_op(
+            {"swa": [[21], [0]], "empty": [[], []], "full": [[11, 12], [13, -1]]}
+        )
+        # Non-strict: the strict contract rejects zero-width groups outright.
+        kwargs = dict(num_reqs=2)
+        one_shot = packed_block_tables_from_forward_op(op, "cpu", **kwargs)
+        split = upload_staged_block_tables(
+            stage_block_tables_from_forward_op(op, "cpu", **kwargs)
+        )
+        for got, want in (
+            (split.tables, one_shot.tables),
+            (split.tables_cpu, one_shot.tables_cpu),
+        ):
+            assert list(got) == ["swa", "empty", "full"]
+            assert {k: v.tolist() for k, v in got.items()} == {
+                k: v.tolist() for k, v in want.items()
+            }
+            assert tuple(got["empty"].shape) == (2, 0)
+        assert (
+            split.tables["full"].untyped_storage().data_ptr()
+            == split.tables["swa"].untyped_storage().data_ptr()
+        )
+
+    def test_stage_validates_before_any_upload(self):
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            stage_block_tables_from_forward_op,
+        )
+
+        out_of_range = self._make_op({"full": [[1, 99]]})
+        with pytest.raises((ValueError), match=("outside -1..8")):
+            stage_block_tables_from_forward_op(
+                out_of_range,
+                "cpu",
+                num_reqs=1,
+                expected_group_ids=("full",),
+                max_page_ids={"full": 8},
+            )
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

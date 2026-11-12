@@ -120,6 +120,9 @@ from tokenspeed.runtime.utils.startup_timing import startup_phase
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
+# Read once at import, like the other per-process A/B knobs: commits wait for
+# the next decode's graph launch (see LaunchGate in forward_thread.py).
+_DECODE_HOST_PREP = envs.TOKENSPEED_DECODE_HOST_PREP.get()
 
 
 def maybe_warm_cupti_for_graph_capture() -> None:
@@ -1382,6 +1385,20 @@ class EventLoop:
                         in_flight, effective_depth, forward_op
                     ):
                         fo, res = in_flight.popleft()
+                        if (
+                            _DECODE_HOST_PREP
+                            and in_flight
+                            and in_flight[0][0].num_extends() == 0
+                        ):
+                            # TOKENSPEED_DECODE_HOST_PREP: once the head's
+                            # result lands, let the forward thread launch the
+                            # queued decode before the commit's Python takes
+                            # the GIL (LaunchGate). result() is memoized, so
+                            # the commit below reads the same result. Extends
+                            # are skipped: their eager forward never blocks in
+                            # a replay.
+                            res.result()
+                            self._device.wait_forward_launched(in_flight[0][1])
                         request_changes.extend(self._commit_forward_results(fo, res))
 
                     request_changes.extend(self._pd_hooks.poll_transfer_events())

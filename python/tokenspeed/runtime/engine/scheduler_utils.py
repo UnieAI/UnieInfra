@@ -910,6 +910,30 @@ class PackedBlockTables(NamedTuple):
     tables_cpu: dict[str, torch.Tensor]
 
 
+class StagedBlockTables(NamedTuple):
+    """The host half of :func:`packed_block_tables_from_forward_op`.
+
+    Validated tables copied into one fresh pinned buffer, not yet uploaded:
+    staging needs no stream and can run on any thread, so the control plane
+    can do it at submit time and leave the forward thread only the H2D copy
+    (:func:`upload_staged_block_tables`).
+
+    Attributes:
+        device: Destination device of the upload.
+        staged: The pinned int32 stage, or None when no table is packable.
+        layout: ``(group_id, rows, cols, offset)`` per packed table, in order.
+        empty_rows: ``(group_id, rows)`` per zero-width table (kept out of the
+            pack; uploaded as empty tensors).
+        order: Every group id in output order.
+    """
+
+    device: torch.device
+    staged: torch.Tensor | None
+    layout: tuple[tuple[str, int, int, int], ...]
+    empty_rows: tuple[tuple[str, int], ...]
+    order: tuple[str, ...]
+
+
 def block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
@@ -965,6 +989,31 @@ def packed_block_tables_from_forward_op(
 
     Raises:
         ValueError: If strict contract validation fails before device transfer.
+    """
+    return upload_staged_block_tables(
+        stage_block_tables_from_forward_op(
+            forward_op,
+            device,
+            num_reqs=num_reqs,
+            expected_group_ids=expected_group_ids,
+            max_page_id=max_page_id,
+            max_page_ids=max_page_ids,
+        )
+    )
+
+
+def stage_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+    expected_group_ids: tuple[str, ...] | None = None,
+    max_page_id: int | None = None,
+    max_page_ids: Mapping[str, int] | None = None,
+) -> StagedBlockTables:
+    """Host half of :func:`packed_block_tables_from_forward_op`: the same
+    validation, then the pinned stage, without the upload. Touches no stream,
+    so any thread may run it; ``upload_staged_block_tables`` finishes it.
     """
     if max_page_id is not None and max_page_ids is not None:
         raise ValueError("pass max_page_id or max_page_ids, not both")
@@ -1041,9 +1090,18 @@ def packed_block_tables_from_forward_op(
                         f"-1..{group_max_page_id}"
                     )
     device = torch.device(device) if isinstance(device, str) else device
-    out: dict[str, torch.Tensor] = {}
-    out_cpu: dict[str, torch.Tensor] = {}
-    packable: list[tuple[str, Any, int]] = []
+    return _stage_ordered_block_tables(ordered_items, device, num_reqs=num_reqs)
+
+
+def _stage_ordered_block_tables(
+    ordered_items: list[tuple[str, Any]],
+    device: torch.device,
+    *,
+    num_reqs: int | None,
+) -> StagedBlockTables:
+    layout: list[tuple[str, int, int, int]] = []
+    empty_rows: list[tuple[str, int]] = []
+    order: list[str] = []
     total = 0
     for key, arr in ordered_items:
         if num_reqs is not None and arr.shape[0] != num_reqs:
@@ -1053,29 +1111,55 @@ def packed_block_tables_from_forward_op(
             )
         if arr.shape[0] == 0:
             continue
+        order.append(key)
         if arr.shape[1] == 0:
             # Kept out of the pack: a zero-width table must stay loud in the
             # replay fill's cols >= 1 assert, not be silently tail-padded.
-            out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
-            out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
+            empty_rows.append((key, arr.shape[0]))
             continue
-        packable.append((key, arr, total))
+        layout.append((key, arr.shape[0], arr.shape[1], total))
         total += arr.shape[0] * arr.shape[1]
-    if not packable:
-        return PackedBlockTables(out, out_cpu)
-    # Fresh pinned stage per step (event-fenced; reuse races overlap).
-    # arr is a read-only zero-copy view over the C++ buffer; np.copyto
-    # reads it into our own writable pinned tensor (never writes back).
-    staged = torch.empty(total, dtype=torch.int32, pin_memory=device.type == "cuda")
-    staged_np = staged.numpy()
-    for key, arr, offset in packable:
-        np.copyto(staged_np[offset : offset + arr.size].reshape(arr.shape), arr)
-    packed = staged.to(device, non_blocking=True)
-    for key, arr, offset in packable:
-        out[key] = packed[offset : offset + arr.size].view(arr.shape[0], arr.shape[1])
-        out_cpu[key] = staged[offset : offset + arr.size].view(
-            arr.shape[0], arr.shape[1]
-        )
+    staged = None
+    if layout:
+        # Fresh pinned stage per step (event-fenced; reuse races overlap).
+        # arr is a read-only zero-copy view over the C++ buffer; np.copyto
+        # reads it into our own writable pinned tensor (never writes back).
+        staged = torch.empty(total, dtype=torch.int32, pin_memory=device.type == "cuda")
+        staged_np = staged.numpy()
+        arrays = dict(ordered_items)
+        for key, rows, cols, offset in layout:
+            np.copyto(
+                staged_np[offset : offset + rows * cols].reshape(rows, cols),
+                arrays[key],
+            )
+    return StagedBlockTables(
+        device, staged, tuple(layout), tuple(empty_rows), tuple(order)
+    )
+
+
+def upload_staged_block_tables(staged: StagedBlockTables) -> PackedBlockTables:
+    """The device half: one H2D copy of the stage, per-group views over it.
+
+    Runs on the thread and stream that will consume the tables.
+    """
+    device = staged.device
+    out: dict[str, torch.Tensor] = {}
+    out_cpu: dict[str, torch.Tensor] = {}
+    empty = dict(staged.empty_rows)
+    by_key = {key: (rows, cols, offset) for key, rows, cols, offset in staged.layout}
+    packed = (
+        staged.staged.to(device, non_blocking=True)
+        if staged.staged is not None
+        else None
+    )
+    for key in staged.order:
+        if key in empty:
+            out[key] = torch.empty((empty[key], 0), dtype=torch.int32, device=device)
+            out_cpu[key] = torch.empty((empty[key], 0), dtype=torch.int32)
+            continue
+        rows, cols, offset = by_key[key]
+        out[key] = packed[offset : offset + rows * cols].view(rows, cols)
+        out_cpu[key] = staged.staged[offset : offset + rows * cols].view(rows, cols)
     return PackedBlockTables(out, out_cpu)
 
 

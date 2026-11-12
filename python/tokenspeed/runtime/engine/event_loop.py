@@ -1530,6 +1530,17 @@ def run_event_loop(
         envs.NVSHMEM_IB_TRAFFIC_CLASS.set(envs.NVSHMEM_IB_TRAFFIC_CLASS.get())
         logger.info(f"NVSHMEM_IB_TRAFFIC_CLASS={envs.NVSHMEM_IB_TRAFFIC_CLASS.get():d}")
     faulthandler.enable()
+    # The scheduler thread and the forward thread share this process's GIL.
+    # When the forward thread waits (e.g. on a stream event) it drops the GIL,
+    # and can then wait a full switch interval (5 ms by default) for the
+    # scheduler thread to hand it back, leaving the GPU idle between decode
+    # steps. A shorter interval bounds that hand-back delay.
+    switch_us = os.environ.get("TOKENSPEED_GIL_SWITCH_INTERVAL_US")
+    if switch_us:
+        sys.setswitchinterval(float(switch_us) * 1e-6)
+        logger.info(
+            f"GIL switch interval set to {sys.getswitchinterval() * 1e6:.0f} us"
+        )
     parent_process = psutil.Process().parent()
     register_usr_signal()
 

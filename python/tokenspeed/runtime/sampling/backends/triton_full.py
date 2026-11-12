@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import os
 import torch
 from tokenspeed_kernel.ops.sampling.triton import (
     accumulate_counts_inplace,
@@ -63,6 +64,8 @@ from tokenspeed.runtime.sampling.backends.triton import (
     TritonSamplingBackend,
 )
 from tokenspeed.runtime.sampling.block_verify import block_verify_chain, draft_logits
+
+_BLOCK_VERIFY_MAX_BS = int(os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_MAX_BS", "128"))
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -540,7 +543,15 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         )
 
         block_state = getattr(self, "_block_verify_state", None)
-        if block_state is not None and num_tokens_per_req > 1:
+        # Block verification gathers full-vocab draft logits across TP ranks
+        # (bs x steps x vocab fp32) every step; past a few dozen requests that
+        # all-gather and the full-vocab softmaxes cost more than the extra
+        # accepted tokens, so large batches keep the exact-match verify.
+        if (
+            block_state is not None
+            and num_tokens_per_req > 1
+            and bs <= _BLOCK_VERIFY_MAX_BS
+        ):
             slots = req_pool_indices.long()
             draft_full = draft_logits(block_state, slots, candidates)
             block_verify_chain(

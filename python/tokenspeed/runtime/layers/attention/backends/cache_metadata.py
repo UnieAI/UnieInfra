@@ -28,7 +28,9 @@ from typing import Any
 import torch
 
 from tokenspeed.runtime.engine.scheduler_utils import (
-    packed_block_tables_from_forward_op,
+    StagedBlockTables,
+    stage_block_tables_from_forward_op,
+    upload_staged_block_tables,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
@@ -60,8 +62,43 @@ class CacheBatchMetadata:
         device: torch.device | str,
         contract: CacheRuntimeContract,
         num_requests: int,
+        staged: StagedBlockTables | None = None,
     ) -> CacheBatchMetadata:
-        """Validate virtual block IDs, pack once, and retain operation provenance."""
+        """Validate virtual block IDs, pack once, and retain operation provenance.
+
+        ``staged`` is this forward's :meth:`stage_tables` result when the
+        host half already ran elsewhere (the control plane, under
+        TOKENSPEED_DECODE_HOST_PREP); only the upload then runs here.
+        """
+        if staged is None:
+            staged = cls.stage_tables(
+                forward_op,
+                device=device,
+                contract=contract,
+                num_requests=num_requests,
+            )
+        tables = upload_staged_block_tables(staged)
+        return cls._from_validated_tables(
+            group_ids=tuple(spec.group_id for spec in contract.group_specs),
+            group_tables=tables.tables,
+            group_tables_cpu=tables.tables_cpu,
+            num_requests=num_requests,
+            forward_op=forward_op,
+        )
+
+    @staticmethod
+    def stage_tables(
+        forward_op: Any,
+        *,
+        device: torch.device | str,
+        contract: CacheRuntimeContract,
+        num_requests: int,
+    ) -> StagedBlockTables:
+        """Validate a forward's virtual block IDs and pin-stage them.
+
+        The host half of :meth:`from_forward_op`: no stream, no device work,
+        so it may run on any thread ahead of the forward.
+        """
         if forward_op is None:
             raise ValueError("forward_op must not be None")
         require_positive_int("num_reqs", num_requests)
@@ -84,19 +121,12 @@ class CacheBatchMetadata:
             raise ValueError(
                 "runtime contract must provide ordered nonempty unique group IDs"
             )
-        tables = packed_block_tables_from_forward_op(
+        return stage_block_tables_from_forward_op(
             forward_op,
             device,
             num_reqs=num_requests,
             expected_group_ids=group_ids,
             max_page_ids=max_page_ids,
-        )
-        return cls._from_validated_tables(
-            group_ids=group_ids,
-            group_tables=tables.tables,
-            group_tables_cpu=tables.tables_cpu,
-            num_requests=num_requests,
-            forward_op=forward_op,
         )
 
     @classmethod

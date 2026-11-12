@@ -355,6 +355,9 @@ class PendingExecution:
     """
 
     _future: Future
+    # The forward's ``LaunchGate`` sequence number under
+    # TOKENSPEED_DECODE_HOST_PREP, else None (no commit waits on it).
+    launch_seq: int | None = None
     _result: ModelExecutionResult | None = field(default=None, init=False, repr=False)
 
     def result(self) -> ModelExecutionResult:

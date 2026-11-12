@@ -45,7 +45,10 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
+from tokenspeed.runtime.engine.scheduler_utils import (
+    StagedBlockTables,
+    engram_context_len,
+)
 from tokenspeed.runtime.execution.accept_simulation import (
     ACCEPT_LENGTH_SCALE,
     parse_simulated_accept_length,
@@ -2219,6 +2222,21 @@ class ModelExecutor:
                 rows, stream=self.execution_stream
             )
 
+    def stage_block_tables(self, forward_op) -> StagedBlockTables | None:
+        """Host half of the forward's block-table pack, for any thread.
+
+        Returns None for an empty batch, which packs no tables.
+        """
+        bs = len(forward_op.request_ids)
+        if bs == 0:
+            return None
+        return CacheBatchMetadata.stage_tables(
+            forward_op,
+            device=self.device,
+            contract=self._cache_runtime_contract,
+            num_requests=bs,
+        )
+
     def execute_forward_op(
         self,
         forward_op,
@@ -2233,6 +2251,7 @@ class ModelExecutor:
         input_logprob_plan: InputLogprobPlan | None,
         sampled_top_k: int,
         stop_criteria: Sequence[StopCriteria],
+        staged_block_tables: StagedBlockTables | None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -2273,6 +2292,7 @@ class ModelExecutor:
                     device=self.device,
                     contract=self._cache_runtime_contract,
                     num_requests=bs,
+                    staged=staged_block_tables,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
                 block_tables_cpu = dict(

@@ -278,6 +278,19 @@ class Envs:
     # raises. Any such synchronization on the data plane stalls the forward
     # thread until the in-flight step drains and defeats overlap scheduling.
     TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
+    # Decode host-gap trim (A/B knob, default off). The forward thread is the
+    # only thread that can enqueue the next decode, and it is free only between
+    # graph launches (hipGraphLaunch blocks for about the GPU step). With this
+    # on, (1) commit post-processing on the event loop waits until the forward
+    # thread has entered the next graph replay, so the two threads no longer
+    # contend for the GIL inside that window, and (2) the next forward's block
+    # tables are validated and staged into pinned memory on the event loop at
+    # submit time, leaving only the H2D copy to the forward thread.
+    TOKENSPEED_DECODE_HOST_PREP = EnvBool(False)
+    # Upper bound, in ms, on (1)'s wait: a forward that never reaches its
+    # launch (a failure before it, a cancelled submission) releases the commit
+    # after this long at the latest.
+    TOKENSPEED_DECODE_HOST_PREP_WAIT_MS = EnvFloat(20.0)
     # Triton compilations once serving starts: "warn" logs each one with what
     # changed and names a compile-time kernel parameter that keeps taking new
     # values (a per-batch constexpr, one JIT compile on the forward thread per

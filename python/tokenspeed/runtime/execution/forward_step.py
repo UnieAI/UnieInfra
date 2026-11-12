@@ -40,6 +40,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_thread import DECODE_LAUNCH_GATE
 from tokenspeed.runtime.execution.graph_ptr_guard import (
     graph_debug_enabled,
     snapshot_graph_metadata,
@@ -1178,6 +1179,9 @@ class ForwardStepRunner:
                         else [ctx.input_num_tokens] * self.world_size
                     ),
                 )
+            # Releases a commit waiting on this forward (see LaunchGate):
+            # replay drops the GIL for the whole blocking launch.
+            DECODE_LAUNCH_GATE.mark_launching()
             with nvtx_range("graph_replay", color="red"):
                 graph.replay()
             if self._expert_load_rows is not None:
@@ -1203,6 +1207,9 @@ class ForwardStepRunner:
                 None,
             )
         else:
+            # An eager decode never blocks in a replay; release a waiting
+            # commit now rather than at its timeout.
+            DECODE_LAUNCH_GATE.mark_launching()
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         if use_graph and padded_bs != bs:

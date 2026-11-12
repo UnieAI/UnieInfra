@@ -97,6 +97,7 @@ from tokenspeed.runtime.distributed.nccl_suspend import (
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_thread import DECODE_LAUNCH_GATE
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -365,6 +366,10 @@ class DeviceHandle:
         # submission that raised would otherwise vanish with the hitter's
         # block left unfilled.
         self._copy_submissions: deque = deque()
+        # TOKENSPEED_DECODE_HOST_PREP: gate commits on the next forward's
+        # launch and stage its block tables here (see LaunchGate).
+        self._decode_host_prep = envs.TOKENSPEED_DECODE_HOST_PREP.get()
+        self._launch_wait_s = envs.TOKENSPEED_DECODE_HOST_PREP_WAIT_MS.get() / 1000.0
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -570,8 +575,25 @@ class DeviceHandle:
             A ``PendingExecution`` the loop resolves at commit.
         """
         executor = self._executor
+        launch_seq = None
+        staged_block_tables = None
+        if self._decode_host_prep:
+            launch_seq = DECODE_LAUNCH_GATE.next_seq()
+            # Host half of the block-table pack (validation + pinned stage)
+            # on the control plane, which is otherwise waiting for the
+            # in-flight step; the forward thread keeps only the H2D copy.
+            staged_block_tables = executor.stage_block_tables(planned.forward_op)
 
         def _forward():
+            if launch_seq is None:
+                return _run_forward()
+            DECODE_LAUNCH_GATE.begin(launch_seq)
+            try:
+                return _run_forward()
+            finally:
+                DECODE_LAUNCH_GATE.end(launch_seq)
+
+        def _run_forward():
             phase_range = contextlib.nullcontext()
             # The C++ profiler-enabled query is thread-local and stays false
             # on pre-existing workers under all-thread capture. This installed
@@ -605,9 +627,24 @@ class DeviceHandle:
                     input_logprob_plan=planned.input_logprob_plan,
                     sampled_top_k=planned.sampled_top_k,
                     stop_criteria=planned.stop_criteria,
+                    staged_block_tables=staged_block_tables,
                 )
 
-        return PendingExecution(self._thread.submit(_forward))
+        return PendingExecution(self._thread.submit(_forward), launch_seq=launch_seq)
+
+    def wait_forward_launched(self, pending: PendingExecution) -> None:
+        """Block until ``pending``'s forward entered its graph replay.
+
+        Under TOKENSPEED_DECODE_HOST_PREP the commit of the previous forward
+        calls this before its Python post-processing, so that work runs
+        while the forward thread sits GIL-free in ``hipGraphLaunch`` instead
+        of competing with it for the GIL while it prepares the launch. Bounded
+        by TOKENSPEED_DECODE_HOST_PREP_WAIT_MS; a no-op for a forward
+        submitted without a sequence number.
+        """
+        if pending.launch_seq is None:
+            return
+        DECODE_LAUNCH_GATE.wait_launched(pending.launch_seq, self._launch_wait_s)
 
     def poll_cache_results(self) -> list:
         """Collect completed Host cache ops (both tiers); never blocks.

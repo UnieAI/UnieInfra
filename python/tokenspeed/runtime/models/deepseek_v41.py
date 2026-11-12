@@ -120,6 +120,7 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
@@ -169,7 +170,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 logger = logging.getLogger(__name__)
 _ROPE_TABLES = WeakValueDictionary()
@@ -1530,6 +1531,31 @@ class DeepseekV41MoE(DeepseekV4MoE):
         return logits, bias, None, None
 
 
+def _hc_mixes_on_aux_stream(
+    residual_device: torch.device,
+    forward_mode: ForwardMode | None,
+    aux_stream_device: torch.device | None,
+    *,
+    inline: bool,
+) -> bool:
+    """Whether a sublayer's mHC mixes fork onto the HC side stream.
+
+    Only CUDA decode forks. ``inline`` (TOKENSPEED_DECODE_HC_INLINE) keeps the
+    mixes on the main stream in decode too: on ROCm each fork/join costs a
+    cross-queue wait on both edges (~12 us per sublayer) that is larger than
+    the ~5 us of overlap with HC apply-pre, and every fork splits the captured
+    graph into more segments for the HIP graph launcher.
+    """
+    return (
+        not inline
+        and residual_device.type == "cuda"
+        and forward_mode is not None
+        and forward_mode.is_decode()
+        and aux_stream_device is not None
+        and aux_stream_device == residual_device
+    )
+
+
 class DeepseekV41DecoderLayer(nn.Module):
     """Overlap HC coefficients with decode sublayer work on CUDA.
 
@@ -1549,11 +1575,13 @@ class DeepseekV41DecoderLayer(nn.Module):
         prefix: str,
         aux_stream,
         hc_stream: torch.cuda.Stream | None,
+        hc_inline: bool,
         host_table: bool,
         host_layout: str,
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.hc_inline = hc_inline
         self.ced_decoder_start = ced_decoder_start
         self.norm_eps, self.hc_eps = config.rms_norm_eps, config.hc_eps
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
@@ -1631,12 +1659,12 @@ class DeepseekV41DecoderLayer(nn.Module):
                     x[:0], None if image_mask is None else image_mask[:0], ctx, False
                 )
             return residual[:0], pre_mix[:0]
-        overlap = (
-            residual.is_cuda
-            and ctx.forward_mode is not None
-            and ctx.forward_mode.is_decode()
-            and self.hc_stream_fork.aux_stream is not None
-            and self.hc_stream_fork.aux_stream.device == residual.device
+        aux = self.hc_stream_fork.aux_stream
+        overlap = _hc_mixes_on_aux_stream(
+            residual.device,
+            ctx.forward_mode,
+            None if aux is None else aux.device,
+            inline=self.hc_inline,
         )
         consumer = torch.cuda.current_stream() if overlap else None
         if overlap:
@@ -2013,6 +2041,7 @@ class DeepseekV41Model(nn.Module):
                     add_prefix(f"layers.{layer_id}", prefix),
                     self.aux_stream,
                     self.hc_stream,
+                    envs.TOKENSPEED_DECODE_HC_INLINE.get(),
                     host_table,
                     host_layout,
                 )

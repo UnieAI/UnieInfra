@@ -1464,12 +1464,11 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
     // prompts) would keep every round on prefill and starve resident decodes
     // forever. After decode_every_prefill_rounds_ prefill rounds in a row,
     // a round that has decodes waiting runs them instead.
-    const bool force_decode =
-        !config_.enable_mixed_prefill_decode && decode_every_prefill_rounds_ > 0 &&
-        prefill_rounds_since_decode_ >= decode_every_prefill_rounds_ &&
-        std::ranges::any_of(candidates, [](const Request* request) {
-            return request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>();
-        });
+    const bool force_decode = !config_.enable_mixed_prefill_decode && decode_every_prefill_rounds_ > 0 &&
+                              prefill_rounds_since_decode_ >= decode_every_prefill_rounds_ &&
+                              std::ranges::any_of(candidates, [](const Request* request) {
+                                  return request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>();
+                              });
     if (!force_decode) {
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
     }

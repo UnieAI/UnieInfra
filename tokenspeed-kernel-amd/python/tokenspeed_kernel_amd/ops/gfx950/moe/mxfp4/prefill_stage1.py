@@ -548,6 +548,7 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr,
     SITU_LINEAR_BETA: gl.constexpr,
 ):
     """Stage 1 with four-wave async FP8 activation staging.
@@ -837,7 +838,7 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
 
     activated = _apply_interleaved_gate_activation(
         acc,
-        True,
+        DO_SITU,
         SWIGLU_ALPHA,
         SWIGLU_LIMIT,
         SWIGLU_BETA,
@@ -2447,7 +2448,6 @@ def invoke_gluon_mxfp4_moe_stage1(
         and output_sorted
         and output_quantized
         and output_format == "e4m3"
-        and situ_linear_beta is not None
         and stride_ak == 1
     )
     if use_e4m3_async:
@@ -2477,7 +2477,10 @@ def invoke_gluon_mxfp4_moe_stage1(
             SWIGLU_ALPHA=float(swiglu_alpha),
             SWIGLU_LIMIT=float(swiglu_limit),
             SWIGLU_BETA=float(swiglu_beta),
-            SITU_LINEAR_BETA=float(situ_linear_beta),
+            DO_SITU=situ_linear_beta is not None,
+            SITU_LINEAR_BETA=(
+                1.0 if situ_linear_beta is None else float(situ_linear_beta)
+            ),
             num_warps=4,
         )
         return out

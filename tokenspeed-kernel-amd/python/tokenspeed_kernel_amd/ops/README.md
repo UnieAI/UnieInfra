@@ -704,6 +704,22 @@ uses 16-head by 32-row tiles, four wave64s, and 18 fixed KV partitions. Its
 second kernel combines the partial outputs and log-sum-exp values before
 applying the sink.
 
+The gfx950 DeepSeek V4.1 CSA2 selection can also run as one radix top-k
+kernel (`gluon_dsv41_index_topk_radix_gfx950`, opt-in through
+`TOKENSPEED_INDEX_RADIX_TOPK=1`), which serves both the top-512 rows of each
+query and the top-2048 8-row blocks by block maximum (newest block forced in)
+with the same position-sorted, lowest-position-tie contract. One 16-wave CTA
+owns a row: pass 1 histograms the high 14 bits of the FP32 order key into a
+16K-bin LDS histogram; pass 2 re-reads the row back to front, sends keys above
+the K-th key's bucket straight to the pick list and compacts that bucket
+(at most 8192 keys and positions, aliasing the histogram) into LDS, where the
+remaining 10 + 8 bits and any boundary ties (a radix select on `~position`)
+are resolved. A position bitmap orders the picks for rows up to 131072
+elements; wider rows and shuffled candidates use an all-pairs rank sort. A
+bucket too large for LDS falls back to one row rescan per remaining digit plus
+a position-order compaction scan. It follows the long-row algorithm of
+AITER's FlyDSL `radix_topk_one_block`, ported to Gluon.
+
 The gfx1250 indexer scores 64 candidates at a time with native scaled E2M1
 wave32 WMMA, accumulates weighted ReLU scores in FP32, and reuses the gfx1250
 DSA radix top-k. Four waves cover 32 index heads; 64-head inputs reuse the same

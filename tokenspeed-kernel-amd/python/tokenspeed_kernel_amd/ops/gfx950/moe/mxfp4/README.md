@@ -22,6 +22,13 @@ Both direct decode and E2M1 package prefill accept token-ordered, prequantized
 activations. Package prefill reuses their packed data and gathers the existing
 CDNA4 scales into route order instead of quantizing the BF16 input again.
 
+`gluon_mxfp_precomputed_mxfp4_fused_moe` takes an explicit
+`decode_activation_format`: with "e4m3" (opt-in through
+`TOKENSPEED_MOE_DECODE_E4M3=1` in tokenspeed-kernel), package batches up to
+1024 rows quantize the BF16 input per sorted route to MXFP8 and run the
+async-LDS E4M3 stage 1, whose epilogue applies SiTU or the clamped SwiGLU.
+Larger batches and prequantized inputs stay E2M1.
+
 Route-tiled GEMMs group each expert's routes into small tiles described by
 `(start, count, expert)`. Both GEMMs reuse these descriptors and preserve
 token/slot order for intermediates and outputs. Matrix dimensions, top-k and

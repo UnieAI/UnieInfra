@@ -396,6 +396,7 @@ def test_dynamic_mxfp4_deferred_ep(
             swiglu_limit=0.0,
             swiglu_beta=0.0,
             out=None,
+            decode_activation_format="e2m1",
         )
     torch.cuda.synchronize()
 

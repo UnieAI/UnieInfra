@@ -1519,6 +1519,12 @@ def _maybe_route_owned_mxfp4_mfma_decode(
 # selected automatically for M >= this threshold (no env toggle).
 _PACKAGE_PREFILL_MIN_M = 9
 
+# Package batches up to this many rows (decode-sized, e.g. speculative verify
+# rows) may quantize activations to E4M3 instead of E2M1; see
+# ``gluon_mxfp_precomputed_mxfp4_fused_moe``. Larger (prefill) batches keep
+# E2M1.
+_E4M3_DECODE_MAX_M = 1024
+
 
 def _maybe_gluon_package_mxfp4_prefill(
     hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -2058,6 +2064,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
     out: torch.Tensor | None = None,
+    decode_activation_format: str,
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
     """Dispatch precomputed routes through dynamic A4W4 gfx950 experts.
 
@@ -2066,7 +2073,17 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     are defined; consumers must not read routes marked ``-1``.
     Deferred mode returns one canonical row per route so
     the shared model epilogue can normalize, weight, and reduce across ranks.
+
+    ``decode_activation_format`` ("e2m1" or "e4m3") is the stage-1 activation
+    format of package batches up to ``_E4M3_DECODE_MAX_M`` rows; "e4m3"
+    requires BF16 ``hidden_states`` (no prequantized input). Larger batches
+    always use E2M1.
     """
+    if decode_activation_format not in ("e2m1", "e4m3"):
+        raise ValueError(
+            "decode_activation_format must be e2m1 or e4m3, "
+            f"got {decode_activation_format}"
+        )
     rows, hidden_dim, device, input_dtype = _mxfp4_input_metadata(hidden_states)
     if isinstance(hidden_states, tuple):
         _resolve_mxfp4_activation(hidden_states, x_quantized)
@@ -2127,6 +2144,9 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     if direct_out is not None:
         return direct_out
 
+    package_format = (
+        decode_activation_format if n_tokens <= _E4M3_DECODE_MAX_M else "e2m1"
+    )
     package_out = _maybe_gluon_package_mxfp4_prefill(
         hidden_states,
         topk_weights,
@@ -2152,6 +2172,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         expert_start=expert_start,
         global_num_experts=global_num_experts,
         out=out if do_finalize else None,
+        activation_format=package_format,
     )
     if package_out is not None:
         return package_out

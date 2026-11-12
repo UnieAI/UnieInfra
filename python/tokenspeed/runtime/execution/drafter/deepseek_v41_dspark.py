@@ -114,6 +114,8 @@ class DeepseekV41DSpark(BaseDrafter):
         self.device = torch.device(draft_model_runner.device)
         self.draft_model = draft_model_runner.model
         self.model = self.draft_model.model
+        # The target's vocab-parallel TP group; filled by wire_target.
+        self.tp_group: tuple[int, ...] | None = None
         self.block_size = int(self.model.block_size)
         validate_block_widths(
             "DSPARK", self.block_size, spec_num_steps, spec_num_tokens
@@ -166,7 +168,9 @@ class DeepseekV41DSpark(BaseDrafter):
                 projection=projection.weight,
                 num_valid=int(projection.shard_indices.num_org_elements),
                 tp_size=int(self.draft_model.mapping.attn.tp_size),
-                tp_group=None,  # set in wire_target
+                # wire_target may run before or after this binding; whichever
+                # runs second copies the target's TP group into the state.
+                tp_group=self.tp_group,
             )
             sampling_backend.bind_block_verify(self.block_verify_state)
 

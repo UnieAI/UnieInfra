@@ -80,9 +80,10 @@ def block_verify_chain(
     lp = torch.log_softmax(target_logits.view(bs, n, vocab) / t, dim=-1)
     lq = torch.log_softmax(draft_logits_full[..., :vocab] / t, dim=-1)
     drafts = candidates[:, 1:].long()
-    ratio = lp[:, :steps].gather(-1, drafts[..., None])[..., 0] - lq.gather(
-        -1, drafts[..., None]
-    )[..., 0]
+    ratio = (
+        lp[:, :steps].gather(-1, drafts[..., None])[..., 0]
+        - lq.gather(-1, drafts[..., None])[..., 0]
+    )
     cum = []
     log_p = torch.zeros(bs, device=ratio.device)
     for i in range(steps):
@@ -104,12 +105,16 @@ def block_verify_chain(
     # Next token: residual after acc accepted tokens, or P after a full block.
     rows = torch.arange(bs, device=h.device)
     pa = torch.where(
-        acc > 0, p.gather(1, (acc - 1).clamp_min(0)[:, None])[:, 0], torch.ones_like(acc, dtype=p.dtype)
+        acc > 0,
+        p.gather(1, (acc - 1).clamp_min(0)[:, None])[:, 0],
+        torch.ones_like(acc, dtype=p.dtype),
     )
     p_row = lp[rows, acc].exp()  # [bs, V]
     q_row = lq[rows, acc.clamp_max(steps - 1)].exp()
     res = torch.clamp(pa[:, None] * p_row - q_row, min=0.0)
-    res = torch.where((acc == steps)[:, None] | (res.sum(-1, keepdim=True) <= 0), p_row, res)
+    res = torch.where(
+        (acc == steps)[:, None] | (res.sum(-1, keepdim=True) <= 0), p_row, res
+    )
     g = -torch.log(-torch.log(torch.rand_like(res).clamp(1.0e-7, 1.0 - 1.0e-7)))
     final = (torch.log(res.clamp_min(1.0e-38)) + g).argmax(-1)  # [bs]
     # Pack like verify_chain_target_sampled.
@@ -119,6 +124,10 @@ def block_verify_chain(
     out = torch.where(pos == acc[:, None], final[:, None], out)
     predict.view(bs, n).copy_(out.to(predict.dtype))
     accept_index.copy_(
-        torch.where(pos <= acc[:, None], rows[:, None] * n + pos, torch.full_like(pos, -1) + rows[:, None] * 0).to(accept_index.dtype)
+        torch.where(
+            pos <= acc[:, None],
+            rows[:, None] * n + pos,
+            torch.full_like(pos, -1) + rows[:, None] * 0,
+        ).to(accept_index.dtype)
     )
     accept_length.copy_(acc.to(accept_length.dtype))

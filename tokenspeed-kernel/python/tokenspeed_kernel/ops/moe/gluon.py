@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -956,6 +957,21 @@ if platform.is_amd:
         if tensors[0].shape[0] != expected:
             raise ValueError("linear MXFP4 weights have the wrong local expert count")
 
+    # TOKENSPEED_MOE_DECODE_E4M3=1: decode-sized gfx950 dynamic-A4W4 batches
+    # quantize their BF16 activations to E4M3 (MXFP8) for stage 1 instead of
+    # E2M1. Prequantized (E2M1) inputs keep E2M1.
+    _MOE_DECODE_E4M3 = os.environ.get("TOKENSPEED_MOE_DECODE_E4M3", "0") == "1"
+
+    def _decode_activation_format(x, x_quantized) -> str:
+        if (
+            _MOE_DECODE_E4M3
+            and x_quantized is None
+            and isinstance(x, torch.Tensor)
+            and x.dtype == torch.bfloat16
+        ):
+            return "e4m3"
+        return "e2m1"
+
     def _swiglu_args(w: torch.nn.Module) -> tuple[float, float, float]:
         swiglu_arg = getattr(w, "swiglu_arg", None)
         if swiglu_arg is None:
@@ -1169,6 +1185,7 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             out=getattr(w, "_situ_output_buffer", None) if do_finalize else None,
+            decode_activation_format=_decode_activation_format(x, x_quantized),
         )
 
     def _warmup_a4w4_ep_deferred(plan: dict, w: torch.nn.Module) -> None:
@@ -1961,6 +1978,7 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             out=getattr(w, "_situ_output_buffer", None),
+            decode_activation_format=_decode_activation_format(x, None),
         )
 
     def gluon_mxfp4_a4w4_moe_weights_gfx950(plan: dict, w: torch.nn.Module) -> None:

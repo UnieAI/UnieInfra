@@ -423,3 +423,139 @@ def test_fused_selected_attention_no_recompile_across_rows(with_rope):
         for tokens in (2, 5, 16, 17, 32, 33, 64, 128, 129, 150, 191):
             run(tokens)
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    ("tokens", "real_heads", "heads", "splits"),
+    [
+        (192, 16, 16, 1),
+        (192, 16, 16, 2),
+        (192, 16, 16, 3),
+        (150, 16, 16, 4),
+        (192, 16, 64, 2),
+        (192, 64, 64, 4),
+        (130, 16, 128, 2),
+        (384, 16, 16, 16),
+    ],
+)
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_rows_split_matches_unsplit(
+    monkeypatch, tokens, real_heads, heads, splits, with_rope
+):
+    """TOKENSPEED_ATTN_ROWS_SPLIT: the rows kernel split over tiles plus the
+    reduce matches the unsplit rows kernel and the gather softmax.
+
+    Covers every split count the auto choice can take, a split count past the
+    SWA/global boundary of most rows (16), zero-query padded heads (row-sum
+    partials) and two head blocks (128 heads).
+    """
+    platform = current_platform()
+    if not platform.is_cdna4:
+        pytest.skip("gfx950 rows kernel")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+    device = torch.device("cuda:0")
+    segments = _decode_inputs(tokens, device, 31)
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    q, sink = _padded_query(tokens, real_heads, heads, device, 37)
+    rope = {}
+    if with_rope:
+        positions = torch.arange(tokens, dtype=torch.int64, device=device) + 3
+        angles = torch.randn((tokens + 3, 32), dtype=torch.float32, device=device)
+        rope = {
+            "rope_positions": positions,
+            "rope_cos_sin": torch.cat((angles.cos(), -angles.sin()), dim=1),
+        }
+
+    def run(mode):
+        monkeypatch.setattr(selected, "_ROWS_SPLIT", mode)
+        return selected.launch_gluon_dsv41_selected_attention_gfx950(
+            q,
+            swa,
+            swa_slots,
+            swa_lens,
+            glob,
+            global_slots,
+            global_lens,
+            sink,
+            512**-0.5,
+            None,
+            256,
+            None,
+            None,
+            None,
+            **rope,
+        )
+
+    unsplit = run(0)
+    split = run(splits)
+    torch.testing.assert_close(split, unsplit, rtol=0.008, atol=0.002)
+    if not with_rope:
+        expected = _gather_softmax(q, sink, segments).bfloat16()
+        torch.testing.assert_close(split, expected, rtol=0.008, atol=0.004)
+    # Deterministic: graph replay must reproduce eager output bit for bit.
+    torch.testing.assert_close(run(splits), split, rtol=0, atol=0)
+
+
+def test_rows_split_auto_count_is_bounded():
+    """The auto split count stays within the reduce's limit and the tiles."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+    for cus in (128, 256):
+        for units in range(cus + 1, 8 * cus, 7):
+            count = selected._rows_split_count(units, 20, cus)
+            assert 1 <= count <= selected._ROWS_AUTO_MAX_SPLITS
+            assert selected._rows_split_count(units, 1, cus) == 1
+    # 192 rows on 128 CUs leave half the CUs with two unsplit workgroups.
+    assert selected._rows_split_count(192, 20, 128) > 1
+
+
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_rows_split_no_recompile_across_rows(monkeypatch, with_rope):
+    """Auto split counts follow the row count without recompiling."""
+    if not current_platform().is_cdna4:
+        pytest.skip("gfx950 rows kernel")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+    monkeypatch.setattr(selected, "_ROWS_SPLIT", 1)
+    device = torch.device("cuda:0")
+    segments = _decode_inputs(768, device, 3)
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    q, sink = _padded_query(768, 16, 16, device, 5)
+    positions = torch.arange(768, dtype=torch.int64, device=device)
+    angles = torch.randn((768, 32), dtype=torch.float32, device=device)
+    cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
+
+    def run(tokens):
+        rope = (
+            {"rope_positions": positions[:tokens], "rope_cos_sin": cos_sin}
+            if with_rope
+            else {}
+        )
+        selected.launch_gluon_dsv41_selected_attention_gfx950(
+            q[:tokens],
+            swa,
+            swa_slots[:tokens],
+            swa_lens[:tokens],
+            glob,
+            global_slots[:tokens],
+            global_lens[:tokens],
+            sink,
+            512**-0.5,
+            None,
+            256,
+            None,
+            None,
+            None,
+            **rope,
+        )
+
+    for tokens in (192, 768):
+        run(tokens)
+    with assert_no_triton_compile(
+        selected.gluon_dsv41_selected_attention_rows_gfx950,
+        selected.gluon_dsv41_selected_attention_reduce_gfx950,
+    ):
+        for tokens in (129, 150, 191, 256, 384, 500, 767):
+            run(tokens)
+    torch.cuda.synchronize()

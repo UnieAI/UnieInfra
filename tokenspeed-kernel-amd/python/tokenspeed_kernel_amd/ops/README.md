@@ -884,6 +884,14 @@ Program ids are remapped so consecutive rows (one request's speculative rows,
 whose selections overlap) share an XCD's L2. The RoPE epilogue loads its
 cos/sin once per pass and rotates the BF16 output in registers.
 
+With `TOKENSPEED_ATTN_ROWS_SPLIT=1` (default 0, off) the rows kernel also
+splits each (row, head block) over a contiguous share of its tiles, like the
+main kernel below, and stores the same FP32 partials for the same reduce.
+An unsplit launch of 192 rows on 128 CUs leaves half the CUs with two
+workgroups and half with one; the split count (1-4, a runtime argument;
+`SPLIT` is a fixed compile-time switch) minimizes the busiest CU's modeled
+time. A value of 2-16 forces that split count.
+
 Below that, the main kernel runs one workgroup per CU (VGPR-bound). While
 `tokens * head_blocks` is below the CU count, rows are split over up to 16
 workgroups that store FP32 `(max, sum, P @ V)` partials (zero-query groups store

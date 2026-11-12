@@ -40,6 +40,7 @@ head dims. See the "DeepSeek V4.1 selected attention" section of
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from tokenspeed_kernel_amd._device import num_cus, num_xcds
@@ -66,6 +67,39 @@ _HEAD_GROUPS_PER_CTA = 4
 # The unsplit decode kernel: 32-row tiles keep two workgroups per CU.
 _ROWS_TILE_K = 32
 _ROWS_WAVES_PER_EU = 2
+# TOKENSPEED_ATTN_ROWS_SPLIT: 0 (default) runs the rows kernel unsplit; 1
+# splits each (row, head block) over a count chosen by _rows_split_count;
+# 2..16 forces that count. A split rows launch writes the main kernel's
+# partials and is merged by the same reduce kernel.
+_ROWS_SPLIT = int(os.environ.get("TOKENSPEED_ATTN_ROWS_SPLIT", "0"))
+if not 0 <= _ROWS_SPLIT <= _MAX_SPLITS:
+    raise ValueError(f"TOKENSPEED_ATTN_ROWS_SPLIT must be in [0, {_MAX_SPLITS}]")
+_ROWS_AUTO_MAX_SPLITS = 4
+# Cost model of the rows kernel per CU, in units of one unsplit workgroup
+# running alone: two resident workgroups finish together in _ROWS_PAIR_COST
+# (they share the CU), and a split launch pays _ROWS_SPLIT_COST for the
+# partial stores and the reduce launch.
+_ROWS_PAIR_COST = 1.6
+_ROWS_SPLIT_COST = 0.1
+
+
+def _rows_split_count(units: int, max_tiles: int, cus: int) -> int:
+    """Splits per (row, head block) unit for the rows kernel.
+
+    ``units`` workgroups of an unsplit launch leave some CUs with two of them
+    and others with one (192 rows on 128 CUs); splitting them into ``s``
+    shorter workgroups evens the per-CU work. Picks the ``s`` that minimizes
+    the busiest CU's modeled time; the result depends only on shapes.
+    """
+    best, best_cost = 1, None
+    for splits in range(1, min(_ROWS_AUTO_MAX_SPLITS, max(1, max_tiles)) + 1):
+        per_cu = -(-units * splits // cus)
+        cost = ((per_cu // 2) * _ROWS_PAIR_COST + per_cu % 2) / splits
+        if splits > 1:
+            cost += _ROWS_SPLIT_COST
+        if best_cost is None or cost < best_cost - 1e-9:
+            best, best_cost = splits, cost
+    return best
 
 
 @gluon.jit
@@ -947,6 +981,9 @@ def _selected_attention_rows_metadata(grid, kernel, args):
     heads = args["num_heads"]
     swa_width = args["swa_width"]
     global_width = args["global_width"] if args["HAS_GLOBAL"] else 0
+    splits = args["num_splits"]
+    # Query plus the BF16 output, or FP32 partials per split.
+    output_bytes = heads * _HEAD_DIM * (2 if splits == 1 else 4 * splits)
     return {
         "name": kernel.name,
         "flops16": 4 * tokens * heads * (swa_width + global_width) * _HEAD_DIM,
@@ -954,7 +991,8 @@ def _selected_attention_rows_metadata(grid, kernel, args):
         * (
             swa_width * (_SWA_ROW_BYTES + 4)
             + global_width * (_GLOBAL_ROW_BYTES + 4)
-            + heads * _HEAD_DIM * 4
+            + heads * _HEAD_DIM * 2
+            + output_bytes
         ),
     }
 
@@ -970,6 +1008,11 @@ def gluon_dsv41_selected_attention_rows_gfx950(
     global_lens,
     attn_sink,
     out,
+    part_stats,
+    part_acc,
+    part_row_sum,
+    part_count,
+    part_active,
     stride_q_t: tl.int64,
     stride_q_h: tl.int64,
     swa_page_stride: tl.int64,
@@ -988,6 +1031,7 @@ def gluon_dsv41_selected_attention_rows_gfx950(
     rope_positions,
     rope_cos_sin,
     stride_rope: tl.int64,
+    num_splits,
     HAS_GLOBAL: gl.constexpr,
     HEAD_GROUPS: gl.constexpr,
     BLOCK_H: gl.constexpr,
@@ -995,10 +1039,18 @@ def gluon_dsv41_selected_attention_rows_gfx950(
     HEAD_DIM: gl.constexpr,
     ROPE_DIM: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    SPLIT: gl.constexpr,
 ):
     """Unsplit decode: program w owns query row w // head_blocks and head block
     w % head_blocks over all of the row's selected tiles, and writes the final
     (optionally RoPE-rotated) output.
+
+    With ``SPLIT`` (a fixed feature switch, not a per-batch value) program w
+    instead owns the (w % num_splits)-th contiguous share of the row's tiles
+    (SWA tiles first, then global tiles) of unit w // num_splits and writes
+    the main kernel's FP32 partials for
+    ``gluon_dsv41_selected_attention_reduce_gfx950``; the runtime
+    ``num_splits`` follows the batch size.
 
     The four waves split the head dims (not the tile rows), so the softmax
     needs one cross-wave exchange per tile. Global tiles dequantize to exact
@@ -1058,8 +1110,13 @@ def gluon_dsv41_selected_attention_rows_gfx950(
     work = xcd * per_xcd + program // NUM_XCDS
     if xcd >= tall_xcds:
         work -= xcd - tall_xcds
+    if SPLIT:
+        # A unit's splits are consecutive work items, so they share an XCD.
+        split_idx = work % num_splits
+        work = work // num_splits
+    head_block = work % head_blocks
     token_idx = work // head_blocks
-    head_base = (work % head_blocks) * (HEAD_GROUPS * BLOCK_H)
+    head_base = head_block * (HEAD_GROUPS * BLOCK_H)
 
     swa_len = gl.minimum(gl.maximum(gl.load(swa_lens + token_idx), 0), swa_width)
     swa_tiles = gl.cdiv(swa_len, TILE_K)
@@ -1073,6 +1130,26 @@ def gluon_dsv41_selected_attention_rows_gfx950(
         global_len = 0
         global_row = token_idx.to(tl.int64) * 0
     global_tiles = gl.cdiv(global_len, TILE_K)
+    if SPLIT:
+        # This split's SWA tiles [swa_first, swa_stop) and global tiles
+        # [global_first, global_stop); rows past its share read as invalid.
+        total_tiles = swa_tiles + global_tiles
+        tile_begin = split_idx * total_tiles // num_splits
+        tile_end = (split_idx + 1) * total_tiles // num_splits
+        swa_first = gl.minimum(tile_begin, swa_tiles)
+        swa_stop = gl.minimum(tile_end, swa_tiles)
+        swa_bound = gl.minimum(swa_len, swa_stop * TILE_K)
+        global_first = gl.maximum(tile_begin, swa_tiles) - swa_tiles
+        global_stop = gl.maximum(tile_end, swa_tiles) - swa_tiles
+        global_bound = gl.minimum(global_len, global_stop * TILE_K)
+        part_row = (token_idx * num_splits + split_idx).to(tl.int64)
+    else:
+        swa_first = 0
+        swa_stop = swa_tiles
+        swa_bound = swa_len
+        global_first = 0
+        global_stop = global_tiles
+        global_bound = global_len
 
     # Bit g of active_groups marks a head group with a nonzero query, which
     # needs its own pass over the selected rows; q_max is its largest |q|.
@@ -1146,19 +1223,28 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                 other=0.0,
             )
             score_heads = group_base + gl.arange(0, BLOCK_H, layout=head_layout)
-            # The sink is the initial state (logit sink, weight 1).
-            max_value = gl.load(
-                attn_sink + score_heads, mask=score_heads < num_heads, other=0.0
-            )
-            denominator = gl.full([BLOCK_H], 1.0, dtype=gl.float32, layout=head_layout)
+            if SPLIT:
+                # Split partials start empty; the reduce adds the sink once.
+                max_value = gl.full(
+                    [BLOCK_H], -float("inf"), dtype=gl.float32, layout=head_layout
+                )
+                denominator = gl.zeros([BLOCK_H], dtype=gl.float32, layout=head_layout)
+            else:
+                # The sink is the initial state (logit sink, weight 1).
+                max_value = gl.load(
+                    attn_sink + score_heads, mask=score_heads < num_heads, other=0.0
+                )
+                denominator = gl.full(
+                    [BLOCK_H], 1.0, dtype=gl.float32, layout=head_layout
+                )
             accumulator = zero_acc
 
             # Slots are fetched two tiles ahead and rows one tile ahead.
             s_slot, s_valid = _tile_slots(
                 swa_slots,
                 swa_row,
-                0,
-                swa_len,
+                swa_first,
+                swa_bound,
                 swa_width,
                 swa_capacity,
                 TILE_K,
@@ -1167,8 +1253,8 @@ def gluon_dsv41_selected_attention_rows_gfx950(
             _, s_score = _tile_slots(
                 swa_slots,
                 swa_row,
-                0,
-                swa_len,
+                swa_first,
+                swa_bound,
                 swa_width,
                 swa_capacity,
                 TILE_K,
@@ -1180,8 +1266,8 @@ def gluon_dsv41_selected_attention_rows_gfx950(
             n_slot, n_valid = _tile_slots(
                 swa_slots,
                 swa_row,
-                1,
-                swa_len,
+                swa_first + 1,
+                swa_bound,
                 swa_width,
                 swa_capacity,
                 TILE_K,
@@ -1190,19 +1276,19 @@ def gluon_dsv41_selected_attention_rows_gfx950(
             _, n_score = _tile_slots(
                 swa_slots,
                 swa_row,
-                1,
-                swa_len,
+                swa_first + 1,
+                swa_bound,
                 swa_width,
                 swa_capacity,
                 TILE_K,
                 score_row_layout,
             )
-            for tile in range(0, swa_tiles):
+            for tile in range(swa_first, swa_stop):
                 nn_slot, nn_valid = _tile_slots(
                     swa_slots,
                     swa_row,
                     tile + 2,
-                    swa_len,
+                    swa_bound,
                     swa_width,
                     swa_capacity,
                     TILE_K,
@@ -1212,7 +1298,7 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                     swa_slots,
                     swa_row,
                     tile + 2,
-                    swa_len,
+                    swa_bound,
                     swa_width,
                     swa_capacity,
                     TILE_K,
@@ -1254,8 +1340,8 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                 g_slot, g_valid = _tile_slots(
                     global_slots,
                     global_row,
-                    0,
-                    global_len,
+                    global_first,
+                    global_bound,
                     global_width,
                     global_capacity,
                     TILE_K,
@@ -1264,8 +1350,8 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                 _, g_score = _tile_slots(
                     global_slots,
                     global_row,
-                    0,
-                    global_len,
+                    global_first,
+                    global_bound,
                     global_width,
                     global_capacity,
                     TILE_K,
@@ -1277,8 +1363,8 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                 n_slot, n_valid = _tile_slots(
                     global_slots,
                     global_row,
-                    1,
-                    global_len,
+                    global_first + 1,
+                    global_bound,
                     global_width,
                     global_capacity,
                     TILE_K,
@@ -1287,19 +1373,19 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                 _, n_score = _tile_slots(
                     global_slots,
                     global_row,
-                    1,
-                    global_len,
+                    global_first + 1,
+                    global_bound,
                     global_width,
                     global_capacity,
                     TILE_K,
                     score_row_layout,
                 )
-                for tile in range(0, global_tiles):
+                for tile in range(global_first, global_stop):
                     nn_slot, nn_valid = _tile_slots(
                         global_slots,
                         global_row,
                         tile + 2,
-                        global_len,
+                        global_bound,
                         global_width,
                         global_capacity,
                         TILE_K,
@@ -1309,7 +1395,7 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                         global_slots,
                         global_row,
                         tile + 2,
-                        global_len,
+                        global_bound,
                         global_width,
                         global_capacity,
                         TILE_K,
@@ -1347,24 +1433,48 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                     n_slot, n_valid, n_score = nn_slot, nn_valid, nn_score
 
             if active:
-                cosine, sine = _split_rope_table(rope_row, ROPE_DIM, mfma)
-                scale = gl.convert_layout(
-                    gl.where(denominator > 0.0, 1.0 / denominator, 0.0),
-                    out_head_layout,
-                )
-                _store_split_rows(
-                    accumulator * scale[None, :, None],
-                    out_row,
-                    group_base,
-                    num_heads,
-                    stride_o_h,
-                    cosine,
-                    sine,
-                    ROPE_DIM,
-                    mfma,
-                )
+                if SPLIT:
+                    stats = part_stats + (part_row * num_heads + score_heads) * 2
+                    valid_heads = score_heads < num_heads
+                    gl.store(stats, max_value, mask=valid_heads)
+                    gl.store(stats + 1, denominator, mask=valid_heads)
+                    _store_split_partial(
+                        accumulator,
+                        part_acc + part_row * num_heads * HEAD_DIM,
+                        group_base,
+                        num_heads,
+                        HEAD_DIM,
+                        mfma,
+                    )
+                else:
+                    cosine, sine = _split_rope_table(rope_row, ROPE_DIM, mfma)
+                    scale = gl.convert_layout(
+                        gl.where(denominator > 0.0, 1.0 / denominator, 0.0),
+                        out_head_layout,
+                    )
+                    _store_split_rows(
+                        accumulator * scale[None, :, None],
+                        out_row,
+                        group_base,
+                        num_heads,
+                        stride_o_h,
+                        cosine,
+                        sine,
+                        ROPE_DIM,
+                        mfma,
+                    )
 
-    if need_row_sum:
+    if SPLIT:
+        if need_row_sum:
+            # Every head row of row_sum holds the same sum; head row 0 is
+            # stored (a one-head view of the [token, split] row).
+            _store_split_partial(
+                row_sum, part_row_sum + part_row * HEAD_DIM, 0, 1, HEAD_DIM, mfma
+            )
+            gl.store(part_count + part_row, row_count)
+        if split_idx == 0:
+            gl.store(part_active + token_idx * head_blocks + head_block, active_groups)
+    elif need_row_sum:
         # A zero query scores exactly zero on every valid row, so its output
         # is row_sum * e^-m / (count * e^-m + e^(sink - m)), m = max(sink, 0).
         count = row_count.to(gl.float32)
@@ -1391,6 +1501,25 @@ def gluon_dsv41_selected_attention_rows_gfx950(
                     ROPE_DIM,
                     mfma,
                 )
+
+
+@gluon.jit
+def _store_split_partial(values, base, head_base, num_heads, HEAD_DIM, LAYOUT):
+    """Store FP32 [4 waves, 16 heads, 128 dims] as rows ``base[head, 128w + d]``
+    of ``HEAD_DIM`` values, for heads below ``num_heads``."""
+    waves = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, LAYOUT)))
+    heads = head_base + gl.arange(
+        0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(2, LAYOUT))
+    )
+    dims = gl.arange(0, 128, layout=gl.SliceLayout(0, gl.SliceLayout(1, LAYOUT)))
+    gl.store(
+        base
+        + heads[None, :, None].to(tl.int64) * HEAD_DIM
+        + waves[:, None, None] * 128
+        + dims[None, None, :],
+        values,
+        mask=(heads < num_heads)[None, :, None],
+    )
 
 
 @gluon.jit
@@ -1754,47 +1883,19 @@ def launch_gluon_dsv41_selected_attention_gfx950(
     )
     # Up to one workgroup per CU the one-wave unsplit main kernel is faster;
     # past that the rows kernel's two workgroups per CU win.
-    if tokens * head_blocks > _TARGET_CTAS:
-        gluon_dsv41_selected_attention_rows_gfx950[(tokens * head_blocks,)](
-            q,
-            swa_cache,
-            swa_slots_i,
-            swa_lens_i,
-            global_cache_u8,
-            global_slots_i,
-            global_lens_i,
-            sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            swa_cache.stride(0),
-            swa_slots_i.stride(0),
-            swa_slots_i.shape[1],
-            global_page_stride,
-            global_slot_stride,
-            global_width,
-            out.stride(0),
-            out.stride(1),
-            scale,
-            swa_cache.shape[0] * _PAGE_ROWS,
-            global_capacity,
-            q.shape[1],
-            head_blocks,
-            rope_positions if rope else swa_lens_i,
-            rope_cos_sin if rope else sink,
-            rope_cos_sin.stride(0) if rope else 0,
-            HAS_GLOBAL=has_global,
-            HEAD_GROUPS=head_groups,
-            BLOCK_H=_BLOCK_H,
-            TILE_K=_ROWS_TILE_K,
-            HEAD_DIM=_HEAD_DIM,
-            ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
-            NUM_XCDS=num_xcds(),
-            num_warps=4,
-            num_stages=1,
-            waves_per_eu=_ROWS_WAVES_PER_EU,
-        )
-        return out
+    rows = tokens * head_blocks > _TARGET_CTAS
+    if rows:
+        if _ROWS_SPLIT == 0:
+            splits = 1
+        elif _ROWS_SPLIT == 1:
+            splits = _rows_split_count(
+                tokens * head_blocks,
+                triton.cdiv(swa_slots_i.shape[1], _ROWS_TILE_K)
+                + triton.cdiv(global_width, _ROWS_TILE_K),
+                _TARGET_CTAS,
+            )
+        else:
+            splits = _ROWS_SPLIT
     if splits > 1:
         heads = q.shape[1]
         part_stats = torch.empty(
@@ -1813,47 +1914,97 @@ def launch_gluon_dsv41_selected_attention_gfx950(
     else:
         part_stats = part_acc = part_row_sum = sink
         part_count = part_active = swa_lens_i
-    gluon_dsv41_selected_attention_gfx950[(tokens, splits, head_blocks)](
-        q,
-        swa_cache,
-        swa_slots_i,
-        swa_lens_i,
-        global_cache_u8,
-        global_slots_i,
-        global_lens_i,
-        sink,
-        out,
-        part_stats,
-        part_acc,
-        part_row_sum,
-        part_count,
-        part_active,
-        q.stride(0),
-        q.stride(1),
-        swa_cache.stride(0),
-        swa_slots_i.stride(0),
-        swa_slots_i.shape[1],
-        global_page_stride,
-        global_slot_stride,
-        global_width,
-        out.stride(0),
-        out.stride(1),
-        scale,
-        swa_cache.shape[0] * _PAGE_ROWS,
-        global_capacity,
-        q.shape[1],
-        rope_positions if rope else swa_lens_i,
-        rope_cos_sin if rope else sink,
-        rope_cos_sin.stride(0) if rope else 0,
-        HAS_GLOBAL=has_global,
-        HEAD_GROUPS=head_groups,
-        BLOCK_H=_BLOCK_H,
-        TILE_K=_TILE_K,
-        HEAD_DIM=_HEAD_DIM,
-        ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
-        num_warps=4,
-        num_stages=1,
-    )
+    if rows:
+        gluon_dsv41_selected_attention_rows_gfx950[(tokens * head_blocks * splits,)](
+            q,
+            swa_cache,
+            swa_slots_i,
+            swa_lens_i,
+            global_cache_u8,
+            global_slots_i,
+            global_lens_i,
+            sink,
+            out,
+            part_stats,
+            part_acc,
+            part_row_sum,
+            part_count,
+            part_active,
+            q.stride(0),
+            q.stride(1),
+            swa_cache.stride(0),
+            swa_slots_i.stride(0),
+            swa_slots_i.shape[1],
+            global_page_stride,
+            global_slot_stride,
+            global_width,
+            out.stride(0),
+            out.stride(1),
+            scale,
+            swa_cache.shape[0] * _PAGE_ROWS,
+            global_capacity,
+            q.shape[1],
+            head_blocks,
+            rope_positions if rope else swa_lens_i,
+            rope_cos_sin if rope else sink,
+            rope_cos_sin.stride(0) if rope else 0,
+            splits,
+            HAS_GLOBAL=has_global,
+            HEAD_GROUPS=head_groups,
+            BLOCK_H=_BLOCK_H,
+            TILE_K=_ROWS_TILE_K,
+            HEAD_DIM=_HEAD_DIM,
+            ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
+            NUM_XCDS=num_xcds(),
+            SPLIT=splits > 1,
+            num_warps=4,
+            num_stages=1,
+            waves_per_eu=_ROWS_WAVES_PER_EU,
+        )
+        if splits == 1:
+            return out
+    else:
+        gluon_dsv41_selected_attention_gfx950[(tokens, splits, head_blocks)](
+            q,
+            swa_cache,
+            swa_slots_i,
+            swa_lens_i,
+            global_cache_u8,
+            global_slots_i,
+            global_lens_i,
+            sink,
+            out,
+            part_stats,
+            part_acc,
+            part_row_sum,
+            part_count,
+            part_active,
+            q.stride(0),
+            q.stride(1),
+            swa_cache.stride(0),
+            swa_slots_i.stride(0),
+            swa_slots_i.shape[1],
+            global_page_stride,
+            global_slot_stride,
+            global_width,
+            out.stride(0),
+            out.stride(1),
+            scale,
+            swa_cache.shape[0] * _PAGE_ROWS,
+            global_capacity,
+            q.shape[1],
+            rope_positions if rope else swa_lens_i,
+            rope_cos_sin if rope else sink,
+            rope_cos_sin.stride(0) if rope else 0,
+            HAS_GLOBAL=has_global,
+            HEAD_GROUPS=head_groups,
+            BLOCK_H=_BLOCK_H,
+            TILE_K=_TILE_K,
+            HEAD_DIM=_HEAD_DIM,
+            ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
+            num_warps=4,
+            num_stages=1,
+        )
     if splits > 1:
         gluon_dsv41_selected_attention_reduce_gfx950[
             (tokens, triton.cdiv(q.shape[1], _BLOCK_H), _HEAD_DIM // _REDUCE_DIM_BLOCK)

@@ -555,6 +555,44 @@ def test_window_attention_kernel_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("heads", [16, 8])
+def test_folded_window_attention_matches_unfolded(monkeypatch, heads):
+    """TOKENSPEED_DRAFT_ATTN_FAST folds a request's block rows into heads.
+
+    Unpadded 16-head queries (``rope_pad_query`` on ROCm) with a 64-head
+    ``-inf`` padded sink, an empty, a partial and a full history and one
+    all -1 graph padding row: the folded launch matches the per-row launch
+    and the fp32 reference.
+    """
+    from tokenspeed.runtime.models import deepseek_v41_dspark as dspark
+
+    torch.manual_seed(11)
+    device = torch.device("cuda:0")
+    block, dim, window, rows = 5, 512, 128, 64
+    starts = torch.tensor([0, 40, 300, -1, 700], device=device)
+    batch = starts.numel()
+    history = _history_slots(starts.clamp_min(0), window, rows).to(device)
+    history[3] = -1
+    positions = starts.clamp_min(0)[:, None] + 1 + torch.arange(block, device=device)
+    positions = positions.flatten()
+    field = torch.randn(16, 97, dim, dtype=torch.bfloat16, device=device)[:, :rows]
+    q = torch.randn(batch * block, heads, dim, dtype=torch.bfloat16, device=device)
+    swa = torch.randn(batch * block, dim, dtype=torch.bfloat16, device=device)
+    sink = torch.full((64,), -float("inf"), dtype=torch.float32, device=device)
+    sink[:heads] = torch.linspace(-2, 2, heads, device=device)
+    backend = _window_backend(positions, field, history, block, rows)
+    kv = backend._workspace(swa, positions, None, None, 1e-6)
+    expected = backend._reference_forward(q, kv, sink[:heads], dim**-0.5)
+    monkeypatch.setattr(dspark, "DRAFT_ATTN_FAST", False)
+    unfolded = backend._kernel_forward(q, kv, sink, dim**-0.5)
+    monkeypatch.setattr(dspark, "DRAFT_ATTN_FAST", True)
+    folded = backend._kernel_forward(q, kv, sink, dim**-0.5)
+    assert folded.shape == q.shape and folded.dtype == q.dtype
+    torch.testing.assert_close(folded, expected, rtol=0.008, atol=0.002)
+    torch.testing.assert_close(folded, unfolded, rtol=0.008, atol=0.002)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_draft_forward_graph_and_context_seeding(monkeypatch):
     config = _draft_config()
     config.hidden_size = 256

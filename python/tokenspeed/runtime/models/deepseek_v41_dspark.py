@@ -31,6 +31,7 @@ CPU reference.
 
 from __future__ import annotations
 
+import os
 import re
 from copy import copy
 from dataclasses import dataclass, replace
@@ -40,6 +41,7 @@ import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 from torch import nn
+from torch.nn import functional as F
 
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_PREFILL_QUERY_TILE,
@@ -62,6 +64,10 @@ from tokenspeed.runtime.models.deepseek_v41 import (
 from tokenspeed.runtime.models.deepseek_v41_dspark_heads import DSparkVanillaMarkov
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
+
+# TOKENSPEED_DRAFT_ATTN_FAST=1 folds each request's block rows into the head
+# dimension of one query row (see _WindowAttention._folded_kernel_forward).
+DRAFT_ATTN_FAST = os.environ.get("TOKENSPEED_DRAFT_ATTN_FAST", "0") == "1"
 
 
 def _quantized_kv(x: torch.Tensor) -> torch.Tensor:
@@ -188,10 +194,13 @@ class _WindowAttention:
     def _kernel_forward(self, q, kv, attn_sink, softmax_scale):
         """The target's prefill workspace kernel over ``[history, block]`` rows.
 
-        ``q`` arrives 64/128-head padded from ``rope_pad_query`` with a
-        matching ``-inf``-padded sink; the caller slices the real heads. No
-        paged cache is involved, so the SWA/global arguments are all None.
+        ``q`` arrives 64/128-head padded from ``rope_pad_query`` (16-head
+        multiples on ROCm) with a matching ``-inf``-padded sink; the caller
+        slices the real heads. No paged cache is involved, so the SWA/global
+        arguments are all None.
         """
+        if DRAFT_ATTN_FAST and self.block_size * q.shape[1] <= 128:
+            return self._folded_kernel_forward(q, kv, attn_sink, softmax_scale)
         return dsv41.selected_attention(
             q,
             None,
@@ -209,6 +218,43 @@ class _WindowAttention:
             self.selection.indices,
             lse=None,
         )
+
+    def _folded_kernel_forward(self, q, kv, attn_sink, softmax_scale):
+        """``_kernel_forward`` with each request's block rows as extra heads.
+
+        Every block row of a request selects the same ``[history, block]``
+        rows, so its ``block x heads`` queries form one query row of
+        ``block * heads`` heads (zero-padded to 64/128, sinks ``-inf``) over
+        the request's selection: one tensor-core workgroup per request and
+        64 heads instead of a per-(row, head) program for 16 unpadded heads.
+        """
+        batch, block = self.history_slots.shape[0], self.block_size
+        tokens, heads, dim = q.shape
+        rows = block * heads
+        padded = 64 if rows <= 64 else 128
+        folded_q = F.pad(q.reshape(batch, rows, dim), (0, 0, 0, padded - rows))
+        sink = F.pad(
+            attn_sink[:heads].repeat(block), (0, padded - rows), value=-float("inf")
+        )
+        indices = self.selection.indices.view(batch, block, -1)[:, 0]
+        out = dsv41.selected_attention(
+            folded_q,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            sink,
+            softmax_scale,
+            None,
+            V41_PREFILL_QUERY_TILE,
+            None,
+            kv.view(-1, 1, kv.shape[-1]),
+            indices,
+            lse=None,
+        )
+        return out[:, :rows].reshape(tokens, heads, dim)
 
     def _reference_forward(self, q, kv, attn_sink, softmax_scale):
         """FP32 reference arithmetic for CPU and non-512 head dims."""

@@ -606,6 +606,19 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
         torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
 
 
+def test_hc_mixes_fork_only_in_cuda_decode_unless_inline():
+    cuda0, cuda1 = torch.device("cuda", 0), torch.device("cuda", 1)
+    fork = v41._hc_mixes_on_aux_stream
+    assert fork(cuda0, ForwardMode.DECODE, cuda0, inline=False)
+    # TOKENSPEED_DECODE_HC_INLINE: decode keeps the mixes on the main stream.
+    assert not fork(cuda0, ForwardMode.DECODE, cuda0, inline=True)
+    assert not fork(cuda0, ForwardMode.EXTEND, cuda0, inline=False)
+    assert not fork(cuda0, None, cuda0, inline=False)
+    assert not fork(cuda0, ForwardMode.DECODE, None, inline=False)
+    assert not fork(cuda0, ForwardMode.DECODE, cuda1, inline=False)
+    assert not fork(torch.device("cpu"), ForwardMode.DECODE, cuda0, inline=False)
+
+
 def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
@@ -624,6 +637,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             f"layers.{i}",
             None,
             None,
+            False,
             False,
             "gpu",
         )

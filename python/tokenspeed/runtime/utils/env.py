@@ -291,6 +291,10 @@ class Envs:
     # launch (a failure before it, a cancelled submission) releases the commit
     # after this long at the latest.
     TOKENSPEED_DECODE_HOST_PREP_WAIT_MS = EnvFloat(20.0)
+    # DeepSeek V4.1 decode (A/B knob, default off): run each sublayer's mHC
+    # mixes on the main stream instead of forking them to the HC side stream.
+    # The shared-expert fork is unaffected.
+    TOKENSPEED_DECODE_HC_INLINE = EnvBool(False)
     # Triton compilations once serving starts: "warn" logs each one with what
     # changed and names a compile-time kernel parameter that keeps taking new
     # values (a per-batch constexpr, one JIT compile on the forward thread per

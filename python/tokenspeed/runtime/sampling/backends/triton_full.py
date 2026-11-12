@@ -63,9 +63,10 @@ from tokenspeed.runtime.sampling.backends.triton import (
     _TOP_P_PARALLEL_VERIFY_ATTEMPTS,
     TritonSamplingBackend,
 )
-from tokenspeed.runtime.sampling.block_verify import block_verify_chain, draft_logits
+from tokenspeed.runtime.sampling.block_verify import block_verify_chain_chunked
 
 _BLOCK_VERIFY_MAX_BS = int(os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_MAX_BS", "128"))
+_BLOCK_VERIFY_CHUNK = int(os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_CHUNK", "16"))
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -553,15 +554,16 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             and bs <= _BLOCK_VERIFY_MAX_BS
         ):
             slots = req_pool_indices.long()
-            draft_full = draft_logits(block_state, slots, candidates)
-            block_verify_chain(
+            block_verify_chain_chunked(
+                block_state,
+                slots,
                 logits,
-                draft_full,
                 candidates.to(torch.int32),
                 self._temperature_pool.index_select(0, slots),
                 predict,
                 accept_index,
                 accept_length,
+                _BLOCK_VERIFY_CHUNK,
             )
             accept_length += 1
             self.broadcast_verify_outputs()

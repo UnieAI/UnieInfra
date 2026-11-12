@@ -37,8 +37,6 @@ def draft_logits(
     Step ``s`` conditions on ``candidates[:, s]`` (the anchor, then draft
     ``s - 1``): base logits plus the Markov bigram bias of that token.
     """
-    from tokenspeed.runtime.distributed.comm_ops import all_gather_single
-
     base = state.pool.index_select(0, slots)  # [bs, steps, local]
     bs, steps, local = base.shape
     prev = candidates[:, :steps].long().clamp_(0, state.embedding.shape[0] - 1)
@@ -48,6 +46,8 @@ def draft_logits(
     mine[..., state.num_valid :] = float("-inf")
     if state.tp_size == 1:
         return mine
+    from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+
     out = torch.empty(
         (state.tp_size, bs, steps, local), dtype=mine.dtype, device=mine.device
     )
@@ -131,3 +131,39 @@ def block_verify_chain(
         ).to(accept_index.dtype)
     )
     accept_length.copy_(acc.to(accept_length.dtype))
+
+
+def block_verify_chain_chunked(
+    state: DSparkBlockVerifyState,
+    slots: torch.Tensor,
+    target_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    temperature: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    chunk: int,
+) -> None:
+    """``draft_logits`` + ``block_verify_chain`` over ``chunk`` requests at a time.
+
+    The full-vocab FP32 temporaries scale with the batch (about 6 x bs x
+    steps x vocab x 4 bytes); captured graphs keep them in their memory pool,
+    which comes out of the KV cache budget. Chunking bounds them by ``chunk``.
+    """
+    bs, n = candidates.shape
+    pred = predict.view(bs, n)
+    aidx = accept_index.view(bs, n)
+    for s in range(0, bs, chunk):
+        e = min(bs, s + chunk)
+        dl = draft_logits(state, slots[s:e], candidates[s:e])
+        block_verify_chain(
+            target_logits[s * n : e * n],
+            dl,
+            candidates[s:e],
+            temperature[s:e],
+            pred[s:e],
+            aidx[s:e],
+            accept_length[s:e],
+        )
+        sub = aidx[s:e]
+        sub.copy_(torch.where(sub >= 0, sub + s * n, sub))

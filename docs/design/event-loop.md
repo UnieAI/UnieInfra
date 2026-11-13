@@ -166,6 +166,15 @@ Consequences:
   but each is a low-rate path whose caller cannot proceed without the result
   (the landing's failure must surface BEFORE the scheduler advances the
   request into decode). A new blocking method on the per-round path is a bug.
+* The two planes share one GIL, and commit's `post_process` is pure Python:
+  woken the moment a forward's future resolves, it takes the GIL at the
+  forward thread's next CUDA call and holds it for milliseconds, while that
+  thread prepares the next round (zeroing, input fill) on the GPU's critical
+  path. `TOKENSPEED_HOLD_RESULTS_UNTIL_LAUNCH=1` (off by default) holds a
+  forward's result on the forward thread until the next forward launches,
+  so commit overlaps the next replay instead of its prep. The hold never
+  waits on the control plane: it ends whenever the queue drains or a task
+  that might wait on the loop is next (`ForwardThread` lists the rules).
 * Keep per-forward state resets asynchronous on the execution stream too.
   Use device-side scalar fills for indexed flags: assigning a Python scalar
   through tensor indexing can stage a CPU tensor and introduce a hidden

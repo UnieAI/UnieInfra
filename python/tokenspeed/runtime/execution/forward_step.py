@@ -40,6 +40,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_thread import mark_launch
 from tokenspeed.runtime.execution.graph_ptr_guard import (
     graph_debug_enabled,
     snapshot_graph_metadata,
@@ -1066,6 +1067,10 @@ class ForwardStepRunner:
         ``ctx.sampled_top_k`` asks for) and None otherwise.
         """
         use_graph = self._can_use_graph(bs, ctx)
+        if not use_graph:
+            # An eager forward launches as it goes: hand back the previous
+            # round's held result now (see ForwardThread).
+            mark_launch()
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
@@ -1178,6 +1183,9 @@ class ForwardStepRunner:
                         else [ctx.input_num_tokens] * self.world_size
                     ),
                 )
+            # The previous round's commit runs while this replay holds the
+            # GPU (and, inside replay, releases the GIL); see ForwardThread.
+            mark_launch()
             with nvtx_range("graph_replay", color="red"):
                 graph.replay()
             if self._expert_load_rows is not None:

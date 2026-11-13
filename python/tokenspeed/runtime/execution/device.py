@@ -468,7 +468,7 @@ class DeviceHandle:
         }
         if copies:
             self._copy_submissions.append(
-                self._thread.submit(lambda: executor.copy_cache_pages(copies))
+                self._thread.submit_prep(lambda: executor.copy_cache_pages(copies))
             )
         # The plan lists every group, empty or not; only groups with pages
         # are work. An empty submission per idle round would flood the FIFO
@@ -480,7 +480,7 @@ class DeviceHandle:
             if len(page_ids)
         }
         zero_future = (
-            self._thread.submit(lambda: executor.zero_cache_pages(pages))
+            self._thread.submit_prep(lambda: executor.zero_cache_pages(pages))
             if pages
             else None
         )
@@ -607,7 +607,7 @@ class DeviceHandle:
                     stop_criteria=planned.stop_criteria,
                 )
 
-        return PendingExecution(self._thread.submit(_forward))
+        return PendingExecution(self._thread.submit_forward(_forward))
 
     def poll_cache_results(self) -> list:
         """Collect completed Host cache ops (both tiers); never blocks.

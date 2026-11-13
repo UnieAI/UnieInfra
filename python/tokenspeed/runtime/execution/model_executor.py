@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -772,7 +773,16 @@ class ModelExecutor:
         # rank promptly regardless of GPU depth. (A few low-rate paths do
         # block on purpose: the DP idle forward, the PD receive and landing,
         # the post-wake KV repair, RL weight updates. See DeviceHandle.)
-        self.forward_thread = ForwardThread(self.device)
+        # TOKENSPEED_HOLD_RESULTS_UNTIL_LAUNCH=1: hand a forward's result to
+        # commit only once the next forward launches, so commit's
+        # post_process does not take the GIL from the next round's prep.
+        self.forward_thread = ForwardThread(
+            self.device,
+            hold_results_until_next_launch=os.environ.get(
+                "TOKENSPEED_HOLD_RESULTS_UNTIL_LAUNCH", "0"
+            )
+            == "1",
+        )
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0

@@ -43,22 +43,30 @@ ISPP_PADDED = 640
 E8M0_ONE = 0x7F
 
 
-def _experts(num_experts: int, seed: int) -> torch.nn.Module:
+def _experts(num_experts: int, seed: int, padded_storage: bool) -> torch.nn.Module:
+    """Checkpoint-layout experts; with ``padded_storage`` as the mxfp4 loader
+    builds them for AITER (unpadded views of the padded buffers)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
 
-    def rand(shape, low, high):
-        return torch.nn.Parameter(
-            torch.randint(
-                low, high, shape, dtype=torch.uint8, device="cuda", generator=gen
-            ),
-            requires_grad=False,
+    def rand(shape, storage_shape, low, high):
+        values = torch.randint(
+            low, high, shape, dtype=torch.uint8, device="cuda", generator=gen
         )
+        if padded_storage:
+            buffer = torch.zeros(storage_shape, dtype=torch.uint8, device="cuda")
+            view = buffer[tuple(slice(0, size) for size in shape)]
+            view.copy_(values)
+            values = view
+        return torch.nn.Parameter(values, requires_grad=False)
 
+    e, p = num_experts, ISPP_PADDED
     w = torch.nn.Module()
-    w.w13_weight = rand((num_experts, 2 * ISPP, HIDDEN // 2), 0, 256)
-    w.w13_weight_scale = rand((num_experts, 2 * ISPP, HIDDEN // 32), 100, 140)
-    w.w2_weight = rand((num_experts, HIDDEN, ISPP // 2), 0, 256)
-    w.w2_weight_scale = rand((num_experts, HIDDEN, ISPP // 32), 100, 140)
+    w.w13_weight = rand((e, 2 * ISPP, HIDDEN // 2), (e, 2 * p, HIDDEN // 2), 0, 256)
+    w.w13_weight_scale = rand(
+        (e, 2 * ISPP, HIDDEN // 32), (e, 2 * p, HIDDEN // 32), 100, 140
+    )
+    w.w2_weight = rand((e, HIDDEN, ISPP // 2), (e, HIDDEN, p // 2), 0, 256)
+    w.w2_weight_scale = rand((e, HIDDEN, ISPP // 32), (e, HIDDEN, 24), 100, 140)
     return w
 
 
@@ -108,8 +116,11 @@ def _reference(w: torch.nn.Module) -> dict[str, torch.Tensor]:
         2 * SHUFFLE_CHUNK_EXPERTS + 5,
     ],
 )
-def test_chunked_preprocessing_matches_whole_stack_shuffle(num_experts: int) -> None:
-    w = _experts(num_experts, seed=num_experts)
+@pytest.mark.parametrize("padded_storage", [True, False])
+def test_chunked_preprocessing_matches_whole_stack_shuffle(
+    num_experts: int, padded_storage: bool
+) -> None:
+    w = _experts(num_experts, seed=num_experts, padded_storage=padded_storage)
     expected = _reference(w)
 
     aiter_mxfp4_moe_weights({}, w)
@@ -123,23 +134,27 @@ def test_chunked_preprocessing_matches_whole_stack_shuffle(num_experts: int) -> 
     assert w._aiter_intermediate_pad == ISPP_PADDED - ISPP
 
 
-def test_preprocessing_leaves_no_reserved_but_unallocated_memory() -> None:
-    # All checkpoint stacks are resident before the first layer is processed,
-    # as in the real loader. The padded outputs are larger than the stacks they
-    # replace, so any freed stack or whole-stack temporary that a later request
-    # splits stays reserved for the life of the process.
-    layers = [_experts(3 * SHUFFLE_CHUNK_EXPERTS, seed=i) for i in range(6)]
+def test_preprocessing_padded_storage_allocates_and_frees_no_device_memory() -> None:
+    # All layers' stacks are resident before the first one is processed, as in
+    # the real loader. A layer that allocates new stacks and frees the old ones
+    # either strands the freed blocks in the caching allocator or, released
+    # with empty_cache, hands them back to the driver, and on ROCm that memory
+    # is not allocatable again right away.
+    layers = [
+        _experts(3 * SHUFFLE_CHUNK_EXPERTS, seed=i, padded_storage=True)
+        for i in range(6)
+    ]
+    # The first layer warms the cached blocks the chunk temporaries reuse.
+    aiter_mxfp4_moe_weights({}, layers[0])
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    stranded_before = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    stats = torch.cuda.memory_stats()
+    allocated = torch.cuda.memory_allocated()
 
-    for w in layers:
+    for w in layers[1:]:
         aiter_mxfp4_moe_weights({}, w)
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    stranded = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
 
-    one_layer = sum(
-        t.numel() * t.element_size() for t in layers[0].parameters(recurse=False)
-    )
-    assert stranded - stranded_before < one_layer // 4
+    after = torch.cuda.memory_stats()
+    assert after["num_device_alloc"] == stats["num_device_alloc"]
+    assert after["num_device_free"] == stats["num_device_free"]
+    assert torch.cuda.memory_allocated() == allocated

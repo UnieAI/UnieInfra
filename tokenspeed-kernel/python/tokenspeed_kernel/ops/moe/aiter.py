@@ -78,7 +78,7 @@ HIDDEN_ALIGN = 512
 # E8M0 1.0, used to fill the scale entries that cover padding.
 E8M0_ONE = 0x7F
 
-# Experts per step of the load-time pad + shuffle (see _shuffle_expert_stack).
+# Experts per step of the load-time pad + shuffle (see _shuffle_in_place).
 SHUFFLE_CHUNK_EXPERTS = 32
 
 # Column alignment shuffle_scale pads the E8M0 scale rows to.
@@ -148,97 +148,85 @@ def _as_dtype(t: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
     return t if t.dtype == dtype else t.view(dtype)
 
 
-def _pad_inter_dim(
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    *,
-    ispp: int,
-    gate_up: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad the intermediate dimension of an expert chunk to AITER's alignment.
+def _padded_buffer(param: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    """The contiguous uint8 ``shape`` buffer whose origin ``param`` views.
 
-    ``gate_up`` weights (``w13``) are ``[E, 2 * ispp, hidden // 2]`` with the
-    gate half first: padding inserts zero rows at the end of each half, because
-    the stage-1 kernel reads gate from rows ``[0, I_pad)`` and up from
-    ``[I_pad, 2 * I_pad)``. ``w2`` is ``[E, hidden, ispp // 2]``, so its packed
-    K grows instead and the scales get one extra E8M0 block per 32 columns.
-
-    Returns the padded weight plus the scales flattened to the ``[E * N, K]``
-    layout ``shuffle_scale`` wants.
+    The mxfp4 loader allocates AITER's padded buffers up front and loads the
+    checkpoint into unpadded views of them (``create_mxfp4_weight_pair``), so
+    this normally returns that buffer and nothing is allocated. Any other
+    layout is copied into a fresh padded buffer once.
     """
-    padded = _round_up(ispp, INTERMEDIATE_ALIGN)
-    num_experts = weight.shape[0]
-    if gate_up:
-        out_weight = weight.new_zeros((num_experts, 2, padded, weight.shape[-1]))
-        out_weight[:, :, :ispp].copy_(weight.view(num_experts, 2, ispp, -1))
-        out_scale = scale.new_full((num_experts, 2, padded, scale.shape[-1]), E8M0_ONE)
-        out_scale[:, :, :ispp].copy_(scale.view(num_experts, 2, ispp, -1))
-        out_weight = out_weight.view(num_experts, 2 * padded, -1)
-    else:
-        out_weight = weight.new_zeros((*weight.shape[:-1], padded // 2))
-        out_weight[..., : weight.shape[-1]].copy_(weight)
-        out_scale = scale.new_full((*scale.shape[:-1], padded // MXFP4_BLOCK), E8M0_ONE)
-        out_scale[..., : scale.shape[-1]].copy_(scale)
-    return out_weight, out_scale.view(-1, out_scale.shape[-1])
+    expected_strides = []
+    stride = 1
+    for size in reversed(shape):
+        expected_strides.append(stride)
+        stride *= size
+    expected_strides.reverse()
+    data = param.data.view(torch.uint8)
+    storage = data.untyped_storage()
+    if (
+        data.storage_offset() == 0
+        and data.stride() == tuple(expected_strides)
+        and storage.nbytes() == stride
+    ):
+        return data.new_empty(0).set_(storage, 0, shape)
+    buffer = data.new_zeros(shape)
+    buffer[tuple(slice(0, size) for size in data.shape)].copy_(data)
+    return buffer
 
 
-def _shuffle_expert_stack(
+def _shuffle_in_place(
     weight: torch.Tensor,
     scale: torch.Tensor,
     *,
     ispp: int,
     gate_up: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad and shuffle one expert stack, ``SHUFFLE_CHUNK_EXPERTS`` at a time.
+) -> None:
+    """Pad and shuffle a padded expert stack in place, a chunk of experts at a time.
 
-    Both AITER shuffles permute within an expert, so the stack is processed in
-    expert chunks written straight into exact-size outputs. Padding and
-    shuffling the whole stack at once would allocate two GB-sized temporaries
-    per weight (1.26 GB each for DeepSeek-V4.1-Flash ``w13`` at TP4); freed
-    between layers next to the weights that stay, they leave the caching
-    allocator with blocks no later request fits, which the KV budget then
-    loses. Chunk temporaries are ~1/12 of that and reuse their cached blocks.
+    ``weight``/``scale`` are the padded uint8 buffers (``[E, N, K//2]`` and
+    ``[E, N, K//32]``) holding the checkpoint values in their unpadded corner.
+    ``gate_up`` stacks (``w13``) hold gate rows ``[0, ispp)`` and up rows
+    ``[ispp, 2 * ispp)``; up moves to ``[I_pad, I_pad + ispp)`` because the
+    stage-1 kernel reads gate from rows ``[0, I_pad)`` and up from
+    ``[I_pad, 2 * I_pad)``. ``w2`` keeps its columns and grows packed K
+    instead. Padding is zero weights and E8M0 ``1.0`` scales.
 
-    Returns the shuffled weight (fp4 pairs) and its E8M0 scale swizzle,
-    flattened to ``[E * N, K]`` as ``fused_moe`` reads it.
+    Both AITER shuffles permute within an expert, so each chunk is shuffled
+    into a temporary and copied back. The temporaries are a few percent of a
+    stack and the same size every layer, so the caching allocator reuses
+    them: nothing GB-sized is allocated or freed (see ``ops/moe/README.md``).
     """
     _, _, _, _, shuffle_scale, shuffle_weight = _aiter_ops()
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
     num_experts = int(weight.shape[0])
     padded = _round_up(ispp, INTERMEDIATE_ALIGN)
-    if gate_up:
-        weight_shape = (num_experts, 2 * padded, weight.shape[-1])
-    else:
-        weight_shape = (num_experts, weight.shape[1], padded // 2)
-    rows_per_expert = weight_shape[1]
-    # shuffle_scale pads the scale columns up to a multiple of 8 (E8M0 1.0).
-    scale_cols = _round_up(weight_shape[-1] * 2 // MXFP4_BLOCK, SCALE_COL_ALIGN)
-    # Outputs first, before any temporary, so they never land in a block a
-    # temporary leaves behind. Raw bytes: copy_ has no fp4/e8m0 kernels.
-    out_weight = torch.empty(weight_shape, dtype=torch.uint8, device=weight.device)
-    out_scale = torch.empty(
-        (num_experts * rows_per_expert, scale_cols),
-        dtype=torch.uint8,
-        device=scale.device,
-    )
     for start in range(0, num_experts, SHUFFLE_CHUNK_EXPERTS):
         end = min(start + SHUFFLE_CHUNK_EXPERTS, num_experts)
-        chunk_weight, chunk_scale = _pad_inter_dim(
-            weight[start:end], scale[start:end], ispp=ispp, gate_up=gate_up
-        )
-        chunk_weight = shuffle_weight(
+        chunk_weight = weight[start:end]
+        chunk_scale = scale[start:end]
+        if gate_up:
+            for chunk, fill in ((chunk_weight, 0), (chunk_scale, E8M0_ONE)):
+                up = chunk[:, ispp : 2 * ispp].clone()
+                chunk[:, ispp:padded].fill_(fill)
+                chunk[:, padded : padded + ispp].copy_(up)
+                chunk[:, padded + ispp :].fill_(fill)
+                del up
+        else:
+            chunk_weight[..., ispp // 2 :].zero_()
+            chunk_scale[..., ispp // MXFP4_BLOCK :].fill_(E8M0_ONE)
+        shuffled = shuffle_weight(
             _as_dtype(chunk_weight, fp4_dtype), is_guinterleave=True, gate_up=gate_up
         )
-        chunk_scale = shuffle_scale(
-            _as_dtype(chunk_scale, e8m0_dtype), end - start, True, gate_up
+        chunk_weight.copy_(shuffled.view(torch.uint8))
+        del shuffled
+        flat_scale = chunk_scale.view(-1, chunk_scale.shape[-1])
+        shuffled = shuffle_scale(
+            _as_dtype(flat_scale, e8m0_dtype), end - start, True, gate_up
         )
-        out_weight[start:end].copy_(chunk_weight.view(torch.uint8))
-        out_scale[start * rows_per_expert : end * rows_per_expert].copy_(
-            chunk_scale.view(torch.uint8)
-        )
-        del chunk_weight, chunk_scale
-    return _as_dtype(out_weight, fp4_dtype), _as_dtype(out_scale, e8m0_dtype)
+        flat_scale.copy_(shuffled.view(torch.uint8))
+        del shuffled
 
 
 def aiter_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
@@ -246,11 +234,11 @@ def aiter_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
 
     Input (from the mxfp4 weight loader): ``w13_weight``/``w2_weight`` packed
     E2M1 as uint8 ``[E, N, K//2]`` and ``w13_weight_scale``/``w2_weight_scale``
-    raw E8M0 as uint8 ``[E, N, K//32]``. Output: the same tensors, padded to
-    AITER's tile alignment and permuted into its N-tile swizzle with gate/up
-    rows interleaved for the w1 matrix, plus matching scale swizzles. The
-    permutation is a pure data movement over the whole expert stack, so it
-    happens once at load and is invisible to steady state.
+    raw E8M0 as uint8 ``[E, N, K//32]``, ideally as views of AITER's padded
+    buffers. Output: the padded buffers, permuted into AITER's N-tile swizzle
+    with gate/up rows interleaved for the w1 matrix, plus matching scale
+    swizzles flattened to ``[E * N, K//32]``. The permutation is a pure data
+    movement, so it happens once at load and is invisible to steady state.
 
     AITER re-reads these tensors every call, so the tensors must keep the
     ``is_shuffled`` marker: ``fused_moe`` rejects blockscaled weights without
@@ -259,33 +247,45 @@ def aiter_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     # ``ispp`` is the per-partition intermediate size; ``w2`` packs its K as
     # fp4 pairs, so ``ispp == 2 * w2.shape[-1]``.
     ispp = 2 * int(w.w2_weight.shape[-1])
-    device = w.w13_weight.device
+    padded = _round_up(ispp, INTERMEDIATE_ALIGN)
+    num_experts, _, packed_hidden = (int(d) for d in w.w13_weight.shape)
+    hidden = int(w.w2_weight.shape[1])
+    # shuffle_scale pads the scale columns up to a multiple of 8.
+    w2_scale_cols = _round_up(padded // MXFP4_BLOCK, SCALE_COL_ALIGN)
 
-    w13_weight, w13_scale = _shuffle_expert_stack(
-        w.w13_weight.data, w.w13_weight_scale.data, ispp=ispp, gate_up=True
+    w13_weight = _padded_buffer(w.w13_weight, (num_experts, 2 * padded, packed_hidden))
+    w13_scale = _padded_buffer(
+        w.w13_weight_scale,
+        (num_experts, 2 * padded, int(w.w13_weight_scale.shape[-1])),
     )
-    w2_weight, w2_scale = _shuffle_expert_stack(
-        w.w2_weight.data, w.w2_weight_scale.data, ispp=ispp, gate_up=False
-    )
+    w2_weight = _padded_buffer(w.w2_weight, (num_experts, hidden, padded // 2))
+    w2_scale = _padded_buffer(w.w2_weight_scale, (num_experts, hidden, w2_scale_cols))
+    _shuffle_in_place(w13_weight, w13_scale, ispp=ispp, gate_up=True)
+    _shuffle_in_place(w2_weight, w2_scale, ispp=ispp, gate_up=False)
 
-    w.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-    w.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-    w.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
-    w.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
-    if device.type == "cuda":
-        # The checkpoint-layout stacks just freed are whole allocator segments
-        # (1.13 GB + 0.57 GB per DeepSeek-V4.1-Flash layer at TP4) that the next layer's larger padded
-        # outputs cannot reuse. Return them now, before a smaller request is
-        # carved out of one and pins the rest of it for the server's lifetime.
-        torch.cuda.empty_cache()
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    w.w13_weight = torch.nn.Parameter(
+        _as_dtype(w13_weight, fp4_dtype), requires_grad=False
+    )
+    w.w2_weight = torch.nn.Parameter(
+        _as_dtype(w2_weight, fp4_dtype), requires_grad=False
+    )
+    w.w13_weight_scale = torch.nn.Parameter(
+        _as_dtype(w13_scale.view(-1, w13_scale.shape[-1]), e8m0_dtype),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        _as_dtype(w2_scale.view(-1, w2_scale_cols), e8m0_dtype), requires_grad=False
+    )
     # The marker has to go on the Parameter, not the tensor it wraps: building a
     # Parameter copies into a fresh tensor object, which drops custom attributes.
     # Without it fused_moe falls back to its "preshuffle_off" CK path.
     w.w13_weight.is_shuffled = True
     w.w2_weight.is_shuffled = True
     w._aiter_ispp = ispp
-    w._aiter_hidden = 2 * int(w13_weight.shape[-1])
-    w._aiter_intermediate_pad = _round_up(ispp, INTERMEDIATE_ALIGN) - ispp
+    w._aiter_hidden = 2 * packed_hidden
+    w._aiter_intermediate_pad = padded - ispp
     w._aiter_hidden_pad = _round_up(w._aiter_hidden, HIDDEN_ALIGN) - w._aiter_hidden
     w._aiter_shuffled = True
 

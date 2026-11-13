@@ -232,20 +232,26 @@ importable); `auto` keeps the gluon MXFP4 kernels. The weight preprocessor pads
 the per-partition intermediate size to a multiple of 128 and permutes the
 experts into AITER's interleaved W4A16 layout.
 
-The padded outputs are larger than the checkpoint stacks they replace, and all
-layers' stacks are resident before the first layer is processed. So the
-preprocessor writes each stack into exact-size outputs allocated before any
-temporary, pads and shuffles 32 experts at a time (both shuffles permute within
-an expert), and calls `empty_cache` once the old stacks are dropped. Shuffling
-the whole stack at once instead strands ~12-14 GB per GPU in the caching
-allocator (reserved, never allocated) on DeepSeek-V4.1-Flash TP4, which the KV
-budget, sized from free device memory, loses.
+The padded stacks are larger than the checkpoint stacks, and all layers'
+stacks are resident before the first layer is processed. So the mxfp4 loader
+allocates the padded buffers up front (`create_mxfp4_weight_pair` with
+`solution="aiter"`) and loads the checkpoint into unpadded views of them; the
+preprocessor then pads and shuffles each buffer in place, 32 experts at a time
+(both shuffles permute within an expert). Its only temporaries are a few
+percent of a stack, reused across layers, so loading allocates and frees
+nothing GB-sized.
 
-Do not replace this with a smaller `max_split_size_mb` around the
-preprocessor: that forces every GB-sized temporary through a fresh `hipMalloc`
-and `hipFree` per layer. VRAM that `hipFree` returns is not allocatable again
-right away on ROCm, so the next allocations can fail with almost nothing
-reserved by PyTorch.
+Two cheaper-looking alternatives fail on DeepSeek-V4.1-Flash TP4:
+
+* Building new padded stacks and dropping the old ones strands ~12-14 GB per
+  GPU in the caching allocator (reserved, never allocated). The freed stacks
+  are smaller than the next layer's outputs, so later small requests split
+  them. The KV budget, sized from free device memory, loses that memory.
+* Releasing those blocks as they are freed (`empty_cache` per layer, with or
+  without a small `max_split_size_mb`) returns GBs to the driver every layer.
+  On ROCm that VRAM is not allocatable again right away. Ranks then OOM during
+  weight load with <1 GB free and almost nothing reserved by PyTorch, and free
+  memory measured right after a large `empty_cache` reads low.
 
 ## FP8 per-channel experts
 

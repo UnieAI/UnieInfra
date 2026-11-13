@@ -54,41 +54,41 @@ def create_mxfp4_weight_pair(
             round_up(ispp, 64) if platform.is_blackwell else round_up(ispp, MXFP4_BLOCK)
         )
 
-    w13_weight = torch.nn.Parameter(
-        torch.zeros(
-            spec.num_local_experts,
-            2 * ispp_padded,
-            hidden_size_padded // 2,
-            dtype=torch.uint8,
-        ),
-        requires_grad=False,
+    # AITER pads the intermediate size to a 128 multiple and its scale shuffle
+    # pads the w2 scale columns to a multiple of 8. Allocate those padded
+    # buffers here and let the checkpoint load into unpadded views of them, so
+    # its weight preprocessor pads and shuffles in place: building a second,
+    # larger copy of every expert stack at load time strands freed device
+    # memory (see tokenspeed_kernel/ops/moe/README.md, "AITER MXFP4 experts").
+    if solution == "aiter":
+        storage_ispp = round_up(ispp_padded, 128)
+        w2_scale_cols = round_up(storage_ispp // MXFP4_BLOCK, 8)
+    else:
+        storage_ispp = ispp_padded
+        w2_scale_cols = ispp_padded // MXFP4_BLOCK
+
+    def padded_param(storage_shape: tuple[int, ...], shape: tuple[int, ...]):
+        storage = torch.zeros(storage_shape, dtype=torch.uint8)
+        if storage_shape != shape:
+            storage = storage[tuple(slice(0, size) for size in shape)]
+        return torch.nn.Parameter(storage, requires_grad=False)
+
+    experts = spec.num_local_experts
+    w13_weight = padded_param(
+        (experts, 2 * storage_ispp, hidden_size_padded // 2),
+        (experts, 2 * ispp_padded, hidden_size_padded // 2),
     )
-    w13_weight_scale = torch.nn.Parameter(
-        torch.zeros(
-            spec.num_local_experts,
-            2 * ispp_padded,
-            hidden_size_padded // MXFP4_BLOCK,
-            dtype=torch.uint8,
-        ),
-        requires_grad=False,
+    w13_weight_scale = padded_param(
+        (experts, 2 * storage_ispp, hidden_size_padded // MXFP4_BLOCK),
+        (experts, 2 * ispp_padded, hidden_size_padded // MXFP4_BLOCK),
     )
-    w2_weight = torch.nn.Parameter(
-        torch.zeros(
-            spec.num_local_experts,
-            hidden_size_padded,
-            ispp_padded // 2,
-            dtype=torch.uint8,
-        ),
-        requires_grad=False,
+    w2_weight = padded_param(
+        (experts, hidden_size_padded, storage_ispp // 2),
+        (experts, hidden_size_padded, ispp_padded // 2),
     )
-    w2_weight_scale = torch.nn.Parameter(
-        torch.zeros(
-            spec.num_local_experts,
-            hidden_size_padded,
-            ispp_padded // MXFP4_BLOCK,
-            dtype=torch.uint8,
-        ),
-        requires_grad=False,
+    w2_weight_scale = padded_param(
+        (experts, hidden_size_padded, w2_scale_cols),
+        (experts, hidden_size_padded, ispp_padded // MXFP4_BLOCK),
     )
     layer.register_parameter("w13_weight", w13_weight)
     layer.register_parameter("w13_weight_scale", w13_weight_scale)

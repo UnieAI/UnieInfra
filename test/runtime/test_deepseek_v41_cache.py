@@ -78,6 +78,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 RATIOS = (0, 0) + (2,) * 18 + (1,) * 20
+# Compressor-tail rows per page: 2, or 32 on ROCm. Derive tail addresses from
+# it instead of pinning the 2-row checkpoint geometry.
+TAIL_ROWS = V41_GROUP_GEOMETRY[TAIL][0]
 OWNERS = (2, 8, 14, 20)
 SOURCES = (2, 8, 14, 20, 24, 28, 32, 36)
 
@@ -931,13 +934,18 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
         gid: torch.zeros(5, t.shape[1], device="cuda", dtype=torch.int32)
         for gid, t in tables.items()
     }
+    # Tails start at parent 11, like _tables: page 541 with 2-row tails.
+    tail_packing = backend.cache_pool.arena.plan.group(TAIL).cache_blocks_per_lcm_block
+    tail_first = 10 * tail_packing + 1
     for r in range(5):
         wide_tables[SWA][r, 0] = r + 1
         wide_tables[R1][r, 0] = 541 + r
         wide_tables[R2][r, 0] = 161 + r
-        tail_pages = (verify_width + 1) // 2
+        tail_pages = -(-verify_width // TAIL_ROWS)
         wide_tables[TAIL][r, :tail_pages] = torch.arange(
-            541 + r * tail_pages, 541 + (r + 1) * tail_pages, device="cuda"
+            tail_first + r * tail_pages,
+            tail_first + (r + 1) * tail_pages,
+            device="cuda",
         )
     for bs in (5, 0):
         backend.refresh_decode_metadata(
@@ -1110,7 +1118,12 @@ def test_dspark_windows_join_the_swa_group():
     # all groups meet the index alignment and stay inside the padding budget.
     layout = _layout(recipe)
     assert layout.lcm_block_bytes == 3_225_600
-    assert dict(layout.group_packing) == {SWA: 2, R2: 45, R1: 140, TAIL: 126}
+    assert dict(layout.group_packing) == {
+        SWA: 2,
+        R2: 45,
+        R1: 140,
+        TAIL: V41_CACHE_FORMATS["v41"].dspark_group_packing[TAIL],
+    }
     recipe.check_layout(layout)
     setup = recipe.setup()
     assert setup.spec.token_capacity == 1024
@@ -1236,15 +1249,20 @@ def test_pd_contract_plan_and_manifest(dspark):
     assert blocks[R1] == logical(R1, prefix_len // 64, (prompt_len + 63) // 64)
     swa_begin = (prompt_len - specs[SWA].sliding_window_tokens + 1) // 64
     assert blocks[SWA] == logical(SWA, swa_begin, (prompt_len + 63) // 64)
-    tail_begin = (prompt_len - specs[TAIL].sliding_window_tokens + 1) // 2
-    assert blocks[TAIL] == logical(TAIL, tail_begin, (prompt_len + 1) // 2)
-    assert (prompt_len - 1) // 2 in range(tail_begin, (prompt_len + 1) // 2)
+    tail_page = specs[TAIL].block_granularity
+    assert tail_page == TAIL_ROWS
+    tail_begin = (prompt_len - specs[TAIL].sliding_window_tokens + 1) // tail_page
+    tail_end = (prompt_len + tail_page - 1) // tail_page
+    assert blocks[TAIL] == logical(TAIL, tail_begin, tail_end)
+    assert (prompt_len - 1) // tail_page in range(tail_begin, tail_end)
 
 
 @pytest.mark.parametrize("cache_format", ["v41", "v4"])
 @pytest.mark.parametrize("dspark", [False, True])
 def test_every_cache_format_packs_to_the_plane_it_declares(cache_format, dspark):
     """Each format's frozen packing must be what the planner derives from it."""
+    if cache_format == "v4" and TAIL_ROWS != 2:
+        pytest.skip("v4 (Hopper) packings only fit 2-row compressor-tail pages")
     rows = V41_CACHE_FORMATS[cache_format]
     recipe = _recipe("cpu")
     spec = recipe.attn_config.component(DeepseekV41Config)
@@ -1284,7 +1302,12 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     assert layout.plane_bytes == (("flatkv", 1_382_400),)
     assert dict(layout.group_packing) == dict(V41_CACHE_FORMATS["v41"].group_packing)
     specs = {s.group_id: s for s, _ in recipe.groups()}
-    assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [64, 128, 64, 2]
+    assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [
+        64,
+        128,
+        64,
+        TAIL_ROWS,
+    ]
     assert all(s.attn_kind != "state" for s in specs.values())
     assert specs[SWA].sliding_window_tokens == 128
     assert specs[TAIL].sliding_window_tokens == 2
@@ -1293,7 +1316,9 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
         for (spec, fields) in recipe.groups()
         for gid in (spec.group_id,)
     }
-    assert payload == {SWA: 1_351_680, R2: 68_352, R1: 22_784, TAIL: 24_576}
+    # Three ratio-2 owners, each a [TAIL_ROWS, 2, 512] FP32 tail page.
+    tail_payload = 3 * TAIL_ROWS * 2 * 512 * 4
+    assert payload == {SWA: 1_351_680, R2: 68_352, R1: 22_784, TAIL: tail_payload}
     assert len(layout.fields) == 51
     assert all(f.page_stride_bytes % 256 == 0 for f in layout.fields)
     setup = recipe.setup()
@@ -1395,7 +1420,12 @@ def test_pool_strides_owner_fences_and_no_redundant_fields():
         (pool.swa(7), (64, 528), 1_382_400, 7),
         (pool.global_kv(8), (64, 288), 69_120, 8),
         (pool.index_k(20), (64, 68), 23_040, 20),
-        (pool.compressor_tail(14), (2, 2, 512), 25_600, 14),
+        (
+            pool.compressor_tail(14),
+            (TAIL_ROWS, 2, 512),
+            1_382_400 // V41_CACHE_FORMATS["v41"].group_packing[TAIL],
+            14,
+        ),
     ):
         assert tuple(view.shape[1:]) == shape
         assert view.stride(0) * view.element_size() == stride
@@ -2213,13 +2243,14 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
     backend = _backend(device, 2)
     tables = _tables(device)
     # The first completed pair needs token2 before token4 reuses its tail slot.
-    tables[TAIL][0, 2] = tables[TAIL][0, 1]
+    # (With wide ROCm tail pages both tokens already share one page.)
+    tables[TAIL][0, 4 // TAIL_ROWS] = tables[TAIL][0, 2 // TAIL_ROWS]
     calls = []
     prepare = dsv41.compressor_metadata
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         calls.append(args)
-        return prepare(*args)
+        return prepare(*args, **kwargs)
 
     monkeypatch.setattr(dsv41, "compressor_metadata", counted)
     meta = _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
@@ -2245,8 +2276,8 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
                 prior = coords.index((position - 1, request))
                 c, s = content[prior], scores[prior]
             else:
-                page = tables[TAIL][request, (position - 1) // 2]
-                c, s = old_tail[page, (position - 1) % 2]
+                page = tables[TAIL][request, (position - 1) // TAIL_ROWS]
+                c, s = old_tail[page, (position - 1) % TAIL_ROWS]
             weights = torch.stack((s, scores[i])).softmax(0)
             expected[i] = weights[0] * c + weights[1] * content[i]
         got, positions, requests = backend.compress(
@@ -2262,7 +2293,7 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
     with pytest.raises(ValueError, match="content/scores"):
         backend.compress(2, content[:2], scores[:2], ForwardMode.EXTEND, None, 0.0)
     # Preparing a new forward must resolve the changed LCM assignment again.
-    tables[TAIL][0, 1] = 0
+    tables[TAIL][0, 2 // TAIL_ROWS] = 0
     _extend(backend, tables, [4, 3], [3, 0], [0, 0], _final([4, 3], [3, 0]))
     assert len(calls) == 2
 
@@ -2339,13 +2370,13 @@ def test_compressor_plan_ragged_windows_rebase_only_predecessors(device):
     requests = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2, 2], device=device)
     table = torch.ones((3, 8), dtype=torch.int32, device=device)
     full = V41CompressorPlan.allocate(positions.numel(), torch.device(device))
-    dsv41.compressor_metadata(positions, requests, table, 2, *full)
+    dsv41.compressor_metadata(positions, requests, table, 2, *full, rows=2)
     before = tuple(tensor.clone() for tensor in full)
     for start, stop in ((0, 3), (3, 10), (6, 10), (4, 8), (6, 6), (0, 0)):
         window = full.window(start, stop)
         expected = V41CompressorPlan.allocate(stop - start, torch.device(device))
         dsv41.compressor_metadata(
-            positions[start:stop], requests[start:stop], table, 2, *expected
+            positions[start:stop], requests[start:stop], table, 2, *expected, rows=2
         )
         for name, parent, got, want in zip(
             full._fields, full, window, expected, strict=True
@@ -2577,7 +2608,9 @@ def _tables_with_packing(device, packing):
     # group numbers its own pages with page 0 reserved, so parent n begins at
     # packing * (n - 1) + 1. Derive the IDs from the pool's packing so DSpark
     # can put multiple SWA pages in one parent.
-    used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: 100}
+    # Tails cover the first 200 raw tokens: 100 two-row pages, or fewer wide
+    # (ROCm) pages, so every tail fits parents 10..15 of the 16-parent pool.
+    used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: -(-200 // TAIL_ROWS)}
     for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
         first = packing[gid] * parent + 1
         assert (
@@ -3039,3 +3072,131 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
     record = backend.sparse_topk.prefill
     assert record.positions is meta.positions
     assert record.request_indices is meta.request_indices
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("fused_rope", [False, True])
+@pytest.mark.parametrize("window", ["full", "decoder", "subset", "split"])
+@pytest.mark.parametrize("layer_id", [0, 2, 20])
+def test_gpu_batched_prefill_matches_per_request_reference(
+    layer_id, window, fused_rope
+):
+    """One batched prefill pass reads the same rows as the per-request loop.
+
+    Two requests with prefix hits (one replaying part of its window), for an
+    SWA-only, a ratio-2 owner and a ratio-1 owner layer, on the full window, the
+    CED decoder tail, an arbitrary row subset, and histories split into groups.
+    Outputs and the published SWA rows must agree.
+    """
+    backend = _backend("cuda", 2)
+    tables = _tables("cuda")
+    generator = torch.Generator(device="cuda").manual_seed(layer_id * 10 + len(window))
+    prefixes, counts, replays = [130, 64], [120, 150], [0, 32]
+    owner = backend.spec.kv_owners[layer_id]
+
+    def randn(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, device="cuda", generator=generator).to(dtype)
+
+    # History: SWA rows below each prefix, global rows below prefix + replay.
+    history_lens = [p + r for p, r in zip(prefixes, replays)]
+    meta = _extend(backend, tables, history_lens, [0, 0], [0, 0], history_lens)
+    cache = backend.cache_pool.swa(layer_id)
+    dsv41_slots = backend.cache_slots(
+        SWA, meta.positions, meta.request_indices, ForwardMode.EXTEND
+    )
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    dsv41.cache_scatter(
+        randn(meta.positions.numel(), 512), cache, dsv41_slots, backend.swa_format
+    )
+    if owner >= 0:
+        ratio = backend.spec.compress_ratios[owner]
+        rows = (meta.positions % ratio == 0).nonzero().squeeze(1)
+        backend.write_global(
+            owner,
+            randn(rows.numel(), 512),
+            randn(rows.numel(), 128),
+            meta.positions[rows],
+            meta.request_indices[rows],
+            ForwardMode.EXTEND,
+            None,
+        )
+    meta = _extend(backend, tables, counts, prefixes, replays, _final(counts, prefixes))
+    n = meta.positions.numel()
+    if owner >= 0:
+        rows = (meta.positions % ratio == 0).nonzero().squeeze(1)
+        backend.write_global(
+            owner,
+            randn(rows.numel(), 512),
+            randn(rows.numel(), 128),
+            meta.positions[rows],
+            meta.request_indices[rows],
+            ForwardMode.EXTEND,
+            None,
+        )
+    positions, requests = meta.positions, meta.request_indices
+    if window == "decoder":
+        view = backend.decoder_view()
+        positions, requests = view.prefill.positions, view.prefill.request_indices
+    elif window == "subset":
+        pick = torch.randperm(n, device="cuda", generator=generator)[: n // 3]
+        positions, requests = positions[pick], requests[pick]
+    elif window == "split":
+        # Requests' histories together exceed the workspace budget.
+        backend.context_len = 200
+    t = positions.numel()
+    q = randn(t, 2, 512)
+    swa = randn(t, 512)
+    index_q = randn(t, 2, 128) if layer_id in SOURCES else None
+    index_weights = (
+        torch.rand(t, 2, device="cuda", generator=generator).to(torch.bfloat16)
+        if layer_id in SOURCES
+        else None
+    )
+    angles = torch.rand(512, 32, device="cuda", generator=generator) * 6.28
+    rope = torch.cat((angles.cos(), angles.sin()), dim=1) if fused_rope else None
+    kwargs = dict(
+        layer_id=layer_id,
+        positions=positions,
+        request_indices=requests,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=index_q,
+        index_weights=index_weights,
+        attn_sink=torch.tensor([0.3, -0.7], device="cuda"),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=rope,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
+    )
+    arena = backend.cache_pool.arena.buffer
+    before = arena.clone()
+    batched = patch.object(
+        backend,
+        "_forward_prefill_batched",
+        wraps=backend._forward_prefill_batched,
+    )
+    with batched as batched_call:
+        got = backend.forward_v41(q, swa, **kwargs)
+    assert batched_call.call_count == 1
+    if window == "split":
+        plan = backend._swa_query_plan(positions, requests, ForwardMode.EXTEND)
+        if owner >= 0:
+            assert len(plan.histories[ratio].groups) == 2
+    published = arena.clone()
+    arena.copy_(before)
+    # The per-request loop, still served for KVP and QCP, is the oracle.
+    backend._batch_prefill = False
+    want = backend.forward_v41(q, swa, **kwargs)
+    torch.cuda.synchronize()
+    error = (got.float() - want.float()).abs()
+    print(
+        f"layer {layer_id} {window} rope={fused_rope}: max abs {error.max():.3e} "
+        f"max rel {(error / want.float().abs().clamp_min(1e-3)).max():.3e}"
+    )
+    # Both read the same quantized rows; only the accumulation order may differ.
+    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-8)
+    assert want.abs().amax() > 0.05
+    if owner >= 0:
+        assert bool((backend.sparse_topk.prefill.lengths > 0).any())
+    assert torch.equal(published, arena)

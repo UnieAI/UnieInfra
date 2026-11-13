@@ -75,6 +75,7 @@ __all__ = [
     "index_query_rope_quant",
     "selected_attention",
     "selected_attention_rope",
+    "prefill_indices",
     "new_attention_schedule",
     "index_score",
     "index_topk",
@@ -292,7 +293,7 @@ def compressor_pool(
 
     content/scores are FP32 current projections; previous[T] names each pair's
     predecessor input row, or -1 to read tail[tail_slots[T]]. tail is the LCM
-    FP32 [pages,2,2,512] field. active[T] masks incomplete/padded pairs to zero.
+    FP32 [pages,rows,2,512] field. active[T] masks incomplete/padded pairs to zero.
     All arguments share a device; out is contiguous FP32 [T,512], or None to
     allocate. With norm_weight[512], preserve the BF16 pooled boundary and
     return BF16 RMS-normalized rows using norm_eps; None returns raw FP32.
@@ -313,7 +314,7 @@ def compressor_tail_scatter(
     """Store FP32 projected compressor inputs without compacting live rows.
 
     ``content`` and ``scores`` are FP32 [T, 512]; ``tail`` is a strided FP32
-    [pages, 2, 2, 512] field (page, token, content/score, channel). ``slots[T]``
+    [pages, rows, 2, 512] field (page, token, content/score, channel). ``slots[T]``
     are int32/int64 field-relative token slots. Negative/out-of-capacity slots
     skip writes; valid slots must be unique. Page zero is not special to this
     op: the caller maps null pages to -1. All input strides are honored.
@@ -521,6 +522,60 @@ def selected_attention_rope(
         schedule,
         positions,
         cos_sin_cache,
+    )
+
+
+def prefill_indices(
+    swa_indices: torch.Tensor,
+    logical_rows: torch.Tensor,
+    global_slots: torch.Tensor,
+    history_base: torch.Tensor,
+    rows: torch.Tensor | None,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Join SWA and selected global rows into compact prefill workspace indices.
+
+    The prefill workspace holds every query's SWA rows and a dequantized copy
+    of each request's global history; this builds the ``prefill_indices`` that
+    ``selected_attention`` reads it with, in one launch for a whole batch.
+
+    Args:
+        swa_indices: Int32 [T, W] workspace rows of each query's SWA keys, -1
+            for absent keys; W is a power of two (128 for V4.1).
+        logical_rows: Integer [T, K] request-local global row ids per query.
+        global_slots: Integer [T, K] physical slots of those rows; a negative
+            slot (non-causal, unselected or unmapped) drops the entry.
+        history_base: Integer [T] workspace row holding global row 0 of the
+            query's request, or -1 to drop all of the query's global entries.
+        rows: Optional contiguous integer [N] query rows to emit, in order;
+            None emits all T rows.
+        out: Contiguous-column int32 [N, W + K] destination, or None to allocate.
+
+    Returns:
+        Int32 [N, W + K]: the SWA indices, then ``history_base + logical_rows``
+        where the row id and slot are valid and -1 elsewhere.
+    """
+    if not swa_indices.is_cuda:
+        if rows is not None:
+            swa_indices, logical_rows, global_slots, history_base = (
+                t[rows] for t in (swa_indices, logical_rows, global_slots, history_base)
+            )
+        valid = (logical_rows >= 0) & (global_slots >= 0) & (history_base[:, None] >= 0)
+        joined = torch.cat(
+            (
+                swa_indices.to(torch.int32),
+                torch.where(valid, logical_rows + history_base[:, None], -1).to(
+                    torch.int32
+                ),
+            ),
+            dim=1,
+        )
+        if out is None:
+            return joined
+        out.copy_(joined)
+        return out
+    return _kernel("prefill_indices", swa_indices)(
+        swa_indices, logical_rows, global_slots, history_base, rows, out
     )
 
 
@@ -817,7 +872,7 @@ def rope_pad_query(
     cos_sin_cache: torch.Tensor,
     solution: str | None,
 ) -> torch.Tensor:
-    """Rotate compact queries while fully writing the FlashMLA 64/128-head input.
+    """Rotate compact queries while fully writing the padded decode-attention input.
 
     Args:
         values: BF16/FP16 [tokens,real_heads,512], 1..128 heads, strided rows/heads.
@@ -826,7 +881,9 @@ def rope_pad_query(
         solution: Optional registered implementation restriction.
 
     Returns:
-        Fresh contiguous [tokens,64 or128,512] queries. Every padded head is zero;
+        Fresh contiguous [tokens,padded_heads,512] queries: 64 or 128 heads for
+        FlashMLA on NVIDIA, the next multiple of 16 on ROCm (the gfx950
+        selected-attention head block). Every padded head is zero;
         input storage is unchanged. This is forward/graph-owned scratch, never
         persistent KV or a request-indexed state buffer.
     """
@@ -1166,13 +1223,15 @@ def compressor_metadata(
     previous,
     read_slots,
     write_slots,
+    rows,
 ):
     """Fill ratio-2 pair coordinates and LCM tail addresses in O(N).
 
     positions/requests are integer [N] in request-major order, with consecutive
     positions within each request. Whole request spans may be reordered; arbitrary
     token permutations are unsupported. The metadata producer owns this layout.
-    table is the LCM tail page table; pages bounds physical residency.
+    table is the LCM tail page table of ``rows``-row pages; pages bounds
+    physical residency.
 
     Destinations are contiguous [N]: bool active and integer pair_positions,
     pair_requests, previous, read_slots, write_slots. previous indexes the input
@@ -1196,10 +1255,10 @@ def compressor_metadata(
             torch.arange(max(positions.numel() - 1, 0)).masked_fill(~in_batch, -1)
         )
         read_slots.copy_(
-            bounded_group_slots(pair_positions, pair_requests, table, 2, 1, 1, pages)
+            bounded_group_slots(pair_positions, pair_requests, table, rows, 1, 1, pages)
         )
         write_slots.copy_(
-            bounded_group_slots(positions, requests, table, 2, 1, 1, pages)
+            bounded_group_slots(positions, requests, table, rows, 1, 1, pages)
         )
         return
     _kernel("compressor_metadata", positions)(
@@ -1213,6 +1272,7 @@ def compressor_metadata(
         previous,
         read_slots,
         write_slots,
+        rows,
     )
 
 

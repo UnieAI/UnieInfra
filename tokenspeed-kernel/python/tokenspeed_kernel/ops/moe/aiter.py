@@ -78,6 +78,12 @@ HIDDEN_ALIGN = 512
 # E8M0 1.0, used to fill the scale entries that cover padding.
 E8M0_ONE = 0x7F
 
+# Experts per step of the load-time pad + shuffle (see _shuffle_expert_stack).
+SHUFFLE_CHUNK_EXPERTS = 32
+
+# Column alignment shuffle_scale pads the E8M0 scale rows to.
+SCALE_COL_ALIGN = 8
+
 # AITER picks fp8 activations over bf16 when the intermediate dimension is
 # large enough; vLLM pins this to 0 for the interleaved W4A16 kernel so the
 # reference and this path agree on bf16. Must be set before the dispatch runs.
@@ -149,7 +155,7 @@ def _pad_inter_dim(
     ispp: int,
     gate_up: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad the intermediate dimension up to AITER's tile alignment.
+    """Pad the intermediate dimension of an expert chunk to AITER's alignment.
 
     ``gate_up`` weights (``w13``) are ``[E, 2 * ispp, hidden // 2]`` with the
     gate half first: padding inserts zero rows at the end of each half, because
@@ -161,26 +167,78 @@ def _pad_inter_dim(
     layout ``shuffle_scale`` wants.
     """
     padded = _round_up(ispp, INTERMEDIATE_ALIGN)
-    pad = padded - ispp
-    if pad:
-        if gate_up:
-            zeros = weight.new_zeros((weight.shape[0], pad, weight.shape[-1]))
-            gate, up = weight.split(ispp, dim=1)
-            weight = torch.cat((gate, zeros, up, zeros), dim=1)
-            ones = scale.new_full((scale.shape[0], pad, scale.shape[-1]), E8M0_ONE)
-            gate_scale, up_scale = scale.split(ispp, dim=1)
-            scale = torch.cat((gate_scale, ones, up_scale, ones), dim=1)
-        else:
-            pad_k = pad // 2
-            weight = torch.cat(
-                (weight, weight.new_zeros((*weight.shape[:-1], pad_k))), dim=-1
-            )
-            pad_blocks = pad // MXFP4_BLOCK
-            scale = torch.cat(
-                (scale, scale.new_full((*scale.shape[:-1], pad_blocks), E8M0_ONE)),
-                dim=-1,
-            )
-    return weight.contiguous(), scale.contiguous().reshape(-1, scale.shape[-1])
+    num_experts = weight.shape[0]
+    if gate_up:
+        out_weight = weight.new_zeros((num_experts, 2, padded, weight.shape[-1]))
+        out_weight[:, :, :ispp].copy_(weight.view(num_experts, 2, ispp, -1))
+        out_scale = scale.new_full((num_experts, 2, padded, scale.shape[-1]), E8M0_ONE)
+        out_scale[:, :, :ispp].copy_(scale.view(num_experts, 2, ispp, -1))
+        out_weight = out_weight.view(num_experts, 2 * padded, -1)
+    else:
+        out_weight = weight.new_zeros((*weight.shape[:-1], padded // 2))
+        out_weight[..., : weight.shape[-1]].copy_(weight)
+        out_scale = scale.new_full((*scale.shape[:-1], padded // MXFP4_BLOCK), E8M0_ONE)
+        out_scale[..., : scale.shape[-1]].copy_(scale)
+    return out_weight, out_scale.view(-1, out_scale.shape[-1])
+
+
+def _shuffle_expert_stack(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    ispp: int,
+    gate_up: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad and shuffle one expert stack, ``SHUFFLE_CHUNK_EXPERTS`` at a time.
+
+    Both AITER shuffles permute within an expert, so the stack is processed in
+    expert chunks written straight into exact-size outputs. Padding and
+    shuffling the whole stack at once would allocate two GB-sized temporaries
+    per weight (1.26 GB each for DeepSeek-V4.1-Flash ``w13`` at TP4); freed
+    between layers next to the weights that stay, they leave the caching
+    allocator with blocks no later request fits, which the KV budget then
+    loses. Chunk temporaries are ~1/12 of that and reuse their cached blocks.
+
+    Returns the shuffled weight (fp4 pairs) and its E8M0 scale swizzle,
+    flattened to ``[E * N, K]`` as ``fused_moe`` reads it.
+    """
+    _, _, _, _, shuffle_scale, shuffle_weight = _aiter_ops()
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    num_experts = int(weight.shape[0])
+    padded = _round_up(ispp, INTERMEDIATE_ALIGN)
+    if gate_up:
+        weight_shape = (num_experts, 2 * padded, weight.shape[-1])
+    else:
+        weight_shape = (num_experts, weight.shape[1], padded // 2)
+    rows_per_expert = weight_shape[1]
+    # shuffle_scale pads the scale columns up to a multiple of 8 (E8M0 1.0).
+    scale_cols = _round_up(weight_shape[-1] * 2 // MXFP4_BLOCK, SCALE_COL_ALIGN)
+    # Outputs first, before any temporary, so they never land in a block a
+    # temporary leaves behind. Raw bytes: copy_ has no fp4/e8m0 kernels.
+    out_weight = torch.empty(weight_shape, dtype=torch.uint8, device=weight.device)
+    out_scale = torch.empty(
+        (num_experts * rows_per_expert, scale_cols),
+        dtype=torch.uint8,
+        device=scale.device,
+    )
+    for start in range(0, num_experts, SHUFFLE_CHUNK_EXPERTS):
+        end = min(start + SHUFFLE_CHUNK_EXPERTS, num_experts)
+        chunk_weight, chunk_scale = _pad_inter_dim(
+            weight[start:end], scale[start:end], ispp=ispp, gate_up=gate_up
+        )
+        chunk_weight = shuffle_weight(
+            _as_dtype(chunk_weight, fp4_dtype), is_guinterleave=True, gate_up=gate_up
+        )
+        chunk_scale = shuffle_scale(
+            _as_dtype(chunk_scale, e8m0_dtype), end - start, True, gate_up
+        )
+        out_weight[start:end].copy_(chunk_weight.view(torch.uint8))
+        out_scale[start * rows_per_expert : end * rows_per_expert].copy_(
+            chunk_scale.view(torch.uint8)
+        )
+        del chunk_weight, chunk_scale
+    return _as_dtype(out_weight, fp4_dtype), _as_dtype(out_scale, e8m0_dtype)
 
 
 def aiter_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
@@ -198,44 +256,28 @@ def aiter_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     ``is_shuffled`` marker: ``fused_moe`` rejects blockscaled weights without
     it, and any later copy that drops the marker has to be re-shuffled.
     """
-    _, _, _, _, shuffle_scale, shuffle_weight = _aiter_ops()
-
-    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-    num_experts = int(w.w13_weight.shape[0])
-
     # ``ispp`` is the per-partition intermediate size; ``w2`` packs its K as
     # fp4 pairs, so ``ispp == 2 * w2.shape[-1]``.
     ispp = 2 * int(w.w2_weight.shape[-1])
+    device = w.w13_weight.device
 
-    weight, scale = _pad_inter_dim(
-        w.w13_weight.data,
-        w.w13_weight_scale.data,
-        ispp=ispp,
-        gate_up=True,
+    w13_weight, w13_scale = _shuffle_expert_stack(
+        w.w13_weight.data, w.w13_weight_scale.data, ispp=ispp, gate_up=True
     )
-    w13_weight = shuffle_weight(
-        _as_dtype(weight, fp4_dtype), is_guinterleave=True, gate_up=True
+    w2_weight, w2_scale = _shuffle_expert_stack(
+        w.w2_weight.data, w.w2_weight_scale.data, ispp=ispp, gate_up=False
     )
-    w13_scale = shuffle_scale(_as_dtype(scale, e8m0_dtype), num_experts, True, True)
-    del weight, scale
-
-    weight, scale = _pad_inter_dim(
-        w.w2_weight.data,
-        w.w2_weight_scale.data,
-        ispp=ispp,
-        gate_up=False,
-    )
-    w2_weight = shuffle_weight(
-        _as_dtype(weight, fp4_dtype), is_guinterleave=True, gate_up=False
-    )
-    w2_scale = shuffle_scale(_as_dtype(scale, e8m0_dtype), num_experts, True, False)
-    del weight, scale
 
     w.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
     w.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
     w.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
     w.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+    if device.type == "cuda":
+        # The checkpoint-layout stacks just freed are whole allocator segments
+        # (1.13 GB + 0.57 GB per DeepSeek-V4.1-Flash layer at TP4) that the next layer's larger padded
+        # outputs cannot reuse. Return them now, before a smaller request is
+        # carved out of one and pins the rest of it for the server's lifetime.
+        torch.cuda.empty_cache()
     # The marker has to go on the Parameter, not the tensor it wraps: building a
     # Parameter copies into a fresh tensor object, which drops custom attributes.
     # Without it fused_moe falls back to its "preshuffle_off" CK path.

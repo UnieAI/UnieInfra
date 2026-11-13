@@ -225,7 +225,29 @@ is never in use by two calls at once; a model that overlapped two MoE calls on
 separate streams would need one buffer per stream. PDL stays off in this
 chain for the race described in the BF16 CUTLASS section of `flashinfer.py`.
 
-### FP8 per-channel experts
+### AITER MXFP4 experts (`aiter.py`)
+
+Opt-in on gfx950 with `--moe-backend aiter` (AMD's AITER package must be
+importable); `auto` keeps the gluon MXFP4 kernels. The weight preprocessor pads
+the per-partition intermediate size to a multiple of 128 and permutes the
+experts into AITER's interleaved W4A16 layout.
+
+The padded outputs are larger than the checkpoint stacks they replace, and all
+layers' stacks are resident before the first layer is processed. So the
+preprocessor writes each stack into exact-size outputs allocated before any
+temporary, pads and shuffles 32 experts at a time (both shuffles permute within
+an expert), and calls `empty_cache` once the old stacks are dropped. Shuffling
+the whole stack at once instead strands ~12-14 GB per GPU in the caching
+allocator (reserved, never allocated) on DeepSeek-V4.1-Flash TP4, which the KV
+budget, sized from free device memory, loses.
+
+Do not replace this with a smaller `max_split_size_mb` around the
+preprocessor: that forces every GB-sized temporary through a fresh `hipMalloc`
+and `hipFree` per layer. VRAM that `hipFree` returns is not allocatable again
+right away on ROCm, so the next allocations can fail with almost nothing
+reserved by PyTorch.
+
+## FP8 per-channel experts
 
 The FP8 per-channel TRT-LLM section of `flashinfer.py` runs `fp8_channel`
 experts (compressed-tensors FP8 dynamic W8A8: one FP32 scale per weight row,

@@ -26,9 +26,9 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
-import os
 import torch
 from tokenspeed_kernel.ops.sampling.triton import (
     accumulate_counts_inplace,
@@ -65,7 +65,9 @@ from tokenspeed.runtime.sampling.backends.triton import (
 )
 from tokenspeed.runtime.sampling.block_verify import block_verify_chain_chunked
 
-_BLOCK_VERIFY_MAX_BS = int(os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_MAX_BS", "128"))
+_BLOCK_VERIFY_MAX_BS = int(
+    os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_MAX_BS", "128")
+)
 _BLOCK_VERIFY_CHUNK = int(os.environ.get("TOKENSPEED_DSPARK_BLOCK_VERIFY_CHUNK", "16"))
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits

@@ -259,6 +259,10 @@ class _ForwardThread:
         self._trace.append("run")
         return fn()
 
+    # Ordering kinds only matter to the real thread's held results.
+    submit_forward = submit
+    submit_prep = submit
+
 
 def _peer(trace=None):
     """A P-role transfer peer the handle will recognize by type."""

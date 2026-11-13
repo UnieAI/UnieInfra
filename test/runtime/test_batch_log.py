@@ -329,3 +329,19 @@ def test_pd_prefill_line_queues_bootstrapping_requests():
         "#cached-token: 0, #running-req: 1, #queue-req: 16"
         ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 9/1/0/0/1"
     ]
+
+
+def test_decode_tokens_count_an_int32_accept_length_result():
+    """The device reports int32 accept lengths; the window sums them as ints."""
+    logger = _logger()
+    logger.record_decode(
+        SimpleNamespace(output_lengths=torch.tensor([1, 4, 2], dtype=torch.int32)),
+        3,
+    )
+    logger.record_decode(
+        SimpleNamespace(output_lengths=torch.tensor([3], dtype=torch.int32)), 1
+    )
+
+    assert logger._num_generated_tokens == 10
+    assert type(logger._num_generated_tokens) is int
+    assert logger._num_decode_steps == 4

@@ -361,6 +361,10 @@ class PipelinedPyobjBroadcaster:
         self.src = src
         self._data = None
         self._ready = torch.zeros(1, dtype=torch.long)
+        # Same memory as ``_ready``: the flag is set and read through numpy
+        # so no torch op runs per round (each would pass through the
+        # control-plane dispatch guard).
+        self._ready_np = self._ready.numpy()
         self._work = None
 
     @property
@@ -370,7 +374,7 @@ class PipelinedPyobjBroadcaster:
     def start(self, data: list[Any] | None) -> None:
         self._data = data
         if self.rank == self.src:
-            self._ready[0] = bool(data)
+            self._ready_np[0] = bool(data)
         self._work = dist.broadcast(
             self._ready,
             src=self.src,
@@ -383,7 +387,7 @@ class PipelinedPyobjBroadcaster:
         data = self._data
         self._data = None
         self._work = None
-        if self._ready.item():
+        if self._ready_np[0]:
             return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
         return data or []
 

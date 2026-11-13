@@ -452,6 +452,48 @@ class RequestState:
         )
         return unsent, self._read_offset - offset
 
+    @property
+    def accepts_plain_tokens(self) -> bool:
+        """Whether ``accept_plain_tokens`` may commit this request's tokens.
+
+        True when ``check_finished`` reads only the output length and the
+        stop tokens: not finished or aborting, no grammar, no stop strings.
+        """
+        return (
+            self.finished_reason is None
+            and not self.to_abort
+            and self.grammar is None
+            and not self.sampling_params.stop_strs
+        )
+
+    def accept_plain_tokens(self, token_ids: list[int]) -> list[int]:
+        """Append ``token_ids`` up to the one that finishes the request.
+
+        Same result as appending one token at a time and calling
+        ``check_finished`` after each, stopping once finished, for a request
+        where ``accepts_plain_tokens`` holds -- without a Python call per
+        token. The length cap is checked before the stop tokens, as in
+        ``check_finished``. Returns the tokens kept.
+        """
+        max_new_tokens = self.sampling_params.max_new_tokens
+        # The token at index ``limit - 1`` brings the output to the cap.
+        limit = max(max_new_tokens - len(self.output_ids), 1)
+        kept = token_ids[:limit]
+        stop_token_ids = self.stop_token_ids
+        if stop_token_ids:
+            for j, token_id in enumerate(kept):
+                if token_id in stop_token_ids:
+                    if j < limit - 1:
+                        kept = kept[: j + 1]
+                        self.output_ids.extend(kept)
+                        self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                        return kept
+                    break
+        self.output_ids.extend(kept)
+        if len(kept) == limit:
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+        return kept
+
     def check_finished(self, skip_grammar_termination: bool = False):
 
         if self.finished:
@@ -605,6 +647,15 @@ class OutputProcesser:
                 "the next KV write would run out of bounds and hang the "
                 "attention kernel."
             )
+
+    def _record_accept_length(self, rid, request_state: RequestState) -> None:
+        """Set the finished request's mean accepted tokens per verify, and log it."""
+        request_state.accept_draft_tokens = (
+            (len(request_state.output_ids) - 1) / request_state.spec_verify_ct
+            if request_state.spec_verify_ct > 0
+            else 0
+        )
+        self.log_accept_length(rid, request_state)
 
     def log_accept_length(self, rid, request_state: RequestState):
         if SHADOW_NGRAM and self.attn_tp_rank == 0:
@@ -1098,60 +1149,67 @@ class OutputProcesser:
                 if use_hostfunc and request_state.grammar is not None
                 else -1
             )
-            new_ids = []
-            for j, model_output_id in enumerate(model_output_ids):
-                request_state.output_ids.append(model_output_id)
-                if advance_grammar:
-                    request_state.grammar.accept_token(model_output_id)
-                if (
-                    request_state.return_logprob
-                    and request_state.output_token_logprobs_val is not None
-                    and model_output_logprobs is not None
-                ):
-                    request_state.output_token_logprobs_val.append(
-                        model_output_logprobs[j]
-                    )
-                    request_state.output_token_logprobs_idx.append(model_output_id)
-                if request_state.output_top_logprobs_val is not None:
-                    if model_output_top is None or j >= len(model_output_top[0]):
-                        # The ingress takes a top-k request only when every
-                        # token of it is sampled in a prefill, which reports
-                        # the alternatives; end the request rather than ship
-                        # a token without them.
-                        if not request_state.finished:
-                            request_state.finished_reason = FINISH_ABORT(
-                                message=(
-                                    "top-k logprobs are not computed for this "
-                                    "step (decode steps return none)"
-                                ),
-                            )
-                    else:
-                        k = request_state.top_logprobs_num
-                        request_state.output_top_logprobs_val.append(
-                            model_output_top[0][j][:k]
-                        )
-                        request_state.output_top_logprobs_idx.append(
-                            model_output_top[1][j][:k]
-                        )
-                if term_idx == j:
-                    # Grammar termination takes precedence over
-                    # length/EOS/stop_str at the same step (matching
-                    # check_finished's original order).
-                    request_state.finished_reason = FINISH_MATCHED_TOKEN(
-                        matched=model_output_id
-                    )
-                else:
-                    request_state.check_finished(skip_grammar_termination=use_hostfunc)
-                new_ids.append(model_output_id)
+            if (
+                request_state.accepts_plain_tokens
+                and request_state.output_token_logprobs_val is None
+                and request_state.output_top_logprobs_val is None
+            ):
+                # No grammar, logprob or stop-string work per token: commit
+                # the round in one call instead of the per-token loop.
+                new_ids = request_state.accept_plain_tokens(model_output_ids)
                 if request_state.finished:
-                    request_state.accept_draft_tokens = (
-                        (len(request_state.output_ids) - 1)
-                        / request_state.spec_verify_ct
-                        if request_state.spec_verify_ct > 0
-                        else 0
-                    )
-                    self.log_accept_length(rid, request_state)
-                    break
+                    self._record_accept_length(rid, request_state)
+            else:
+                new_ids = []
+                for j, model_output_id in enumerate(model_output_ids):
+                    request_state.output_ids.append(model_output_id)
+                    if advance_grammar:
+                        request_state.grammar.accept_token(model_output_id)
+                    if (
+                        request_state.return_logprob
+                        and request_state.output_token_logprobs_val is not None
+                        and model_output_logprobs is not None
+                    ):
+                        request_state.output_token_logprobs_val.append(
+                            model_output_logprobs[j]
+                        )
+                        request_state.output_token_logprobs_idx.append(model_output_id)
+                    if request_state.output_top_logprobs_val is not None:
+                        if model_output_top is None or j >= len(model_output_top[0]):
+                            # The ingress takes a top-k request only when every
+                            # token of it is sampled in a prefill, which reports
+                            # the alternatives; end the request rather than ship
+                            # a token without them.
+                            if not request_state.finished:
+                                request_state.finished_reason = FINISH_ABORT(
+                                    message=(
+                                        "top-k logprobs are not computed for this "
+                                        "step (decode steps return none)"
+                                    ),
+                                )
+                        else:
+                            k = request_state.top_logprobs_num
+                            request_state.output_top_logprobs_val.append(
+                                model_output_top[0][j][:k]
+                            )
+                            request_state.output_top_logprobs_idx.append(
+                                model_output_top[1][j][:k]
+                            )
+                    if term_idx == j:
+                        # Grammar termination takes precedence over
+                        # length/EOS/stop_str at the same step (matching
+                        # check_finished's original order).
+                        request_state.finished_reason = FINISH_MATCHED_TOKEN(
+                            matched=model_output_id
+                        )
+                    else:
+                        request_state.check_finished(
+                            skip_grammar_termination=use_hostfunc
+                        )
+                    new_ids.append(model_output_id)
+                    if request_state.finished:
+                        self._record_accept_length(rid, request_state)
+                        break
 
             # The device cuts a round at the request's stop tokens and token
             # limit, so a request ending on those finishes on its last kept
@@ -1501,6 +1559,9 @@ class OutputProcesser:
         )
 
         for i, rs in enumerate(output_states):
+            # Read once: neither changes while this frame is built.
+            output_length = len(rs.output_ids)
+            sampling_params = rs.sampling_params
             # For finished requests, always output (unless already output)
             if rs.finished:
                 if rs.finished_output:
@@ -1512,20 +1573,18 @@ class OutputProcesser:
             else:
                 # For ongoing requests, use stream interval logic
                 if rs.stream:
-                    stream_interval = getattr(
-                        rs.sampling_params, "stream_interval", None
-                    )
+                    stream_interval = getattr(sampling_params, "stream_interval", None)
                     if stream_interval is None:
                         stream_interval = self.stream_interval
                     should_output = (
-                        rs.output_length % stream_interval == 1
+                        output_length % stream_interval == 1
                         if stream_interval > 1
-                        else rs.output_length % stream_interval == 0
+                        else output_length % stream_interval == 0
                     )
                 else:
                     stream_interval = DEFAULT_FORCE_STREAM_INTERVAL
                     should_output = (
-                        rs.output_length == 1 or rs.output_length % stream_interval == 0
+                        output_length == 1 or output_length % stream_interval == 0
                     )
 
             if not should_output:
@@ -1544,17 +1603,17 @@ class OutputProcesser:
 
             read_offsets.append(read_offset)
             output_ids.append(rs.output_ids[send_token_offset:])
-            rs.send_token_offset = rs.output_length
+            rs.send_token_offset = output_length
 
             output_multi_ids.append([])
 
-            skip_special_tokens.append(rs.sampling_params.skip_special_tokens)
+            skip_special_tokens.append(sampling_params.skip_special_tokens)
             spaces_between_special_tokens.append(
-                rs.sampling_params.spaces_between_special_tokens
+                sampling_params.spaces_between_special_tokens
             )
-            no_stop_trim.append(rs.sampling_params.no_stop_trim)
-            prompt_tokens.append(rs.input_length)
-            completion_tokens.append(rs.output_length)
+            no_stop_trim.append(sampling_params.no_stop_trim)
+            prompt_tokens.append(len(rs.prompt_input_ids))
+            completion_tokens.append(output_length)
             cached_tokens.append(rs.cached_tokens)
 
             if self.spec_algorithm is not None:
@@ -1566,7 +1625,7 @@ class OutputProcesser:
             if rs.return_logprob and rs.output_token_logprobs_val is not None:
                 # Send only the slice not yet shipped; send_token_offset was
                 # just advanced above, so use the logprob list tail.
-                n_new = rs.output_length - send_token_offset
+                n_new = output_length - send_token_offset
                 output_token_logprobs_val.append(
                     rs.output_token_logprobs_val[-n_new:] if n_new > 0 else []
                 )
@@ -1600,7 +1659,7 @@ class OutputProcesser:
                     input_top_logprobs_idx.append([])
                 if rs.output_top_logprobs_val is not None:
                     # One entry per generated token, shipped with its logprob.
-                    n_new = rs.output_length - send_token_offset
+                    n_new = output_length - send_token_offset
                     output_top_logprobs_val.append(
                         rs.output_top_logprobs_val[-n_new:] if n_new > 0 else []
                     )

@@ -1250,3 +1250,140 @@ def test_streamed_frames_carry_the_detokenizer_ids_once():
         [104, 105, 106],
         [107],
     ]
+
+
+def _reason(state: RequestState):
+    return state.finished_reason.to_json() if state.finished else None
+
+
+def _plain_state(max_new_tokens: int, stop_token_ids: set[int]) -> RequestState:
+    state = RequestState(
+        prompt_input_ids=[5, 6, 7],
+        sampling_params=SamplingParams(
+            max_new_tokens=max_new_tokens,
+            stop=[],
+            stop_token_ids=stop_token_ids,
+        ),
+        stream=True,
+        tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
+    )
+    state.computed_length = 3
+    return state
+
+
+@pytest.mark.parametrize("max_new_tokens", [1, 2, 3, 4, 5, 8])
+@pytest.mark.parametrize("already_generated", [0, 1, 3, 4])
+@pytest.mark.parametrize(
+    "window",
+    [[], [9], [9, 9, 9], [2, 9, 9], [9, 2, 9], [9, 9, 2], [9, 2, 2], [2, 2, 2, 2]],
+)
+def test_accept_plain_tokens_matches_one_token_at_a_time(
+    max_new_tokens, already_generated, window
+):
+    """The one-call commit keeps the same tokens and ends with the same
+    reason as appending each token and checking after it, including a stop
+    token on the token that also reaches the length cap (length wins)."""
+    reference = _plain_state(max_new_tokens, {2})
+    fast = _plain_state(max_new_tokens, {2})
+    for state in (reference, fast):
+        state.output_ids = [9] * already_generated
+    assert fast.accepts_plain_tokens
+
+    reference_kept = []
+    for token_id in window:
+        reference.output_ids.append(token_id)
+        reference.check_finished()
+        reference_kept.append(token_id)
+        if reference.finished:
+            break
+
+    assert fast.accept_plain_tokens(list(window)) == reference_kept
+    assert fast.output_ids == reference.output_ids
+    assert _reason(fast) == _reason(reference)
+
+
+def test_plain_tokens_do_not_apply_to_requests_check_finished_does_more_for():
+    stop_string = RequestState(
+        prompt_input_ids=[5, 6, 7],
+        sampling_params=SamplingParams(max_new_tokens=8, stop=["11"]),
+        stream=False,
+        tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
+    )
+    stop_string.sampling_params.normalize(None)
+    assert not stop_string.accepts_plain_tokens
+
+    aborting = _plain_state(8, set())
+    aborting.to_abort = True
+    assert not aborting.accepts_plain_tokens
+
+    finished = _plain_state(8, set())
+    finished.output_ids = [9] * 8
+    finished.check_finished()
+    assert finished.finished and not finished.accepts_plain_tokens
+
+
+def test_a_decode_window_finishes_on_its_first_stop_token_and_streams_once():
+    """A plain decode row whose window holds a stop token commits the tokens
+    up to it, finishes, streams one final frame and reports the device's
+    whole kept window to the scheduler."""
+    sender = _Sender()
+    processor = OutputProcesser(
+        sender,
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+    )
+    state = _plain_state(8, {12})
+    state.spec_verify_ct = 1
+    processor.rid_to_state["decode"] = state
+
+    events = processor.post_process_forward_op(
+        _DecodeOp(), _DecodeResult(), is_prefill_instance=False
+    )
+
+    (extend,) = [e for e in events if type(e).__name__ == "ExtendResult"]
+    assert list(extend.tokens) == [11, 12, 13]
+    assert state.output_ids == [11, 12]
+    assert type(state.finished_reason).__name__ == "FINISH_MATCHED_TOKEN"
+    # Mean accepted tokens per verify: (2 - 1) over two verify rounds.
+    assert state.accept_draft_tokens == 0.5
+    assert "decode" not in processor.rid_to_state
+    (frame,) = sender.items
+    assert frame.output_ids == [[11, 12]]
+    assert frame.completion_tokens == [2]
+    assert frame.prompt_tokens == [3]
+    assert frame.finished_reasons[0]["type"] == "stop"
+
+
+def test_a_stream_interval_skips_frames_between_intervals():
+    """With a stream interval of 2 a live request streams on odd lengths
+    only, and each frame carries every token not sent yet."""
+    sender = _Sender()
+    processor = OutputProcesser(
+        sender,
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+        stream_interval=2,
+    )
+    state = _plain_state(100, set())
+    processor.rid_to_state["decode"] = state
+
+    class _One(_DecodeResult):
+        output_lengths = torch.tensor([1], dtype=torch.int32)
+
+    sent = []
+    for _ in range(4):
+        processor.post_process_forward_op(
+            _DecodeOp(), _One(), is_prefill_instance=False
+        )
+        sent.append(len(sender.items))
+
+    # Lengths 1, 2, 3, 4: frames at 1 and 3.
+    assert sent == [1, 1, 2, 2]
+    assert [frame.output_ids for frame in sender.items] == [[[11]], [[11, 11]]]
+    assert [frame.completion_tokens for frame in sender.items] == [[1], [3]]

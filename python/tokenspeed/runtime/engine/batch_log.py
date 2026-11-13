@@ -237,14 +237,15 @@ class BatchLogger:
     def record_decode(self, results, bs: int) -> None:
         """Fold one committed decode step into the throughput window.
 
-        Reads host tensors of an already-synced result — no GPU sync.
+        Reads host tensors of an already-synced result — no GPU sync. The
+        sum runs on a Python list: a torch op here would pass through the
+        control-plane dispatch guard.
         """
-        accept_lengths = results.output_lengths
-        self._num_generated_tokens += int(accept_lengths.sum().item())
+        accepted_widths = results.output_lengths.tolist()
+        self._num_generated_tokens += sum(accepted_widths)
         self._num_decode_steps += bs
         if not (LOG_SPEC_ACCEPT_LENGTHS and self._enabled and self._spec_num_steps):
             return
-        accepted_widths = [int(value) for value in accept_lengths.tolist()]
         logger.info(
             f"Spec verify step. #dp-rank: {self._dp_rank!s}, "
             f"accept_lengths={accepted_widths!s}, "

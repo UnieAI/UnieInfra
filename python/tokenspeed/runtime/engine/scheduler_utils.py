@@ -20,6 +20,7 @@
 
 """Helper functions for constructing scheduler specs and events."""
 
+import contextlib
 import os
 import weakref
 from collections.abc import Mapping, Sequence
@@ -625,6 +626,20 @@ def scheduler_cache_group_pages(scheduler):
     return pages
 
 
+def profiler_range(name: str):
+    """``record_function(name)`` while a profile records, else a null context.
+
+    nanobind calls emit no Python-tracer or Kineto events, so the C++ time
+    needs this annotation to be labeled in a profile. ``record_function`` is
+    itself a torch op, so outside a profile it would cost a pass through the
+    control-plane dispatch guard on every call for nothing. The flag is the
+    process-global one the profile startup validates.
+    """
+    if getattr(torch.autograd.profiler, "_is_profiler_enabled", False):
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
+
+
 def advance_scheduler(scheduler, events: list) -> None:
     """Feed completion events (forward results or cache-op results) back into
     the C++ scheduler. The ONLY caller of ``scheduler.advance``.
@@ -637,9 +652,7 @@ def advance_scheduler(scheduler, events: list) -> None:
     ec = ExecutionEvent()
     for event in events:
         ec.add_event(event)
-    # nanobind calls emit no Python-tracer or Kineto events, so without this
-    # annotation the C++ time is an unlabeled gap in the profiler timeline.
-    with torch.profiler.record_function("scheduler.advance"):
+    with profiler_range("scheduler.advance"):
         scheduler.advance(ec)
 
 

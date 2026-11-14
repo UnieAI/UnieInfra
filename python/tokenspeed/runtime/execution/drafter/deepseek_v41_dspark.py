@@ -167,6 +167,7 @@ class DeepseekV41DSpark(BaseDrafter):
                 embedding=self.model.markov_head.embedding.weight,
                 projection=projection.weight,
                 num_valid=int(projection.shard_indices.num_org_elements),
+                vocab_start=int(projection.shard_indices.org_vocab_start_index),
                 tp_size=int(self.draft_model.mapping.attn.tp_size),
                 # wire_target may run before or after this binding; whichever
                 # runs second copies the target's TP group into the state.

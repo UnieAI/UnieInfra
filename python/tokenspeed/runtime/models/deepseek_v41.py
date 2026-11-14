@@ -107,6 +107,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     all_reduce_mhc_post,
     can_acquire_all_reduce_outputs,
+    overlap_all_reduce_lanes,
 )
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -122,6 +123,8 @@ from tokenspeed.runtime.execution.context import (
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+    DeepseekV41AttentionBackend,
+    V41MicroBatches,
     V41RowPlan,
 )
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
@@ -664,10 +667,30 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     )
 
 
+# Prefill two-micro-batch overlap (TOKENSPEED_PREFILL_TBO=1): a pure prefill
+# window of at least _PREFILL_TBO_MIN_ROWS rows runs its encoder layers as two
+# micro-batches, so one micro-batch's all-reduce (on a side stream, through
+# its own Iris lane capped at _PREFILL_TBO_IRIS_PROGRAMS workgroups) overlaps
+# the other's attention or MoE (see DeepseekV41Model._encoder_layers_overlapped).
+_PREFILL_TBO = os.environ.get("TOKENSPEED_PREFILL_TBO", "0") == "1"
+_PREFILL_TBO_MIN_ROWS = int(os.environ.get("TOKENSPEED_PREFILL_TBO_MIN_ROWS", "4096"))
+_PREFILL_TBO_IRIS_PROGRAMS = int(
+    os.environ.get("TOKENSPEED_PREFILL_TBO_IRIS_PROGRAMS", "32")
+)
+# Split alignment inside a request: keeps ratio-2 compressor pairs, candidate
+# blocks and SWA pages whole on each side.
+_PREFILL_TBO_ALIGN = 128
+# The overlap lane the attention output projection writes into, while one
+# micro-batch's attention runs (None: the group's ordinary producer buffer).
+_attention_output_lane = None
+
+
 def _all_reduce_output(
     shape: tuple[int, int], like: torch.Tensor, group
 ) -> torch.Tensor | None:
     """Memory the all-reduce over ``group`` reads without staging, or None."""
+    if _attention_output_lane is not None:
+        return _attention_output_lane.acquire(shape)
     if not can_acquire_all_reduce_outputs((shape,), like, group):
         return None
     return acquire_all_reduce_outputs((shape,), like, group)[0]
@@ -695,7 +718,10 @@ def _prefill_comm_stream(device: torch.device) -> torch.cuda.Stream:
     """The side stream overlapped prefill all-reduces run on, one per device."""
     stream = _prefill_comm_streams.get(device.index)
     if stream is None:
-        stream = torch.cuda.Stream(device=device)
+        # High priority: ROCm maps same-priority streams round-robin onto a few
+        # hardware queues (GPU_MAX_HW_QUEUES, 4 by default), and a side stream
+        # sharing the compute stream's queue runs strictly after it.
+        stream = torch.cuda.Stream(device=device, priority=-1)
         _prefill_comm_streams[device.index] = stream
     return stream
 
@@ -1833,6 +1859,88 @@ class DeepseekV41DecoderLayer(nn.Module):
         x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
         return (x, None) if defer_reduce else x
 
+    # The three stages of an encoder layer for one prefill micro-batch (see
+    # DeepseekV41Model._encoder_layers_overlapped). Each stage ends with a TP
+    # partial written into the micro-batch's overlap lane; the caller reduces
+    # it and hands the sum to the next stage. Same arithmetic as forward(),
+    # except the mHC post runs as its own kernel after the plain reduction.
+
+    def overlap_can_run(self, ctx: ForwardContext) -> bool:
+        """Whether this layer's attention and MoE reduce over one TP group."""
+        attn = self.attn.mapping.attn
+        return (
+            attn.has_tp
+            and self.layer_id < self.ced_decoder_start
+            and not self.ffn.owns_ep_communication
+            and self.comm_manager.moe_output_all_reduced(ctx)
+            and tuple(self.comm_manager.mapping.moe.tp_ep_group) == tuple(attn.tp_group)
+        )
+
+    def overlap_attention(self, hidden, pre_mix, positions, ctx, lane):
+        """HC mixes and attention; the TP partial lands in ``lane``."""
+        global _attention_output_lane
+        attn_pre, post, comb = v41_hc_mixes(
+            hidden,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.norm_eps,
+            self.hc_eps,
+            self.hc_sinkhorn_iters,
+        )
+        if isinstance(self.attn.wq_a_wkv.quant_method, _ReferenceFp8LinearMethod):
+            x, codes, scales = _v41_hc_input_fp8(hidden, pre_mix, self.attn_norm)
+        else:
+            x, codes, scales = (
+                _v41_hc_input(hidden, pre_mix, self.attn_norm),
+                None,
+                None,
+            )
+        _attention_output_lane = lane
+        try:
+            partial = self.attn(
+                positions,
+                x,
+                ctx,
+                reduce_output=False,
+                hidden_codes=codes,
+                hidden_scales=scales,
+            )
+        finally:
+            _attention_output_lane = None
+        return partial, (hidden, attn_pre, post, comb)
+
+    def overlap_ffn(self, reduced, saved, image_mask, lane):
+        """Attention mHC post, FFN mixes and the MoE; its partial lands in ``lane``."""
+        residual, attn_pre, post, comb = saved
+        hidden = v41_hc_post(reduced, residual, post, comb)
+        ffn_pre, post, comb = v41_hc_mixes(
+            hidden,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.norm_eps,
+            self.hc_eps,
+            self.hc_sinkhorn_iters,
+        )
+        rows = hidden.shape[0]
+        partial = self.ffn(
+            _v41_hc_input(hidden, attn_pre, self.ffn_norm),
+            image_mask,
+            rows,
+            rows,
+            ctx=None,
+            comm_manager=None,
+            out=lane.acquire((rows, hidden.shape[-1])),
+        )
+        return partial, (hidden, ffn_pre, post, comb)
+
+    @staticmethod
+    def overlap_finish(reduced, saved):
+        """FFN mHC post: the layer's output residual and its pre-mix."""
+        hidden, ffn_pre, post, comb = saved
+        return v41_hc_post(reduced, hidden, post, comb), ffn_pre
+
 
 def _ced_decoder_start(config) -> int:
     """First decoder layer of the causal encoder-decoder split.
@@ -2164,10 +2272,145 @@ class DeepseekV41Model(nn.Module):
         state = V41RowState(
             h, pre_mix, positions, image_mask, hashes, engram_token_mask, []
         )
-        for layer in self.layers[: self.ced_decoder_start]:
-            h, pre_mix = self._run_layer(layer, h, pre_mix, state, ctx, state.captured)
+        overlap = self._plan_encoder_overlap(state, ctx)
+        if overlap is not None:
+            h, pre_mix = self._encoder_layers_overlapped(state, ctx, *overlap)
+        else:
+            for layer in self.layers[: self.ced_decoder_start]:
+                h, pre_mix = self._run_layer(
+                    layer, h, pre_mix, state, ctx, state.captured
+                )
         state.hidden, state.pre_mix = h, pre_mix
         return state
+
+    def _plan_encoder_overlap(self, state: V41RowState, ctx: ForwardContext):
+        """(micro-batches, lanes) for an overlapped encoder, or None to run it whole."""
+        rows = state.rows
+        encoder = self.layers[: self.ced_decoder_start]
+        backend = ctx.attn_backend
+        if (
+            not _PREFILL_TBO
+            or rows < _PREFILL_TBO_MIN_ROWS
+            or not state.hidden.is_cuda
+            or ctx.forward_mode is None
+            or not ctx.forward_mode.is_extend()
+            or ctx.global_num_tokens is not None
+            or torch.cuda.is_current_stream_capturing()
+            or is_breakable_capture_active()
+            or state.image_mask is not None
+            or not encoder
+            or any(
+                layer_id < self.ced_decoder_start
+                for layer_id in self.dspark_capture_layers
+            )
+            or not isinstance(backend, DeepseekV41AttentionBackend)
+            or backend.kvp_size != 1
+            or len(backend.spec.indexer_query_group) > 1
+            or not all(layer.overlap_can_run(ctx) for layer in encoder)
+        ):
+            return None
+        group = encoder[0].attn.mapping.attn.tp_group
+        lanes = overlap_all_reduce_lanes(
+            group, state.hidden.dtype, 2, _PREFILL_TBO_IRIS_PROGRAMS
+        )
+        if lanes is None:
+            return None
+        plan = backend.plan_prefill_micro_batches(_PREFILL_TBO_ALIGN)
+        if plan is None:
+            return None
+        hidden = self.config.hidden_size
+        if not all(
+            lane.can_reduce((n, hidden))
+            for lane, n in zip(lanes, (plan.split, rows - plan.split))
+        ):
+            return None
+        return plan, lanes
+
+    def _encoder_layers_overlapped(
+        self, state: V41RowState, ctx: ForwardContext, plan: V41MicroBatches, lanes
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The encoder layers as two pipelined micro-batches A and B.
+
+        Per layer the compute stream runs attn(A), attn(B), MoE(A), MoE(B)
+        while a side stream all-reduces A's attention output during attn(B),
+        B's during MoE(A), A's MoE output during MoE(B) and B's during the next
+        layer's attn(A). A runs first in every layer, so B's attention finds
+        A's rows of the same layer in the KV cache, as the next chunk of a
+        chunked prefill would. Each micro-batch reduces through its own Iris
+        lane into a buffer it reuses: every reuse is ordered after the
+        previous reduction by the events below.
+        """
+        backend = ctx.attn_backend
+        compute = torch.cuda.current_stream()
+        comm = _prefill_comm_stream(state.hidden.device)
+        comm.wait_stream(compute)
+        split, rows = plan.split, state.rows
+        windows = (slice(0, split), slice(split, rows))
+        metadata = (plan.first, plan.second)
+        hidden = [state.hidden[w] for w in windows]
+        pre_mix = [state.pre_mix[w] for w in windows]
+        positions = [state.positions[w] for w in windows]
+        hashes = [None if state.hashes is None else state.hashes[w] for w in windows]
+        masks = [
+            None if state.engram_token_mask is None else state.engram_token_mask[w]
+            for w in windows
+        ]
+        reduced = [
+            torch.empty(
+                (w.stop - w.start, self.config.hidden_size),
+                dtype=state.hidden.dtype,
+                device=state.hidden.device,
+            )
+            for w in windows
+        ]
+
+        def reduce_async(i: int, partial: torch.Tensor) -> torch.cuda.Event:
+            if not lanes[i].state.owns_outputs((partial,)):
+                raise RuntimeError("V4.1 overlapped prefill partial left its lane")
+            produced = torch.cuda.Event()
+            produced.record(compute)
+            with torch.cuda.stream(comm):
+                comm.wait_event(produced)
+                lanes[i].reduce(reduced[i])
+                done = torch.cuda.Event()
+                done.record(comm)
+            return done
+
+        pending: list[tuple[torch.cuda.Event, tuple] | None] = [None, None]
+        for layer in self.layers[: self.ced_decoder_start]:
+            after_attention = []
+            for i in (0, 1):
+                if pending[i] is not None:
+                    compute.wait_event(pending[i][0])
+                    hidden[i], pre_mix[i] = layer.overlap_finish(
+                        reduced[i], pending[i][1]
+                    )
+                if layer.engram is not None:
+                    hidden[i] = layer.engram(
+                        hidden[i],
+                        hashes[i][:, layer.engram.layer_hash_index],
+                        masks[i],
+                    )
+                backend.use_forward_state(metadata[i])
+                partial, saved = layer.overlap_attention(
+                    hidden[i], pre_mix[i], positions[i], ctx, lanes[i]
+                )
+                after_attention.append((reduce_async(i, partial), saved))
+            backend.use_forward_state(plan.full)
+            for i in (0, 1):
+                compute.wait_event(after_attention[i][0])
+                partial, saved = layer.overlap_ffn(
+                    reduced[i], after_attention[i][1], None, lanes[i]
+                )
+                pending[i] = (reduce_async(i, partial), saved)
+        for i in (0, 1):
+            compute.wait_event(pending[i][0])
+            hidden[i], pre_mix[i] = DeepseekV41DecoderLayer.overlap_finish(
+                reduced[i], pending[i][1]
+            )
+        compute.wait_stream(comm)
+        backend.use_forward_state(plan.full)
+        return torch.cat(hidden), torch.cat(pre_mix)
 
     def narrowing_forward(self, state: V41RowState, ctx: ForwardContext) -> V41RowState:
         """Run the candidate source layer and narrow to the decoder view.

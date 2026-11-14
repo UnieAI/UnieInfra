@@ -623,6 +623,49 @@ def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
     assert backend.decoder_view()[1:] == (None, (), None, None)
 
 
+def test_prefill_micro_batches_continue_the_cut_request_as_its_next_chunk():
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    full = _extend(backend, tables, [200, 120], [0, 0], [0, 0], [200, 120])
+    plan = backend.plan_prefill_micro_batches(128)
+    # Row 160 is the middle; position 128 of request 0 is the nearest
+    # aligned cut and beats the request boundary at row 200.
+    assert plan.split == 128
+    assert backend.query_metadata(ForwardMode.EXTEND) is full
+    backend.use_forward_state(plan.first)
+    first = backend.query_metadata(ForwardMode.EXTEND)
+    assert first.positions.tolist() == list(range(128))
+    assert first.request_indices.tolist() == [0] * 128
+    assert [(s.request, s.prefix, s.count) for s in backend._prefill_spans] == [
+        (0, 0, 128)
+    ]
+    backend.use_forward_state(plan.second)
+    second = backend.query_metadata(ForwardMode.EXTEND)
+    assert second.positions.tolist() == list(range(128, 200)) + list(range(120))
+    assert second.request_indices.tolist() == [0] * 72 + [1] * 120
+    # B continues request 0 from position 128: its SWA window reaches back
+    # into A's rows, which A's layer has already written to the cache.
+    assert [
+        (s.request, s.prefix, s.count, s.swa_prefix_begin)
+        for s in backend._prefill_spans
+    ] == [(0, 128, 72, 1), (1, 0, 120, 0)]
+    # Both halves address the same cache rows as the whole window, and every
+    # ratio-2 pair stays on one side of the cut.
+    for part, rows in ((first, slice(0, 128)), (second, slice(128, 320))):
+        torch.testing.assert_close(part.swa_write_slots, full.swa_write_slots[rows])
+        torch.testing.assert_close(
+            part.compressor.pair_positions, full.compressor.pair_positions[rows]
+        )
+        torch.testing.assert_close(
+            part.compressor.write_slots, full.compressor.write_slots[rows]
+        )
+    backend.use_forward_state(plan.full)
+    assert backend.query_metadata(ForwardMode.EXTEND) is full
+    # A window too small to split leaves each side under a quarter.
+    _extend(backend, tables, [3, 120], [0, 0], [0, 0], [3, 120])
+    assert backend.plan_prefill_micro_batches(128) is None
+
+
 @pytest.mark.parametrize("open_count", [1, 17])
 def test_decoder_view_preserves_compute_rows_without_open_chunk_logits(open_count):
     backend = _verify_backend("cpu", 2, 1)

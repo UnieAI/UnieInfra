@@ -56,6 +56,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
+    SparseTopKShare,
     reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
@@ -263,6 +264,44 @@ class V41SWAQueryPlan:
 
 
 @dataclass
+class V41ForwardState:
+    """Everything one forward's metadata preparation and layers keep on the backend.
+
+    The prefill two-micro-batch overlap prepares one state per micro-batch and
+    swaps them in around each micro-batch's attention (``use_forward_state``).
+    """
+
+    init_args: dict | None
+    forward_metadata: V41Metadata | None
+    forward_prefill_metadata: V41Metadata | None
+    forward_decode_metadata: V41Metadata | None
+    prefill_spans: tuple[V41PrefillSpan, ...]
+    decoder_view: V41DecoderView | None
+    swa_plans: dict
+    prepared_selections: dict
+    index_geometry: dict
+    decode_schedules: dict
+    local_decode_selections: dict
+    sparse_topk: SparseTopKShare
+
+
+@dataclass
+class V41MicroBatches:
+    """A pure prefill window split at query row ``split`` into two forwards.
+
+    Rows ``[0, split)`` form micro-batch A and ``[split, T)`` micro-batch B.
+    A request cut by the split continues in B as its next chunk would, so B's
+    attention reads A's rows of the same layer from the cache (A's layer must
+    run first). ``full`` restores the whole window's metadata.
+    """
+
+    split: int
+    first: V41ForwardState
+    second: V41ForwardState
+    full: V41ForwardState
+
+
+@dataclass
 class V41IndexGeometry:
     # positions, request_indices and source_table are never read back: they
     # pin the tensors whose id()s key the per-invocation geometry cache, so a
@@ -348,6 +387,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._in_model_forward = False
         self._local_decode_selections: dict[tuple, tuple] = {}
         self._partitioned_index_layers: set[int] = set()
+        # The last pure-prefill metadata request, kept so the window can be
+        # re-prepared as two micro-batches (plan_prefill_micro_batches).
+        self._extend_init_args: dict | None = None
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -656,6 +698,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "DeepseekV41AttentionBackend")
+        self._extend_init_args = (
+            dict(
+                bs=bs,
+                num_extends=num_extends,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                block_tables=block_tables,
+                extend_seq_lens=extend_seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_replay_lens_cpu=extend_replay_lens_cpu,
+                extend_prompt_lens_cpu=extend_prompt_lens_cpu,
+                extend_with_prefix=extend_with_prefix,
+                query_shard=query_shard,
+                **kwargs,
+            )
+            if forward_mode.is_extend() and num_extends == bs and self.kvp_size == 1
+            else None
+        )
         if self.kvp_size > 1:
             if (
                 not forward_mode.is_extend()
@@ -786,6 +849,138 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             meta, completes, window, forward_mode
         )
         self.sparse_topk.clear()
+
+    def _forward_state(self) -> V41ForwardState:
+        return V41ForwardState(
+            self._extend_init_args,
+            self.forward_metadata,
+            self.forward_prefill_metadata,
+            self.forward_decode_metadata,
+            self._prefill_spans,
+            self._decoder_view,
+            self._swa_plans,
+            self._prepared_selections,
+            self._index_geometry,
+            self._decode_schedules,
+            self._local_decode_selections,
+            self._sparse_topk,
+        )
+
+    def use_forward_state(self, state: V41ForwardState) -> None:
+        """Make ``state`` the current forward's metadata (see V41MicroBatches)."""
+        self._extend_init_args = state.init_args
+        self.forward_metadata = state.forward_metadata
+        self.forward_prefill_metadata = state.forward_prefill_metadata
+        self.forward_decode_metadata = state.forward_decode_metadata
+        self._prefill_spans = state.prefill_spans
+        self._decoder_view = state.decoder_view
+        self._swa_plans = state.swa_plans
+        self._prepared_selections = state.prepared_selections
+        self._index_geometry = state.index_geometry
+        self._decode_schedules = state.decode_schedules
+        self._local_decode_selections = state.local_decode_selections
+        self._sparse_topk = state.sparse_topk
+
+    def plan_prefill_micro_batches(self, align: int) -> V41MicroBatches | None:
+        """Re-prepare the current pure prefill window as two micro-batches.
+
+        The split lands near the middle of the window, on a request boundary
+        or inside a request at an absolute position that is a multiple of
+        ``align`` (keeping ratio-2 compressor pairs and candidate blocks whole)
+        and past the request's replayed rows. Returns None when the forward is
+        not a pure prefill or no split leaves each side a quarter of the rows.
+        Leaves the full window's metadata current.
+        """
+        args = self._extend_init_args
+        if args is None or align <= 0 or align % 2:
+            return None
+        spans = self._prefill_spans
+        total = sum(span.count for span in spans)
+        replays = [int(n) for n in args["extend_replay_lens_cpu"][: len(spans)]]
+        target = total // 2
+        candidates = [span.offset for span in spans[1:]]
+        for span, replay in zip(spans, replays):
+            if not span.offset < target < span.offset + span.count:
+                continue
+            position = (span.prefix + target - span.offset + align // 2) // align
+            cut = position * align - span.prefix
+            if replay < cut < span.count:
+                candidates.append(span.offset + cut)
+        candidates = [m for m in candidates if total // 4 <= m <= total - total // 4]
+        if not candidates:
+            return None
+        split = min(candidates, key=lambda m: abs(m - target))
+        full = self._forward_state()
+        try:
+            first = self._prepare_rows(args, spans, 0, split)
+            second = self._prepare_rows(args, spans, split, total)
+        finally:
+            self.use_forward_state(full)
+        return V41MicroBatches(split, first, second, full)
+
+    def _prepare_rows(
+        self, args: dict, spans: tuple[V41PrefillSpan, ...], begin: int, end: int
+    ) -> V41ForwardState:
+        """Prepare a fresh forward state for query rows [begin, end) of ``args``."""
+        requests = [
+            span.request
+            for span in spans
+            if span.offset < end and begin < span.offset + span.count
+        ]
+        lo, hi = requests[0], requests[-1] + 1
+        first, last = spans[lo], spans[hi - 1]
+        skip = begin - first.offset  # rows of the first request before begin
+        drop = last.offset + last.count - end  # rows of the last request after end
+        counts = args["extend_seq_lens_cpu"][lo:hi].clone()
+        prefixes = args["extend_prefix_lens_cpu"][lo:hi].clone()
+        replays = args["extend_replay_lens_cpu"][lo:hi].clone()
+        counts[-1] -= drop
+        replays[-1] = min(int(replays[-1]), int(counts[-1]))
+        counts[0] -= skip
+        prefixes[0] += skip
+        replays[0] = max(0, int(replays[0]) - skip)
+        seq_lens = args["seq_lens"][lo:hi].clone()
+        extend_seq_lens = args["extend_seq_lens"][lo:hi].clone()
+        extend_prefix_lens = args["extend_prefix_lens"][lo:hi].clone()
+        if drop:
+            seq_lens[-1] -= drop
+            extend_seq_lens[-1] -= drop
+        if skip:
+            extend_seq_lens[0] -= skip
+            extend_prefix_lens[0] += skip
+        sub = dict(args)
+        sub.update(
+            bs=hi - lo,
+            num_extends=hi - lo,
+            req_pool_indices=args["req_pool_indices"][lo:hi],
+            seq_lens=seq_lens,
+            block_tables={
+                gid: table[lo:hi] for gid, table in args["block_tables"].items()
+            },
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=counts,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=prefixes,
+            extend_replay_lens_cpu=replays,
+            extend_prompt_lens_cpu=args["extend_prompt_lens_cpu"][lo:hi],
+        )
+        if "num_tokens" in sub:
+            sub["num_tokens"] = end - begin
+        if sub.get("positions") is not None:
+            sub["positions"] = sub["positions"][begin:end]
+        if sub.get("block_tables_cpu") is not None:
+            sub["block_tables_cpu"] = {
+                gid: table[lo:hi] for gid, table in sub["block_tables_cpu"].items()
+            }
+        # Fresh containers: preparation clears the current ones in place.
+        self._swa_plans = {}
+        self._prepared_selections = {}
+        self._index_geometry = {}
+        self._decode_schedules = {}
+        self._local_decode_selections = {}
+        self._sparse_topk = SparseTopKShare()
+        self.init_forward_metadata(**sub)
+        return self._forward_state()
 
     def _build_decoder_view(
         self,

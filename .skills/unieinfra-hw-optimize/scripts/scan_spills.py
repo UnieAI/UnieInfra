@@ -4,9 +4,18 @@
 KV 吃滿記憶體後首次在新佇列執行大 spill kernel 會 HSA_STATUS_ERROR_OUT_OF_RESOURCES。
 NVIDIA：改用 cuobjdump/ptxas -v 看 "bytes spill stores"。
 """
-import collections, glob, os, re, sys
 
-dirs = sys.argv[1:] or [d for d in (os.environ.get("TRITON_CACHE_DIR"), os.path.expanduser("~/.triton/cache")) if d]
+import collections
+import glob
+import os
+import re
+import sys
+
+dirs = sys.argv[1:] or [
+    d
+    for d in (os.environ.get("TRITON_CACHE_DIR"), os.path.expanduser("~/.triton/cache"))
+    if d
+]
 pat_name = re.compile(r"^\s*\.amdhsa_kernel\s+(\S+)", re.M)
 pat_priv = re.compile(r"\.amdhsa_private_segment_fixed_size\s+(\d+)")
 pat_vgpr = re.compile(r"\.amdhsa_next_free_vgpr\s+(\d+)")
@@ -16,12 +25,21 @@ for d in dirs:
     for f in glob.glob(os.path.join(d, "**", "*.amdgcn"), recursive=True):
         n += 1
         s = open(f, errors="ignore").read()
-        names, privs, vgprs = pat_name.findall(s), pat_priv.findall(s), pat_vgpr.findall(s)
+        names, privs, vgprs = (
+            pat_name.findall(s),
+            pat_priv.findall(s),
+            pat_vgpr.findall(s),
+        )
         for name, priv, vg in zip(names, privs, vgprs or ["?"] * len(names)):
             priv = int(priv)
-            if priv > best[name][0]: best[name] = (priv, vg, f)
-spill = sorted(((v[0], k, v[1], v[2]) for k, v in best.items() if v[0] > 0), reverse=True)
-print(f"scanned {n} .amdgcn files; {len(spill)} kernels with scratch (private segment > 0)")
+            if priv > best[name][0]:
+                best[name] = (priv, vg, f)
+spill = sorted(
+    ((v[0], k, v[1], v[2]) for k, v in best.items() if v[0] > 0), reverse=True
+)
+print(
+    f"scanned {n} .amdgcn files; {len(spill)} kernels with scratch (private segment > 0)"
+)
 print(f"{'bytes/lane':>10s}  {'vgpr':>5s}  kernel")
 for priv, name, vg, f in spill[:60]:
     print(f"{priv:10d}  {vg:>5s}  {name}")

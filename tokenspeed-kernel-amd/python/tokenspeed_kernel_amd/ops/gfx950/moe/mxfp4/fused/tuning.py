@@ -37,7 +37,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
 )
 
 # Mirrors ``prefill_stage1._S1_PIPELINE``; read once at import.
-_PREFILL_S1_V2 = os.environ.get("TOKENSPEED_MOE_PREFILL_S1_V2", "0") == "1"
+_PREFILL_S1_V2 = os.environ.get("TOKENSPEED_MOE_PREFILL_S1_V2", "1") == "1"
 
 
 class _GroupedMoEConfig(NamedTuple):

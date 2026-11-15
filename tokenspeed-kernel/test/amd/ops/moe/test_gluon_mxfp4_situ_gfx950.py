@@ -1809,11 +1809,16 @@ def test_deferred_stage2_masks_uninitialized_remote_routes_gfx950() -> None:
 def test_grouped_moe_block_m_selection_gfx950(
     num_tokens: int,
     expected: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import tuning
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
         _select_grouped_moe_block_m,
     )
 
+    # Legacy table; the S1_V2 64-row band is covered in
+    # test_gluon_mxfp4_prefill_v2_gfx950.py.
+    monkeypatch.setattr(tuning, "_PREFILL_S1_V2", False)
     assert _select_grouped_moe_block_m(num_tokens, 16, 16) == expected
 
 

@@ -88,10 +88,10 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_N_BLOCK,
 )
 
-# Opt-in 3-slot A / one-ahead B stage-1 K pipeline with dword scale loads
+# Default-on 3-slot A / one-ahead B stage-1 K pipeline with dword scale loads
 # for interleaved GDOT128 W13, E2M1 activations and BLOCK_M == 64
 # (``S1_PIPELINE``). Read once at import.
-_S1_PIPELINE = os.environ.get("TOKENSPEED_MOE_PREFILL_S1_V2", "0") == "1"
+_S1_PIPELINE = os.environ.get("TOKENSPEED_MOE_PREFILL_S1_V2", "1") == "1"
 
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:

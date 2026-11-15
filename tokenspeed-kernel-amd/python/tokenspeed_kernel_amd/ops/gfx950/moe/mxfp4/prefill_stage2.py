@@ -81,9 +81,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
 
 _USES_FP32_ATOMIC: Optional[bool] = None
 
-# Opt-in dword E8M0 scale loads in the 1x2 kernel (``SCALE_DWORD``) for
+# Default-on dword E8M0 scale loads in the 1x2 kernel (``SCALE_DWORD``) for
 # BLOCK_M >= 32; the result is bit-identical. Read once at import.
-_S2_SCALE_DWORD = os.environ.get("TOKENSPEED_MOE_PREFILL_S2_V2", "0") == "1"
+_S2_SCALE_DWORD = os.environ.get("TOKENSPEED_MOE_PREFILL_S2_V2", "1") == "1"
 
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:

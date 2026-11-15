@@ -84,6 +84,11 @@ _USES_FP32_ATOMIC: Optional[bool] = None
 # Default-on dword E8M0 scale loads in the 1x2 kernel (``SCALE_DWORD``) for
 # BLOCK_M >= 32; the result is bit-identical. Read once at import.
 _S2_SCALE_DWORD = os.environ.get("TOKENSPEED_MOE_PREFILL_S2_V2", "1") == "1"
+# Reduce-mode tuning: walk GEMM tiles M-major (all N tiles of one route block
+# back to back, so the expert's W2 rows are reused while L2-resident) and read
+# the partials with ``.cg`` in the reduce kernel. Bit-exact; set to 0 to fall
+# back to the N-major order and default-cached reduce loads.
+_S2_REDUCE_V2 = os.environ.get("TOKENSPEED_MOE_PREFILL_S2_REDUCE_V2", "1") == "1"
 
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
@@ -189,6 +194,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     INPUT_SORTED: gl.constexpr = False,
     A_FORMAT: gl.constexpr = "e2m1",
     SCALE_DWORD: gl.constexpr = False,
+    M_MAJOR: gl.constexpr = False,
 ):
     """Stage 2 1x2 kernel: 2 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
 
@@ -422,9 +428,11 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             flat_tile = pid_n * num_pid_m + pid_m
         else:
             flat_tile = cta_id
-            if not USE_REDUCE and A_FORMAT == "e2m1":
+            if M_MAJOR or (not USE_REDUCE and A_FORMAT == "e2m1"):
                 # Spread simultaneous atomic updates across output columns,
                 # instead of having every expert update the same N tile.
+                # Reduce mode (``M_MAJOR``) uses the same order so one route
+                # block's N tiles run together and share its W2 rows in L2.
                 pid_m = flat_tile // num_pid_n
                 pid_n = flat_tile % num_pid_n
             else:
@@ -1683,6 +1691,7 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     stride_rs=0,
     expert_start=0,
     num_experts=0,
+    LOAD_CM: gl.constexpr = "",
 ):
     """Sum per-(token, slot) partials over the topk dim.
 
@@ -1732,7 +1741,7 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
             )
             valid = (ids >= expert_start) & (ids < expert_start + num_experts)
             mask = mask & valid[:, None]
-        v = gl.load(p, mask=mask, other=0.0)
+        v = gl.load(p, mask=mask, other=0.0, cache_modifier=LOAD_CM)
         acc += v.to(gl.float32)
 
     out_ptrs = (
@@ -2063,6 +2072,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         INPUT_SORTED=bool(input_sorted),
         A_FORMAT=a_format,
         SCALE_DWORD=_S2_SCALE_DWORD and not COALESCE_SCALES and BLOCK_M >= 32,
+        M_MAJOR=_S2_REDUCE_V2 and _use_reduce,
         num_warps=NUM_WARPS,
     )
 
@@ -2088,6 +2098,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             BLOCK_N=BLOCK_N_R,
             TOP_K=topk,
             MASK_INVALID_ROUTES=False,
+            # ``.cg`` partial reads: ~11% faster reduce at M >= 4096.
+            LOAD_CM=".cg" if _S2_REDUCE_V2 else "",
             num_warps=NUM_WARPS_R,
         )
     if _USES_FP32_ATOMIC is None:

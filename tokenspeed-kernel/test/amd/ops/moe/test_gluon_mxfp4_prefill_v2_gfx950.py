@@ -93,7 +93,8 @@ def _run(module, hidden_states, topk_weights, topk_ids, num_experts):
 # intermediate 576 an odd number of BK128 stage-2 tiles (K padded to 640).
 # 2304 tokens with top-2 over 32 experts is 144 routes per expert: BLOCK_M 64
 # with and without the opt-in selection, and above the 2048-token atomic
-# combine bound, so both runs use the deterministic FP32 reduction.
+# combine bound, so both runs use the deterministic FP32 reduction (covering
+# the M-major tile order and ``.cg`` partial reads of the reduce path).
 @pytest.mark.parametrize("hidden_size", [1024, 1280])
 def test_package_prefill_v2_paths_match_default_gfx950(
     monkeypatch: pytest.MonkeyPatch, hidden_size: int
@@ -120,11 +121,13 @@ def test_package_prefill_v2_paths_match_default_gfx950(
 
     monkeypatch.setattr(prefill_stage1, "_S1_PIPELINE", False)
     monkeypatch.setattr(prefill_stage2, "_S2_SCALE_DWORD", False)
+    monkeypatch.setattr(prefill_stage2, "_S2_REDUCE_V2", False)
     monkeypatch.setattr(tuning, "_PREFILL_S1_V2", False)
     expected = _run(module, hidden_states, topk_weights, topk_ids, num_experts)
 
     monkeypatch.setattr(prefill_stage1, "_S1_PIPELINE", True)
     monkeypatch.setattr(prefill_stage2, "_S2_SCALE_DWORD", True)
+    monkeypatch.setattr(prefill_stage2, "_S2_REDUCE_V2", True)
     monkeypatch.setattr(tuning, "_PREFILL_S1_V2", True)
     actual = _run(module, hidden_states, topk_weights, topk_ids, num_experts)
 

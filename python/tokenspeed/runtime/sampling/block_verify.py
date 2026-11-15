@@ -113,9 +113,10 @@ def block_verify_chain_tp(
     tl = target_logits.view(bs, n, vocab)
     lse_p = torch.logsumexp(tl / t, dim=-1)  # [bs, n]
     drafts = candidates[:, 1:].long()
-    lp_x = tl[:, :steps].gather(-1, drafts[..., None])[..., 0] / t[..., 0] - lse_p[
-        :, :steps
-    ]
+    lp_x = (
+        tl[:, :steps].gather(-1, drafts[..., None])[..., 0] / t[..., 0]
+        - lse_p[:, :steps]
+    )
     mine = _local_draft_logits(state, slots, candidates) / t  # [bs, steps, local]
     rel = drafts - lo
     own = (rel >= 0) & (rel < local)

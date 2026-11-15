@@ -69,12 +69,21 @@ branch is retained only as a kernel-level config.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
+    load_cdna4_scale_pair_u8,
+    load_cdna4_scale_u8,
+)
 
 _USES_FP32_ATOMIC: Optional[bool] = None
+
+# Opt-in dword E8M0 scale loads in the 1x2 kernel (``SCALE_DWORD``) for
+# BLOCK_M >= 32; the result is bit-identical. Read once at import.
+_S2_SCALE_DWORD = os.environ.get("TOKENSPEED_MOE_PREFILL_S2_V2", "0") == "1"
 
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
@@ -179,6 +188,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     APPLY_ROUTED_WEIGHT: gl.constexpr = True,
     INPUT_SORTED: gl.constexpr = False,
     A_FORMAT: gl.constexpr = "e2m1",
+    SCALE_DWORD: gl.constexpr = False,
 ):
     """Stage 2 1x2 kernel: 2 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
 
@@ -188,6 +198,13 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     to sum across the topk dim. ``c_ptr`` is then expected to point at
     a ``[token_num * topk, N]`` bf16 scratch buffer; ``stride_cm`` /
     ``stride_cn`` describe that shape (``stride_cm = N``).
+
+    With ``SCALE_DWORD``, the per-tile A / B scale gathers (non-coalesced
+    path) load whole 4-byte CDNA4 scale cells as dwords instead of single
+    bytes. A cell holds the scales of a BK128 tile and of the next one, so
+    each tile pair issues one load per cell
+    (``load_cdna4_scale_pair_u8``) instead of two byte loads per lane and
+    tile, and no byte packing sits between the loads and the MFMAs.
 
     When ``PERSISTENT`` is True, the kernel is launched with
     ``grid = (num_pid_n, workers)``: grid axis 0 owns a fixed N tile and
@@ -790,9 +807,14 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         + (a_k_iter0 % 4) * 64
                         + ((a_k_iter0 % 8) // 4) * 2
                     )[None, :]
-                    a_scale0 = gl.amd.cdna4.buffer_load(
-                        ptr=a_scales_ptr, offsets=a_m_part + a_k_part0
-                    )
+                    if SCALE_DWORD:
+                        a_scale0, a_scale1 = load_cdna4_scale_pair_u8(
+                            a_scales_ptr, a_m_part + a_k_part0
+                        )
+                    else:
+                        a_scale0 = gl.amd.cdna4.buffer_load(
+                            ptr=a_scales_ptr, offsets=a_m_part + a_k_part0
+                        )
                 b0_c0 = gl.amd.cdna4.buffer_load(ptr=b_base_ptr, offsets=offs_b_c0)
                 b0_c1 = gl.amd.cdna4.buffer_load(ptr=b_base_ptr, offsets=offs_b_c1)
                 b0_c2 = gl.amd.cdna4.buffer_load(ptr=b_base_ptr, offsets=offs_b_c2)
@@ -804,18 +826,32 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         + (bsc_k_iter0 % 4) * 64
                         + ((bsc_k_iter0 % 8) // 4) * 2
                     )[None, :]
-                    b_scale0_c0 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c0 + bsc_k_off0
-                    )
-                    b_scale0_c1 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c1 + bsc_k_off0
-                    )
-                    b_scale0_c2 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c2 + bsc_k_off0
-                    )
-                    b_scale0_c3 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c3 + bsc_k_off0
-                    )
+                    if SCALE_DWORD:
+                        b_scale0_c0, b_scale1_c0 = load_cdna4_scale_pair_u8(
+                            b_scale_base, b_n_scale_part_c0 + bsc_k_off0
+                        )
+                        b_scale0_c1, b_scale1_c1 = load_cdna4_scale_pair_u8(
+                            b_scale_base, b_n_scale_part_c1 + bsc_k_off0
+                        )
+                        b_scale0_c2, b_scale1_c2 = load_cdna4_scale_pair_u8(
+                            b_scale_base, b_n_scale_part_c2 + bsc_k_off0
+                        )
+                        b_scale0_c3, b_scale1_c3 = load_cdna4_scale_pair_u8(
+                            b_scale_base, b_n_scale_part_c3 + bsc_k_off0
+                        )
+                    else:
+                        b_scale0_c0 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c0 + bsc_k_off0
+                        )
+                        b_scale0_c1 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c1 + bsc_k_off0
+                        )
+                        b_scale0_c2 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c2 + bsc_k_off0
+                        )
+                        b_scale0_c3 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c3 + bsc_k_off0
+                        )
 
                 if not COALESCE_SCALES:
                     a_k_iter1 = BLOCK_K_SCALE + a_k_lanes
@@ -824,9 +860,10 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         + (a_k_iter1 % 4) * 64
                         + ((a_k_iter1 % 8) // 4) * 2
                     )[None, :]
-                    a_scale1 = gl.amd.cdna4.buffer_load(
-                        ptr=a_scales_ptr, offsets=a_m_part + a_k_part1
-                    )
+                    if not SCALE_DWORD:
+                        a_scale1 = gl.amd.cdna4.buffer_load(
+                            ptr=a_scales_ptr, offsets=a_m_part + a_k_part1
+                        )
                 b1_c0 = gl.amd.cdna4.buffer_load(
                     ptr=b_base_ptr, offsets=offs_b_c0 + B_DATA_K_STEP1
                 )
@@ -846,18 +883,19 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         + (bsc_k_iter1 % 4) * 64
                         + ((bsc_k_iter1 % 8) // 4) * 2
                     )[None, :]
-                    b_scale1_c0 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c0 + bsc_k_off1
-                    )
-                    b_scale1_c1 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c1 + bsc_k_off1
-                    )
-                    b_scale1_c2 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c2 + bsc_k_off1
-                    )
-                    b_scale1_c3 = gl.amd.cdna4.buffer_load(
-                        ptr=b_scale_base, offsets=b_n_scale_part_c3 + bsc_k_off1
-                    )
+                    if not SCALE_DWORD:
+                        b_scale1_c0 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c0 + bsc_k_off1
+                        )
+                        b_scale1_c1 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c1 + bsc_k_off1
+                        )
+                        b_scale1_c2 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c2 + bsc_k_off1
+                        )
+                        b_scale1_c3 = gl.amd.cdna4.buffer_load(
+                            ptr=b_scale_base, offsets=b_n_scale_part_c3 + bsc_k_off1
+                        )
 
                 if COALESCE_SCALES:
                     # One coalesced full-N, full-K B-scale load via a 4D
@@ -1158,18 +1196,24 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             + (a_k_even % 4) * 64
                             + ((a_k_even % 8) // 4) * 2
                         )[None, :]
-                        a_scale_even = gl.amd.cdna4.buffer_load(
-                            ptr=a_scales_ptr, offsets=a_m_part + a_k_part_even
-                        )
+                        if SCALE_DWORD:
+                            a_scale_even, a_scale_odd = load_cdna4_scale_pair_u8(
+                                a_scales_ptr, a_m_part + a_k_part_even
+                            )
+                        else:
+                            a_scale_even = gl.amd.cdna4.buffer_load(
+                                ptr=a_scales_ptr, offsets=a_m_part + a_k_part_even
+                            )
                         a_k_odd = (pair_k + 1) * BLOCK_K_SCALE + a_k_lanes
                         a_k_part_odd = (
                             (a_k_odd // 8) * 256
                             + (a_k_odd % 4) * 64
                             + ((a_k_odd % 8) // 4) * 2
                         )[None, :]
-                        a_scale_odd = gl.amd.cdna4.buffer_load(
-                            ptr=a_scales_ptr, offsets=a_m_part + a_k_part_odd
-                        )
+                        if not SCALE_DWORD:
+                            a_scale_odd = gl.amd.cdna4.buffer_load(
+                                ptr=a_scales_ptr, offsets=a_m_part + a_k_part_odd
+                            )
 
                         if B_GDOT128:
                             b_even_k = pair_k * BLOCK_K_B + offs_bk
@@ -1239,44 +1283,59 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             + (bsc_k_even % 4) * 64
                             + ((bsc_k_even % 8) // 4) * 2
                         )[None, :]
-                        b_scale_even_c0 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c0 + bsc_k_off_even,
-                        )
-                        b_scale_even_c1 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c1 + bsc_k_off_even,
-                        )
-                        b_scale_even_c2 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c2 + bsc_k_off_even,
-                        )
-                        b_scale_even_c3 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c3 + bsc_k_off_even,
-                        )
+                        if SCALE_DWORD:
+                            b_scale_even_c0, b_scale_odd_c0 = load_cdna4_scale_pair_u8(
+                                b_scale_base, b_n_scale_part_c0 + bsc_k_off_even
+                            )
+                            b_scale_even_c1, b_scale_odd_c1 = load_cdna4_scale_pair_u8(
+                                b_scale_base, b_n_scale_part_c1 + bsc_k_off_even
+                            )
+                            b_scale_even_c2, b_scale_odd_c2 = load_cdna4_scale_pair_u8(
+                                b_scale_base, b_n_scale_part_c2 + bsc_k_off_even
+                            )
+                            b_scale_even_c3, b_scale_odd_c3 = load_cdna4_scale_pair_u8(
+                                b_scale_base, b_n_scale_part_c3 + bsc_k_off_even
+                            )
+                        else:
+                            b_scale_even_c0 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c0 + bsc_k_off_even,
+                            )
+                            b_scale_even_c1 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c1 + bsc_k_off_even,
+                            )
+                            b_scale_even_c2 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c2 + bsc_k_off_even,
+                            )
+                            b_scale_even_c3 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c3 + bsc_k_off_even,
+                            )
                         bsc_k_odd = (pair_k + 1) * BLOCK_K_SCALE + b_k_lanes
                         bsc_k_off_odd = (
                             (bsc_k_odd // 8) * 256
                             + (bsc_k_odd % 4) * 64
                             + ((bsc_k_odd % 8) // 4) * 2
                         )[None, :]
-                        b_scale_odd_c0 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c0 + bsc_k_off_odd,
-                        )
-                        b_scale_odd_c1 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c1 + bsc_k_off_odd,
-                        )
-                        b_scale_odd_c2 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c2 + bsc_k_off_odd,
-                        )
-                        b_scale_odd_c3 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c3 + bsc_k_off_odd,
-                        )
+                        if not SCALE_DWORD:
+                            b_scale_odd_c0 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c0 + bsc_k_off_odd,
+                            )
+                            b_scale_odd_c1 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c1 + bsc_k_off_odd,
+                            )
+                            b_scale_odd_c2 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c2 + bsc_k_off_odd,
+                            )
+                            b_scale_odd_c3 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c3 + bsc_k_off_odd,
+                            )
 
                         cdna4_async_copy.wait_group(1)
                         a_even = cdna4_async_copy.load_shared_relaxed(
@@ -1378,9 +1437,14 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             + (a_k_tail % 4) * 64
                             + ((a_k_tail % 8) // 4) * 2
                         )[None, :]
-                        a_scale_tail = gl.amd.cdna4.buffer_load(
-                            ptr=a_scales_ptr, offsets=a_m_part + a_k_part_tail
-                        )
+                        if SCALE_DWORD:
+                            a_scale_tail = load_cdna4_scale_u8(
+                                a_scales_ptr, a_m_part + a_k_part_tail
+                            )
+                        else:
+                            a_scale_tail = gl.amd.cdna4.buffer_load(
+                                ptr=a_scales_ptr, offsets=a_m_part + a_k_part_tail
+                            )
                         if B_GDOT128:
                             b_tail_k = tail_k * BLOCK_K_B + offs_bk
                             b_tail_c0_off = _gdot128_weight_offset(
@@ -1418,22 +1482,36 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             + (bsc_k_tail % 4) * 64
                             + ((bsc_k_tail % 8) // 4) * 2
                         )[None, :]
-                        b_scale_tail_c0 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c0 + bsc_k_off_tail,
-                        )
-                        b_scale_tail_c1 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c1 + bsc_k_off_tail,
-                        )
-                        b_scale_tail_c2 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c2 + bsc_k_off_tail,
-                        )
-                        b_scale_tail_c3 = gl.amd.cdna4.buffer_load(
-                            ptr=b_scale_base,
-                            offsets=b_n_scale_part_c3 + bsc_k_off_tail,
-                        )
+                        if SCALE_DWORD:
+                            b_scale_tail_c0 = load_cdna4_scale_u8(
+                                b_scale_base, b_n_scale_part_c0 + bsc_k_off_tail
+                            )
+                            b_scale_tail_c1 = load_cdna4_scale_u8(
+                                b_scale_base, b_n_scale_part_c1 + bsc_k_off_tail
+                            )
+                            b_scale_tail_c2 = load_cdna4_scale_u8(
+                                b_scale_base, b_n_scale_part_c2 + bsc_k_off_tail
+                            )
+                            b_scale_tail_c3 = load_cdna4_scale_u8(
+                                b_scale_base, b_n_scale_part_c3 + bsc_k_off_tail
+                            )
+                        else:
+                            b_scale_tail_c0 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c0 + bsc_k_off_tail,
+                            )
+                            b_scale_tail_c1 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c1 + bsc_k_off_tail,
+                            )
+                            b_scale_tail_c2 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c2 + bsc_k_off_tail,
+                            )
+                            b_scale_tail_c3 = gl.amd.cdna4.buffer_load(
+                                ptr=b_scale_base,
+                                offsets=b_n_scale_part_c3 + bsc_k_off_tail,
+                            )
                         cdna4_async_copy.wait_group(0)
                         a_tail = cdna4_async_copy.load_shared_relaxed(
                             smem_a.index(0), dot_a_layout
@@ -1984,6 +2062,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         APPLY_ROUTED_WEIGHT=do_finalize,
         INPUT_SORTED=bool(input_sorted),
         A_FORMAT=a_format,
+        SCALE_DWORD=_S2_SCALE_DWORD and not COALESCE_SCALES and BLOCK_M >= 32,
         num_warps=NUM_WARPS,
     )
 

@@ -66,6 +66,21 @@ _HEAD_GROUPS_PER_CTA = 4
 # The unsplit decode kernel: 32-row tiles keep two workgroups per CU.
 _ROWS_TILE_K = 32
 _ROWS_WAVES_PER_EU = 2
+# Row-group decode kernel: GROUP_ROWS consecutive query rows per workgroup
+# (a DSpark request's 6 verify rows form two groups), padded to GROUP_PAD
+# 16-head MFMA blocks; each segment's selections are deduplicated in LDS.
+_GROUP_ROWS = int(__import__('os').environ.get('SA_G', 2))
+_GROUP_PAD = int(__import__('os').environ.get('SA_GP', 2))
+_GROUP_TILE_K = int(__import__("os").environ.get("SA_TK", 32))
+_GROUP_HASH = int(__import__('os').environ.get('SA_H', 2048))
+_GROUP_MAX_WIDTH = 512
+# Set False to force the per-row kernels (benchmarks, A/B checks).
+_GROUP_ENABLED = True
+_GROUP_TARGET_CTAS = int(__import__('os').environ.get('SA_T', 2 * num_cus()))
+_GROUP_SPLITS = int(__import__('os').environ.get('SA_S', 0))
+_GROUP_M_WAVES = int(__import__('os').environ.get('SA_MW', 1))
+_GROUP_WAVES_PER_EU = int(__import__('os').environ.get('SA_W', 2))
+_GROUP_MIN_TOKENS = 1
 
 
 @gluon.jit
@@ -147,6 +162,61 @@ def _load_global_rows(cache, slot, valid, page_stride, RAW_LAYOUT: gl.constexpr)
     return values & keep[:, None, None, None], (scales & keep[:, None, None]).to(
         gl.uint8
     )
+
+
+@gluon.jit
+def _global_rows_unmasked(cache, slot, page_stride, RAW_LAYOUT: gl.constexpr):
+    """``_load_global_rows`` without zeroing invalid rows (slot clamped to a
+    valid row): the caller masks at dequant time, so prefetched loads are not
+    waited for at issue."""
+    scale_layout: gl.constexpr = gl.SliceLayout(3, RAW_LAYOUT)
+    chunk_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
+    page_base = (slot // 64).to(tl.int64) * page_stride
+    row = slot % 64
+    chunks = gl.arange(0, 16, layout=gl.SliceLayout(1, chunk_layout))
+    groups = gl.arange(0, 2, layout=gl.SliceLayout(0, chunk_layout))
+    scale_idx = chunks[:, None] * 2 + groups[None, :]
+    words = gl.arange(
+        0,
+        2,
+        layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, RAW_LAYOUT))),
+    )
+    word_offsets = (
+        ((page_base + row * 256) // 4)[:, None, None, None]
+        + (scale_idx * 2)[None, :, :, None]
+        + words[None, None, None, :]
+    )
+    # Each lane's two scale bytes as one 16-bit load, split at dequant time
+    # (unpacking at load time would wait for the prefetch).
+    pair_chunks = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(2, scale_layout)))
+    pair_offsets = ((page_base + 64 * 256 + row * 32) // 2)[:, None] + pair_chunks[None, :]
+    values = gl.load(cache.to(gl.pointer_type(gl.int32)) + word_offsets)
+    return values, gl.load(cache.to(gl.pointer_type(gl.int16)) + pair_offsets)
+
+
+@gluon.jit
+def _global_scale_pairs(pairs, keep, SCALE_LAYOUT: gl.constexpr):
+    """int16 [TILE_K, 16] scale-byte pairs to uint8 [TILE_K, 16, 2]."""
+    word = pairs.to(gl.int32) & keep[:, None]
+    scales = gl.join(word & 0xFF, (word >> 8) & 0xFF).to(gl.uint8)
+    return gl.convert_layout(scales, SCALE_LAYOUT)
+
+
+@gluon.jit
+def _swa_rows_unmasked(cache, slot, page_stride, RAW_LAYOUT: gl.constexpr):
+    """``_load_swa_rows`` without zeroing invalid rows (see above)."""
+    scale_layout: gl.constexpr = gl.SliceLayout(2, RAW_LAYOUT)
+    page_base = (slot // 64).to(tl.int64) * page_stride
+    row = slot % 64
+    chunks = gl.arange(0, 32, layout=gl.SliceLayout(0, scale_layout))
+    lanes = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(1, RAW_LAYOUT)))
+    value_offsets = (
+        (page_base + row * 512)[:, None, None]
+        + (chunks * 16)[None, :, None]
+        + lanes[None, None, :]
+    )
+    scale_offsets = (page_base + 64 * 512 + row * 16)[:, None] + (chunks // 2)[None, :]
+    return gl.load(cache + value_offsets), gl.load(cache + scale_offsets)
 
 
 @gluon.jit
@@ -1538,6 +1608,658 @@ def gluon_dsv41_selected_attention_reduce_gfx950(
     )
 
 
+# ---------------------------------------------------------------------------
+# Row-group decode kernel: one workgroup per GROUP_ROWS consecutive query rows.
+#
+# The speculative rows of one request (consecutive positions) share most of
+# their SWA window and of their top-k global rows, yet the per-row kernels
+# gather and dequantize every selected row once per query row. Here a
+# workgroup first deduplicates its rows' selections in LDS (a hash of slot ids
+# with per-row multiplicities), then streams each distinct KV row once through
+# M = GROUP_PAD * 16 MFMA rows (query row x head). Row r scores union entry u
+# with weight count_r(u) (0 masks it), so duplicates and ragged lengths keep
+# the exact gather-softmax semantics. Correctness never depends on how rows
+# map to requests: rows of different requests only enlarge the union.
+# ---------------------------------------------------------------------------
+
+
+@gluon.jit
+def _group_bucket(x, H: gl.constexpr):
+    """Fibonacci hash of non-negative slot ids into [0, H)."""
+    LOG: gl.constexpr = H.bit_length() - 1
+    h = x * -1640531535  # 0x9E3779B1, wrapping int32 multiply
+    return (h >> (32 - LOG)) & (H - 1)
+
+
+@gluon.jit
+def _group_selections(
+    slots,
+    lens,
+    row0,
+    rows_left,
+    slot_stride,
+    width,
+    capacity,
+    GROUP_ROWS: gl.constexpr,
+    GROUP_PAD: gl.constexpr,
+    WIDTH_P2: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    """Valid selected slots (-1 otherwise) of rows [row0, row0 + GROUP_ROWS),
+    flattened row-major over [GROUP_PAD, WIDTH_P2]."""
+    E: gl.constexpr = GROUP_PAD * WIDTH_P2
+    e = gl.arange(0, E, layout=LAYOUT)
+    r = e // WIDTH_P2
+    j = e % WIDTH_P2
+    row_ok = (r < GROUP_ROWS) & (r < rows_left)
+    rows = row0 + r
+    n = gl.load(lens + rows, mask=row_ok, other=0)
+    n = gl.minimum(gl.maximum(n, 0), width)
+    valid = row_ok & (j < n)
+    x = gl.load(slots + rows.to(tl.int64) * slot_stride + j, mask=valid, other=-1)
+    return gl.where(valid & (x >= 0) & (x < capacity), x, -1)
+
+
+@gluon.jit
+def _group_union(
+    x,
+    table,
+    u_slot,
+    u_weight,
+    GROUP_PAD: gl.constexpr,
+    WIDTH_P2: gl.constexpr,
+    TILE_K: gl.constexpr,
+    H: gl.constexpr,
+    LAYOUT: gl.constexpr,
+    TABLE_LAYOUT: gl.constexpr,
+):
+    """Deduplicate a group's selections ``x`` (from ``_group_selections``).
+
+    Writes the distinct slots to ``u_slot`` [E] and per-row multiplicities to
+    ``u_weight`` (tile-major [E / TILE_K, GROUP_PAD, TILE_K]) and returns the
+    union size. A slot that loses its hash bucket to a larger slot is kept
+    once per occurrence with weight one for its own row, so collisions cost
+    only redundant work, never correctness.
+    """
+    gl.static_assert((GROUP_PAD == 2) or (GROUP_PAD == 4))
+    WORDS: gl.constexpr = GROUP_PAD // 2
+    E: gl.constexpr = GROUP_PAD * WIDTH_P2
+    e = gl.arange(0, E, layout=LAYOUT)
+    r = e // WIDTH_P2
+    valid = x >= 0
+
+    key_t = table.slice(0, H)
+    rep_t = table.slice(H, H)
+    cnt_t = table.slice(2 * H, WORDS * H)
+    key_t.store(gl.full([H], -1, gl.int32, layout=TABLE_LAYOUT))
+    rep_t.store(gl.full([H], 1 << 30, gl.int32, layout=TABLE_LAYOUT))
+    zeros = gl.zeros([H], gl.int32, layout=TABLE_LAYOUT)
+    for k in gl.static_range(WORDS):
+        cnt_t.slice(k * H, H).store(zeros)
+    gl.barrier()
+    b = _group_bucket(gl.maximum(x, 0), H)
+    key_t.atomic_scatter_max(x, b, 0, mask=valid)
+    gl.barrier()
+    own = valid & (key_t.gather(b, 0) == x)
+    rep_t.atomic_scatter_min(e, b, 0, mask=own)
+    # Two 16-bit row counters per word: rows 0/1 in word 0, rows 2/3 in word 1.
+    cnt_t.atomic_scatter_add(1 << ((r % 2) * 16), b * WORDS + r // 2, 0, mask=own)
+    gl.barrier()
+    rep = own & (rep_t.gather(b, 0) == e)
+    keep = rep | (valid & ~own)
+    word0 = cnt_t.gather(b * WORDS, 0)
+    if WORDS > 1:
+        word1 = cnt_t.gather(b * WORDS + 1, 0)
+    else:
+        word1 = word0
+    kept = keep.to(gl.int32)
+    pos = gl.cumsum(kept, axis=0) - kept
+    count = gl.sum(kept, axis=0)
+    u_slot.atomic_scatter_xchg(x, pos, 0, mask=keep)
+    tile_base = (pos // TILE_K) * (GROUP_PAD * TILE_K) + pos % TILE_K
+    for k in gl.static_range(GROUP_PAD):
+        if k < 2:
+            word = word0
+        else:
+            word = word1
+        weight = gl.where(rep, (word >> ((k % 2) * 16)) & 0xFFFF, (r == k).to(gl.int32))
+        u_weight.atomic_scatter_xchg(weight, tile_base + k * TILE_K, 0, mask=keep)
+    gl.barrier()
+    return count
+
+
+@gluon.constexpr_function
+def _group_score_layout(block_m, tile_k, m_waves):
+    """[source wave, m, column quarter, column] partial scores: wave v owns
+    column quarter v of every m (registers sum the four source waves); with
+    ``m_waves`` 2 the M halves go to separate waves too."""
+    quarter = tile_k // 4
+    per_thread = min(quarter, 4)
+    column_threads = quarter // per_thread
+    return gl.BlockedLayout(
+        [4, 1, 1, per_thread],
+        [1, 64 // column_threads, 1, column_threads],
+        [1, m_waves, 4, 1],
+        [3, 0, 1, 2],
+    )
+
+
+@gluon.jit
+def _group_attend_tile(
+    kv_view,
+    partial_shared,
+    p_shared,
+    weights,
+    m_ok,
+    q_dot,
+    score_scale,
+    max_value,
+    denominator,
+    accumulator,
+    BLOCK_M: gl.constexpr,
+    TILE_K: gl.constexpr,
+    MFMA_LAYOUT: gl.constexpr,
+    SCORE_LAYOUT: gl.constexpr,
+):
+    """Fold one BF16 LDS tile [TILE_K, 512] into the softmax of BLOCK_M
+    (row, head) pairs. Wave w owns head dims [128w, 128w + 128) for QK and
+    PV, and tile columns [w, w + 1) * TILE_K / 4 for the softmax, so the
+    score work is not repeated per wave. ``denominator`` [BLOCK_M, 4] holds
+    each wave's column share of the softmax sum."""
+    dtype: gl.constexpr = kv_view.dtype
+    Q4: gl.constexpr = TILE_K // 4
+    a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=MFMA_LAYOUT, k_width=8
+    )
+    b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=MFMA_LAYOUT, k_width=8
+    )
+    acc_m_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, MFMA_LAYOUT))
+    flat4: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [3, 2, 1, 0])
+    flat3: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
+    slices = kv_view.reshape([TILE_K, 4, 128])
+    k_dot = slices.permute([1, 2, 0]).load(b_layout)
+    partial = gl.amd.cdna4.mfma(
+        q_dot,
+        k_dot,
+        gl.zeros([4, BLOCK_M, TILE_K], dtype=gl.float32, layout=MFMA_LAYOUT),
+    )
+    partial_shared.store(partial.reshape([4 * BLOCK_M, TILE_K]))
+    parts = partial_shared.reinterpret(gl.float32, [4, BLOCK_M, 4, Q4], flat4)
+    scores = gl.sum(parts.load(SCORE_LAYOUT), axis=0)
+    ok = (weights > 0) & m_ok[:, None, None]
+    scores = gl.where(ok, scores * score_scale, -float("inf"))
+    tile_max = gl.max(gl.max(scores, axis=2), axis=1)
+    next_max = gl.maximum(max_value, tile_max)
+    safe_next_max = gl.where(next_max > -float("inf"), next_max, 0.0)
+    alpha = gl.exp(max_value - safe_next_max)
+    probabilities = gl.exp(scores - safe_next_max[:, None, None]) * weights.to(
+        gl.float32
+    )
+    denominator = alpha[:, None] * denominator + gl.sum(probabilities, axis=2)
+    max_value = next_max
+    p_shared.reinterpret(dtype, [BLOCK_M, 4, Q4], flat3).store(
+        probabilities.to(dtype)
+    )
+    p_tile = p_shared.load(gl.SliceLayout(0, a_layout))
+    p_wide, _ = gl.broadcast(
+        p_tile[None, :, :], gl.zeros([4, BLOCK_M, TILE_K], dtype=dtype, layout=a_layout)
+    )
+    previous_scale = gl.convert_layout(alpha, acc_m_layout)
+    v_dot = slices.permute([1, 0, 2]).load(b_layout)
+    accumulator = gl.amd.cdna4.mfma(
+        p_wide, v_dot, accumulator * previous_scale[None, :, None]
+    )
+    return max_value, denominator, accumulator
+
+
+@gluon.jit
+def _group_tile_slots(u_slot2d, tile, count, TILE_K: gl.constexpr, N_TILES: gl.constexpr, LAYOUT: gl.constexpr):
+    """(slot, valid) of union tile ``tile`` (clamped reads past the end)."""
+    index = gl.minimum(tile, N_TILES - 1)
+    slot = u_slot2d.index(index).load(LAYOUT)
+    positions = tile * TILE_K + gl.arange(0, TILE_K, layout=LAYOUT)
+    valid = positions < count
+    return gl.where(valid, slot, 0), valid
+
+
+@gluon.jit
+def _group_segment(
+    cache,
+    page_stride,
+    count,
+    u_slot,
+    u_weight,
+    kv_shared,
+    partial_shared,
+    p_shared,
+    m_block,
+    m_ok,
+    q_dot,
+    softmax_scale,
+    max_value,
+    denominator,
+    accumulator,
+    split_idx,
+    num_splits,
+    IS_GLOBAL: gl.constexpr,
+    GROUP_PAD: gl.constexpr,
+    E: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    TILE_K: gl.constexpr,
+    MFMA_LAYOUT: gl.constexpr,
+    P_LAYOUT: gl.constexpr,
+    RAW_LAYOUT: gl.constexpr,
+    ROW_LAYOUT: gl.constexpr,
+):
+    """Attend the union tiles of one segment (SWA or global)."""
+    N_TILES: gl.constexpr = E // TILE_K
+    # Leading (indexed) dims take no layout order.
+    flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    flat3: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    u_slot2d = u_slot.reinterpret(gl.int32, [N_TILES, TILE_K], flat)
+    Q4: gl.constexpr = TILE_K // 4
+    flat4: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
+    u_w4d = u_weight.reinterpret(gl.int32, [N_TILES, GROUP_PAD, 4, Q4], flat4)
+    l3: gl.constexpr = gl.SliceLayout(0, P_LAYOUT)
+    w_rows = gl.zeros([BLOCK_M, 4, Q4], gl.int32, layout=l3) + m_block[:, None, None]
+    w_cols = (
+        gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, l3)))[None, :, None]
+        * Q4
+        + gl.arange(0, Q4, layout=gl.SliceLayout(0, gl.SliceLayout(1, l3)))[
+            None, None, :
+        ]
+    )
+    tiles = gl.cdiv(count, TILE_K)
+    tile_begin = split_idx * tiles // num_splits
+    tile_end = (split_idx + 1) * tiles // num_splits
+    slot, valid = _group_tile_slots(
+        u_slot2d, tile_begin, count, TILE_K, N_TILES, ROW_LAYOUT
+    )
+    if IS_GLOBAL:
+        values, scales = _global_rows_unmasked(cache, slot, page_stride, RAW_LAYOUT)
+    else:
+        values, scales = _swa_rows_unmasked(cache, slot, page_stride, RAW_LAYOUT)
+    for tile in range(tile_begin, tile_end):
+        n_slot, n_valid = _group_tile_slots(
+            u_slot2d, tile + 1, count, TILE_K, N_TILES, ROW_LAYOUT
+        )
+        # Rows past the union size (slot 0 stand-ins) must dequantize to
+        # finite values; their weights are zero.
+        if IS_GLOBAL:
+            n_values, n_scales = _global_rows_unmasked(
+                cache, n_slot, page_stride, RAW_LAYOUT
+            )
+            keep = gl.where(valid, -1, 0)
+            kv_shared.store(
+                _dequant_global_rows(
+                    values & keep[:, None, None, None],
+                    _global_scale_pairs(
+                        scales, keep, gl.SliceLayout(3, RAW_LAYOUT)
+                    ),
+                )
+            )
+        else:
+            n_values, n_scales = _swa_rows_unmasked(
+                cache, n_slot, page_stride, RAW_LAYOUT
+            )
+            keep = gl.where(valid, 255, 0).to(gl.uint8)
+            kv_shared.store(
+                _dequant_swa_rows(values & keep[:, None, None], scales)
+            )
+        # Entries past the union size hold stale weights.
+        weights = gl.where(
+            w_cols < count - tile * TILE_K, u_w4d.index(tile).gather(w_rows, 0), 0
+        )
+        max_value, denominator, accumulator = _group_attend_tile(
+            kv_shared,
+            partial_shared,
+            p_shared,
+            weights,
+            m_ok,
+            q_dot,
+            softmax_scale,
+            max_value,
+            denominator,
+            accumulator,
+            BLOCK_M,
+            TILE_K,
+            MFMA_LAYOUT,
+            P_LAYOUT,
+        )
+        values, scales, valid = n_values, n_scales, n_valid
+    return max_value, denominator, accumulator
+
+
+def _selected_attention_group_metadata(grid, kernel, args):
+    return _selected_attention_rows_metadata(grid, kernel, args)
+
+
+@gluon.jit(launch_metadata=_selected_attention_group_metadata)
+def gluon_dsv41_selected_attention_group_gfx950(
+    q,
+    swa_cache,
+    swa_slots,
+    swa_lens,
+    global_cache,
+    global_slots,
+    global_lens,
+    attn_sink,
+    out,
+    part_stats,
+    part_acc,
+    num_tokens,
+    stride_q_t: tl.int64,
+    stride_q_h: tl.int64,
+    swa_page_stride: tl.int64,
+    swa_slot_stride: tl.int64,
+    swa_width,
+    global_page_stride: tl.int64,
+    global_slot_stride: tl.int64,
+    global_width,
+    stride_o_t: tl.int64,
+    stride_o_h: tl.int64,
+    softmax_scale: tl.float32,
+    swa_capacity,
+    global_capacity,
+    num_heads,
+    rope_positions,
+    rope_cos_sin,
+    stride_rope: tl.int64,
+    HAS_GLOBAL: gl.constexpr,
+    GROUP_ROWS: gl.constexpr,
+    GROUP_PAD: gl.constexpr,
+    SWA_P2: gl.constexpr,
+    GLOBAL_P2: gl.constexpr,
+    HASH: gl.constexpr,
+    TILE_K: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    M_WAVES: gl.constexpr,
+):
+    """Program g owns query rows [g * GROUP_ROWS, ...) (all <= 16 heads):
+    dedups their SWA then global selections and attends each distinct row
+    once for all GROUP_ROWS x 16 (row, head) pairs."""
+    gl.static_assert(HEAD_DIM == 512)
+    BLOCK_M: gl.constexpr = GROUP_PAD * 16
+    mfma: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, M_WAVES, 1],
+    )
+    a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma, k_width=8
+    )
+    THREADS: gl.constexpr = 256 * M_WAVES
+    swa_raw_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 16], [8, 8, 1], [M_WAVES, 4, 1], [2, 1, 0]
+    )
+    global_raw_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 2, 2], [16, 4, 1, 1], [M_WAVES, 4, 1, 1], [3, 2, 1, 0]
+    )
+    swa_row_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, swa_raw_layout))
+    global_row_layout: gl.constexpr = gl.SliceLayout(
+        1, gl.SliceLayout(2, gl.SliceLayout(3, global_raw_layout))
+    )
+    # Softmax layouts: wave v owns column quarter v of every (row, head) m.
+    p_operand_layout: gl.constexpr = _group_score_layout(BLOCK_M, TILE_K, M_WAVES)
+    score_layout: gl.constexpr = gl.SliceLayout(0, p_operand_layout)
+    share_layout: gl.constexpr = gl.SliceLayout(2, score_layout)
+    m_layout: gl.constexpr = gl.SliceLayout(1, share_layout)
+    kv_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, [1, 0])
+    flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    E_MAX: gl.constexpr = GROUP_PAD * GLOBAL_P2 if GLOBAL_P2 > SWA_P2 else GROUP_PAD * SWA_P2
+    union_layout: gl.constexpr = gl.BlockedLayout(
+        [E_MAX // THREADS], [64], [4 * M_WAVES], [0]
+    )
+    union_layout_swa: gl.constexpr = gl.BlockedLayout(
+        [GROUP_PAD * SWA_P2 // THREADS], [64], [4 * M_WAVES], [0]
+    )
+    table_layout: gl.constexpr = gl.BlockedLayout(
+        [HASH // THREADS], [64], [4 * M_WAVES], [0]
+    )
+
+    program = gl.program_id(axis=0)
+    programs = gl.num_programs(axis=0)
+    per_xcd = (programs + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = programs % NUM_XCDS
+    if tall_xcds == 0:
+        tall_xcds = NUM_XCDS
+    xcd = program % NUM_XCDS
+    group = xcd * per_xcd + program // NUM_XCDS
+    if xcd >= tall_xcds:
+        group -= xcd - tall_xcds
+    row0 = group * GROUP_ROWS
+    rows_left = num_tokens - row0
+    split_idx = gl.program_id(axis=1)
+    num_splits = gl.num_programs(axis=1)
+    single = num_splits == 1
+
+    # LDS: the hash tables alias the KV tile and the score partials.
+    table = gl.allocate_shared_memory(gl.int32, [4 * HASH], layout=flat)
+    gl.static_assert(4 * HASH * 4 >= TILE_K * HEAD_DIM * 2)
+    kv_shared = table.slice(0, TILE_K * HEAD_DIM // 2).reinterpret(
+        gl.bfloat16, [TILE_K, HEAD_DIM], kv_shared_layout
+    )
+    partial_shared = gl.allocate_shared_memory(
+        gl.float32, [4 * BLOCK_M, TILE_K], layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    )
+    p_shared = gl.allocate_shared_memory(
+        gl.bfloat16, [BLOCK_M, TILE_K], layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    )
+    u_slot = gl.allocate_shared_memory(gl.int32, [E_MAX], layout=flat)
+    u_weight = gl.allocate_shared_memory(gl.int32, [GROUP_PAD * E_MAX], layout=flat)
+
+    # (row, head) pairs: m = 16 * group row + head.
+    q_waves = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, a_layout)))
+    q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(0, gl.SliceLayout(2, a_layout)))
+    q_dims = gl.arange(0, 128, layout=gl.SliceLayout(0, gl.SliceLayout(1, a_layout)))
+    q_ok = ((q_m // 16) < GROUP_ROWS) & ((q_m // 16) < rows_left) & ((q_m % 16) < num_heads)
+    q_dot = gl.load(
+        q
+        + (row0 + q_m // 16)[None, :, None].to(tl.int64) * stride_q_t
+        + (q_m % 16)[None, :, None].to(tl.int64) * stride_q_h
+        + q_waves[:, None, None] * 128
+        + q_dims[None, None, :],
+        mask=q_ok[None, :, None],
+        other=0.0,
+    )
+    m_idx = gl.arange(0, BLOCK_M, layout=m_layout)
+    m_block = m_idx // 16
+    m_head = m_idx % 16
+    m_ok = (m_block < GROUP_ROWS) & (m_block < rows_left) & (m_head < num_heads)
+    # One split starts from the sink (logit sink, weight 1); split partials
+    # start empty and the reduce kernel adds the sink once.
+    sink = gl.load(attn_sink + m_head, mask=m_ok, other=0.0)
+    max_value = gl.where(single, sink, -float("inf"))
+    # Per (m, column quarter) sums; the sink's weight goes to quarter 0.
+    quarter = gl.arange(0, 4, layout=gl.SliceLayout(0, share_layout))
+    denominator = gl.where(
+        single & (quarter[None, :] == 0), 1.0, 0.0
+    ) + gl.zeros([BLOCK_M, 4], dtype=gl.float32, layout=share_layout)
+    accumulator = gl.zeros([4, BLOCK_M, 128], dtype=gl.float32, layout=mfma)
+
+    # Both segments' selections are loaded up front, so the global dedup does
+    # not wait on memory after the SWA tiles.
+    swa_x = _group_selections(
+        swa_slots,
+        swa_lens,
+        row0,
+        rows_left,
+        swa_slot_stride,
+        swa_width,
+        swa_capacity,
+        GROUP_ROWS,
+        GROUP_PAD,
+        SWA_P2,
+        union_layout_swa,
+    )
+    if HAS_GLOBAL:
+        global_x = _group_selections(
+            global_slots,
+            global_lens,
+            row0,
+            rows_left,
+            global_slot_stride,
+            global_width,
+            global_capacity,
+            GROUP_ROWS,
+            GROUP_PAD,
+            GLOBAL_P2,
+            union_layout,
+        )
+    swa_count = _group_union(
+        swa_x,
+        table,
+        u_slot,
+        u_weight,
+        GROUP_PAD,
+        SWA_P2,
+        TILE_K,
+        HASH,
+        union_layout_swa,
+        table_layout,
+    )
+    max_value, denominator, accumulator = _group_segment(
+        swa_cache,
+        swa_page_stride,
+        swa_count,
+        u_slot,
+        u_weight,
+        kv_shared,
+        partial_shared,
+        p_shared,
+        m_block,
+        m_ok,
+        q_dot,
+        softmax_scale,
+        max_value,
+        denominator,
+        accumulator,
+        split_idx,
+        num_splits,
+        False,
+        GROUP_PAD,
+        E_MAX,
+        BLOCK_M,
+        TILE_K,
+        mfma,
+        p_operand_layout,
+        swa_raw_layout,
+        swa_row_layout,
+    )
+    if HAS_GLOBAL:
+        gl.barrier()
+        global_count = _group_union(
+            global_x,
+            table,
+            u_slot,
+            u_weight,
+            GROUP_PAD,
+            GLOBAL_P2,
+            TILE_K,
+            HASH,
+            union_layout,
+            table_layout,
+        )
+        max_value, denominator, accumulator = _group_segment(
+            global_cache,
+            global_page_stride,
+            global_count,
+            u_slot,
+            u_weight,
+            kv_shared,
+            partial_shared,
+            p_shared,
+            m_block,
+            m_ok,
+            q_dot,
+            softmax_scale,
+            max_value,
+            denominator,
+            accumulator,
+            split_idx,
+            num_splits,
+            True,
+            GROUP_PAD,
+            E_MAX,
+            BLOCK_M,
+            TILE_K,
+            mfma,
+            p_operand_layout,
+            global_raw_layout,
+            global_row_layout,
+        )
+
+    # Epilogue: normalize, optionally rotate the RoPE tail, store BF16.
+    out_m_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, mfma))
+    denominator = gl.sum(denominator, axis=1)
+    if not single:
+        # Partials in the split kernel's [token, split, head] layout.
+        part_rows = ((row0 + m_block) * num_splits + split_idx).to(tl.int64)
+        stats = part_stats + (part_rows * num_heads + m_head) * 2
+        gl.store(stats, max_value, mask=m_ok)
+        gl.store(stats + 1, denominator, mask=m_ok)
+        a_waves = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, mfma)))
+        a_m = gl.arange(0, BLOCK_M, layout=out_m_layout)
+        a_dims = gl.arange(0, 128, layout=gl.SliceLayout(0, gl.SliceLayout(1, mfma)))
+        a_ok = ((a_m // 16) < GROUP_ROWS) & ((a_m // 16) < rows_left) & ((a_m % 16) < num_heads)
+        a_rows = ((row0 + a_m // 16) * num_splits + split_idx).to(tl.int64)
+        gl.store(
+            part_acc
+            + ((a_rows * num_heads + a_m % 16) * HEAD_DIM)[None, :, None]
+            + a_waves[:, None, None] * 128
+            + a_dims[None, None, :],
+            accumulator,
+            mask=a_ok[None, :, None],
+        )
+        return
+    scale = gl.convert_layout(
+        gl.where(denominator > 0.0, 1.0 / denominator, 0.0), out_m_layout
+    )
+    values = accumulator * scale[None, :, None]
+    o_waves = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, mfma)))
+    o_m = gl.arange(0, BLOCK_M, layout=out_m_layout)
+    o_dims = gl.arange(0, 128, layout=gl.SliceLayout(0, gl.SliceLayout(1, mfma)))
+    o_rows = row0 + o_m // 16
+    o_ok = ((o_m // 16) < GROUP_ROWS) & ((o_m // 16) < rows_left) & ((o_m % 16) < num_heads)
+    if ROPE_DIM > 0:
+        values = values.to(gl.bfloat16).to(gl.float32)
+        even, odd = gl.split(values.reshape([4, BLOCK_M, 64, 2]))
+        pair_layout: gl.constexpr = even.type.layout
+        start: gl.constexpr = (512 - ROPE_DIM) // 2
+        p_w = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, pair_layout)))
+        p_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(0, gl.SliceLayout(2, pair_layout)))
+        p_d = gl.arange(0, 64, layout=gl.SliceLayout(0, gl.SliceLayout(1, pair_layout)))
+        pairs = p_w[:, None, None] * 64 + p_d[None, None, :]
+        rope = pairs >= start
+        index = gl.where(rope, pairs - start, 0)
+        p_rows = row0 + p_m // 16
+        p_ok = ((p_m // 16) < GROUP_ROWS) & ((p_m // 16) < rows_left)
+        position = gl.maximum(gl.load(rope_positions + p_rows, mask=p_ok, other=0), 0)
+        table_row = rope_cos_sin + (position.to(tl.int64) * stride_rope)[None, :, None]
+        c = gl.load(table_row + index, mask=rope & p_ok[None, :, None], other=1.0)
+        s = gl.load(
+            table_row + ROPE_DIM // 2 + index, mask=rope & p_ok[None, :, None], other=0.0
+        )
+        values = gl.convert_layout(
+            gl.join(even * c - odd * s, odd * c + even * s).reshape([4, BLOCK_M, 128]),
+            values.type.layout,
+            assert_trivial=True,
+        )
+    gl.store(
+        out
+        + o_rows[None, :, None].to(tl.int64) * stride_o_t
+        + (o_m % 16)[None, :, None].to(tl.int64) * stride_o_h
+        + o_waves[:, None, None] * 128
+        + o_dims[None, None, :],
+        values.to(gl.bfloat16),
+        mask=o_ok[None, :, None],
+    )
+
+
 def _output(out, shape, dtype, device):
     if out is None:
         return torch.empty(shape, dtype=dtype, device=device)
@@ -1752,6 +2474,107 @@ def launch_gluon_dsv41_selected_attention_gfx950(
             _TARGET_CTAS // (tokens * head_blocks),
         ),
     )
+    swa_p2 = triton.next_power_of_2(swa_slots_i.shape[1])
+    global_p2 = triton.next_power_of_2(max(global_width, 1))
+    if (
+        _GROUP_ENABLED
+        and q.shape[1] <= _BLOCK_H
+        and tokens >= _GROUP_MIN_TOKENS
+        and swa_p2 <= _GROUP_MAX_WIDTH
+        and global_p2 <= _GROUP_MAX_WIDTH
+    ):
+        swa_p2 = max(swa_p2, 256 * _GROUP_M_WAVES // _GROUP_PAD, _GROUP_TILE_K)
+        global_p2 = max(global_p2, 256 * _GROUP_M_WAVES // _GROUP_PAD, _GROUP_TILE_K)
+        groups = triton.cdiv(tokens, _GROUP_ROWS)
+        # Split each group's union tiles over workgroups while the grid is
+        # short of _GROUP_TARGET_CTAS; depends only on shapes.
+        splits = max(1, min(_MAX_SPLITS, _GROUP_TARGET_CTAS // groups))
+        if _GROUP_SPLITS:
+            splits = _GROUP_SPLITS
+        heads = q.shape[1]
+        if splits > 1:
+            part_stats = torch.empty(
+                (tokens, splits, heads, 2), dtype=torch.float32, device=q.device
+            )
+            part_acc = torch.empty(
+                (tokens, splits, heads, _HEAD_DIM), dtype=torch.float32, device=q.device
+            )
+        else:
+            part_stats = part_acc = sink
+        gluon_dsv41_selected_attention_group_gfx950[(groups, splits)](
+            q,
+            swa_cache,
+            swa_slots_i,
+            swa_lens_i,
+            global_cache_u8,
+            global_slots_i,
+            global_lens_i,
+            sink,
+            out,
+            part_stats,
+            part_acc,
+            tokens,
+            q.stride(0),
+            q.stride(1),
+            swa_cache.stride(0),
+            swa_slots_i.stride(0),
+            swa_slots_i.shape[1],
+            global_page_stride,
+            global_slot_stride,
+            global_width,
+            out.stride(0),
+            out.stride(1),
+            scale,
+            swa_cache.shape[0] * _PAGE_ROWS,
+            global_capacity,
+            q.shape[1],
+            rope_positions if rope else swa_lens_i,
+            rope_cos_sin if rope else sink,
+            rope_cos_sin.stride(0) if rope else 0,
+            HAS_GLOBAL=has_global,
+            GROUP_ROWS=_GROUP_ROWS,
+            GROUP_PAD=_GROUP_PAD,
+            SWA_P2=swa_p2,
+            GLOBAL_P2=global_p2,
+            HASH=_GROUP_HASH,
+            TILE_K=_GROUP_TILE_K,
+            HEAD_DIM=_HEAD_DIM,
+            ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
+            NUM_XCDS=num_xcds(),
+            M_WAVES=_GROUP_M_WAVES,
+            num_warps=4 * _GROUP_M_WAVES,
+            num_stages=1,
+            waves_per_eu=_GROUP_WAVES_PER_EU,
+        )
+        if splits > 1:
+            part_active = torch.ones((tokens, 1), dtype=torch.int32, device=q.device)
+            gluon_dsv41_selected_attention_reduce_gfx950[
+                (tokens, 1, _HEAD_DIM // _REDUCE_DIM_BLOCK)
+            ](
+                part_stats,
+                part_acc,
+                part_stats,
+                part_active,
+                part_active,
+                sink,
+                out,
+                out.stride(0),
+                out.stride(1),
+                heads,
+                splits,
+                1,
+                rope_positions if rope else swa_lens_i,
+                rope_cos_sin if rope else sink,
+                rope_cos_sin.stride(0) if rope else 0,
+                BLOCK_H=_BLOCK_H,
+                HEAD_GROUPS=1,
+                MAX_SPLITS=_MAX_SPLITS,
+                HEAD_DIM=_HEAD_DIM,
+                DIM_BLOCK=_REDUCE_DIM_BLOCK,
+                ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
+                num_warps=4,
+            )
+        return out
     # Up to one workgroup per CU the one-wave unsplit main kernel is faster;
     # past that the rows kernel's two workgroups per CU win.
     if tokens * head_blocks > _TARGET_CTAS:

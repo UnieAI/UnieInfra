@@ -1897,6 +1897,7 @@ def moe_apply(
 
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.ops.moe.aiter  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401

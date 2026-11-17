@@ -666,6 +666,56 @@ def test_prefill_micro_batches_continue_the_cut_request_as_its_next_chunk():
     assert backend.plan_prefill_micro_batches(128) is None
 
 
+def test_mixed_micro_batches_keep_every_decode_row_in_the_second():
+    """A mixed window splits inside its extend rows: A is a pure prefill and
+    B the rest of the extend rows followed by every decode request."""
+    backend = _verify_backend("cpu", 3, 2)
+    tables = _tables("cpu")
+    tables = {gid: torch.cat((t, t[:1])) for gid, t in tables.items()}
+    counts = torch.tensor([200, 120])
+    backend.init_forward_metadata(
+        3,
+        2,
+        torch.tensor([0, 1, 2]),
+        torch.tensor([200, 120, 9]),
+        ForwardMode.MIXED,
+        block_tables=tables,
+        extend_seq_lens=counts,
+        extend_seq_lens_cpu=counts,
+        extend_prefix_lens=torch.tensor([0, 0]),
+        extend_prefix_lens_cpu=torch.tensor([0, 0]),
+        extend_replay_lens_cpu=torch.tensor([0, 0]),
+        extend_prompt_lens_cpu=counts,
+        extend_with_prefix=False,
+        query_shard=None,
+    )
+    full = backend.query_metadata(ForwardMode.MIXED)
+    plan = backend.plan_prefill_micro_batches(128)
+    assert plan.split == 128
+    assert backend.query_metadata(ForwardMode.MIXED) is full
+    backend.use_forward_state(plan.first)
+    first = backend.query_metadata(ForwardMode.EXTEND)
+    assert first.positions.tolist() == list(range(128))
+    assert first.num_extends == first.request_pool_indices.numel() == 1
+    backend.use_forward_state(plan.second)
+    second = backend.query_metadata(ForwardMode.MIXED)
+    assert second.positions.tolist() == (
+        list(range(128, 200)) + list(range(120)) + [7, 8]
+    )
+    assert second.request_indices.tolist() == [0] * 72 + [1] * 120 + [2] * 2
+    assert second.request_pool_indices.tolist() == [0, 1, 2]
+    assert second.num_extends == 2
+    decode = backend.query_metadata(ForwardMode.DECODE)
+    assert decode.positions.tolist() == [7, 8]
+    for part, rows in ((first, slice(0, 128)), (second, slice(128, 322))):
+        torch.testing.assert_close(part.swa_write_slots, full.swa_write_slots[rows])
+        torch.testing.assert_close(
+            part.compressor.write_slots, full.compressor.write_slots[rows]
+        )
+    backend.use_forward_state(plan.full)
+    assert backend.query_metadata(ForwardMode.MIXED) is full
+
+
 @pytest.mark.parametrize("open_count", [1, 17])
 def test_decoder_view_preserves_compute_rows_without_open_chunk_logits(open_count):
     backend = _verify_backend("cpu", 2, 1)

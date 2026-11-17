@@ -287,7 +287,7 @@ class V41ForwardState:
 
 @dataclass
 class V41MicroBatches:
-    """A pure prefill window split at query row ``split`` into two forwards.
+    """A prefill or mixed window split at query row ``split`` into two forwards.
 
     Rows ``[0, split)`` form micro-batch A and ``[split, T)`` micro-batch B.
     A request cut by the split continues in B as its next chunk would, so B's
@@ -716,7 +716,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 query_shard=query_shard,
                 **kwargs,
             )
-            if forward_mode.is_extend() and num_extends == bs and self.kvp_size == 1
+            if self.kvp_size == 1
+            and (
+                (forward_mode.is_extend() and num_extends == bs)
+                or (forward_mode.is_mixed() and 0 < num_extends < bs)
+            )
             else None
         )
         if self.kvp_size > 1:
@@ -882,20 +886,24 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._sparse_topk = state.sparse_topk
 
     def plan_prefill_micro_batches(self, align: int) -> V41MicroBatches | None:
-        """Re-prepare the current pure prefill window as two micro-batches.
+        """Re-prepare the current prefill or mixed window as two micro-batches.
 
         The split lands near the middle of the window, on a request boundary
         or inside a request at an absolute position that is a multiple of
         ``align`` (keeping ratio-2 compressor pairs and candidate blocks whole)
-        and past the request's replayed rows. Returns None when the forward is
-        not a pure prefill or no split leaves each side a quarter of the rows.
-        Leaves the full window's metadata current.
+        and past the request's replayed rows. It always falls inside the
+        extend rows: in a mixed window the decode rows (which follow every
+        extend row) join micro-batch B, so B is itself a mixed forward and A a
+        pure prefill. Returns None for other forwards or when no split leaves
+        each side a quarter of the rows. Leaves the full window's metadata
+        current.
         """
         args = self._extend_init_args
         if args is None or align <= 0 or align % 2:
             return None
         spans = self._prefill_spans
-        total = sum(span.count for span in spans)
+        extend_rows = sum(span.count for span in spans)
+        total = self.forward_metadata.positions.numel()
         replays = [int(n) for n in args["extend_replay_lens_cpu"][: len(spans)]]
         target = total // 2
         candidates = [span.offset for span in spans[1:]]
@@ -906,22 +914,39 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             cut = position * align - span.prefix
             if replay < cut < span.count:
                 candidates.append(span.offset + cut)
-        candidates = [m for m in candidates if total // 4 <= m <= total - total // 4]
+        candidates = [
+            m
+            for m in candidates
+            if total // 4 <= m <= total - total // 4 and m < extend_rows
+        ]
         if not candidates:
             return None
         split = min(candidates, key=lambda m: abs(m - target))
         full = self._forward_state()
         try:
-            first = self._prepare_rows(args, spans, 0, split)
-            second = self._prepare_rows(args, spans, split, total)
+            first = self._prepare_rows(args, spans, 0, split, with_decodes=False)
+            second = self._prepare_rows(
+                args, spans, split, extend_rows, with_decodes=True
+            )
         finally:
             self.use_forward_state(full)
         return V41MicroBatches(split, first, second, full)
 
     def _prepare_rows(
-        self, args: dict, spans: tuple[V41PrefillSpan, ...], begin: int, end: int
+        self,
+        args: dict,
+        spans: tuple[V41PrefillSpan, ...],
+        begin: int,
+        end: int,
+        *,
+        with_decodes: bool,
     ) -> V41ForwardState:
-        """Prepare a fresh forward state for query rows [begin, end) of ``args``."""
+        """Prepare a fresh forward state for extend rows [begin, end) of ``args``.
+
+        ``with_decodes`` appends every decode request of a mixed ``args``
+        (and its rows, which follow all extend rows) as a mixed forward;
+        otherwise the rows form a pure prefill.
+        """
         requests = [
             span.request
             for span in spans
@@ -948,14 +973,30 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if skip:
             extend_seq_lens[0] -= skip
             extend_prefix_lens[0] += skip
+        bs, num_extends = args["bs"], args["num_extends"]
+        decodes = with_decodes and num_extends < bs
+        decode_rows = self.forward_metadata.positions.numel() - sum(
+            span.count for span in spans
+        )
+
+        def rows_of(table: torch.Tensor) -> torch.Tensor:
+            if not decodes:
+                return table[lo:hi]
+            return torch.cat((table[lo:hi], table[num_extends:bs]))
+
         sub = dict(args)
         sub.update(
-            bs=hi - lo,
+            bs=hi - lo + (bs - num_extends if decodes else 0),
             num_extends=hi - lo,
-            req_pool_indices=args["req_pool_indices"][lo:hi],
-            seq_lens=seq_lens,
+            forward_mode=ForwardMode.MIXED if decodes else ForwardMode.EXTEND,
+            req_pool_indices=rows_of(args["req_pool_indices"]),
+            seq_lens=(
+                torch.cat((seq_lens, args["seq_lens"][num_extends:bs]))
+                if decodes
+                else seq_lens
+            ),
             block_tables={
-                gid: table[lo:hi] for gid, table in args["block_tables"].items()
+                gid: rows_of(table) for gid, table in args["block_tables"].items()
             },
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=counts,
@@ -964,13 +1005,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             extend_replay_lens_cpu=replays,
             extend_prompt_lens_cpu=args["extend_prompt_lens_cpu"][lo:hi],
         )
+        stop = end + (decode_rows if decodes else 0)
         if "num_tokens" in sub:
-            sub["num_tokens"] = end - begin
+            sub["num_tokens"] = stop - begin
         if sub.get("positions") is not None:
-            sub["positions"] = sub["positions"][begin:end]
+            sub["positions"] = sub["positions"][begin:stop]
         if sub.get("block_tables_cpu") is not None:
             sub["block_tables_cpu"] = {
-                gid: table[lo:hi] for gid, table in sub["block_tables_cpu"].items()
+                gid: rows_of(table) for gid, table in sub["block_tables_cpu"].items()
             }
         # Fresh containers: preparation clears the current ones in place.
         self._swa_plans = {}

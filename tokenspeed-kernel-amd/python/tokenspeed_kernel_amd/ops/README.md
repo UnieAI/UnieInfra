@@ -884,6 +884,26 @@ Program ids are remapped so consecutive rows (one request's speculative rows,
 whose selections overlap) share an XCD's L2. The RoPE epilogue loads its
 cos/sin once per pass and rotates the BF16 output in registers.
 
+With at most 16 heads (the ROCm decode layout pads to a multiple of 16) and
+selection widths up to 512, `gluon_dsv41_selected_attention_group_gfx950`
+serves every batch instead. One workgroup owns `GROUP_ROWS` consecutive query
+rows (a DSpark request's six verify rows form whole groups) and deduplicates
+their selections in LDS, SWA then global: a hash of slot ids (max slot wins a
+bucket, the lowest entry index represents it) yields the distinct slots and
+per-row multiplicities. A slot that loses its bucket to another is kept once
+per occurrence for its own row only, so collisions cost redundant work, never
+correctness, and rows of different requests sharing a group only enlarge the
+union. Each distinct row is gathered and dequantized once and scored by all
+`GROUP_ROWS x 16` (row, head) pairs (MFMA M blocks); row r weights union
+entry u by its multiplicity (0 masks it), which reproduces the gather-softmax
+over duplicates and ragged lengths exactly. The waves split the head dims for
+QK and PV as in the rows kernel, but each wave runs the softmax for one
+quarter of the tile columns (the partials are reduce-scattered through LDS
+and the probabilities gathered back), so the score work is not repeated per
+wave. Prefetched rows are masked at dequant time, not at load time, so the
+next tile's loads stay in flight. Short grids split each group's union tiles
+and merge through the reduce kernel above.
+
 Below that, the main kernel runs one workgroup per CU (VGPR-bound). While
 `tokens * head_blocks` is below the CU count, rows are split over up to 16
 workgroups that store FP32 `(max, sum, P @ V)` partials (zero-query groups store

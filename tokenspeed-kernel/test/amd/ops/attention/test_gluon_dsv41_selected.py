@@ -423,3 +423,136 @@ def test_fused_selected_attention_no_recompile_across_rows(with_rope):
         for tokens in (2, 5, 16, 17, 32, 33, 64, 128, 129, 150, 191):
             run(tokens)
     torch.cuda.synchronize()
+
+
+def _speculative_inputs(requests, rows_per_request, device, seed, shared):
+    """DSpark verify-shaped selections: each request's consecutive rows slide
+    one SWA window and share ``shared`` of their 512 global slots; ragged
+    lengths, duplicate and out-of-range slots, and large slot ids (hash
+    collisions) included."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    swa_rows, global_rows = 2048, 16384
+    swa = _arena_cache(
+        torch.randn((swa_rows, 512), generator=generator).bfloat16().to(device),
+        "swa",
+        512,
+    )
+    glob = _arena_cache(
+        torch.randn((global_rows, 512), generator=generator).bfloat16().to(device),
+        "global",
+        256,
+    )
+    tokens = requests * rows_per_request
+    swa_slots = torch.empty((tokens, 128), dtype=torch.int64)
+    global_slots = torch.empty((tokens, 512), dtype=torch.int64)
+    for r in range(requests):
+        window = torch.randperm(swa_rows, generator=generator)[: 128 + rows_per_request]
+        pool = torch.randperm(global_rows, generator=generator)
+        common = pool[:512]
+        for i in range(rows_per_request):
+            t = r * rows_per_request + i
+            swa_slots[t] = window[i : i + 128]
+            keep = torch.rand(512, generator=generator) < shared
+            own = pool[512 + i * 512 : 1024 + i * 512]
+            global_slots[t] = torch.where(keep, common, own)
+    # Duplicates within a row, invalid and out-of-range slots.
+    global_slots[0, 1:4] = global_slots[0, 0]
+    global_slots[1, 5] = -1
+    global_slots[2, 7] = global_rows + 64
+    swa_slots[3, 9] = swa_slots[3, 8]
+    swa_lens = torch.full((tokens,), 128, dtype=torch.int32)
+    global_lens = torch.full((tokens,), 512, dtype=torch.int32)
+    swa_lens[4] = 3
+    global_lens[4] = 0
+    global_lens[5] = 77
+    swa_lens[tokens - 1] = 0
+    return [
+        (swa, swa_slots.to(device), swa_lens.to(device), "swa"),
+        (glob, global_slots.to(device), global_lens.to(device), "global"),
+    ]
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 6, 13, 96, 384])
+@pytest.mark.parametrize("shared", [0.0, 0.85, 1.0])
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_row_group_kernel_matches_gather_softmax(tokens, shared, with_rope):
+    """Row-group kernel (<= 16 heads): deduplicated selections over
+    consecutive rows, any row-to-request mapping, split and unsplit grids."""
+    platform = current_platform()
+    if not platform.is_cdna4:
+        pytest.skip("gfx950 row-group decode kernel")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+    device = torch.device("cuda:0")
+    requests = -(-tokens // 6)
+    segments = _speculative_inputs(requests, 6, device, 31, shared)
+    segments = [(c, s[:tokens], n[:tokens], f) for c, s, n, f in segments]
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    q, sink = _padded_query(tokens, 16, 16, device, 37)
+    expected = _gather_softmax(q, sink, segments).bfloat16()
+    rope = {}
+    if with_rope:
+        positions = torch.arange(tokens, dtype=torch.int64, device=device) + 3
+        angles = torch.randn((tokens + 3, 32), dtype=torch.float32, device=device)
+        cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
+        rope = {"rope_positions": positions, "rope_cos_sin": cos_sin}
+        expected = dsv41.rope_inplace(expected, positions, cos_sin, None)
+    out = selected.launch_gluon_dsv41_selected_attention_gfx950(
+        q,
+        swa,
+        swa_slots,
+        swa_lens,
+        glob,
+        global_slots,
+        global_lens,
+        sink,
+        512**-0.5,
+        None,
+        256,
+        None,
+        None,
+        None,
+        **rope,
+    )
+    torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
+
+
+def test_row_group_kernel_no_recompile_across_rows():
+    platform = current_platform()
+    if not platform.is_cdna4:
+        pytest.skip("gfx950 row-group decode kernel")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+    device = torch.device("cuda:0")
+    segments = _speculative_inputs(64, 6, device, 41, 0.85)
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    q, sink = _padded_query(384, 16, 16, device, 43)
+
+    def run(tokens):
+        selected.launch_gluon_dsv41_selected_attention_gfx950(
+            q[:tokens],
+            swa,
+            swa_slots[:tokens],
+            swa_lens[:tokens],
+            glob,
+            global_slots[:tokens],
+            global_lens[:tokens],
+            sink,
+            512**-0.5,
+            None,
+            256,
+            None,
+            None,
+            None,
+        )
+
+    kernels = (
+        selected.gluon_dsv41_selected_attention_group_gfx950,
+        selected.gluon_dsv41_selected_attention_reduce_gfx950,
+    )
+    for tokens in (1, 16, 96, 384):
+        run(tokens)
+    with assert_no_triton_compile(*kernels):
+        for tokens in (2, 6, 17, 32, 33, 64, 128, 129, 192, 383):
+            run(tokens)
+    torch.cuda.synchronize()

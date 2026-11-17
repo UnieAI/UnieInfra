@@ -975,9 +975,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             extend_prefix_lens[0] += skip
         bs, num_extends = args["bs"], args["num_extends"]
         decodes = with_decodes and num_extends < bs
-        decode_rows = self.forward_metadata.positions.numel() - sum(
-            span.count for span in spans
-        )
+        # From ``args``, not the current metadata: preparing A replaces it.
+        decode_rows = self.spec_num_tokens * (bs - num_extends)
 
         def rows_of(table: torch.Tensor) -> torch.Tensor:
             if not decodes:

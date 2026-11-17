@@ -688,6 +688,7 @@ def test_mixed_micro_batches_keep_every_decode_row_in_the_second():
         extend_prompt_lens_cpu=counts,
         extend_with_prefix=False,
         query_shard=None,
+        num_tokens=322,
     )
     full = backend.query_metadata(ForwardMode.MIXED)
     plan = backend.plan_prefill_micro_batches(128)

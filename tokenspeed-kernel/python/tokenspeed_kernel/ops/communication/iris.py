@@ -42,7 +42,36 @@ _platform = current_platform()
 IRIS_ALL_REDUCE_MAX_BYTES = 512 << 10
 _PACKED_WORD_BYTES = 8
 _TWO_SHOT_WORLD_SIZES = (4, 8)
+# Two-shot wins above these payload sizes for TP4/TP8 producer-direct reductions.
 _PRODUCER_TWO_SHOT_MIN_BYTES = {4: 160 << 10, 8: 96 << 10}
+
+
+def _apply_two_shot_threshold_override() -> None:
+    """Pin the producer-direct geometry for a whole run.
+
+    Decode-sized reductions never reach the default thresholds, so nothing there
+    can be measured against the other geometry. TOKENSPEED_IRIS_TWOSHOT_MIN_BYTES
+    sets the cutover directly: 0 always two-shots, a value above the largest
+    payload never does. A malformed value is ignored rather than taking the
+    engine down at import.
+    """
+    global _PRODUCER_TWO_SHOT_MIN_BYTES
+    raw = os.environ.get("TOKENSPEED_IRIS_TWOSHOT_MIN_BYTES")
+    if not raw:
+        return
+    try:
+        min_bytes = int(raw)
+        if min_bytes < 0:
+            raise ValueError("threshold must be non-negative")
+    except ValueError as exc:
+        logger.warning("ignoring TOKENSPEED_IRIS_TWOSHOT_MIN_BYTES=%r: %s", raw, exc)
+        return
+    _PRODUCER_TWO_SHOT_MIN_BYTES = dict.fromkeys(
+        _PRODUCER_TWO_SHOT_MIN_BYTES, min_bytes
+    )
+
+
+_apply_two_shot_threshold_override()
 _PRODUCER_DIRECT_GL_DTYPES = {
     torch.bfloat16: gl.bfloat16,
     torch.float16: gl.float16,

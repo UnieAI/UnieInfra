@@ -2821,10 +2821,11 @@ class ServerArgs:
         parser.add_argument(
             "--kvstore-storage-backend",
             type=str,
-            choices=["mooncake", "memory"],
+            choices=["mooncake", "file", "memory"],
             default=ServerArgs.kvstore_storage_backend,
             help="L3 store under compact Host (flat) KV. "
             "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'file' keeps objects on a local disk (NVMe), one file per block. "
             "'memory' is an in-process dict for tests. Requires Host L2 "
             "(do not pass --disable-kvstore).",
         )
@@ -2834,7 +2835,9 @@ class ServerArgs:
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
-            "global_segment_size, protocol, device_name, tenant_id.",
+            "global_segment_size, protocol, device_name, tenant_id. For file "
+            "(all required): path, capacity_gb (per rank), io_threads, o_direct, "
+            "verify_crc, fsync.",
         )
         parser.add_argument(
             "--kvstore-prefetch-min-pages",

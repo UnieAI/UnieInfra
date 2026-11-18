@@ -1622,6 +1622,8 @@ def build_device_side(
         )
     if server_args.enable_kvstore and server_args.kvstore_storage_backend is not None:
         # L3 under the L2 tier.
+        import torch.distributed as dist
+
         from tokenspeed.runtime.cache.l3.backend import (
             L3_RUNTIME_COMPAT,
             cache_layout_signature,
@@ -1634,25 +1636,24 @@ def build_device_side(
             create_kvstore_storage_backend,
         )
 
-        storage_backend = create_kvstore_storage_backend(
-            server_args.kvstore_storage_backend,
-            server_args.kvstore_storage_backend_extra_config,
-            host_buffer=host_cache_executor.host_storage.host_buffer,
-            tp_size=server_args.mapping.attn.tp_size,
-            pp_size=(server_args.mapping.pp_size if server_args.mapping.has_pp else 1),
-        )
-        cache_signature = cache_layout_signature(
-            host_cache_executor.layout,
-            cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
-        )
-        import torch.distributed as dist
-
         world_size = (
             dist.get_world_size()
             if dist.is_available() and dist.is_initialized()
             else 1
         )
         rank = dist.get_rank() if world_size > 1 else 0
+        storage_backend = create_kvstore_storage_backend(
+            server_args.kvstore_storage_backend,
+            server_args.kvstore_storage_backend_extra_config,
+            host_buffer=host_cache_executor.host_storage.host_buffer,
+            tp_size=server_args.mapping.attn.tp_size,
+            pp_size=(server_args.mapping.pp_size if server_args.mapping.has_pp else 1),
+            rank=rank,
+        )
+        cache_signature = cache_layout_signature(
+            host_cache_executor.layout,
+            cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
+        )
         checkpoint_id = l3_checkpoint_id(
             model_config.model_path,
             hf_config=model_config.hf_config,

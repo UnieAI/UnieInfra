@@ -1580,17 +1580,17 @@ class TestL3StoreStatsTest:
 class TestFactoryTest:
     def test_memory_and_unknown_backend(self):
         backend = create_kvstore_storage_backend(
-            "memory", None, host_buffer=object(), tp_size=1, pp_size=1
+            "memory", None, host_buffer=object(), tp_size=1, pp_size=1, rank=0
         )
         assert isinstance((backend), (MemoryKvStore))
         assert (
             create_kvstore_storage_backend(
-                None, None, host_buffer=object(), tp_size=1, pp_size=1
+                None, None, host_buffer=object(), tp_size=1, pp_size=1, rank=0
             )
         ) is None
         with pytest.raises((ValueError), match=("unsupported")):
             create_kvstore_storage_backend(
-                "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
+                "nfs", None, host_buffer=object(), tp_size=1, pp_size=1, rank=0
             )
 
 

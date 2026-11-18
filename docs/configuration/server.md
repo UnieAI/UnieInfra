@@ -1143,18 +1143,18 @@ old-weight KV is never restored under new weights.
 `--debug-force-retraction-interval` exercises the path without pressure in
 tests (see the flag above).
 
-### Host L2 and Mooncake Store L3
+### Host L2 and L3 storage (Mooncake Store or local disk)
 
 Host KVStore (`--kvstore-ratio` / `--kvstore-size`) is a compact pinned
 buffer under GPU cache (flat KV). `--kvstore-storage-backend mooncake`
-adds Mooncake Store as L3 under that buffer:
+adds Mooncake Store as L3 under that buffer; `file` uses a local disk instead:
 
 ```
 GPU Device KV (L1)
   ↕ D2H / H2D
 Host pinned buffer (L2 / flat KV)
   ↕ batch_put_from / batch_get_into
-Mooncake Store (L3)
+Mooncake Store or local disk (L3)
 ```
 
 **Sizing.** `--kvstore-size` (gigabytes per rank) wins over
@@ -1276,6 +1276,45 @@ in `--kvstore-storage-backend-extra-config`, for example:
 
 Constructing `MooncakeKvStore` requires `extra_config`. Pass `None` to
 use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other environment defaults.
+
+**Local disk (`--kvstore-storage-backend file`).** Keeps L3 objects on a
+local NVMe directory, one file per packed Host CacheBlock, under
+`<path>/rank<N>` so each rank sizes and evicts only its own objects. Every
+field of the extra config is required:
+
+```json
+{
+  "path": "/nvme/l3",
+  "capacity_gb": 200,
+  "io_threads": 8,
+  "o_direct": true,
+  "verify_crc": true,
+  "fsync": false
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `path` | Directory on a local file system; created if missing. |
+| `capacity_gb` | Disk bytes per rank (headers and 4 KiB padding included). A put that does not fit evicts least-recently-used objects; an existence probe or a read refreshes an object. |
+| `io_threads` | Parallel reads/writes inside one `batch_get_into` / `batch_put_from`. |
+| `o_direct` | Bypass the page cache. Start-up fails when the file system refuses O_DIRECT (for example tmpfs). |
+| `verify_crc` | Store a CRC32 per object and treat a mismatch as a miss. |
+| `fsync` | `fdatasync` each object before it becomes visible. Puts are atomic either way (temporary file, then rename); without it a crash can lose recent objects, which then read as misses. |
+
+Each object is a 4 KiB header (magic, payload size, CRC32, full key) and the
+payload padded to 4 KiB. A Host slice that is 4 KiB aligned in address and
+size is read and written directly between the file and the pinned Host
+buffer; any other slice goes through an aligned per-thread bounce buffer.
+A read whose key, size or CRC does not match the header is a miss. The
+index is rebuilt from the headers at start-up (temporary and torn files are
+deleted), so cached prefixes survive a restart; the key namespace already
+carries the model, weight version, cache layout and quantization, so a
+different deployment never reads them.
+
+On one Micron 7450 NVMe with 3.2 MiB objects, `o_direct: true` and CRC
+verification, reads reach about 5.3 GB/s with 4 threads (2.5 GB/s with 1)
+and writes about 1.4 GB/s, close to the drive's limits.
 
 **Prefetch before admission.** An L3 hit is never loaded under a running
 forward. When a waiting request's registered L3 keys past its Device/Host

@@ -44,7 +44,8 @@ least-recently-used segments (with every object in them) first.
 
 An attention-TP group whose ranks cache identical bytes shares one
 directory: only its rank 0 writes and deletes, and every rank derives the
-same segment names and offsets from the same puts (``FileKvStore``).
+same segment names and offsets from the same puts (``FileKvStore``). The
+group reads through the page cache, so the drive serves each file once.
 """
 
 from __future__ import annotations
@@ -303,6 +304,9 @@ class FileKvStore:
         self.root = os.path.join(config.path, f"rank{owner}")
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         self._flags = os.O_DIRECT if config.o_direct else 0
+        # The ranks of a shared group read the same files at about the same
+        # time: through the page cache the drive serves each file once.
+        self._read_flags = 0 if self._shared else self._flags
         if config.o_direct:
             self._check_o_direct(rank=int(rank))
         self._lock = threading.Lock()
@@ -650,7 +654,7 @@ class FileKvStore:
         """Read one segment and copy the wanted objects; return their indices."""
 
         try:
-            fd = os.open(self._segment_path(name), os.O_RDONLY | self._flags)
+            fd = os.open(self._segment_path(name), os.O_RDONLY | self._read_flags)
         except FileNotFoundError:
             return []
         try:

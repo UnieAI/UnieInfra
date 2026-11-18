@@ -1340,8 +1340,11 @@ that rank writes and deletes files, and the other ranks index the same
 segment names and offsets from their identical puts. Every rank records the
 CRC32 of its own bytes and checks reads against it, whatever `verify_crc`
 says, so a rank whose bytes differ reads a miss instead of another rank's
-data. Disk use and write traffic drop by the attention-TP size (4x under
-TP4); each rank still reads the file itself.
+data. The group reads through the page cache (writes keep `o_direct`): its
+ranks prefetch the same files at about the same time, so the drive serves
+each file once. Under TP4 disk use and write traffic drop 4x; a 93-page
+prefetch takes about 14 ms per rank (17 ms with a copy per rank) and a
+24k-token prompt restored after a restart has a TTFT of about 0.08 s.
 
 **What reaches L3.** L3 receives exactly what is written to Host L2, so the
 Host write policy decides what persists. `TOKENSPEED_KVSTORE_WRITE_POLICY`

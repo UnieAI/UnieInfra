@@ -1323,10 +1323,13 @@ and quantization, so a different deployment never reads them.
 
 On one Micron 7450 NVMe with 3.2 MiB objects, `o_direct: true` and CRC
 verification, reads reach about 5.3 GB/s with 4 threads (2.5 GB/s with 1)
-and writes about 1.4 GB/s, close to the drive's limits. Small objects are
-bound by per-object CPU cost rather than the drive: DeepSeek V4.1-Flash
-under TP4 writes about 38 KB per object, and a 558-object prefetch takes
-about 30 ms per rank with four ranks on one drive (16 threads; 50 ms with 4).
+and writes about 1.3 GB/s, close to the drive's limits. Small objects are
+bound by per-file CPU cost, which segments amortize: DeepSeek V4.1-Flash
+under TP4 writes six objects of about 38 KB per prefix page, and a 93-page
+prefetch (558 objects) takes about 17 ms per rank with four ranks on one
+drive and `io_threads: 16`, against about 30 ms with one file per object.
+Restoring a 24k-token prompt from L3 after a restart then has a TTFT of
+about 0.08 s, against 0.77 s to recompute it.
 
 **What reaches L3.** L3 receives exactly what is written to Host L2, so the
 Host write policy decides what persists. `TOKENSPEED_KVSTORE_WRITE_POLICY`

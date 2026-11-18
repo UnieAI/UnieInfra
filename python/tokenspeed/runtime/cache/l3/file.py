@@ -18,40 +18,47 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Local-disk L3 store: one file per packed Host CacheBlock on an NVMe path.
+"""Local-disk L3 store: packed Host CacheBlocks in segment files on NVMe.
 
-Each object is a 4 KiB header (magic, payload size, CRC32, the full key) and
-the payload padded to 4 KiB, so the file can be read and written with
-O_DIRECT. Reads and writes of one ``batch_*`` call run in parallel on a
-thread pool (``os.preadv`` / ``os.pwritev`` release the GIL). When a Host
-slice is 4 KiB aligned in address and size, the transfer goes straight
-between the file and the pinned Host buffer; otherwise it goes through an
-aligned per-thread bounce buffer.
+One ``batch_put_from`` call is written as one or more *segment* files. A
+segment is a header (magic, a CRC32 of the entry table, and per object its
+key, payload offset, size and payload CRC32) padded to 4 KiB, followed by
+the payloads packed back to back and padded to 4 KiB at the end, so the
+whole file is read and written with O_DIRECT in one call. Objects written
+together are usually read together (the pages of one prefix), so a read
+opens each segment once and copies every requested object out of it; small
+KV objects (tens of KiB) are otherwise bound by per-file CPU cost, not by
+the drive.
+
+Reads and writes of one ``batch_*`` call run in parallel, one contiguous
+slice of segments per thread (``os.preadv`` / ``os.pwritev``, ``zlib.crc32``
+and ``ctypes.memmove`` release the GIL), through a page-aligned per-thread
+bounce buffer.
 
 Puts are atomic (written to a temporary name, then renamed), so a reader
-never sees a partial object; a torn file left by a crash fails the size or
-CRC check and reads as a miss. The key → file index lives in memory and is
+never sees a partial segment; a torn segment fails the header or payload
+CRC and reads as a miss. The key -> segment index lives in memory and is
 rebuilt from the headers at start-up, so objects survive a restart.
-Capacity is bounded: a put that does not fit evicts least-recently-used
-objects first.
+Capacity is bounded per segment: a put that does not fit evicts
+least-recently-used segments (with every object in them) first.
 """
 
 from __future__ import annotations
 
 import ctypes
 import errno
-import hashlib
 import json
 import logging
 import mmap
 import os
 import struct
 import threading
+import uuid
 import zlib
 from collections import OrderedDict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from tokenspeed.runtime.cache.l3.backend import host_buffer_ptr
@@ -59,12 +66,23 @@ from tokenspeed.runtime.cache.l3.backend import host_buffer_ptr
 logger = logging.getLogger(__name__)
 
 ALIGN = 4096
+# Smallest header region; a segment with many or long keys takes more.
 HEADER_BYTES = ALIGN
-_MAGIC = b"TSL3FIL1"
-# magic, payload bytes, CRC32 of the payload (0 when not verified), key bytes
-_HEADER = struct.Struct("<8sQII")
-_MAX_KEY_BYTES = HEADER_BYTES - _HEADER.size
-_SUFFIX = ".kv"
+# A put is split so no segment exceeds this many payload bytes (one object
+# larger than it gets a segment of its own) ...
+MAX_SEGMENT_BYTES = 8 << 20
+# ... and split across the I/O threads only into segments of at least this
+# size: a few small objects (one page of a prefix) stay one file.
+MIN_SPLIT_BYTES = 1 << 20
+_MAGIC = b"TSL3SEG1"
+# magic, header region bytes, entry count, CRC32 of the entry table
+_PREFIX = struct.Struct("<8sIII")
+# payload offset in the file, payload bytes, payload CRC32 (0 when not
+# verified), key bytes; the key follows each entry
+_ENTRY = struct.Struct("<QQIH")
+_MAX_KEY_BYTES = 1024
+_SUFFIX = ".seg"
+_LEGACY_SUFFIX = ".kv"
 
 
 def _round_up(value: int, multiple: int = ALIGN) -> int:
@@ -75,14 +93,14 @@ def _round_up(value: int, multiple: int = ALIGN) -> int:
 class FileStoreConfig:
     """Settings of the local-disk L3 store; every field is required.
 
-    ``path``: directory for the objects (a local NVMe file system).
+    ``path``: directory for the segments (a local NVMe file system).
     ``capacity_gb``: bytes on disk each rank may use, in GiB, headers and
-    padding included; least-recently-used objects are evicted beyond it.
+    padding included; least-recently-used segments are evicted beyond it.
     ``io_threads``: parallel reads/writes per ``batch_*`` call.
     ``o_direct``: bypass the page cache (start-up fails if the file system
     refuses O_DIRECT).
     ``verify_crc``: store a CRC32 per object and reject reads that mismatch.
-    ``fsync``: flush each object to the device before it becomes visible.
+    ``fsync``: flush each segment to the device before it becomes visible.
     """
 
     path: str
@@ -155,21 +173,26 @@ def _host_view(address: int, size: int) -> memoryview:
     return memoryview((ctypes.c_char * size).from_address(address)).cast("B")
 
 
+def _skip(views: list[memoryview], done: int) -> list[memoryview]:
+    """The part of ``views`` after the first ``done`` bytes."""
+
+    remaining = []
+    for view in views:
+        if done >= len(view):
+            done -= len(view)
+            continue
+        remaining.append(view[done:])
+        done = 0
+    return remaining
+
+
 def _read_full(fd: int, views: list[memoryview], offset: int) -> int:
-    """preadv until every view is filled or EOF; return bytes read."""
+    """preadv until every view is full or EOF; return bytes read."""
 
     total = 0
-    want = sum(len(v) for v in views)
+    want = sum(len(view) for view in views)
     while total < want:
-        remaining = []
-        skip = total
-        for view in views:
-            if skip >= len(view):
-                skip -= len(view)
-                continue
-            remaining.append(view[skip:])
-            skip = 0
-        got = os.preadv(fd, remaining, offset + total)
+        got = os.preadv(fd, _skip(views, total), offset + total)
         if got <= 0:
             break
         total += got
@@ -178,20 +201,72 @@ def _read_full(fd: int, views: list[memoryview], offset: int) -> int:
 
 def _write_full(fd: int, views: list[memoryview]) -> None:
     total = 0
-    want = sum(len(v) for v in views)
+    want = sum(len(view) for view in views)
     while total < want:
-        remaining = []
-        skip = total
-        for view in views:
-            if skip >= len(view):
-                skip -= len(view)
-                continue
-            remaining.append(view[skip:])
-            skip = 0
-        written = os.pwritev(fd, remaining, total)
+        written = os.pwritev(fd, _skip(views, total), total)
         if written <= 0:
             raise OSError(errno.EIO, "short write to L3 file")
         total += written
+
+
+def _aligned(address: int, size: int) -> bool:
+    return address % ALIGN == 0 and size % ALIGN == 0
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """Where one object lives: its segment, payload offset, size and CRC."""
+
+    segment: str
+    offset: int
+    size: int
+    crc: int
+
+
+@dataclass
+class _Segment:
+    """One segment file: its on-disk bytes and the keys still served from it."""
+
+    disk: int
+    live: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _PutObject:
+    index: int
+    key: str
+    address: int
+    size: int
+
+
+def _header_bytes(keys: Sequence[bytes]) -> int:
+    table = _PREFIX.size + sum(_ENTRY.size + len(key) for key in keys)
+    return _round_up(table)
+
+
+def _parse_header(
+    view: memoryview,
+) -> tuple[int, list[tuple[str, int, int, int]]] | None:
+    """Return (header bytes, [(key, offset, size, crc)]) or None if invalid."""
+
+    magic, header, count, table_crc = _PREFIX.unpack_from(view, 0)
+    if magic != _MAGIC or header < ALIGN or header % ALIGN or header > len(view):
+        return None
+    entries = []
+    pos = _PREFIX.size
+    for _ in range(count):
+        if pos + _ENTRY.size > header:
+            return None
+        offset, size, crc, key_len = _ENTRY.unpack_from(view, pos)
+        pos += _ENTRY.size
+        if pos + key_len > header:
+            return None
+        key = bytes(view[pos : pos + key_len]).decode(errors="replace")
+        pos += key_len
+        entries.append((key, offset, size, crc))
+    if zlib.crc32(view[_PREFIX.size : pos]) != table_crc:
+        return None
+    return header, entries
 
 
 class FileKvStore:
@@ -200,15 +275,16 @@ class FileKvStore:
     def __init__(self, config: FileStoreConfig, *, rank: int) -> None:
         self.config = config
         # One subdirectory per rank: each rank indexes, sizes and evicts only
-        # its own objects even when ranks share the configured path.
+        # its own segments even when ranks share the configured path.
         self.root = os.path.join(config.path, f"rank{int(rank)}")
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         self._flags = os.O_DIRECT if config.o_direct else 0
         if config.o_direct:
             self._check_o_direct()
         self._lock = threading.Lock()
-        # key -> on-disk bytes, least recently used first
-        self._index: OrderedDict[str, int] = OrderedDict()
+        self._keys: dict[str, _Entry] = {}
+        # segment name -> segment, least recently used first
+        self._segments: OrderedDict[str, _Segment] = OrderedDict()
         self._used = 0
         self._local = threading.local()
         self._pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
@@ -218,9 +294,8 @@ class FileKvStore:
 
     # -- layout -------------------------------------------------------------
 
-    def _path(self, key: str) -> str:
-        digest = hashlib.sha256(key.encode()).hexdigest()
-        return os.path.join(self.root, digest[:2], digest + _SUFFIX)
+    def _segment_path(self, name: str) -> str:
+        return os.path.join(self.root, name[:2], name + _SUFFIX)
 
     def _buffer(self) -> _AlignedBuffer:
         buf = getattr(self._local, "buffer", None)
@@ -244,56 +319,80 @@ class FileKvStore:
         os.unlink(probe)
 
     def _rebuild_index(self) -> None:
-        """Index the objects already on disk; drop temporaries and torn files."""
+        """Index the segments already on disk; drop temporaries and torn files."""
 
         found = []
         for root, _dirs, files in os.walk(self.root):
             for name in files:
                 path = os.path.join(root, name)
                 if not name.endswith(_SUFFIX):
-                    if ".tmp." in name:
+                    # Temporaries of an interrupted put, and one-object files
+                    # of the earlier layout (".kv"), which nothing reads.
+                    if ".tmp." in name or name.endswith(_LEGACY_SUFFIX):
                         os.unlink(path)
                     continue
-                header = self._read_header_file(path)
-                if header is None:
+                parsed = self._read_segment_header(path)
+                if parsed is None:
                     os.unlink(path)
                     continue
-                key, payload = header
+                disk, entries = parsed
                 found.append(
-                    (os.stat(path).st_mtime, key, HEADER_BYTES + _round_up(payload))
+                    (os.stat(path).st_mtime, name[: -len(_SUFFIX)], disk, entries)
                 )
-        for _mtime, key, disk in sorted(found):
-            self._index[key] = disk
+        for _mtime, name, disk, entries in sorted(found):
+            segment = _Segment(disk=disk)
+            self._segments[name] = segment
             self._used += disk
+            for key, offset, size, crc in entries:
+                # A key written twice (two racing puts) is served by the newer
+                # segment; the older copy stays until its segment is evicted.
+                if key in self._keys:
+                    self._drop_key_locked(key)
+                self._keys[key] = _Entry(name, offset, size, crc)
+                segment.live.add(key)
+        for name in [name for name, seg in self._segments.items() if not seg.live]:
+            self._delete_segment_locked(name)
         if found:
             logger.info(
-                f"[L3 file] indexed {len(found)} objects, "
+                f"[L3 file] indexed {len(self._keys)} objects in "
+                f"{len(self._segments)} segments, "
                 f"{self._used / (1 << 30):.2f} GiB under {self.root}"
             )
 
-    def _read_header_file(self, path: str) -> tuple[str, int] | None:
+    def _read_segment_header(
+        self, path: str
+    ) -> tuple[int, list[tuple[str, int, int, int]]] | None:
         try:
             fd = os.open(path, os.O_RDONLY | self._flags)
         except OSError:
             return None
         try:
+            disk = os.fstat(fd).st_size
             buf = self._buffer()
-            buf.ensure(HEADER_BYTES)
-            if _read_full(fd, [buf.view(HEADER_BYTES)], 0) != HEADER_BYTES:
+            buf.ensure(ALIGN)
+            if _read_full(fd, [buf.view(ALIGN)], 0) != ALIGN:
                 return None
-            return self._parse_header(buf.view(HEADER_BYTES))
+            header = _PREFIX.unpack_from(buf.view(ALIGN), 0)[1]
+            if header > ALIGN:
+                if header % ALIGN or header > disk:
+                    return None
+                buf.ensure(header)
+                if _read_full(fd, [buf.view(header)], 0) != header:
+                    return None
+            parsed = _parse_header(buf.view(max(header, ALIGN)))
+            if parsed is None:
+                return None
+            header, entries = parsed
+            end = max(
+                (offset + size for _k, offset, size, _c in entries), default=header
+            )
+            if disk != _round_up(end) or any(
+                off < header for _k, off, _s, _c in entries
+            ):
+                return None
+            return disk, entries
         finally:
             os.close(fd)
-
-    @staticmethod
-    def _parse_header(view: memoryview) -> tuple[str, int] | None:
-        magic, payload, _crc, key_len = _HEADER.unpack_from(view, 0)
-        if magic != _MAGIC or key_len > _MAX_KEY_BYTES:
-            return None
-        key = bytes(view[_HEADER.size : _HEADER.size + key_len]).decode(
-            errors="replace"
-        )
-        return key, payload
 
     # -- KvStoreStorage ---------------------------------------------------------
 
@@ -301,12 +400,12 @@ class FileKvStore:
         with self._lock:
             results = []
             for key in keys:
-                present = key in self._index
-                if present:
-                    # A probe precedes a prefetch: keep the object from being
+                entry = self._keys.get(key)
+                if entry is not None:
+                    # A probe precedes a prefetch: keep the segment from being
                     # evicted between the two.
-                    self._index.move_to_end(key)
-                results.append(present)
+                    self._segments.move_to_end(entry.segment)
+                results.append(entry is not None)
             return results
 
     def batch_get_into(
@@ -319,15 +418,23 @@ class FileKvStore:
         if not (len(keys) == len(offsets) == len(sizes)):
             raise ValueError("ragged L3 get")
         base = host_buffer_ptr(host_buffer)
-        return list(
-            self._run(
-                self._get_one,
-                [
-                    (key, base + int(off), int(size))
-                    for key, off, size in zip(keys, offsets, sizes)
-                ],
-            )
-        )
+        results = [False] * len(keys)
+        # segment -> [(result index, key, entry, host address)], in request order
+        jobs: dict[str, list[tuple[int, str, _Entry, int]]] = {}
+        with self._lock:
+            for i, (key, off, size) in enumerate(zip(keys, offsets, sizes)):
+                entry = self._keys.get(key)
+                if entry is None or entry.size != int(size):
+                    continue
+                self._segments.move_to_end(entry.segment)
+                jobs.setdefault(entry.segment, []).append(
+                    (i, key, entry, base + int(off))
+                )
+        outcomes = self._run(self._get_segment, list(jobs.items()))
+        for indices in outcomes:
+            for i in indices:
+                results[i] = True
+        return results
 
     def batch_put_from(
         self,
@@ -340,48 +447,67 @@ class FileKvStore:
             raise ValueError("ragged L3 put")
         base = host_buffer_ptr(host_buffer)
         results = [False] * len(keys)
-        todo = []
+        pending: list[_PutObject] = []
+        seen: set[str] = set()
         with self._lock:
-            batch = set(keys)
             for i, (key, off, size) in enumerate(zip(keys, offsets, sizes)):
-                if key in self._index:
-                    self._index.move_to_end(key)
+                entry = self._keys.get(key)
+                if entry is not None:
+                    self._segments.move_to_end(entry.segment)
                     results[i] = True
                     continue
-                if len(key.encode()) > _MAX_KEY_BYTES:
+                if key in seen or len(key.encode()) > _MAX_KEY_BYTES:
                     continue
-                disk = HEADER_BYTES + _round_up(int(size))
-                if not self._make_room(disk, keep=batch):
+                seen.add(key)
+                pending.append(_PutObject(i, key, base + int(off), int(size)))
+            groups = self._split(pending)
+            keep = {self._keys[k].segment for k in keys if k in self._keys}
+            todo: list[tuple[list[_PutObject], int]] = []
+            for group in groups:
+                disk = self._disk_bytes(group)
+                if not self._make_room(disk, keep=keep):
                     continue
                 # Reserve the bytes now so concurrent puts cannot overcommit.
                 self._used += disk
-                todo.append((i, key, base + int(off), int(size), disk))
-        outcomes = self._run(
-            self._put_one, [(key, addr, size) for _, key, addr, size, _ in todo]
-        )
+                todo.append((group, disk))
+        names = self._run(lambda group, disk: self._put_segment(group), todo)
         with self._lock:
-            for (i, key, _addr, _size, disk), ok in zip(todo, outcomes):
-                if ok:
-                    self._index[key] = disk
-                    results[i] = True
-                else:
+            for (group, disk), written in zip(todo, names):
+                if written is None:
                     self._used -= disk
+                    continue
+                name, entries = written
+                segment = _Segment(disk=disk)
+                self._segments[name] = segment
+                for obj, entry in zip(group, entries):
+                    results[obj.index] = True
+                    if obj.key in self._keys:
+                        continue  # a racing put stored it first
+                    self._keys[obj.key] = entry
+                    segment.live.add(obj.key)
+                if not segment.live:
+                    self._delete_segment_locked(name)
         return results
 
     def remove_by_prefix(self, prefix: str) -> bool:
+        """Delete every segment holding a key under ``prefix``.
+
+        A segment's header lists all its keys, so a deletion must remove the
+        whole file to stay deleted across a restart. Keys of another prefix
+        written in the same put go with it; they are cache and read as misses.
+        """
+
         with self._lock:
-            victims = [key for key in self._index if key.startswith(prefix)]
-            for key in victims:
-                self._used -= self._index.pop(key)
-        ok = True
-        for key in victims:
-            try:
-                os.unlink(self._path(key))
-            except FileNotFoundError:
-                pass
-            except OSError:
-                logger.exception(f"[L3 file] failed to delete {key!r}")
-                ok = False
+            names = {
+                entry.segment
+                for key, entry in self._keys.items()
+                if key.startswith(prefix)
+            }
+            ok = True
+            for name in names:
+                for key in self._segments[name].live:
+                    del self._keys[key]
+                ok = self._delete_segment_locked(name) and ok
         return ok
 
     def close(self) -> None:
@@ -395,7 +521,7 @@ class FileKvStore:
 
     # -- internals --------------------------------------------------------------
 
-    def _run(self, fn, items: list[tuple]) -> list[bool]:
+    def _run(self, fn, items: list[tuple]) -> list:
         if not items:
             return []
         if self._pool is None:
@@ -403,17 +529,43 @@ class FileKvStore:
         workers = min(self.config.io_threads, len(items))
         if workers == 1:
             return [fn(*args) for args in items]
-        # One contiguous slice per thread, not one future per object: KV
-        # pages are often tens of KiB, where per-future dispatch and GIL
-        # hand-offs cost as much as the read itself (DSV4.1 TP4, 38 KB
-        # objects: 38 -> 29 ms for a 558-object batch per rank).
+        # One contiguous slice per thread, not one future per item: per-future
+        # dispatch and GIL hand-offs otherwise cost as much as a small read.
         step = -(-len(items) // workers)
         slices = [items[start : start + step] for start in range(0, len(items), step)]
         results = self._pool.map(lambda part: [fn(*args) for args in part], slices)
-        return [flag for part in results for flag in part]
+        return [item for part in results for item in part]
+
+    def _split(self, objects: list[_PutObject]) -> list[list[_PutObject]]:
+        """Group a put into segments of at most ``MAX_SEGMENT_BYTES`` payload.
+
+        A large put is also split across the I/O threads so it is written in
+        parallel, but never into segments under ``MIN_SPLIT_BYTES``; a put of
+        a few small objects stays one segment.
+        """
+
+        if not objects:
+            return []
+        total = sum(obj.size for obj in objects)
+        share = -(-total // self.config.io_threads)
+        limit = min(MAX_SEGMENT_BYTES, max(share, MIN_SPLIT_BYTES))
+        groups: list[list[_PutObject]] = [[]]
+        filled = 0
+        for obj in objects:
+            if groups[-1] and filled + obj.size > limit:
+                groups.append([])
+                filled = 0
+            groups[-1].append(obj)
+            filled += obj.size
+        return groups
+
+    @staticmethod
+    def _disk_bytes(group: Sequence[_PutObject]) -> int:
+        header = _header_bytes([obj.key.encode() for obj in group])
+        return _round_up(header + sum(obj.size for obj in group))
 
     def _make_room(self, disk: int, *, keep: set[str]) -> bool:
-        """Evict LRU objects (not in ``keep``) until ``disk`` more bytes fit.
+        """Evict LRU segments (not in ``keep``) until ``disk`` more bytes fit.
 
         Called with the lock held. Files are unlinked here too: an evicted
         key is gone from the index first, so a concurrent get misses cleanly.
@@ -422,86 +574,127 @@ class FileKvStore:
         capacity = self.config.capacity_bytes
         if disk > capacity:
             return False
-        if self._used + disk <= capacity:
-            return True
-        for key in list(self._index):
+        for name in list(self._segments):
             if self._used + disk <= capacity:
                 break
-            if key in keep:
+            if name in keep:
                 continue
-            self._used -= self._index.pop(key)
-            try:
-                os.unlink(self._path(key))
-            except FileNotFoundError:
-                pass
+            for key in list(self._segments[name].live):
+                del self._keys[key]
+            self._delete_segment_locked(name)
         return self._used + disk <= capacity
 
-    def _get_one(self, key: str, address: int, size: int) -> bool:
-        with self._lock:
-            disk = self._index.get(key)
-            if disk is None or disk != HEADER_BYTES + _round_up(size):
-                return False
-            self._index.move_to_end(key)
+    def _drop_key_locked(self, key: str) -> bool:
+        """Forget ``key``; return True when its segment has no live key left."""
+
+        entry = self._keys.pop(key)
+        segment = self._segments[entry.segment]
+        segment.live.discard(key)
+        return not segment.live
+
+    def _delete_segment_locked(self, name: str) -> bool:
+        segment = self._segments.pop(name)
+        self._used -= segment.disk
         try:
-            fd = os.open(self._path(key), os.O_RDONLY | self._flags)
+            os.unlink(self._segment_path(name))
         except FileNotFoundError:
-            return False
-        try:
-            buf = self._buffer()
-            padded = _round_up(size)
-            direct = address % ALIGN == 0 and size % ALIGN == 0
-            if direct:
-                buf.ensure(HEADER_BYTES)
-                views = [buf.view(HEADER_BYTES), _host_view(address, size)]
-            else:
-                buf.ensure(HEADER_BYTES + padded)
-                views = [buf.view(HEADER_BYTES + padded)]
-            if _read_full(fd, views, 0) != HEADER_BYTES + padded:
-                return False
-            magic, payload, crc, key_len = _HEADER.unpack_from(
-                buf.view(HEADER_BYTES), 0
-            )
-            stored_key = (
-                bytes(buf.view(key_len, _HEADER.size))
-                if key_len <= _MAX_KEY_BYTES
-                else b""
-            )
-            if magic != _MAGIC or payload != size or stored_key != key.encode():
-                return False
-            data = views[1] if direct else buf.view(size, HEADER_BYTES)
-            if self.config.verify_crc and zlib.crc32(data) != crc:
-                return False
-            if not direct:
-                ctypes.memmove(address, buf.address + HEADER_BYTES, size)
-            return True
+            pass
         except OSError:
-            logger.exception(f"[L3 file] read failed for {key!r}")
+            logger.exception(f"[L3 file] failed to delete segment {name}")
             return False
+        return True
+
+    def _get_segment(
+        self, name: str, wanted: list[tuple[int, str, _Entry, int]]
+    ) -> list[int]:
+        """Read one segment and copy the wanted objects; return their indices."""
+
+        try:
+            fd = os.open(self._segment_path(name), os.O_RDONLY | self._flags)
+        except FileNotFoundError:
+            return []
+        try:
+            disk = os.fstat(fd).st_size
+            buf = self._buffer()
+            wanted = sorted(wanted, key=lambda item: item[2].offset)
+            header = wanted[0][2].offset
+            # Every object of the file wanted, back to back, 4 KiB aligned on
+            # both sides: scatter the payloads straight into the Host slices.
+            direct = all(_aligned(address, e.size) for _i, _k, e, address in wanted)
+            end = header
+            for _i, _k, entry, _a in wanted:
+                direct = direct and entry.offset == end
+                end = entry.offset + entry.size
+            direct = direct and end == disk and header % ALIGN == 0
+            if direct:
+                buf.ensure(header)
+                views = [buf.view(header)] + [
+                    _host_view(address, entry.size) for _i, _k, entry, address in wanted
+                ]
+            else:
+                buf.ensure(disk)
+                views = [buf.view(disk)]
+            if _read_full(fd, views, 0) != disk:
+                return []
+            parsed = _parse_header(buf.view(header if direct else disk))
+            if parsed is None:
+                return []
+            stored = {key: (offset, size, crc) for key, offset, size, crc in parsed[1]}
+            done = []
+            for (i, key, entry, address), view in zip(
+                wanted, views[1:] if direct else [None] * len(wanted)
+            ):
+                # The index is checked against the file itself, so a segment
+                # file that does not hold this key never serves it.
+                if stored.get(key) != (entry.offset, entry.size, entry.crc):
+                    continue
+                payload = view if direct else buf.view(entry.size, entry.offset)
+                if self.config.verify_crc and zlib.crc32(payload) != entry.crc:
+                    continue
+                if not direct:
+                    ctypes.memmove(address, buf.address + entry.offset, entry.size)
+                done.append(i)
+            return done
+        except OSError:
+            logger.exception(f"[L3 file] read failed for segment {name}")
+            return []
         finally:
             os.close(fd)
 
-    def _put_one(self, key: str, address: int, size: int) -> bool:
-        path = self._path(key)
+    def _put_segment(self, group: list[_PutObject]) -> tuple[str, list[_Entry]] | None:
+        name = uuid.uuid4().hex
+        path = self._segment_path(name)
         tmp = f"{path}.tmp.{threading.get_ident()}"
-        source = _host_view(address, size)
-        crc = zlib.crc32(source) if self.config.verify_crc else 0
-        key_bytes = key.encode()
+        key_bytes = [obj.key.encode() for obj in group]
+        header = _header_bytes(key_bytes)
+        disk = self._disk_bytes(group)
+        # 4 KiB aligned Host slices are written straight from the Host buffer;
+        # anything else is packed into the bounce buffer first.
+        direct = all(_aligned(obj.address, obj.size) for obj in group)
         buf = self._buffer()
-        padded = _round_up(size)
-        direct = address % ALIGN == 0 and size % ALIGN == 0
-        buf.ensure(HEADER_BYTES if direct else HEADER_BYTES + padded)
-        header = buf.view(HEADER_BYTES)
-        header[:] = bytes(HEADER_BYTES)
-        _HEADER.pack_into(header, 0, _MAGIC, size, crc, len(key_bytes))
-        header[_HEADER.size : _HEADER.size + len(key_bytes)] = key_bytes
-        if direct:
-            views = [header, source]
-        else:
-            body = buf.view(padded, HEADER_BYTES)
-            ctypes.memmove(buf.address + HEADER_BYTES, address, size)
-            if padded > size:
-                body[size:] = bytes(padded - size)
-            views = [buf.view(HEADER_BYTES + padded)]
+        buf.ensure(header if direct else disk)
+        entries = []
+        table = bytearray()
+        views = []
+        offset = header
+        for obj, key in zip(group, key_bytes):
+            if direct:
+                payload = _host_view(obj.address, obj.size)
+                views.append(payload)
+            else:
+                ctypes.memmove(buf.address + offset, obj.address, obj.size)
+                payload = buf.view(obj.size, offset)
+            crc = zlib.crc32(payload) if self.config.verify_crc else 0
+            table += _ENTRY.pack(offset, obj.size, crc, len(key)) + key
+            entries.append(_Entry(name, offset, obj.size, crc))
+            offset += obj.size
+        if not direct and disk > offset:
+            buf.view(disk - offset, offset)[:] = bytes(disk - offset)
+        head = buf.view(header)
+        head[:] = bytes(header)
+        _PREFIX.pack_into(head, 0, _MAGIC, header, len(group), zlib.crc32(table))
+        head[_PREFIX.size : _PREFIX.size + len(table)] = table
+        views = [head] + views if direct else [buf.view(disk)]
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         try:
             fd = os.open(
@@ -514,11 +707,11 @@ class FileKvStore:
             finally:
                 os.close(fd)
             os.replace(tmp, path)
-            return True
+            return name, entries
         except OSError:
-            logger.exception(f"[L3 file] write failed for {key!r}")
+            logger.exception(f"[L3 file] write failed for segment {name}")
             try:
                 os.unlink(tmp)
             except FileNotFoundError:
                 pass
-            return False
+            return None

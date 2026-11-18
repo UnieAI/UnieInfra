@@ -1296,21 +1296,30 @@ field of the extra config is required:
 | Field | Meaning |
 | --- | --- |
 | `path` | Directory on a local file system; created if missing. |
-| `capacity_gb` | Disk bytes per rank (headers and 4 KiB padding included). A put that does not fit evicts least-recently-used objects; an existence probe or a read refreshes an object. |
+| `capacity_gb` | Disk bytes per rank (headers and 4 KiB padding included). A put that does not fit evicts least-recently-used segments; an existence probe or a read refreshes the segment holding the object. |
 | `io_threads` | Parallel reads/writes inside one `batch_get_into` / `batch_put_from`. |
 | `o_direct` | Bypass the page cache. Start-up fails when the file system refuses O_DIRECT (for example tmpfs). |
 | `verify_crc` | Store a CRC32 per object and treat a mismatch as a miss. |
 | `fsync` | `fdatasync` each object before it becomes visible. Puts are atomic either way (temporary file, then rename); without it a crash can lose recent objects, which then read as misses. |
 
-Each object is a 4 KiB header (magic, payload size, CRC32, full key) and the
-payload padded to 4 KiB. A Host slice that is 4 KiB aligned in address and
-size is read and written directly between the file and the pinned Host
-buffer; any other slice goes through an aligned per-thread bounce buffer.
-A read whose key, size or CRC does not match the header is a miss. The
-index is rebuilt from the headers at start-up (temporary and torn files are
-deleted), so cached prefixes survive a restart; the key namespace already
-carries the model, weight version, cache layout and quantization, so a
-different deployment never reads them.
+Objects written by one `batch_put_from` call (for example the KV groups of
+one prefix page) go into one *segment* file: a header (magic, per object its
+key, offset, size and CRC32, and a CRC32 over that table) padded to 4 KiB,
+then the payloads back to back, padded to 4 KiB at the end. A large put is
+split across the I/O threads, never into segments under 1 MiB nor over
+8 MiB of payload. A read opens each segment once and copies every requested
+object out of it, so small KV objects do not pay a file open per object.
+When every object of a segment is requested and the Host slices are 4 KiB
+aligned in address and size, the payloads are read and written directly
+between the file and the pinned Host buffer; otherwise they go through an
+aligned per-thread bounce buffer. A read whose key, size or CRC does not
+match the segment header is a miss. Capacity and LRU eviction work per
+segment, and `remove_by_prefix` deletes every segment holding a matching
+key (other keys written in the same put go with it, as misses). The index
+is rebuilt from the headers at start-up (temporary files and segments with
+a bad header or length are deleted), so cached prefixes survive a restart;
+the key namespace already carries the model, weight version, cache layout
+and quantization, so a different deployment never reads them.
 
 On one Micron 7450 NVMe with 3.2 MiB objects, `o_direct: true` and CRC
 verification, reads reach about 5.3 GB/s with 4 threads (2.5 GB/s with 1)

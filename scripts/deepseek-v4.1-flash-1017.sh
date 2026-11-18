@@ -11,7 +11,9 @@
 # four-group KV cache; the serve knobs below follow the recipe in
 # docs/recipes/models.md ("DeepSeek V4.1-Flash"). Same-checkpoint DSpark
 # speculative decoding is on by default (the CI/eval default for this
-# checkpoint); it requires --disable-kvstore and prefix caching on.
+# checkpoint). It needs prefix caching on; V4.1 keeps the draft windows in
+# its SWA cache group, so the Host KVStore (and L3 under it) works with
+# DSpark too. The KVStore stays off unless ENABLE_KVSTORE=1.
 #
 # MoE backend is arch-aware:
 #   Datacenter Blackwell (sm100/sm103, B200/GB200): mega_moe + expert parallel
@@ -34,6 +36,8 @@
 #   ENABLE_EXPERT_PARALLEL  default: 1 when MOE_BACKEND=mega_moe, else 0.
 #                        Non-empty/1 = --enable-expert-parallel (ep_size=world).
 #   ENABLE_DSPARK        default: 1 (--speculative-algorithm DSPARK). 0 to disable.
+#   ENABLE_KVSTORE       default: 0 (--disable-kvstore). 1 keeps the Host KVStore
+#                        (L2) on; add --kvstore-* / L3 flags via EXTRA_SERVE_ARGS.
 #   DTYPE                default: bfloat16
 #   MAX_MODEL_LEN        default: 32768
 #   MAX_TOTAL_TOKENS     default: 262144  (KV budget; caps admission)
@@ -195,6 +199,7 @@ else
 fi
 
 ENABLE_DSPARK="${ENABLE_DSPARK:-1}"
+ENABLE_KVSTORE="${ENABLE_KVSTORE:-0}"
 DTYPE="${DTYPE:-bfloat16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-262144}"
@@ -265,9 +270,12 @@ if [[ "${TENSOR_PARALLEL_SIZE}" == "2" && "${ALLOW_TP2_OOM:-}" != "1" ]]; then
     fi
 fi
 
-# DSpark replay requires KVStore off and prefix caching on (scheduler_utils).
 if [[ "${ENABLE_DSPARK}" != "0" && "${ENABLE_DSPARK}" != "1" ]]; then
     echo "ERROR: ENABLE_DSPARK must be 0 or 1." >&2
+    exit 1
+fi
+if [[ "${ENABLE_KVSTORE}" != "0" && "${ENABLE_KVSTORE}" != "1" ]]; then
+    echo "ERROR: ENABLE_KVSTORE must be 0 or 1." >&2
     exit 1
 fi
 
@@ -291,7 +299,7 @@ else
     exit 1
 fi
 
-echo "[deepseek-v4.1-flash-1017] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB moe_policy=${_MOE_POLICY} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} moe_backend=${MOE_BACKEND} expert_parallel=${ENABLE_EXPERT_PARALLEL} dspark=${ENABLE_DSPARK} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none} auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE:-off} engram_host_table=${ENGRAM_HOST_TABLE:-off} lm_only=${LANGUAGE_MODEL_ONLY:-off} model=${MODEL_PATH}" >&2
+echo "[deepseek-v4.1-flash-1017] arch=${_CUDA_ARCH:-unknown} gpu_mem=${_GPU_MEM_MIB:-unknown}MiB moe_policy=${_MOE_POLICY} CUDA_DEVICES=${CUDA_DEVICES} TP=${TENSOR_PARALLEL_SIZE} moe_backend=${MOE_BACKEND} expert_parallel=${ENABLE_EXPERT_PARALLEL} dspark=${ENABLE_DSPARK} kvstore=${ENABLE_KVSTORE} MAX_MODEL_LEN=${MAX_MODEL_LEN} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS} gpu_mem_util=${GPU_MEMORY_UTILIZATION:-engine_default} reasoning=${REASONING_PARSER:-none} tool_parser=${TOOL_CALL_PARSER:-none} auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE:-off} engram_host_table=${ENGRAM_HOST_TABLE:-off} lm_only=${LANGUAGE_MODEL_ONLY:-off} model=${MODEL_PATH}" >&2
 
 # --served-model-name is nargs="+": SPACE-separated names, each its own argv
 # item (NOT comma-separated -- a comma becomes part of a single literal name).
@@ -313,8 +321,10 @@ cmd=(
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
     --enable-prefix-caching
-    --disable-kvstore
 )
+if [[ "$ENABLE_KVSTORE" == "0" ]]; then
+    cmd+=(--disable-kvstore)
+fi
 if [[ -n "$ENGRAM_HOST_TABLE" && "$ENGRAM_HOST_TABLE" != "0" ]]; then
     cmd+=(--engram-host-table --engram-host-table-layout "$ENGRAM_HOST_TABLE_LAYOUT")
 fi

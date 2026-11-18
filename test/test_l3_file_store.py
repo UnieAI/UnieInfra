@@ -126,13 +126,16 @@ def test_objects_survive_a_restart_and_temporaries_are_dropped(tmp_path):
     src[base : base + 5000] = _pattern(5000, 7)
     assert store.batch_put_from(["persist"], src, [base], [5000]) == [True]
     store.close()
-    stray = os.path.join(str(tmp_path), "rank0", "ab", "x.kv.tmp.1")
-    os.makedirs(os.path.dirname(stray), exist_ok=True)
-    open(stray, "wb").write(b"partial")
+    stray = os.path.join(str(tmp_path), "rank0", "ab", "x.seg.tmp.1")
+    legacy = os.path.join(str(tmp_path), "rank0", "cd", "y.kv")
+    for path in (stray, legacy):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").write(b"partial")
 
     again = FileKvStore(_config(tmp_path), rank=0)
     assert again.batch_exists(["persist"]) == [True]
     assert not os.path.exists(stray)
+    assert not os.path.exists(legacy)
     dst, dbase = _aligned_host(2 * ALIGN)
     assert again.batch_get_into(["persist"], dst, [dbase], [5000]) == [True]
     assert torch.equal(dst[dbase : dbase + 5000], _pattern(5000, 7))
@@ -141,7 +144,92 @@ def test_objects_survive_a_restart_and_temporaries_are_dropped(tmp_path):
 
 
 def _object_file(store: FileKvStore, key: str) -> str:
-    return store._path(key)
+    return store._segment_path(store._keys[key].segment)
+
+
+def _segment_files(root) -> list[str]:
+    return sorted(
+        os.path.join(d, f)
+        for d, _, files in os.walk(root)
+        for f in files
+        if f.endswith(".seg")
+    )
+
+
+def test_one_put_is_one_segment_and_partial_reads_work(tmp_path):
+    size, count = 3000, 6
+    src = torch.empty(count * size, dtype=torch.uint8)
+    for i in range(count):
+        src[i * size : (i + 1) * size] = _pattern(size, 200 + i)
+    keys = [f"p{i}" for i in range(count)]
+    offsets = [i * size for i in range(count)]
+    # A small put stays one segment even with several I/O threads.
+    single = FileKvStore(
+        FileStoreConfig(str(tmp_path / "one"), 1.0, 16, True, True, False), rank=0
+    )
+    assert single.batch_put_from(keys, src, offsets, [size] * count) == [True] * count
+    assert len(_segment_files(single.root)) == 1
+    dst = torch.zeros(count * size, dtype=torch.uint8)
+    # Read two objects of the segment, out of order, into other offsets.
+    assert single.batch_get_into(["p4", "p1"], dst, [0, size], [size, size]) == [
+        True,
+        True,
+    ]
+    assert torch.equal(dst[:size], _pattern(size, 204))
+    assert torch.equal(dst[size : 2 * size], _pattern(size, 201))
+    single.close()
+
+
+def test_remove_by_prefix_deletes_whole_segments_and_stays_deleted(tmp_path):
+    cfg = FileStoreConfig(str(tmp_path), 1.0, 1, True, True, False)
+    store = FileKvStore(cfg, rank=0)
+    src = torch.empty(3 * 1000, dtype=torch.uint8)
+    keys = ["a_0", "b_1", "a_2"]
+    assert store.batch_put_from(keys, src, [0, 1000, 2000], [1000] * 3) == [True] * 3
+    assert store.batch_put_from(["b_3"], src, [0], [1000]) == [True]
+    assert store.remove_by_prefix("a_") is True
+    # "b_1" shared a segment with the "a_" keys and goes with it.
+    assert store.batch_exists(keys + ["b_3"]) == [False, False, False, True]
+    assert store.used_bytes() == HEADER_BYTES + ALIGN
+    store.close()
+    again = FileKvStore(cfg, rank=0)
+    assert again.batch_exists(keys + ["b_3"]) == [False, False, False, True]
+    assert len(_segment_files(again.root)) == 1
+    again.close()
+
+
+def test_large_put_is_split_across_io_threads(tmp_path):
+    store = FileKvStore(_config(tmp_path), rank=0)  # 4 threads
+    size, count = 1 << 20, 8  # 8 MiB: four 2 MiB shares, above MIN_SPLIT_BYTES
+    src = torch.empty(count * size, dtype=torch.uint8)
+    for i in range(count):
+        src[i * size : (i + 1) * size] = _pattern(size, 400 + i)
+    keys = [f"s{i}" for i in range(count)]
+    offsets = [i * size for i in range(count)]
+    assert store.batch_put_from(keys, src, offsets, [size] * count) == [True] * count
+    assert len(_segment_files(store.root)) == 4
+    dst = torch.zeros(count * size, dtype=torch.uint8)
+    assert store.batch_get_into(keys, dst, offsets, [size] * count) == [True] * count
+    assert torch.equal(dst, src)
+    store.close()
+
+
+def test_corrupted_segment_header_is_dropped_at_restart(tmp_path):
+    store = FileKvStore(_config(tmp_path), rank=0)
+    src, base = _aligned_host(2 * ALIGN)
+    assert store.batch_put_from(["h"], src, [base], [ALIGN]) == [True]
+    path = _object_file(store, "h")
+    store.close()
+    with open(path, "r+b") as f:
+        f.seek(40)  # inside the entry table, covered by its CRC
+        byte = f.read(1)
+        f.seek(40)
+        f.write(bytes([byte[0] ^ 0xFF]))
+    again = FileKvStore(_config(tmp_path), rank=0)
+    assert again.batch_exists(["h"]) == [False]
+    assert not os.path.exists(path)
+    assert again.used_bytes() == 0
+    again.close()
 
 
 def test_corrupted_payload_reads_as_a_miss(tmp_path):
@@ -182,9 +270,10 @@ def test_capacity_evicts_least_recently_used(tmp_path):
     for key in ("a", "b", "c"):
         assert store.batch_put_from([key], src, [base], [ALIGN]) == [True]
     store.batch_exists(["a"])  # touch: "b" is now the oldest
+    b_file = _object_file(store, "b")
     assert store.batch_put_from(["d"], src, [base], [ALIGN]) == [True]
     assert store.batch_exists(["a", "b", "c", "d"]) == [True, False, True, True]
-    assert not os.path.exists(_object_file(store, "b"))
+    assert not os.path.exists(b_file)
     assert store.used_bytes() == 3 * per_object
     # An object larger than the whole capacity is refused, nothing evicted.
     big, bbase = _aligned_host(4 * per_object)
@@ -197,10 +286,9 @@ def test_remove_by_prefix_and_rank_isolation(tmp_path):
     rank0 = FileKvStore(_config(tmp_path), rank=0)
     rank1 = FileKvStore(_config(tmp_path), rank=1)
     src, base = _aligned_host(2 * ALIGN)
-    assert rank0.batch_put_from(["ns1_x", "ns2_y"], src, [base, base], [64, 64]) == [
-        True,
-        True,
-    ]
+    # Separate puts: a prefix delete removes whole segments.
+    assert rank0.batch_put_from(["ns1_x"], src, [base], [64]) == [True]
+    assert rank0.batch_put_from(["ns2_y"], src, [base], [64]) == [True]
     assert rank1.batch_put_from(["ns1_x"], src, [base], [64]) == [True]
     assert rank0.remove_by_prefix("ns1_") is True
     assert rank0.batch_exists(["ns1_x", "ns2_y"]) == [False, True]

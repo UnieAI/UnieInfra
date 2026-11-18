@@ -71,7 +71,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from weakref import WeakValueDictionary
 
 import torch
@@ -121,6 +121,7 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     DeepseekV41AttentionBackend,
@@ -667,7 +668,7 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     )
 
 
-# Prefill two-micro-batch overlap (TOKENSPEED_PREFILL_TBO=1): a pure prefill
+# Prefill two-micro-batch overlap (TOKENSPEED_PREFILL_TBO=1): a prefill or mixed
 # window of at least _PREFILL_TBO_MIN_ROWS rows runs its encoder layers as two
 # micro-batches, so one micro-batch's all-reduce (on a side stream, through
 # its own Iris lane capped at _PREFILL_TBO_IRIS_PROGRAMS workgroups) overlaps
@@ -680,6 +681,8 @@ _PREFILL_TBO_IRIS_PROGRAMS = int(
 # Split alignment inside a request: keeps ratio-2 compressor pairs, candidate
 # blocks and SWA pages whole on each side.
 _PREFILL_TBO_ALIGN = 128
+# Set once the first mixed window runs overlapped (logged once per process).
+_logged_mixed_overlap = False
 # The overlap lane the attention output projection writes into, while one
 # micro-batch's attention runs (None: the group's ordinary producer buffer).
 _attention_output_lane = None
@@ -2293,7 +2296,7 @@ class DeepseekV41Model(nn.Module):
             or rows < _PREFILL_TBO_MIN_ROWS
             or not state.hidden.is_cuda
             or ctx.forward_mode is None
-            or not ctx.forward_mode.is_extend()
+            or not ctx.forward_mode.is_extend_or_mixed()
             or ctx.global_num_tokens is not None
             or torch.cuda.is_current_stream_capturing()
             or is_breakable_capture_active()
@@ -2324,6 +2327,12 @@ class DeepseekV41Model(nn.Module):
             for lane, n in zip(lanes, (plan.split, rows - plan.split))
         ):
             return None
+        global _logged_mixed_overlap
+        if ctx.forward_mode.is_mixed() and not _logged_mixed_overlap:
+            _logged_mixed_overlap = True
+            logger.info(
+                f"prefill TBO: first mixed window split at row {plan.split} of {rows}"
+            )
         return plan, lanes
 
     def _encoder_layers_overlapped(
@@ -2347,6 +2356,28 @@ class DeepseekV41Model(nn.Module):
         split, rows = plan.split, state.rows
         windows = (slice(0, split), slice(split, rows))
         metadata = (plan.first, plan.second)
+        # A mixed window's decode rows all land in B: A runs as a pure
+        # prefill, B as a mixed forward of the rest (see
+        # plan_prefill_micro_batches).
+        contexts = (
+            (
+                replace(
+                    ctx,
+                    forward_mode=ForwardMode.EXTEND,
+                    bs=plan.first.forward_metadata.num_extends,
+                    num_extends=plan.first.forward_metadata.num_extends,
+                    input_num_tokens=split,
+                ),
+                replace(
+                    ctx,
+                    bs=plan.second.forward_metadata.request_pool_indices.numel(),
+                    num_extends=plan.second.forward_metadata.num_extends,
+                    input_num_tokens=rows - split,
+                ),
+            )
+            if ctx.forward_mode.is_mixed()
+            else (ctx, ctx)
+        )
         hidden = [state.hidden[w] for w in windows]
         pre_mix = [state.pre_mix[w] for w in windows]
         positions = [state.positions[w] for w in windows]
@@ -2393,7 +2424,7 @@ class DeepseekV41Model(nn.Module):
                     )
                 backend.use_forward_state(metadata[i])
                 partial, saved = layer.overlap_attention(
-                    hidden[i], pre_mix[i], positions[i], ctx, lanes[i]
+                    hidden[i], pre_mix[i], positions[i], contexts[i], lanes[i]
                 )
                 after_attention.append((reduce_async(i, partial), saved))
             backend.use_forward_state(plan.full)

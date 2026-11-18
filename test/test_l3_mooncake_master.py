@@ -263,6 +263,7 @@ class TestMooncakeMasterLiveTest:
             tp_size=1,
             pp_size=1,
             rank=0,
+            shared_owner_rank=None,
         )
         assert isinstance((backend), (MooncakeKvStore))
         l3 = L3HostStore(backend, host, key_prefix="live", rank=0)

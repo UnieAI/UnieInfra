@@ -194,6 +194,7 @@ class CacheRecipe(ABC):
             ),
             fixed_workspace_bytes=self.workspace_bytes(),
             uses_paged_state_verify=self.uses_paged_state_verify,
+            kv_identical_across_attn_tp=self.kv_identical_across_attn_tp,
         )
 
     def offload_policy(self) -> KVOffloadPolicy | None:
@@ -506,6 +507,17 @@ class CacheRecipe(ABC):
     def pool_options(self) -> object | None:
         """Family-specific options the pool constructor needs."""
         return None
+
+    @property
+    def kv_identical_across_attn_tp(self) -> bool:
+        """Whether every attention-TP rank caches the same bytes for a page.
+
+        True when no cache field is split across attention TP (one latent
+        KV, compressed rows, replicated indexer keys), so the L3 store may
+        keep one copy per page instead of one per rank. False, the default,
+        is always safe: each rank keeps its own copy.
+        """
+        return False
 
 
 def kda_verify_scratch_in_pool(server_args, attn_config) -> bool:

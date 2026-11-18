@@ -41,12 +41,17 @@ CRC and reads as a miss. The key -> segment index lives in memory and is
 rebuilt from the headers at start-up, so objects survive a restart.
 Capacity is bounded per segment: a put that does not fit evicts
 least-recently-used segments (with every object in them) first.
+
+An attention-TP group whose ranks cache identical bytes shares one
+directory: only its rank 0 writes and deletes, and every rank derives the
+same segment names and offsets from the same puts (``FileKvStore``).
 """
 
 from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import logging
 import mmap
@@ -272,15 +277,34 @@ def _parse_header(
 class FileKvStore:
     """L3 byte store on a local directory (see the module docstring)."""
 
-    def __init__(self, config: FileStoreConfig, *, rank: int) -> None:
+    def __init__(
+        self, config: FileStoreConfig, *, rank: int, shared_owner_rank: int | None
+    ) -> None:
+        """Open (or create) this rank's store.
+
+        ``rank`` is the process's global rank. ``shared_owner_rank`` is None
+        when every rank keeps its own copy (one subdirectory per rank), or
+        the global rank of the attention-TP rank 0 when the group caches the
+        same bytes on every rank (``CacheRecipe.kv_identical_across_attn_tp``):
+        the group then shares the owner's subdirectory, only the owner writes
+        and deletes files, and every rank indexes the same segment names and
+        offsets for the same puts. A non-owner records the CRC of its own
+        Host bytes and reads verify against it, so a rank whose bytes differ
+        from the owner's reads a miss, never the owner's data.
+        """
+
         self.config = config
-        # One subdirectory per rank: each rank indexes, sizes and evicts only
-        # its own segments even when ranks share the configured path.
-        self.root = os.path.join(config.path, f"rank{int(rank)}")
+        self._shared = shared_owner_rank is not None
+        owner = int(rank) if shared_owner_rank is None else int(shared_owner_rank)
+        self._writer = owner == int(rank)
+        self._verify = config.verify_crc or self._shared
+        # One subdirectory per owner: it indexes, sizes and evicts only its
+        # own segments even when ranks share the configured path.
+        self.root = os.path.join(config.path, f"rank{owner}")
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         self._flags = os.O_DIRECT if config.o_direct else 0
         if config.o_direct:
-            self._check_o_direct()
+            self._check_o_direct(rank=int(rank))
         self._lock = threading.Lock()
         self._keys: dict[str, _Entry] = {}
         # segment name -> segment, least recently used first
@@ -304,8 +328,8 @@ class FileKvStore:
             self._local.buffer = buf
         return buf
 
-    def _check_o_direct(self) -> None:
-        probe = os.path.join(self.root, ".o_direct_probe")
+    def _check_o_direct(self, *, rank: int) -> None:
+        probe = os.path.join(self.root, f".o_direct_probe.{rank}")
         try:
             fd = os.open(
                 probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o600
@@ -319,7 +343,11 @@ class FileKvStore:
         os.unlink(probe)
 
     def _rebuild_index(self) -> None:
-        """Index the segments already on disk; drop temporaries and torn files."""
+        """Index the segments already on disk; drop temporaries and torn files.
+
+        Only the writer deletes: in a shared directory the other ranks may
+        scan while the owner is still writing or cleaning up.
+        """
 
         found = []
         for root, _dirs, files in os.walk(self.root):
@@ -328,12 +356,15 @@ class FileKvStore:
                 if not name.endswith(_SUFFIX):
                     # Temporaries of an interrupted put, and one-object files
                     # of the earlier layout (".kv"), which nothing reads.
-                    if ".tmp." in name or name.endswith(_LEGACY_SUFFIX):
+                    if self._writer and (
+                        ".tmp." in name or name.endswith(_LEGACY_SUFFIX)
+                    ):
                         os.unlink(path)
                     continue
                 parsed = self._read_segment_header(path)
                 if parsed is None:
-                    os.unlink(path)
+                    if self._writer:
+                        os.unlink(path)
                     continue
                 disk, entries = parsed
                 found.append(
@@ -477,6 +508,13 @@ class FileKvStore:
                     self._used -= disk
                     continue
                 name, entries = written
+                if name in self._segments:
+                    # Shared names are derived from the put; a repeated put
+                    # of the same keys replaced the file under the same name.
+                    old = self._segments.pop(name)
+                    self._used -= old.disk
+                    for key in old.live:
+                        del self._keys[key]
                 segment = _Segment(disk=disk)
                 self._segments[name] = segment
                 for obj, entry in zip(group, entries):
@@ -595,6 +633,8 @@ class FileKvStore:
     def _delete_segment_locked(self, name: str) -> bool:
         segment = self._segments.pop(name)
         self._used -= segment.disk
+        if not self._writer:
+            return True  # the owner deletes the shared file
         try:
             os.unlink(self._segment_path(name))
         except FileNotFoundError:
@@ -649,7 +689,7 @@ class FileKvStore:
                 if stored.get(key) != (entry.offset, entry.size, entry.crc):
                     continue
                 payload = view if direct else buf.view(entry.size, entry.offset)
-                if self.config.verify_crc and zlib.crc32(payload) != entry.crc:
+                if self._verify and zlib.crc32(payload) != entry.crc:
                     continue
                 if not direct:
                     ctypes.memmove(address, buf.address + entry.offset, entry.size)
@@ -662,7 +702,16 @@ class FileKvStore:
             os.close(fd)
 
     def _put_segment(self, group: list[_PutObject]) -> tuple[str, list[_Entry]] | None:
-        name = uuid.uuid4().hex
+        if self._shared:
+            # Every rank of the group must arrive at the owner's file name.
+            digest = hashlib.sha256()
+            for obj in group:
+                digest.update(f"{obj.key}\0{obj.size}\0".encode())
+            name = digest.hexdigest()[:32]
+        else:
+            name = uuid.uuid4().hex
+        if not self._writer:
+            return name, self._shared_entries(name, group)
         path = self._segment_path(name)
         tmp = f"{path}.tmp.{threading.get_ident()}"
         key_bytes = [obj.key.encode() for obj in group]
@@ -684,7 +733,7 @@ class FileKvStore:
             else:
                 ctypes.memmove(buf.address + offset, obj.address, obj.size)
                 payload = buf.view(obj.size, offset)
-            crc = zlib.crc32(payload) if self.config.verify_crc else 0
+            crc = zlib.crc32(payload) if self._verify else 0
             table += _ENTRY.pack(offset, obj.size, crc, len(key)) + key
             entries.append(_Entry(name, offset, obj.size, crc))
             offset += obj.size
@@ -715,3 +764,14 @@ class FileKvStore:
             except FileNotFoundError:
                 pass
             return None
+
+    def _shared_entries(self, name: str, group: list[_PutObject]) -> list[_Entry]:
+        """The entries the owner writes for ``group``, CRCs from this rank's bytes."""
+
+        offset = _header_bytes([obj.key.encode() for obj in group])
+        entries = []
+        for obj in group:
+            crc = zlib.crc32(_host_view(obj.address, obj.size))
+            entries.append(_Entry(name, offset, obj.size, crc))
+            offset += obj.size
+        return entries

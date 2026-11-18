@@ -81,3 +81,10 @@
 29. **不先算上限就投入**：prefix cache 已在 96.5%（理論 96.6%）；decode AR 實測已是延遲主導，
     壓縮無效。先算，再做。
 30. **有損技術沒問使用者**：INT8 all-reduce 有效但有損，要使用者明確同意才能列入結果。
+
+## 換 ROCm 版本（細節見 10-rocm-versions.md）
+
+31. **只換一部分 ROCm 函式庫**：兩套 HIP runtime 同時載入，直接 segfault。一次換齊。
+32. **少了 `.kpack`**：RCCL `invalid device function`，沒有其他提示。
+33. **單元件全部變快就以為端到端會變快**：7.14／10.0 的 GEMM、RCCL、launch 都更快，端到端卻慢 6–29%。
+    一定要跑同日交錯的端到端，再用 GPU 計時找停頓在哪。

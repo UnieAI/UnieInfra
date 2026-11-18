@@ -93,6 +93,29 @@ def test_round_trip_into_aligned_and_unaligned_host_slices(
     store.close()
 
 
+def test_batch_larger_than_io_threads_keeps_per_key_results_in_order(tmp_path):
+    # 11 objects over 4 threads: uneven slices, with a miss in the middle.
+    store = FileKvStore(_config(tmp_path), rank=0)
+    size, count = 1000, 11
+    src = torch.empty(count * size, dtype=torch.uint8)
+    for i in range(count):
+        src[i * size : (i + 1) * size] = _pattern(size, 100 + i)
+    keys = [f"k{i}" for i in range(count)]
+    offsets = [i * size for i in range(count)]
+    assert store.batch_put_from(keys, src, offsets, [size] * count) == [True] * count
+
+    keys[5] = "missing"
+    dst = torch.zeros(count * size, dtype=torch.uint8)
+    flags = store.batch_get_into(keys, dst, offsets, [size] * count)
+    assert flags == [i != 5 for i in range(count)]
+    for i in range(count):
+        want = (
+            torch.zeros(size, dtype=torch.uint8) if i == 5 else _pattern(size, 100 + i)
+        )
+        assert torch.equal(dst[i * size : (i + 1) * size], want)
+    store.close()
+
+
 def _round(n: int) -> int:
     return (n + ALIGN - 1) // ALIGN * ALIGN
 

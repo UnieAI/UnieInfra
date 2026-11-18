@@ -400,9 +400,17 @@ class FileKvStore:
             return []
         if self._pool is None:
             raise RuntimeError("file L3 store is closed")
-        if len(items) == 1:
-            return [fn(*items[0])]
-        return list(self._pool.map(lambda args: fn(*args), items))
+        workers = min(self.config.io_threads, len(items))
+        if workers == 1:
+            return [fn(*args) for args in items]
+        # One contiguous slice per thread, not one future per object: KV
+        # pages are often tens of KiB, where per-future dispatch and GIL
+        # hand-offs cost as much as the read itself (DSV4.1 TP4, 38 KB
+        # objects: 38 -> 29 ms for a 558-object batch per rank).
+        step = -(-len(items) // workers)
+        slices = [items[start : start + step] for start in range(0, len(items), step)]
+        results = self._pool.map(lambda part: [fn(*args) for args in part], slices)
+        return [flag for part in results for flag in part]
 
     def _make_room(self, disk: int, *, keep: set[str]) -> bool:
         """Evict LRU objects (not in ``keep``) until ``disk`` more bytes fit.

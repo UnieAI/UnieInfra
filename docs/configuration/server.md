@@ -1314,7 +1314,18 @@ different deployment never reads them.
 
 On one Micron 7450 NVMe with 3.2 MiB objects, `o_direct: true` and CRC
 verification, reads reach about 5.3 GB/s with 4 threads (2.5 GB/s with 1)
-and writes about 1.4 GB/s, close to the drive's limits.
+and writes about 1.4 GB/s, close to the drive's limits. Small objects are
+bound by per-object CPU cost rather than the drive: DeepSeek V4.1-Flash
+under TP4 writes about 38 KB per object, and a 558-object prefetch takes
+about 30 ms per rank with four ranks on one drive (16 threads; 50 ms with 4).
+
+**What reaches L3.** L3 receives exactly what is written to Host L2, so the
+Host write policy decides what persists. `TOKENSPEED_KVSTORE_WRITE_POLICY`
+is `reuse` by default (a Device prefix is copied out after its first reuse
+hit), `reuse_pressure` (also when the Device pool runs low), or `eager`
+(every published prefix, as each prefill chunk completes). Under `reuse` a
+prompt that is sent once is never written, so it does not survive a
+restart; use `eager` when L3 should keep every prompt.
 
 **Prefetch before admission.** An L3 hit is never loaded under a running
 forward. When a waiting request's registered L3 keys past its Device/Host

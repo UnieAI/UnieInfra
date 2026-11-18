@@ -283,6 +283,8 @@ python3 scripts/log_experiment.py --area "..." --experiment "..." --result "待�
 | `scan_spills.py` | 掃 kernel 快取的 register spill |
 | `needle_test.py` / `run_gsm8k.sh` | 正確性關卡 |
 | `log_experiment.py` | 安全地新增/更新 experiments.json |
+| `rocm_overlay.sh` | 同一 Python 環境換另一版 ROCm user-space 做 A/B（見 references/10-rocm-versions.md） |
+| `rocm_micro.py` / `rocm_allreduce.py` | 換 ROCm 版本時的單元件微基準：launch、graph、GEMM、頻寬、RCCL |
 
 範本在 `templates/`：實驗紀錄、server 啟動、A/B 腳本、PR 描述。
 

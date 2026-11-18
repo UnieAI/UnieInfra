@@ -24,6 +24,11 @@ The deliberate invariants of each subsystem are written down in [`docs/design/`]
 
 ### NVIDIA H200 — DeepSeek-V4.1-Flash, TP4
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/perf/h200-dsv41-dark.svg">
+  <img src="assets/perf/h200-dsv41-light.svg" alt="DeepSeek-V4.1-Flash on H200: UnieInfra speedup over vLLM 0.31 by concurrency" width="760">
+</picture>
+
 AgentX agent workload, 256 requests (9.7K input tokens on average, 128 output tokens each), prefix cache flushed before every cell, each engine run three times in a different cell order (median). Baseline: vLLM 0.31.0. Speedup in requests/min:
 
 | Concurrency | c1 | c8 | c16 | c32 | c64 | c128 |
@@ -37,6 +42,11 @@ AgentX agent workload, 256 requests (9.7K input tokens on average, 128 output to
 
 ### NVIDIA RTX PRO 6000 Blackwell (sm120)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/perf/pro6000-models-dark.svg">
+  <img src="assets/perf/pro6000-models-light.svg" alt="RTX PRO 6000: UnieInfra speedup over vLLM 0.32 for whisper-large-v3, MiniMax-Music3 and MiniMax-H3" width="760">
+</picture>
+
 Baseline: vLLM 0.32.0 (with vLLM-Omni for MiniMax models).
 
 | Model | Setup | Result |
@@ -48,6 +58,11 @@ Baseline: vLLM 0.32.0 (with vLLM-Omni for MiniMax models).
 | DeepSeek-V4.1-Flash | TP4, text and image | served on 96 GiB cards (Engram tables in host memory) |
 
 ### AMD Instinct MI350P (gfx950, PCIe-only) — DeepSeek-V4.1-Flash, TP4
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/perf/mi350p-dsv41-dark.svg">
+  <img src="assets/perf/mi350p-dsv41-light.svg" alt="DeepSeek-V4.1-Flash on MI350P: UnieInfra speedup over vLLM by concurrency" width="760">
+</picture>
 
 4× MI350P without xGMI, AgentX coding-agent traces in stress mode (600 s per cell, T=1.0 sampling, no quantized communication), each engine at its best running-request cap. Speedup in requests/min:
 

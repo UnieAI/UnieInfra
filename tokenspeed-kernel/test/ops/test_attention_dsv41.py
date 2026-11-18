@@ -57,8 +57,10 @@ def _make_cache(x, fmt):
     return cache
 
 
-def test_compressor_tail_scatter_graph_strides_and_replay(device):
-    storage = torch.zeros(5, 2, 2, 1024, device=device)
+# Compressor-tail rows per page: the checkpoint's 2, and ROCm's wide 32.
+@pytest.mark.parametrize("rows", [2, 32])
+def test_compressor_tail_scatter_graph_strides_and_replay(device, rows):
+    storage = torch.zeros(5, rows, 2, 1024, device=device)
     tail = storage[1:4, :, :, 1::2]
     content = torch.randn(6, 1024, device=device)[:, ::2]
     scores = torch.randn(6, 1024, device=device)[:, 1::2]
@@ -74,16 +76,22 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
         with torch.cuda.graph(graph, stream=stream):
             dsv41.compressor_tail_scatter(content, scores, tail, slots)
     torch.cuda.current_stream().wait_stream(stream)
-    for values in ([-1, 1, 3, 5, 6, -2], [4, -1, 2, 0, 99, -1], [-1] * 6):
+    capacity = 3 * rows
+    for values in (
+        [-1, 1, 3, 5, 6, -2],
+        [4, -1, 2, 0, 99, -1],
+        [rows - 1, rows, 2 * rows, capacity - 1, capacity, -1],
+        [-1] * 6,
+    ):
         storage.zero_()
         content.normal_()
         scores.normal_()
         slots.copy_(torch.tensor(values, device=device))
         expected = torch.zeros_like(storage)
         for i, slot in enumerate(values):
-            if 0 <= slot < 6:
-                expected[1 + slot // 2, slot % 2, 0, 1::2] = content[i]
-                expected[1 + slot // 2, slot % 2, 1, 1::2] = scores[i]
+            if 0 <= slot < capacity:
+                expected[1 + slot // rows, slot % rows, 0, 1::2] = content[i]
+                expected[1 + slot // rows, slot % rows, 1, 1::2] = scores[i]
         graph.replay()
         torch.testing.assert_close(storage, expected, rtol=0, atol=0)
     dsv41.compressor_tail_scatter(content[:0], scores[:0], tail, slots[:0])
@@ -993,24 +1001,26 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     assert not torch.any(actual[~active])
 
 
-def test_compressor_pool_token_count_does_not_recompile(device):
+@pytest.mark.parametrize("rows", [2, 32])
+def test_compressor_pool_token_count_does_not_recompile(device, rows):
     """Every prefill brings a new token count; the kernel must not key its
     compile cache on the row count."""
-    tail = torch.randn(5, 2, 2, 512, device=device)
+    tail = torch.randn(5, rows, 2, 512, device=device)
 
     def run(count):
         projection = torch.randn(count, 1024, device=device)
         content, scores = projection[:, :512], projection[:, 512:]
         previous = torch.arange(count, device=device) - 1
-        slots = torch.full((count,), 2, device=device, dtype=torch.int32)
+        # The last row of page 1, so the in-page row offset is exercised.
+        slots = torch.full((count,), 2 * rows - 1, device=device, dtype=torch.int32)
         active = torch.arange(count, device=device) % 2 == 1
         pooled = dsv41.compressor_pool(
             content, scores, previous, tail, slots, active, None, None, 0.0
         )
         # Row 0 pairs with the tail slot; every later active row pairs with
         # its predecessor in this forward.
-        prior_content = torch.cat([tail[1, 0, 0][None], content[:-1]])
-        prior_scores = torch.cat([tail[1, 0, 1][None], scores[:-1]])
+        prior_content = torch.cat([tail[1, rows - 1, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[1, rows - 1, 1][None], scores[:-1]])
         maximum = torch.maximum(prior_scores, scores)
         old_exp = torch.exp(prior_scores - maximum)
         new_exp = torch.exp(scores - maximum)
@@ -1185,9 +1195,32 @@ def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
     torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
 
 
+def _compressor_pairs(positions, requests, table, pages, rows):
+    """torch_dsv41_compressor_pairs with ``rows``-row tail pages."""
+    pairs = torch_dsv41_compressor_pairs(positions, requests, table, pages)
+    table = table.cpu().long()
+
+    def slots(p, r):
+        p, r = p.cpu().long(), r.cpu().long()
+        column = torch.div(p, rows, rounding_mode="floor")
+        valid = (p >= 0) & (r >= 0) & (r < table.shape[0]) & (column < table.shape[1])
+        page = table[
+            r.clamp(0, table.shape[0] - 1), column.clamp(0, table.shape[1] - 1)
+        ]
+        valid &= (page > 0) & (page < pages)
+        return torch.where(valid, page * rows + p % rows, -1)
+
+    expected = (*pairs[:4], slots(pairs[1], pairs[2]), slots(positions, requests))
+    if rows == 2:
+        for got, want in zip(expected[4:], pairs[4:], strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    return expected
+
+
 @pytest.mark.parametrize("n", [0, 1, 16, 128, 129, 257, 8192, 32768])
 @pytest.mark.parametrize("target", ["cpu", "cuda"])
-def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
+@pytest.mark.parametrize("rows", [2, 32])
+def test_compressor_metadata_consecutive_requests_and_refresh(n, target, rows):
     if target == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA/ROCm")
     indices = torch.arange(n)
@@ -1220,12 +1253,10 @@ def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
     )
 
     def prepare():
-        dsv41.compressor_metadata(p, r, table, 4, *out)
+        dsv41.compressor_metadata(p, r, table, 4, *out, rows=rows)
 
     prepare()
-    for got, want in zip(
-        out, torch_dsv41_compressor_pairs(p, r, table, 4), strict=True
-    ):
+    for got, want in zip(out, _compressor_pairs(p, r, table, 4, rows), strict=True):
         torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
     if target == "cuda":
         graph = torch.cuda.CUDAGraph()
@@ -1242,9 +1273,7 @@ def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
             graph.replay()
         else:
             prepare()
-        for got, want in zip(
-            out, torch_dsv41_compressor_pairs(p, r, table, 4), strict=True
-        ):
+        for got, want in zip(out, _compressor_pairs(p, r, table, 4, rows), strict=True):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
 
 
@@ -1270,7 +1299,7 @@ def test_compressor_metadata_table_width_does_not_recompile():
                 torch.int64,
             )
         )
-        implementation.compressor_metadata(p, r, table, 4, *out)
+        implementation.compressor_metadata(p, r, table, 4, *out, rows=2)
         for got, want in zip(
             out, torch_dsv41_compressor_pairs(p, r, table, 4), strict=True
         ):

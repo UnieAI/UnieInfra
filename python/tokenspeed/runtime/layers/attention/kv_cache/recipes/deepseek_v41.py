@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_INDEX_HEAD_DIM,
     V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
+    V41_TAIL_ROWS,
     V41_WINDOW_SIZE,
     v41_dspark_field_name,
     v41_layer_mapping,
@@ -85,6 +86,10 @@ class DeepseekV41Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
+        # Without DSpark the parent holds 112 tail rows: wide ROCm tail pages
+        # pad it (3 x 32 rows, 17%), which costs only tail-group parents.
+        if V41_TAIL_ROWS > 2 and not self.dspark_stages():
+            return 0.2
         return 0.05
 
     def dspark_stages(self) -> int:
@@ -194,7 +199,7 @@ class DeepseekV41Recipe(CacheRecipe):
                     V41_COMPRESSOR_TAIL_GROUP_ID,
                     owner,
                     "compressor_tail",
-                    (2, 2, V41_HEAD_DIM),
+                    (V41_TAIL_ROWS, 2, V41_HEAD_DIM),
                     "float32",
                 )
 

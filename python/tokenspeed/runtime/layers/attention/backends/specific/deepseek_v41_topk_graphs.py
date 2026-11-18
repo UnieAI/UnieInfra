@@ -39,6 +39,10 @@ from dataclasses import dataclass
 
 import torch
 
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+    V41_INDEX_SCORE_CHUNK,
+)
+
 _MIN_ROWS = 16
 _MIN_PAGES = 8
 _MIN_POOL = 64
@@ -173,7 +177,7 @@ class V41PrefillTopkGraphs:
                     candidate_topk,
                     candidate_block_size,
                     query_tile,
-                    256,
+                    V41_INDEX_SCORE_CHUNK,
                     None,
                     statics.out,
                     None,

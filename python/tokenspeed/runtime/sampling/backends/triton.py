@@ -47,6 +47,7 @@ from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
     SamplingBackend,
     SamplingBackendConfig,
+    SpeculativeSamplingPools,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
@@ -289,6 +290,13 @@ class TritonSamplingBackend(SamplingBackend):
                 return _SAMPLE_ROUTE_GUMBEL_TOP_K
             return _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P
         return _SAMPLE_ROUTE_GUMBEL_GENERIC
+
+    def coupled_draft_pools(self) -> SpeculativeSamplingPools:
+        return SpeculativeSamplingPools(
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            seed=self._seed_pool,
+        )
 
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
         self._temperature_pool[pool_idx].fill_(float(sp.temperature))

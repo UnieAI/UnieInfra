@@ -1222,6 +1222,18 @@ every token bucket and capped at 128 rows per request
 `--prefill-graph-capture-sizes` sets both ladders. `--disable-prefill-graph`
 turns both off. Decode CUDA graphs are unaffected.
 
+On PCIe-only AMD hosts the prefill all-reduces dominate an eager prefill
+chunk. `TOKENSPEED_PREFILL_TBO=1` (default off, attention TP with an
+all-reduced MoE only) runs the encoder layers of a pure prefill window of at
+least `TOKENSPEED_PREFILL_TBO_MIN_ROWS` rows (4096) as two micro-batches: the
+attention backend re-prepares the window as two forwards split near its
+middle (a request cut by the split continues in the second one as its next
+chunk would), and each micro-batch's attention and MoE all-reduces run on a
+high-priority side stream through their own Iris producer lane, capped at
+`TOKENSPEED_PREFILL_TBO_IRIS_PROGRAMS` workgroups (32), while the other
+micro-batch computes. The mHC post then runs as its own kernel instead of
+inside the reduction. The arithmetic is otherwise unchanged and lossless.
+
 ```bash
 tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
   --served-model-name deepseek-v41-flash \

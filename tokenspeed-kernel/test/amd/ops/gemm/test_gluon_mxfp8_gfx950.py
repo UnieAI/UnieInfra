@@ -222,7 +222,7 @@ def test_mxfp8_gemm_async_scales_accept_row_padding() -> None:
     [
         (1024, 1792, 5120, True),
         (8175, 1152, 5120, True),
-        (641, 5120, 576, True),
+        (769, 5120, 576, True),
         (257, 256, 512, True),
         (256, 4096, 1280, False),
     ],

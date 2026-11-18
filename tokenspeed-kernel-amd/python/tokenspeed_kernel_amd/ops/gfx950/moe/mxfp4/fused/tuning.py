@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import NamedTuple
 
 import torch
@@ -34,6 +35,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _SWIZZLE_K_S_INNER,
     _TCP_INFLIGHT_CAP_BYTES,
 )
+
+# Mirrors ``prefill_stage1._S1_PIPELINE``; read once at import.
+_PREFILL_S1_V2 = os.environ.get("TOKENSPEED_MOE_PREFILL_S1_V2", "1") == "1"
 
 
 class _GroupedMoEConfig(NamedTuple):
@@ -78,6 +82,11 @@ def _select_grouped_moe_block_m(
 ) -> int:
     """Limit per-expert padding for sparse routes without shrinking dense tiles."""
     routed_rows = num_tokens * top_k
+    # The pipelined stage-1 K loop (``TOKENSPEED_MOE_PREFILL_S1_V2``) only
+    # covers 64-row tiles; with it, those win from 24 to 320 routes per
+    # expert, including the dense bands that otherwise pick 32 or 128.
+    if _PREFILL_S1_V2 and 24 * num_experts < routed_rows <= 320 * num_experts:
+        return 64
     if routed_rows <= 8 * num_experts:
         return 16
     if routed_rows <= 32 * num_experts:

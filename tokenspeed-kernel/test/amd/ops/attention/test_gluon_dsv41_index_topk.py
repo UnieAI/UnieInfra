@@ -80,11 +80,14 @@ def test_gluon_index_topk_is_selected_on_supported_amd():
 
 @pytest.mark.parametrize(
     ("width", "expected"),
-    [(32768, 256), (131072, 64), (1048576, 8)],
+    # Up to a 512K-row history (1M tokens at compress ratio 2) one tile holds a
+    # whole 256-query API chunk, so launches per chunk don't grow with context.
+    # A split tile keeps a multiple of 120 rows so speculative rows stay whole.
+    [(32768, 256), (131072, 256), (524288, 256), (1048576, 120)],
 )
 def test_gluon_index_topk_query_tile_bounds_logits(width, expected):
     assert gluon_indexer._score_query_tile(256, width) == expected
-    assert expected * width * torch.float32.itemsize <= 32 << 20
+    assert expected * width * torch.float32.itemsize <= 512 << 20
 
 
 @pytest.fixture
@@ -193,9 +196,29 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
 
 
 @pytest.mark.parametrize(
+    ("queries", "width", "bound", "expected"),
+    [
+        # Small scoring work keeps short chunks so enough CTAs stay resident.
+        (6, 4096, 1024, 256),
+        (96, 8192, 1024, 512),
+        # Long histories take the longest chunk the caller allows.
+        (96, 75_008, 1024, 1024),
+        (16, 300_032, 1024, 1024),
+        (96, 75_008, 256, 256),
+        (96, 75_008, 64, 64),
+    ],
+)
+def test_gfx950_index_score_chunk_follows_work(queries, width, bound, expected):
+    module = importlib.import_module(
+        "tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer"
+    )
+    assert module._score_chunk(queries, width, bound) == expected
+
+
+@pytest.mark.parametrize(
     ("arch", "entry_name", "kernel_name", "tile_n"),
     [
-        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950", 32),
+        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950", 16),
         ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250", 64),
     ],
 )
@@ -232,7 +255,10 @@ def test_indexer_score_chunk_bound(
     table = torch.empty((tokens, 5), dtype=torch.int32)
     visible = torch.empty((tokens,), dtype=torch.int32)
     logits = torch.empty((tokens, width), dtype=torch.float32)
-    getattr(module, entry_name)(
+    # gfx950 sends chunks of 64+ rows to the row-block and candidate kernels;
+    # this checks the per-row scorer's chunking directly.
+    entry = module._launch_per_row if arch == "gfx950" else getattr(module, entry_name)
+    entry(
         torch.empty((tokens, 32, 64), dtype=torch.uint8),
         torch.empty((tokens, 32), dtype=torch.int32),
         weights,

@@ -23,10 +23,15 @@
 import dataclasses
 import math
 import os
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes, iris
+from tokenspeed_kernel.ops.communication._iris.synchronization import (
+    wait_stores,
+    wait_vmem,
+)
 from tokenspeed_kernel.ops.communication.iris import (
     _PACKED_WORD_BYTES,
     _PRODUCER_DIRECT_GL_DTYPES,
@@ -67,16 +72,23 @@ class PullAllReduceArchConfig:
             empty selects the default.
         remote_store_cache: Cache modifier for stores into peer symmetric
             memory; empty selects the default.
+        wait_stores: Gluon function waiting until this subgroup's vector
+            stores completed, run by every subgroup before the barrier that
+            precedes a one-thread release (``s_barrier`` waits for no memory
+            counter, and the releasing thread's wait covers only its own
+            subgroup).
     """
 
     peer_load_cache: str
     remote_store_cache: str
+    wait_stores: Callable
 
 
 _PULL_ALL_REDUCE_ARCH_CONFIGS = {
     ArchVersion(9, 5): PullAllReduceArchConfig(
         peer_load_cache=".cg",
         remote_store_cache=".wt",
+        wait_stores=wait_vmem,
     ),
     # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
     # partially read sector over the fabric, and ".wt" peer stores are an order
@@ -84,6 +96,7 @@ _PULL_ALL_REDUCE_ARCH_CONFIGS = {
     ArchVersion(12, 5): PullAllReduceArchConfig(
         peer_load_cache="",
         remote_store_cache="",
+        wait_stores=wait_stores,
     ),
 }
 
@@ -261,6 +274,7 @@ def _launch_pull_twoshot(
         EXIT_BARRIER=exit_barrier,
         PEER_LOAD_CACHE=arch.peer_load_cache,
         REMOTE_STORE_CACHE=arch.remote_store_cache,
+        WAIT_STORES=arch.wait_stores,
         **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
@@ -1298,6 +1312,7 @@ def iris_pull_twoshot(
     EXIT_BARRIER: gl.constexpr,
     PEER_LOAD_CACHE: gl.constexpr,
     REMOTE_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
     residual=None,
     post=None,
     comb=None,
@@ -1430,6 +1445,12 @@ def iris_pull_twoshot(
         )
         tile_id += NUM_PROGRAMS
 
+    # Every subgroup stored part of the partition. The barrier the compiler
+    # inserts before the one-thread release does not wait for memory, and the
+    # releasing thread's buffer_wbl2 and s_waitcnt vmcnt(0) cover only its own
+    # subgroup's stores. So each subgroup first waits until its stores reach
+    # L2 (s_waitcnt vmcnt(0) on gfx950).
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,

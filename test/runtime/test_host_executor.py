@@ -391,7 +391,9 @@ class TestGroupAwareWireTest:
 
         tracker.set_consumers.assert_called_once_with(-1)
 
-    def _prefetch_executor(self, *, batch_pages=2, timeout_base_s=10.0, rank=0):
+    def _prefetch_executor(
+        self, *, batch_pages=2, timeout_base_s=10.0, rank=0, depth=1
+    ):
         """A bare executor with the prefetch lane's state and a mock L3 store."""
         module = _load_executor_module_without_triton(force_isolated=True)
         executor = module.HostCacheExecutor.__new__(module.HostCacheExecutor)
@@ -409,6 +411,8 @@ class TestGroupAwareWireTest:
         executor._l3_prefetch_timeout_base_s = timeout_base_s
         executor._l3_prefetch_timeout_per_page_s = 0.0
         executor._l3_prefetch_batch_pages = batch_pages
+        executor._l3_prefetch_depth = depth
+        executor._l3_prefetch_io = None
         executor.block_owners = _identity_owners(num_groups=2)
         return module, executor
 
@@ -477,6 +481,58 @@ class TestGroupAwareWireTest:
         assert (executor.l3_prefetch_progress()) == ({})
         with pytest.raises((KeyError)):
             executor.complete_l3_prefetch(5, 1)
+
+    def test_prefetch_read_ahead_keeps_two_batches_in_flight(self):
+        """Depth 2: the next batch is issued while the current one is still
+        reading, so the store never idles between batches; every page lands."""
+        module, executor = self._prefetch_executor(batch_pages=1, depth=2)
+        second_started = threading.Event()
+        calls = []
+
+        def prefetch(pages):
+            calls.append(pages[0][2])
+            if pages[0][2] == "h0":
+                # Batch 0 finishes only once batch 1 has been issued.
+                if not second_started.wait(5.0):
+                    raise AssertionError("batch 1 was not issued during batch 0")
+            elif pages[0][2] == "h1":
+                second_started.set()
+            return [True] * len(pages)
+
+        executor.l3_store.prefetch.side_effect = prefetch
+        executor.submit_prefetches([self._prefetch_op(module, 7, 4)])
+        try:
+            assert (self._settle(executor, 7)) == (4)
+        finally:
+            executor._l3_prefetch_io.shutdown(wait=True)
+        assert (sorted(calls)) == (["h0", "h1", "h2", "h3"])
+
+    def test_prefetch_read_ahead_past_a_miss_retires_before_the_result(self):
+        """A miss in batch 0 lands nothing, but the read-ahead batch 1 is
+        writing Host pages: the op reports done only after it finished."""
+        module, executor = self._prefetch_executor(batch_pages=1, depth=2)
+        release = threading.Event()
+        finished = []
+
+        def prefetch(pages):
+            if pages[0][2] == "h0":
+                return [False]
+            if not release.wait(5.0):
+                raise AssertionError("test did not release batch 1")
+            finished.append(pages[0][2])
+            return [True]
+
+        executor.l3_store.prefetch.side_effect = prefetch
+        executor.submit_prefetches([self._prefetch_op(module, 8, 3)])
+        try:
+            time.sleep(0.1)
+            assert (executor.l3_prefetch_progress()[8]) == ((False, 0))
+            release.set()
+            assert (self._settle(executor, 8)) == (0)
+            assert (finished) == (["h1"])  # batch 2 is never issued after the miss
+        finally:
+            release.set()
+            executor._l3_prefetch_io.shutdown(wait=True)
 
     def test_prefetch_lane_stops_at_the_deadline_and_on_a_backend_fault(self):
         module, executor = self._prefetch_executor(batch_pages=1, timeout_base_s=1.0)

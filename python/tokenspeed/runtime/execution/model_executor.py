@@ -1089,8 +1089,11 @@ class ModelExecutor:
 
         tic = time.time()
         set_autotune_process_group(cpu_group)
-        # Capture later refreshes the metadata created here in place.
-        with torch.no_grad(), autotune(
+        # Capture later refreshes the metadata created here in place. Same
+        # grad mode as the serving forward: communication staging buffers
+        # created there are inference tensors, which only accept in-place
+        # writes inside inference mode (no_grad alone fails at TP>1 on Iris).
+        with maybe_inference_mode(), autotune(
             tune_mode=True, tuning_buckets=None, round_up=None
         ):
             # Dummy forwards must not borrow live Engram history or masks.

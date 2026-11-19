@@ -1474,6 +1474,21 @@ class DeepseekV41Attention(nn.Module):
             else:
                 q = self.rotary_emb.apply_owned(q, positions, False)
             swa, swa_rope_cache, swa_norm_weight = self._swa_inputs(swa, positions)
+            if mode.is_decode() and self.is_index_source and rows.keep_rows is None:
+                # Publish this step's SWA rows on the main stream while the
+                # index branch still runs; forward_v41 then skips its write.
+                # Nothing on the index branch reads the SWA cache, and the
+                # attention that reads it follows on this stream.
+                backend.write_decode_swa(
+                    self.layer_id,
+                    swa,
+                    positions,
+                    requests,
+                    mode,
+                    swa_rope_cache=swa_rope_cache,
+                    swa_norm_weight=swa_norm_weight,
+                    swa_norm_eps=self.kv_norm.variance_epsilon,
+                )
         if overlap:
             # Aux-owned scratch can outlive this layer through source/reuse
             # records. Main consumers and allocator reuse both follow the join.
@@ -2186,6 +2201,17 @@ class DeepseekV41Model(nn.Module):
             )
         backend = ctx.attn_backend
         backend.begin_indexer_forward()
+        # Decode builds the Full sources' index geometry on the auxiliary
+        # stream, off the index layers' chains, and joins it at the end.
+        geometry_built = (
+            self._index_geometry_branch(
+                lambda: backend.prepare_decode_index_geometry(ctx.forward_mode)
+            )
+            if ctx.forward_mode is not None
+            and ctx.forward_mode.is_decode()
+            and hasattr(backend, "prepare_decode_index_geometry")
+            else None
+        )
         state = self.encoder_forward(
             input_ids,
             positions,
@@ -2199,8 +2225,33 @@ class DeepseekV41Model(nn.Module):
         state = self.narrowing_forward(state, ctx)
         hidden, captured = self.decoder_forward(state, ctx)
         output = self.finish_forward(hidden, captured, ctx)
+        if geometry_built is not None:
+            torch.cuda.current_stream().wait_event(geometry_built)
         backend.end_indexer_forward()
         return output
+
+    def _index_geometry_branch(self, build) -> torch.cuda.Event | None:
+        """Run ``build`` on the auxiliary stream after the main stream's queued work.
+
+        The main stream does not wait here: index layers read the geometry on
+        the auxiliary stream, which orders them after it; a scoring call on
+        another stream waits through the index metadata's ready event.
+        Returns the branch's completion event, which the forward joins at its
+        end so no capture leaves it unjoined. Without an auxiliary stream
+        (CPU) the build runs in place and there is nothing to join.
+        """
+        if self.aux_stream is None:
+            build()
+            return None
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        with torch.cuda.stream(self.aux_stream):
+            self.aux_stream.wait_event(fork)
+            build()
+            done = torch.cuda.Event()
+            done.record(self.aux_stream)
+        return done
 
     def _run_layer(
         self,

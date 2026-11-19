@@ -32,6 +32,7 @@ multimodal, so image requests are rejected by the text-only request path.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from typing import Any
 
@@ -42,6 +43,7 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
 from tokenspeed.runtime.models.llama import (
@@ -51,6 +53,36 @@ from tokenspeed.runtime.models.llama import (
 from tokenspeed.runtime.utils import add_prefix
 
 _VISION_PREFIXES = ("model.vision_tower.", "model.multi_modal_projector.")
+
+
+def _yarn_mscale(scale: float, mscale: float = 1.0) -> float:
+    return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
+
+
+def hf_yarn_rope_scaling(rope_parameters: dict[str, Any]) -> dict[str, Any] | None:
+    """``rope_parameters`` for ``get_rope`` with HF's YaRN attention factor.
+
+    HF scales cos/sin by ``attention_factor``, or, when both ``mscale`` and
+    ``mscale_all_dim`` are set, by ``mscale(f, mscale) / mscale(f,
+    mscale_all_dim)`` (1.0 for Ministral-3-14B), else by ``mscale(f)``.
+    TokenSpeed's ``yarn`` multiplies ``mscale(f)`` by ``attn_factor``, so pass
+    the ratio as ``attn_factor``.
+    """
+    params = dict(rope_parameters or {})
+    if params.get("rope_type", params.get("type")) != "yarn":
+        return params or None
+    factor = float(params["factor"])
+    attention_factor = params.get("attention_factor")
+    mscale, mscale_all_dim = params.get("mscale"), params.get("mscale_all_dim")
+    if attention_factor is None:
+        if mscale and mscale_all_dim:
+            attention_factor = _yarn_mscale(factor, mscale) / _yarn_mscale(
+                factor, mscale_all_dim
+            )
+        else:
+            attention_factor = _yarn_mscale(factor)
+    params["attn_factor"] = float(attention_factor) / _yarn_mscale(factor)
+    return params
 
 
 def llama4_query_scale(
@@ -66,9 +98,17 @@ class Ministral3Attention(LlamaAttention):
     """Llama attention + YaRN + Llama-4 query temperature scaling."""
 
     def __init__(self, config, *args, **kwargs) -> None:
-        # LlamaAttention builds YaRN RoPE from ``config.rope_scaling``.
         super().__init__(config, *args, **kwargs)
         params = get_rope_parameters(config)
+        # Rebuild RoPE: LlamaAttention's YaRN ignores mscale / mscale_all_dim.
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=getattr(config, "max_position_embeddings", 8192),
+            base=params.get("rope_theta", 10000.0),
+            rope_scaling=hf_yarn_rope_scaling(params),
+        )
+        self.attn.rotary_emb = self.rotary_emb
         self.llama4_beta = float(params.get("llama_4_scaling_beta") or 0.0)
         self.llama4_orig_max = int(
             params.get("original_max_position_embeddings")

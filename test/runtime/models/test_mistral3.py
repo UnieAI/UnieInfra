@@ -22,8 +22,10 @@ import math
 
 import torch
 
+from tokenspeed.runtime.layers.rotary_embedding import _yarn_get_mscale
 from tokenspeed.runtime.models.mistral3 import (
     Mistral3ForConditionalGeneration,
+    hf_yarn_rope_scaling,
     llama4_query_scale,
 )
 
@@ -53,3 +55,38 @@ def test_checkpoint_names_map_to_text_model():
     # Vision tower / projector are unsupported and dropped.
     assert r("model.vision_tower.patch_conv.weight") is None
     assert r("model.multi_modal_projector.linear_1.weight") is None
+
+
+def _hf_attention_factor(p):
+    def m(scale, ms=1.0):
+        return 1.0 if scale <= 1 else 0.1 * ms * math.log(scale) + 1.0
+
+    if p.get("mscale") and p.get("mscale_all_dim"):
+        return m(p["factor"], p["mscale"]) / m(p["factor"], p["mscale_all_dim"])
+    return m(p["factor"])
+
+
+def test_yarn_attention_factor_matches_hf():
+    # Ministral-3-14B (mscale == mscale_all_dim -> 1.0) and the tiny config
+    # (mscale_all_dim == 0 -> mscale(factor)).
+    for p in (
+        {
+            "rope_type": "yarn",
+            "factor": 16.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 16384,
+            "beta_fast": 32.0,
+        },
+        {
+            "rope_type": "yarn",
+            "factor": 64.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 0.0,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 4.0,
+        },
+    ):
+        out = hf_yarn_rope_scaling(p)
+        got = _yarn_get_mscale(p["factor"]) * out["attn_factor"]
+        assert math.isclose(got, _hf_attention_factor(p), rel_tol=1e-9)

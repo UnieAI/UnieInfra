@@ -2510,5 +2510,15 @@
     "interpretation": "No regression; fixes are correctness-only, c4 gain likely run variance. #3317 Petit EP4 hangs on MI350P (hardcoded 256 CUs, MI350P 128).",
     "decision": "PR #52 opened, awaiting merge approval. Next: vLLM #66047 decode indexer row sharding.",
     "commit": "0e910b51b (roy/upstream-fixes)"
+  },
+  {
+    "id": 264,
+    "date": "2026-11-19",
+    "area": "KV tiering / L3 prefetch double buffering",
+    "experiment": "Idea from Hibana (2x256 MiB restore staging): L3 prefetch keeps 2 batch_get_into batches in flight (batch k+1 issued before batch k is checked). Read-ahead past a miss retires before the op reports done. Microbench: file L3 on NVMe, O_DIRECT, 16 io threads, 6x38 KB objects/page, 128 pages/batch, depth 1 vs 2 interleaved x12.",
+    "result": "93 pages (24k tok, 21 MiB): 6.0 -> 5.8 ms. 512 pages (~131k tok, 114 MiB): 30.6 -> 25.7 ms (-16%, 3.64 -> 4.33 GiB/s). 2048 pages (456 MiB): 169.7 -> 173.7 ms (disk-bound, no gain). Tests: 2 new pass, fail with depth forced to 1; same 9 pre-existing failures on base l3-tp-dedupe.",
+    "interpretation": "Helps mid-size prefixes that span several batches; short prefixes fit one batch, very long ones are bound by the drive. No e2e run (machine wipe).",
+    "decision": "Branch roy/l3-prefetch-pipeline pushed, no PR yet.",
+    "commit": "3f4c679ba (l3-prefetch-pipeline)"
   }
 ]

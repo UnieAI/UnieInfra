@@ -43,6 +43,7 @@ holds (``V41Metadata.global_write_floor``).
 """
 
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -93,13 +94,23 @@ from tokenspeed.runtime.layers.attention.prefill_head_exchange import (
     selected_prefill_with_head_exchange,
     should_exchange_prefill_heads,
 )
-from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
+from tokenspeed.runtime.layers.attention.query_partition import (
+    ContiguousQueryPlan,
+    InterleavedQueryPlan,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
 
 # Initial long-prefill thresholds; tune with query count and visible history.
 _INDEXER_PARTITION_MIN_QUERIES = 4096
 _INDEXER_PARTITION_MIN_HISTORY = 8192
+# Decode indexer row sharding over attention TP (vLLM #66047): each rank scores
+# a contiguous block of whole requests, then one int32 all-gather per source
+# layer restores every row's Top-K. Pure decode only; off by default.
+_DECODE_INDEXER_TP = os.environ.get("TOKENSPEED_DSV41_DECODE_INDEXER_TP", "0") == "1"
+_DECODE_INDEXER_TP_MIN_ROWS = int(
+    os.environ.get("TOKENSPEED_DSV41_DECODE_INDEXER_TP_MIN_ROWS", "64")
+)
 
 
 class V41CompressorPlan(NamedTuple):
@@ -1542,6 +1553,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         source = self.spec.index_sources[layer_id]
         group = self.spec.indexer_query_group
         total = positions.numel()
+        if forward_mode.is_decode():
+            return self._plan_decode_indexer_queries(
+                layer_id, positions, requests, index_process_group
+            )
         if (
             forward_mode.is_mixed()
             or not forward_mode.is_extend()
@@ -1567,6 +1582,56 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         return InterleavedQueryPlan(
             total_rows=total, rank=self.spec.indexer_query_rank, size=len(group)
         )
+
+    def _plan_decode_indexer_queries(
+        self, layer_id, positions, requests, index_process_group
+    ) -> ContiguousQueryPlan | None:
+        """Shard pure-decode indexer rows by whole requests over attention TP.
+
+        The decision depends only on host shapes and layer topology, so eager
+        and captured decode of one batch size take the same branch. Mixed
+        steps (num_extends > 0), KVP, sharded indexer heads and the
+        candidate-source layer keep the replicated path.
+        """
+        group = self.spec.indexer_decode_group
+        total = positions.numel()
+        meta = self.forward_decode_metadata
+        owner = self.spec.kv_owners[layer_id]
+        width = self.spec_num_tokens
+        if (
+            not _DECODE_INDEXER_TP
+            or len(group) <= 1
+            or total < max(_DECODE_INDEXER_TP_MIN_ROWS, len(group))
+            or not positions.is_cuda
+            or index_process_group is not None
+            or self.kvp_size != 1
+            or owner < 0
+            or layer_id != self.spec.index_sources[layer_id]
+            or layer_id == self.spec.candidate_source
+            or meta is None
+            or meta.num_extends
+            or positions is not meta.positions
+            or requests is not meta.request_indices
+            or total % width
+        ):
+            return None
+        requests_per_rank = -(-(total // width) // len(group))
+        return ContiguousQueryPlan(
+            total_rows=total,
+            rank=self.spec.indexer_decode_rank,
+            size=len(group),
+            block=requests_per_rank * width,
+        )
+
+    def _decode_shard_rows(self, partition, positions, requests):
+        """Per-forward local row views, so source layers share index geometry."""
+        key = ("decode-shard", id(positions), id(requests), partition)
+        entry = self._index_geometry.get(key)
+        if entry is None or entry[0] is not positions or entry[1] is not requests:
+            local = partition.local_slice
+            entry = (positions, requests, positions[local], requests[local])
+            self._index_geometry[key] = entry
+        return entry[2], entry[3]
 
     def select_global(
         self,
@@ -1727,19 +1792,34 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError(
                 "Indexer projection row count disagrees with its query plan"
             )
+        decode_shard = isinstance(partition, ContiguousQueryPlan)
+        if decode_shard:
+            query_group = self.spec.indexer_decode_group
         if partition is not None:
             if projected_partition is None:
                 index_q = index_q[partition.local_slice]
                 index_weights = index_weights[partition.local_slice].contiguous()
-            scoring_positions = positions[partition.local_slice].contiguous()
-            scoring_requests = request_indices[partition.local_slice].contiguous()
+            if decode_shard:
+                scoring_positions, scoring_requests = self._decode_shard_rows(
+                    partition, positions, request_indices
+                )
+                if reindex:
+                    # Candidate rows follow the scoring rows' local numbering.
+                    if same_candidate_rows:
+                        candidate_blocks = candidates.block_ids[partition.local_slice]
+                    else:
+                        candidate_index = candidate_index[partition.local_slice]
+            else:
+                scoring_positions = positions[partition.local_slice].contiguous()
+                scoring_requests = request_indices[partition.local_slice].contiguous()
             n = partition.local_rows
             if layer_id not in self._partitioned_index_layers:
                 self._partitioned_index_layers.add(layer_id)
-                if self.spec.indexer_query_rank == 0:
+                if partition.rank == 0:
                     logging.getLogger(__name__).info(
                         f"V4.1 indexer QCP: layer={layer_id}, "
-                        f"layout=interleave, size={partition.size}, "
+                        f"layout={'contiguous' if decode_shard else 'interleave'}, "
+                        f"size={partition.size}, "
                         f"global_rows={partition.total_rows}, local_rows={n}, "
                         f"local_projection={projected_partition is not None}"
                     )
@@ -1773,7 +1853,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 for start in range(0, n, query_tile)
             ]
         )
-        if partition is not None:
+        if partition is not None and not decode_shard:
             windows = [
                 (*partition.local_bounds(start, stop), span)
                 for start, stop, span in windows
@@ -1864,7 +1944,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             cb = None
             if reindex and selection_kind == "candidates":
                 if same_candidate_rows:
-                    cb = candidates.block_ids[start:stop]
+                    cb = (
+                        candidate_blocks[start:stop]
+                        if decode_shard
+                        else candidates.block_ids[start:stop]
+                    )
                 else:
                     ci = candidate_index[start:stop]
                     cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(

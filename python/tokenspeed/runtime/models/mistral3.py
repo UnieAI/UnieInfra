@@ -53,6 +53,15 @@ from tokenspeed.runtime.utils import add_prefix
 _VISION_PREFIXES = ("model.vision_tower.", "model.multi_modal_projector.")
 
 
+def llama4_query_scale(
+    positions: torch.Tensor, beta: float, original_max_position: int
+) -> torch.Tensor:
+    """Per-token query temperature ``1 + beta * log(1 + floor(pos / orig_max))``."""
+    return 1.0 + beta * torch.log1p(
+        torch.floor(positions.float() / original_max_position)
+    )
+
+
 class Ministral3Attention(LlamaAttention):
     """Llama attention + YaRN + Llama-4 query temperature scaling."""
 
@@ -68,10 +77,10 @@ class Ministral3Attention(LlamaAttention):
 
     def _attn(self, positions, q, k, v, ctx: ForwardContext) -> torch.Tensor:
         if self.llama4_beta != 0.0:
-            # 1 + beta * log(1 + floor(pos / original_max)); RoPE is a rotation,
-            # so scaling q before it equals HF's scaling after it.
-            scale = 1.0 + self.llama4_beta * torch.log1p(
-                torch.floor(positions.float() / self.llama4_orig_max)
+            # RoPE is a rotation, so scaling q before it equals HF's scaling
+            # after it.
+            scale = llama4_query_scale(
+                positions, self.llama4_beta, self.llama4_orig_max
             )
             q = (
                 q.view(q.shape[0], -1, self.head_dim) * scale.to(q.dtype)[:, None, None]

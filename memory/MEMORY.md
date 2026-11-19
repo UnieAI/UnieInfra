@@ -1,0 +1,4 @@
+- [MI350P benchmark rules](mi350p-benchmark-rules.md) — optimize only UnieInfra, fill every c1–c128 cell, log every iteration to experiments.json + dashboard
+- [No Claude attribution](no-claude-attribution.md) — unieinfra commits/PRs: no Co-Authored-By/Claude-Session/Generated-with lines; keep Signed-off-by
+- [Keep kernel wins](keep-kernel-wins.md) — default-enable verified microbench gains even if e2e A/B is noise
+- [GB10 UMA pending](gb10-uma-pending.md) — GB10 UMA phase 2 waits for a machine; PR #49 file L3 is open

@@ -1,0 +1,105 @@
+agent_config: null
+analysis_report: false
+api_key: '**********'
+api_url: http://127.0.0.1:8000/v1
+chat_template: null
+collect_perf: true
+dataset_args:
+  gsm8k:
+    dataset_id: openai/gsm8k
+dataset_dir: /home/smc/.cache/modelscope/hub/datasets
+dataset_hub: huggingface
+datasets:
+- gsm8k
+debug: false
+enable_progress_tracker: false
+eval_backend: Native
+eval_batch_size: 32
+eval_config: null
+eval_type: openai_api
+evalscope_version: 1.11.1
+evaluation_identity:
+  benchmarks:
+    gsm8k:
+      cache_source: null
+      evaluation_version: v1.0
+      fingerprint: sha256:6f368882841bc4ec8e7a690cd20c137f798538463d1135aa7204e28bbb51553e
+  schema_version: 1
+generation_config:
+  batch_size: 32
+  do_sample: false
+  max_tokens: 512
+  temperature: 0.0
+ignore_errors: false
+judge:
+  aggregation: mean
+  contract:
+    prompt_template: null
+    score_mapping: null
+    score_type: pattern
+    system_prompt: null
+  min_valid_judges: 1
+  models: []
+  position_swap: auto
+  repeats: 1
+  strategy: auto
+limit: null
+model: deepseek-ai/DeepSeek-V4.1-Flash-1017
+model_args: {}
+model_id: DeepSeek-V4.1-Flash-1017
+model_task: text_generation
+no_timestamp: false
+repeats: 1
+rerun_review: false
+resolved_benchmarks:
+  gsm8k:
+    aggregation: mean
+    dataset_hub: huggingface
+    dataset_id: openai/gsm8k
+    dataset_revision: null
+    default_subset: default
+    eval_split: test
+    extra_params: {}
+    few_shot_num: 4
+    few_shot_prompt_template: 'Here are some examples of how to solve similar problems:
+
+
+      {fewshot}
+
+
+      {question}
+
+      Please reason step by step, and put your final answer within \boxed{{}}.'
+    few_shot_random: false
+    filters: null
+    max_image_bytes: null
+    metric_list:
+    - accuracy:
+        numeric: true
+    name: gsm8k
+    primary_metric: null
+    prompt_template: '{question}
+
+      Please reason step by step, and put your final answer within \boxed{{}}.'
+    query_template: null
+    sandbox_config: {}
+    shuffle: false
+    shuffle_choices: false
+    subset_list:
+    - main
+    system_prompt: null
+    train_split: train
+sandbox:
+  default_config: {}
+  enabled: false
+  engine: docker
+  manager_config: {}
+  pool_size: null
+sandbox_manager_config: {}
+sandbox_type: docker
+seed: 42
+stream: null
+timeout: null
+use_cache: null
+use_sandbox: false
+work_dir: /home/smc/workspace/roy/results/gsm8k/unieinfra-mtbo-20261117T102354Z/20261117_102355

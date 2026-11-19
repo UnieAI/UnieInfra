@@ -1,0 +1,742 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UnieInfra on 4× MI350P — AgentX vs vLLM and SGLang</title>
+<style>
+  :root{
+    --bg:#0b0d10; --panel:#12151a; --panel-2:#0f1216;
+    --line:#232830; --line-soft:#1b2027;
+    --fg:#e7ebf0; --muted:#98a2b0; --dim:#6b7684;
+    --accent:#f5b544; --warn:#f0857a;
+    --r:10px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg); color:var(--fg);
+    font:15px/1.6 Inter, ui-sans-serif, -apple-system, "Segoe UI", "Noto Sans TC", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  strong{font-weight:600; color:#fff}
+  em{font-style:normal; color:var(--fg); border-bottom:1px solid var(--line)}
+  a{color:inherit}
+
+  header.top{
+    position:sticky; top:0; z-index:20;
+    display:flex; align-items:center; justify-content:space-between; gap:16px;
+    padding:10px 28px; border-bottom:1px solid var(--line-soft);
+    background:rgba(11,13,16,.88); backdrop-filter:blur(10px);
+    font-size:12.5px; color:var(--muted);
+  }
+  header.top b{color:var(--fg); font-weight:600; letter-spacing:.01em}
+  header.top .sep{color:#3a424d; margin:0 8px}
+  header.top .dot{display:inline-block; width:6px; height:6px; border-radius:50%; background:#4ade80; margin-right:7px; vertical-align:1px}
+
+  main{max-width:1560px; margin:0 auto; padding:34px 28px 64px}
+
+  .intro h1{
+    margin:0 0 14px; font-size:clamp(24px,3vw,34px); line-height:1.15;
+    font-weight:600; letter-spacing:-.018em; max-width:24ch;
+  }
+  .lede{margin:0 0 10px; max-width:86ch; color:#cfd7e1; font-size:15.5px}
+  .sub{margin:0; max-width:86ch; color:var(--muted); font-size:14px}
+
+  .kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(168px,1fr)); gap:10px; margin:22px 0 6px}
+  .kpi{background:var(--panel); border:1px solid var(--line); border-radius:var(--r); padding:12px 14px}
+  .kpi-k{font-size:11px; letter-spacing:.07em; text-transform:uppercase; color:var(--dim)}
+  .kpi-v{font-size:27px; line-height:1.2; font-weight:600; font-variant-numeric:tabular-nums; margin-top:2px}
+  .kpi-u{font-size:12px; font-weight:500; color:var(--muted); margin-left:5px}
+  .kpi-f{font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; margin-top:2px}
+  .kpi-warn .kpi-v{color:var(--warn)}
+
+  .controls{
+    margin:26px 0 6px; padding:14px 16px; border:1px solid var(--line); border-radius:var(--r);
+    background:var(--panel-2);
+  }
+  .control-row{display:flex; flex-wrap:wrap; align-items:center; gap:14px 18px}
+  .ctl-group{display:flex; align-items:center; gap:8px; font-size:12px; color:var(--dim)}
+  .ctl-group > span{letter-spacing:.04em}
+  .seg{display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden}
+  .seg button{
+    appearance:none; background:transparent; border:0; color:var(--muted);
+    font:inherit; font-size:12.5px; padding:6px 11px; cursor:pointer;
+  }
+  .seg button + button{border-left:1px solid var(--line-soft)}
+  .seg button[aria-pressed="true"]{background:#1c2129; color:var(--fg)}
+  .seg button:hover{color:var(--fg)}
+  select{
+    appearance:none; background:#151920 url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M0 0l5 6 5-6z' fill='%2398a2b0'/></svg>") no-repeat right 9px center;
+    color:var(--fg); border:1px solid var(--line); border-radius:8px;
+    font:inherit; font-size:12.5px; padding:6px 26px 6px 10px; cursor:pointer;
+  }
+  .legend{display:flex; flex-wrap:wrap; gap:6px; margin-top:14px}
+  .chip{
+    display:inline-flex; align-items:center; gap:6px; padding:3px 9px;
+    border:1px solid var(--line); border-radius:999px; background:#14181e;
+    font-size:11.5px; color:var(--muted); cursor:pointer; user-select:none;
+    transition:color .12s, border-color .12s;
+  }
+  .chip:hover{color:var(--fg); border-color:#3a424d}
+  .chip .sw{width:8px; height:8px; border-radius:2px; flex:none}
+  .chip.off{opacity:.4; text-decoration:line-through}
+  .chip.stress{border-style:dashed}
+  .hintline{margin:10px 0 0; font-size:12px; color:var(--dim)}
+
+  .charts{display:grid; grid-template-columns:1fr; gap:14px; margin-top:22px}
+  @media (min-width:1180px){ .charts.two{grid-template-columns:1fr 1fr} }
+  figure.card{
+    margin:0; background:var(--panel); border:1px solid var(--line);
+    border-radius:var(--r); padding:14px 16px 8px;
+  }
+  figcaption h3{
+    margin:0; font-size:11.5px; letter-spacing:.085em; text-transform:uppercase;
+    color:var(--fg); font-weight:600;
+  }
+  figcaption p{margin:4px 0 10px; font-size:12px; color:var(--dim); max-width:86ch}
+  .plot{width:100%; overflow:hidden}
+  .plot-empty{padding:40px 0; text-align:center; color:var(--dim); font-size:13px}
+  svg{display:block; width:100%}
+  .grid{stroke:#1d222a; stroke-width:1}
+  .axis-label{fill:var(--dim); font-size:10.5px; font-variant-numeric:tabular-nums}
+  .axis-title{fill:var(--dim); font-size:10.5px; letter-spacing:.05em; text-transform:uppercase}
+  .val{fill:#8b95a3; font-size:9.5px; font-variant-numeric:tabular-nums}
+  .val.focus{fill:#fff; font-size:10px; font-weight:600}
+  .bar{cursor:crosshair}
+  .bar.dim, .dot.dim, .seg.dim{opacity:.16}
+  .seg{pointer-events:none}
+  .dot{cursor:crosshair}
+  .goal{stroke:var(--accent); stroke-width:1; stroke-dasharray:5 4; opacity:.75}
+  .goal-label{fill:var(--accent); font-size:10px; letter-spacing:.04em}
+
+  section.block{margin-top:40px}
+  .block h2{margin:0 0 4px; font-size:15px; font-weight:600; letter-spacing:-.01em}
+  .block > p.note{margin:0 0 14px; font-size:12.5px; color:var(--dim); max-width:90ch}
+
+  .tip{
+    position:fixed; z-index:60; pointer-events:none; max-width:330px;
+    background:#080a0d; border:1px solid #2c333d; border-radius:9px;
+    padding:9px 11px; font-size:12px; line-height:1.5; color:var(--fg);
+    box-shadow:0 14px 34px rgba(0,0,0,.55);
+  }
+  .tip .tt-h{display:flex; align-items:center; gap:7px; font-weight:600; font-size:12.5px}
+  .tip .tt-h .sw{width:8px; height:8px; border-radius:2px}
+  .tip .tt-sub{color:var(--dim); font-size:11px; margin:2px 0 6px}
+  .tip table{border-collapse:collapse; font-variant-numeric:tabular-nums}
+  .tip td{padding:1px 0}
+  .tip td:first-child{color:var(--muted); padding-right:14px}
+  .tip td:last-child{text-align:right}
+
+  details.data{margin-top:34px; border-top:1px solid var(--line-soft); padding-top:14px}
+  details.data summary{cursor:pointer; font-size:12.5px; color:var(--muted)}
+  .tablewrap{max-height:460px; overflow:auto; margin-top:12px; border:1px solid var(--line); border-radius:8px}
+  table.rows{border-collapse:collapse; width:100%; font-size:11.5px; font-variant-numeric:tabular-nums}
+  table.rows th{
+    position:sticky; top:0; background:#171b22; text-align:right; font-weight:500;
+    color:var(--muted); padding:7px 9px; border-bottom:1px solid var(--line); white-space:nowrap;
+  }
+  table.rows th:first-child, table.rows td:first-child{text-align:left}
+  table.rows td{padding:5px 9px; text-align:right; color:#c6cdd6; border-bottom:1px solid #171b22; white-space:nowrap}
+  table.rows tr:hover td{background:#151a21}
+  table.rows td.run{text-align:left; color:var(--dim); font-size:10.5px}
+
+  footer{margin-top:44px; padding-top:16px; border-top:1px solid var(--line-soft); color:var(--dim); font-size:11.5px}
+  footer code{color:#b7c0cc; font-size:11px}
+
+  @media (max-width:640px){
+    header.top{padding:9px 16px}
+    header.top .hide-sm{display:none}
+    main{padding:24px 16px 48px}
+    .seg button{padding:7px 9px}
+    .kpi-v{font-size:23px}
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div><b>UnieInfra</b><span class="sep">/</span>4× MI350P<span class="sep">·</span>AgentX benchmark</div>
+  <div class="hide-sm"><span class="dot"></span><span id="meta"></span></div>
+</header>
+
+<main>
+  <section class="intro">
+    <h1>UnieInfra on 4× MI350P: AgentX vs vLLM and SGLang</h1>
+    <p class="lede">__LEDE__</p>
+    <p class="sub">__SUB__</p>
+    <div class="kpis">__KPIS__</div>
+  </section>
+
+  <section class="controls">
+    <div class="control-row">
+      <div class="ctl-group"><span>Show</span>
+        <div class="seg" id="filterSeg" role="group" aria-label="Series filter">
+          <button type="button" data-f="all">All series</button>
+          <button type="button" data-f="official" aria-pressed="true">Official runs</button>
+          <button type="button" data-f="stress">Stress runs</button>
+          <button type="button" data-f="best">Best vs best</button>
+        </div>
+      </div>
+      <div class="ctl-group"><span>Scale</span>
+        <div class="seg" id="scaleSeg" role="group" aria-label="Throughput scale">
+          <button type="button" data-s="abs" aria-pressed="true">Absolute</button>
+          <button type="button" data-s="rel">× vLLM</button>
+        </div>
+      </div>
+      <div class="ctl-group"><span>Baseline</span>
+        <select id="baselineSel" aria-label="Baseline">
+          <option value="auto">best vLLM of the same kind</option>
+          <option value="official">vLLM, official recipe</option>
+          <option value="best">best vLLM overall</option>
+        </select>
+      </div>
+    </div>
+    <div class="legend" id="legend"></div>
+    <p class="hintline" id="viewNote"></p>
+  </section>
+
+  <section class="charts" aria-label="Throughput by concurrency">
+    <figure class="card">
+      <figcaption>
+        <h3>Total output tokens/s</h3>
+        <p>Generated tokens per second across all four GPUs. Each bar is its own run's average rate and run windows differ (300–930 s), so read the tooltip before comparing two bars that are far apart.</p>
+      </figcaption>
+      <div class="plot" id="chart-out"></div>
+    </figure>
+    <figure class="card">
+      <figcaption>
+        <h3>Requests per minute</h3>
+        <p>Completed AgentX requests per minute. Each lane sends its next turn only after the previous one finishes.</p>
+      </figcaption>
+      <div class="plot" id="chart-rpm"></div>
+    </figure>
+    <figure class="card">
+      <figcaption>
+        <h3>Total input tokens/s</h3>
+        <p>Prompt tokens per second, prefix-cache hits included.</p>
+      </figcaption>
+      <div class="plot" id="chart-in"></div>
+    </figure>
+  </section>
+
+  <section class="block" aria-label="Throughput vs interactivity and latency">
+    <h2>Throughput vs interactivity and latency</h2>
+    <p class="note">Each point is one concurrency, c1 → c128. Up and to the right is better on both charts; a curve that turns left is the point where queueing starts to cost the user.</p>
+    <div class="charts two">
+      <figure class="card">
+        <figcaption>
+          <h3>Output tokens/s per GPU vs interactivity</h3>
+          <p>Interactivity is the median output speed a single user sees. Per-GPU throughput is total output divided by 4.</p>
+        </figcaption>
+        <div class="plot" id="chart-inter"></div>
+      </figure>
+      <figure class="card">
+        <figcaption>
+          <h3>Total output tokens/s vs TTFT</h3>
+          <p>Mean time to first token, queueing included, on a log axis.</p>
+        </figcaption>
+        <div class="plot" id="chart-ttft"></div>
+      </figure>
+    </div>
+  </section>
+
+  <details class="data">
+    <summary>All rows (each engine at each concurrency)</summary>
+    <div class="tablewrap">
+      <table class="rows">
+        <thead><tr>
+          <th>Engine</th><th>c</th><th>out tok/s</th><th>per GPU</th><th>req/min</th>
+          <th>in tok/s</th><th>TTFT mean</th><th>TTFT p99</th><th>user tok/s</th>
+          <th>dur s</th><th>err %</th><th style="text-align:left">Run</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </details>
+
+  <footer>
+    <div id="foot"></div>
+    <p style="margin:8px 0 0">Source: <code>dash_data/agentx_fresh.json</code> — one row per (engine, concurrency), latest successful AiPerf run for that cell. Rebuild with <code>python3 scripts/export_dashboard.py dash_data/agentx_fresh.json &amp;&amp; python3 dashboard/build.py</code>.</p>
+  </footer>
+</main>
+
+<div id="tip" class="tip" hidden></div>
+
+<script>
+"use strict";
+const ROWS = __ROWS__;
+const META = __META__;
+
+/* ---------- model ---------- */
+const CONCS = [1, 4, 16, 32, 64, 128];
+const FAMILIES = ["vLLM", "SGLang", "UnieInfra"];
+const PAL = {
+  vLLM: ["#4f9cf9", "#a9cbfb", "#2f7fe0"],
+  SGLang: ["#f0883e", "#f8c08a", "#cf6a1e"],
+  UnieInfra: ["#4ade80", "#22c55e", "#86efac", "#16a34a", "#6ee7b7", "#059669",
+              "#a7f3d0", "#34d399", "#bbf7d0", "#10b981"]
+};
+
+const fam = e => e.startsWith("vLLM") ? "vLLM" : e.startsWith("SGLang") ? "SGLang" : "UnieInfra";
+const isStress = e => e.indexOf("(stress") !== -1;
+
+for (const r of ROWS) {
+  r.family = fam(r.engine);
+  r.stress = isStress(r.engine);
+}
+
+const ENGINES = [...new Set(ROWS.map(r => r.engine))].sort((a, b) => {
+  const fa = FAMILIES.indexOf(fam(a)), fb = FAMILIES.indexOf(fam(b));
+  if (fa !== fb) return fa - fb;
+  const sa = isStress(a) ? 1 : 0, sb = isStress(b) ? 1 : 0;
+  if (sa !== sb) return sa - sb;
+  return rank(a).localeCompare(rank(b));
+});
+
+function rank(name) {
+  if (name === "UnieInfra optimized") return "00";
+  if (name.startsWith("AB ")) return "01 " + name;
+  if (name.startsWith("UnieInfra pareto")) {
+    const cap = +(name.match(/cap(\d+)/) || [, "999"])[1];
+    return "02 " + String(cap).padStart(4, "0");
+  }
+  if (name === "UnieInfra baseline") return "03";
+  if (name === "UnieInfra overlap off") return "04";
+  return "05 " + name;
+}
+
+const COLORS = (() => {
+  const n = { vLLM: 0, SGLang: 0, UnieInfra: 0 }, out = {};
+  for (const e of ENGINES) out[e] = PAL[fam(e)][n[fam(e)]++ % PAL[fam(e)].length];
+  return out;
+})();
+
+const POINTS = {};
+for (const e of ENGINES) POINTS[e] = new Map();
+for (const r of ROWS) POINTS[e0(r)].set(r.concurrency, r);
+function e0(r) { return r.engine; }
+
+const state = { filter: "official", scale: "abs", baseline: "auto", hidden: new Set(), focus: null };
+
+/* ---------- series selection ---------- */
+function seriesFor(name) {
+  return { name, family: fam(name), stress: isStress(name), color: COLORS[name], dashed: isStress(name), points: POINTS[name] };
+}
+
+function bestSeries(f) {
+  const pts = new Map();
+  for (const c of CONCS) {
+    let best = null;
+    for (const r of ROWS) {
+      if (r.family !== f || r.concurrency !== c) continue;
+      if (!best || r.output_tps > best.output_tps) best = r;
+    }
+    if (best) pts.set(c, best);
+  }
+  return { name: f + " (best)", family: f, stress: false, color: PAL[f][0], dashed: false, points: pts, synth: true };
+}
+
+function filteredSeries() {
+  if (state.filter === "best") return FAMILIES.map(bestSeries);
+  return ENGINES
+    .filter(e => state.filter === "all" ? true : state.filter === "stress" ? isStress(e) : !isStress(e))
+    .map(seriesFor)
+    .filter(s => s.points.size);
+}
+const activeSeries = () => filteredSeries().filter(s => !state.hidden.has(s.name));
+
+/* ---------- metrics ---------- */
+const val = (r, m) => (r && r[m] != null && !isNaN(r[m])) ? r[m] : null;
+
+function kindOf(s) { return state.filter === "best" ? "any" : (s.stress ? "stress" : "official"); }
+
+function baselineAt(conc, kind) {
+  let pool = ROWS.filter(r => r.family === "vLLM" && r.concurrency === conc);
+  if (state.baseline === "official") pool = pool.filter(r => !r.stress);
+  else if (state.baseline === "auto" && kind !== "any") pool = pool.filter(r => r.stress === (kind === "stress"));
+  let best = null;
+  for (const r of pool) if (!best || r.output_tps > best.output_tps) best = r;
+  return best;
+}
+
+function scaled(r, m, kind) {
+  const v = val(r, m);
+  if (v == null) return null;
+  if (state.scale !== "rel") return v;
+  const b = baselineAt(r.concurrency, kind);
+  const bv = b ? val(b, m) : null;
+  return bv ? v / bv : null;
+}
+
+/* ---------- formatting ---------- */
+const fInt = n => n.toLocaleString("en-US");
+const f1 = n => n.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const fTok = n => n >= 100 ? fInt(Math.round(n)) : n.toFixed(1);
+const fTokAxis = n => n >= 1000 ? (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + "K" : String(Math.round(n));
+const fRatio = n => n >= 10 ? Math.round(n) + "×" : n.toFixed(2) + "×";
+const fMs = n => n >= 1000 ? (n / 1000).toFixed(1) + "s" : Math.round(n) + "ms";
+
+/* ---------- svg helpers ---------- */
+const NS = "http://www.w3.org/2000/svg";
+function E(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) { const v = attrs[k]; if (v != null) e.setAttribute(k, v); }
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const exp = Math.floor(Math.log10(v)), base = Math.pow(10, exp), f = v / base;
+  const nf = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
+  return nf * base;
+}
+
+/* ---------- bar chart ---------- */
+function drawBars(host, spec) {
+  const series = activeSeries();
+  const concs = CONCS.filter(c => series.some(s => s.points.has(c)));
+  host.textContent = "";
+  const W = Math.max(320, host.clientWidth || 900);
+  const H = spec.h || 300;
+  const M = { t: 12, r: 12, b: 34, l: 62 };
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+  const svg = E("svg", { width: W, height: H, viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": spec.aria }, host);
+  if (!series.length || !concs.length) { host.appendChild(empty()); return; }
+
+  const data = series.map(s => ({
+    s, vals: concs.map(c => { const r = s.points.get(c); return r ? scaled(r, spec.metric, kindOf(s)) : null; })
+  }));
+  let maxV = 0;
+  for (const d of data) for (const v of d.vals) if (v != null && v > maxV) maxV = v;
+  const rel = state.scale === "rel";
+  let top, ticks;
+  if (rel) {
+    top = Math.max(2.5, Math.ceil(maxV * 2) / 2);
+    ticks = [];
+    for (let t = 0; t <= top + 1e-9; t += 0.5) ticks.push(+t.toFixed(1));
+    if (ticks.length > 8) ticks = ticks.filter((t, i) => i % 2 === 0 || t === 1);
+  } else {
+    top = niceMax(maxV * 1.06);
+    ticks = [0, 1, 2, 3, 4].map(i => top * i / 4);
+  }
+  const Y = v => M.t + ih - (v / top) * ih;
+
+  for (const t of ticks) {
+    E("line", { x1: M.l, x2: W - M.r, y1: Y(t), y2: Y(t), class: "grid" }, svg);
+    const lab = E("text", { x: M.l - 9, y: Y(t) + 3.5, class: "axis-label", "text-anchor": "end" }, svg);
+    lab.textContent = spec.tick(t);
+  }
+  if (rel) {
+    E("line", { x1: M.l, x2: W - M.r, y1: Y(2), y2: Y(2), class: "goal" }, svg);
+    E("text", { x: W - M.r - 2, y: Y(2) - 6, class: "goal-label", "text-anchor": "end" }, svg).textContent = "2× goal";
+  }
+
+  const gw = iw / concs.length;
+  const slot = gw * 0.86 / series.length;
+  const bw = Math.max(1, slot - 1);
+  const labels = [];
+
+  concs.forEach((c, ci) => {
+    const x0 = M.l + ci * gw + gw * 0.07;
+    let bestIdx = -1, bestVal = -1;
+    data.forEach((d, di) => { const v = d.vals[ci]; if (v != null && v > bestVal) { bestVal = v; bestIdx = di; } });
+
+    data.forEach((d, di) => {
+      const v = d.vals[ci];
+      if (v == null) return;
+      const r = d.s.points.get(c);
+      const bx = x0 + di * slot, by = Y(v), h = Math.max(0.8, M.t + ih - by);
+      const rect = E("rect", {
+        x: bx.toFixed(2), y: by.toFixed(2), width: Math.max(1, bw).toFixed(2), height: h.toFixed(2),
+        rx: 1, class: "bar", fill: d.s.color, "fill-opacity": d.s.stress ? 0.55 : 0.95, "data-s": d.s.name
+      }, svg);
+      rect.addEventListener("mouseenter", ev => {
+        state.focus = d.s.name; showTip(ev, r, d.s); highlight(d.s.name);
+      });
+      rect.addEventListener("mousemove", moveTip);
+      rect.addEventListener("mouseleave", () => {
+        state.focus = null; hideTip(); unhighlight();
+      });
+      if (di === bestIdx) labels.push({ x: bx + bw / 2, y: by - 4, text: spec.fmt(v), cls: "val" });
+      else if (state.focus === d.s.name) labels.push({ x: bx + bw / 2, y: by - 4, text: spec.fmt(v), cls: "val focus" });
+    });
+
+    E("text", { x: M.l + ci * gw + gw / 2, y: H - 12, class: "axis-label", "text-anchor": "middle" }, svg).textContent = "c" + c;
+  });
+
+  for (const L of labels) {
+    const t = E("text", { x: L.x, y: L.y, class: L.cls, "text-anchor": "middle" }, svg);
+    t.textContent = L.text;
+  }
+}
+
+/* ---------- scatter ---------- */
+function drawScatter(host, spec) {
+  const series = activeSeries();
+  host.textContent = "";
+  const W = Math.max(320, host.clientWidth || 700);
+  const H = spec.h || 360;
+  const M = { t: 14, r: 16, b: 38, l: 64 };
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+  const svg = E("svg", { width: W, height: H, viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": spec.aria }, host);
+
+  const groups = [];
+  for (const s of series) {
+    const arr = [];
+    for (const c of CONCS) {
+      const r = s.points.get(c);
+      if (!r) continue;
+      const yv = scaled(r, spec.metric, kindOf(s));
+      const xv = val(r, spec.x);
+      if (yv == null || xv == null || xv <= 0) continue;
+      arr.push({ x: xv, y: yv, c, r });
+    }
+    if (arr.length) groups.push({ s, arr });
+  }
+  if (!groups.length) { host.appendChild(empty()); return; }
+
+  const xs = groups.flatMap(g => g.arr.map(d => d.x));
+  const ys = groups.flatMap(g => g.arr.map(d => d.y));
+  const xmin = Math.min(...xs), xmax = Math.max(...xs);
+  const ymax0 = Math.max(...ys);
+  const ytop = state.scale === "rel" ? Math.max(2.5, Math.ceil(ymax0 * 2) / 2) : niceMax(ymax0 * 1.08);
+
+  const pad = (xmax - xmin) * 0.05 || xmax * 0.05;
+  const X = spec.logX
+    ? x => M.l + (Math.log10(x) - Math.log10(xmin / 1.15)) / (Math.log10(xmax * 1.15) - Math.log10(xmin / 1.15)) * iw
+    : x => M.l + (x - (xmin - pad)) / ((xmax + pad) - (xmin - pad)) * iw;
+  const Y = v => M.t + ih - (v / ytop) * ih;
+
+  const yTicks = state.scale === "rel"
+    ? (() => { const t = []; for (let v = 0; v <= ytop + 1e-9; v += 0.5) t.push(+v.toFixed(1)); return t; })()
+    : [0, 1, 2, 3, 4].map(i => ytop * i / 4);
+  for (const t of yTicks) {
+    E("line", { x1: M.l, x2: W - M.r, y1: Y(t), y2: Y(t), class: "grid" }, svg);
+    const lab = E("text", { x: M.l - 9, y: Y(t) + 3.5, class: "axis-label", "text-anchor": "end" }, svg);
+    lab.textContent = spec.yTick(t);
+  }
+
+  const xTicks = spec.ticks(Math.max(xmin / 1.15, 1), xmax * 1.15);
+  for (const t of xTicks) {
+    const x = X(t);
+    if (x < M.l - 1 || x > W - M.r + 1) continue;
+    E("line", { x1: x, x2: x, y1: M.t, y2: M.t + ih, class: "grid" }, svg);
+    const lab = E("text", { x: x, y: H - 20, class: "axis-label", "text-anchor": "middle" }, svg);
+    lab.textContent = spec.xTick(t);
+  }
+  E("text", { x: M.l + iw / 2, y: H - 4, class: "axis-title", "text-anchor": "middle" }, svg).textContent = spec.xLabel;
+  const yt = E("text", { x: 12, y: M.t + ih / 2, class: "axis-title", "text-anchor": "middle",
+    transform: "rotate(-90 12 " + (M.t + ih / 2) + ")" }, svg);
+  yt.textContent = spec.yLabel;
+
+  if (state.scale === "rel") {
+    E("line", { x1: M.l, x2: W - M.r, y1: Y(2), y2: Y(2), class: "goal" }, svg);
+    E("text", { x: W - M.r - 2, y: Y(2) - 6, class: "goal-label", "text-anchor": "end" }, svg).textContent = "2× goal";
+  }
+
+  for (const g of groups) {
+    const pts = g.arr.slice().sort((a, b) => a.x - b.x);
+    if (pts.length > 1) {
+      E("polyline", {
+        points: pts.map(d => X(d.x).toFixed(1) + "," + Y(d.y).toFixed(1)).join(" "),
+        class: "seg", fill: "none", stroke: g.s.color,
+        "stroke-opacity": g.s.stress ? 0.45 : 0.7, "stroke-width": 1.4,
+        "stroke-dasharray": g.s.dashed ? "4 3" : null, "data-s": g.s.name
+      }, svg);
+    }
+    for (const d of g.arr) {
+      const dot = E("circle", {
+        cx: X(d.x).toFixed(1), cy: Y(d.y).toFixed(1), r: 3.2, class: "dot",
+        fill: g.s.color, "fill-opacity": g.s.stress ? 0.7 : 0.95,
+        stroke: "#0b0d10", "stroke-width": 1, "data-s": g.s.name
+      }, svg);
+      dot.addEventListener("mouseenter", ev => { showTip(ev, d.r, g.s); highlight(g.s.name); });
+      dot.addEventListener("mousemove", moveTip);
+      dot.addEventListener("mouseleave", () => { hideTip(); unhighlight(); });
+    }
+  }
+}
+
+function empty() {
+  const d = document.createElement("div");
+  d.className = "plot-empty";
+  d.textContent = "No series in this view.";
+  return d;
+}
+
+/* ---------- hover ---------- */
+function highlight(name) {
+  for (const el of document.querySelectorAll(".bar,.dot,.seg")) {
+    el.classList.toggle("dim", el.getAttribute("data-s") !== name);
+  }
+}
+function unhighlight() {
+  for (const el of document.querySelectorAll(".dim")) el.classList.remove("dim");
+}
+
+const tip = document.getElementById("tip");
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function showTip(ev, r, s) {
+  if (!r) return;
+  const rel = state.scale === "rel";
+  const kind = kindOf(s);
+  const b = rel ? baselineAt(r.concurrency, kind) : null;
+  const rows = [
+    ["output tok/s", f1(r.output_tps)],
+    ["per GPU", f1(r.output_tps_per_gpu)],
+    ["requests/min", f1(r.rpm)],
+    ["input tok/s", fInt(r.input_tps)],
+    ["TTFT mean", fMs(r.ttft_mean_ms)],
+    ["TTFT p99", fMs(r.ttft_p99_ms)],
+    ["user tok/s p50", f1(r.tps_user_p50)],
+    ["run window", Math.round(r.duration_s) + " s"],
+    ["requests", fInt(r.requests)],
+    ["errors", r.err_pct ? r.err_pct + " %" : "0"]
+  ];
+  if (rel && b) {
+    rows.unshift(["vs " + b.engine, fRatio(r.output_tps / b.output_tps)]);
+  }
+  tip.innerHTML =
+    '<div class="tt-h"><span class="sw" style="background:' + s.color + '"></span>' + esc(s.name) + "</div>" +
+    '<div class="tt-sub">c' + r.concurrency + " · " + esc(r.run) + "</div>" +
+    "<table>" + rows.map(x => "<tr><td>" + esc(x[0]) + "</td><td>" + x[1] + "</td></tr>").join("") + "</table>";
+  tip.hidden = false;
+  moveTip(ev);
+}
+function moveTip(ev) {
+  if (tip.hidden) return;
+  const pad = 14, r = tip.getBoundingClientRect();
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - pad;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - pad;
+  tip.style.left = Math.max(8, x) + "px";
+  tip.style.top = Math.max(8, y) + "px";
+}
+function hideTip() { tip.hidden = true; }
+
+/* ---------- legend + chrome ---------- */
+function renderLegend() {
+  const box = document.getElementById("legend");
+  box.textContent = "";
+  const all = filteredSeries();
+  for (const s of all) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "chip" + (s.stress ? " stress" : "") + (state.hidden.has(s.name) ? " off" : "");
+    chip.innerHTML = '<span class="sw" style="background:' + s.color + ';opacity:' + (s.stress ? 0.55 : 0.95) + '"></span>' + esc(s.name);
+    chip.title = state.hidden.has(s.name) ? "show " + s.name : "hide " + s.name;
+    chip.addEventListener("click", () => {
+      if (state.hidden.has(s.name)) state.hidden.delete(s.name); else state.hidden.add(s.name);
+      renderLegend(); redrawAll();
+    });
+    chip.addEventListener("mouseenter", () => highlight(s.name));
+    chip.addEventListener("mouseleave", unhighlight);
+    box.appendChild(chip);
+  }
+  const shown = all.length - all.filter(s => state.hidden.has(s.name)).length;
+  document.getElementById("viewNote").textContent =
+    shown + " of " + all.length + " series shown · " + META.cells + " runs across " + CONCS.length +
+    " concurrencies · click a chip to hide a series, hover to highlight it everywhere";
+}
+
+function renderTable() {
+  const tb = document.getElementById("tbody");
+  const rows = ROWS.slice().sort((a, b) => {
+    const fa = ENGINES.indexOf(a.engine), fb = ENGINES.indexOf(b.engine);
+    return fa !== fb ? fa - fb : a.concurrency - b.concurrency;
+  });
+  tb.innerHTML = rows.map(r => "<tr>" +
+    "<td>" + esc(r.engine) + "</td><td>c" + r.concurrency + "</td>" +
+    "<td>" + f1(r.output_tps) + "</td><td>" + f1(r.output_tps_per_gpu) + "</td>" +
+    "<td>" + f1(r.rpm) + "</td><td>" + fInt(r.input_tps) + "</td>" +
+    "<td>" + fInt(r.ttft_mean_ms) + "</td><td>" + fInt(r.ttft_p99_ms) + "</td>" +
+    "<td>" + f1(r.tps_user_p50) + "</td><td>" + Math.round(r.duration_s) + "</td>" +
+    "<td>" + (r.err_pct ? r.err_pct : "0") + "</td>" +
+    '<td class="run">' + esc(r.run) + "</td></tr>").join("");
+}
+
+/* ---------- wiring ---------- */
+const charts = [
+  { host: document.getElementById("chart-out"), draw: (h) => drawBars(h, {
+      metric: "output_tps", fmt: fTok, tick: t => state.scale === "rel" ? t.toFixed(1) + "×" : fTokAxis(t),
+      aria: "Total output tokens per second by concurrency" }) },
+  { host: document.getElementById("chart-rpm"), draw: (h) => drawBars(h, {
+      metric: "rpm", fmt: t => t.toFixed(1), tick: t => state.scale === "rel" ? t.toFixed(1) + "×" : Math.round(t),
+      aria: "Requests per minute by concurrency" }) },
+  { host: document.getElementById("chart-in"), draw: (h) => drawBars(h, {
+      metric: "input_tps", fmt: fTok, tick: t => state.scale === "rel" ? t.toFixed(1) + "×" : fTokAxis(t),
+      aria: "Total input tokens per second by concurrency" }) },
+  { host: document.getElementById("chart-inter"), draw: (h) => drawScatter(h, {
+      x: "tps_user_p50", metric: "output_tps_per_gpu", logX: false, h: 360,
+      xLabel: "interactivity · per-user output tok/s (median)",
+      yLabel: state.scale === "rel" ? "output tok/s per GPU · × vLLM" : "output tok/s per GPU",
+      yTick: t => state.scale === "rel" ? t.toFixed(1) + "×" : fTokAxis(t),
+      xTick: t => t >= 100 ? String(Math.round(t)) : t.toFixed(0),
+      ticks: (lo, hi) => linearTicks(lo, hi),
+      aria: "Output tokens per second per GPU against interactivity" }) },
+  { host: document.getElementById("chart-ttft"), draw: (h) => drawScatter(h, {
+      x: "ttft_mean_ms", metric: "output_tps", logX: true, h: 360,
+      xLabel: "mean TTFT · log scale",
+      yLabel: state.scale === "rel" ? "total output tok/s · × vLLM" : "total output tok/s",
+      yTick: t => state.scale === "rel" ? t.toFixed(1) + "×" : fTokAxis(t),
+      xTick: t => t >= 1000 ? (t / 1000) + "s" : Math.round(t) + "ms",
+      ticks: (lo, hi) => logTicks(lo, hi),
+      aria: "Total output tokens per second against mean time to first token" }) }
+];
+
+function linearTicks(lo, hi) {
+  const span = hi - lo;
+  if (!(span > 0)) return [lo];
+  const step = niceMax(span / 5);
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) out.push(v);
+  return out;
+}
+function logTicks(lo, hi) {
+  const base = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000];
+  return base.filter(v => v >= lo && v <= hi);
+}
+
+function redrawAll() { for (const c of charts) c.draw(c.host); }
+
+document.getElementById("filterSeg").addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-f]");
+  if (!b) return;
+  state.filter = b.dataset.f;
+  for (const x of document.querySelectorAll("#filterSeg button")) x.setAttribute("aria-pressed", String(x === b));
+  renderLegend(); redrawAll();
+});
+document.getElementById("scaleSeg").addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-s]");
+  if (!b) return;
+  state.scale = b.dataset.s;
+  for (const x of document.querySelectorAll("#scaleSeg button")) x.setAttribute("aria-pressed", String(x === b));
+  redrawAll();
+});
+document.getElementById("baselineSel").addEventListener("change", ev => {
+  state.baseline = ev.target.value;
+  if (state.scale === "rel") redrawAll();
+});
+
+document.getElementById("meta").textContent =
+  META.cells + " runs · " + META.engines + " series · " + META.window + " · updated " + META.generated;
+document.getElementById("foot").textContent =
+  "Throughput is each run's own average, not normalised to a common window (windows range across the set); " +
+  "interactivity and TTFT are AiPerf aggregates. Latest successful run per (engine, concurrency) cell.";
+
+renderLegend();
+renderTable();
+redrawAll();
+
+let raf = 0;
+const ro = new ResizeObserver(() => {
+  cancelAnimationFrame(raf);
+  raf = requestAnimationFrame(redrawAll);
+});
+for (const c of charts) ro.observe(c.host);
+</script>
+</body>
+</html>

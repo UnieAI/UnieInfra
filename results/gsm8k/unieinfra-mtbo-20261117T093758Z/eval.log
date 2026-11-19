@@ -1,0 +1,827 @@
+2026-11-17 09:37:59 - evalscope - [32mINFO[0m: Args: Task config is provided with CommandLine type.[0m
+2026-11-17 09:37:59 - evalscope - [32mINFO[0m: api_url is provided, setting eval_type to 'openai_api'.[0m
+2026-11-17 09:37:59 - evalscope - [32mINFO[0m: Running with native backend[0m
+2026-11-17 09:37:59 - evalscope - [32mINFO[0m: Dump task config to /home/smc/workspace/roy/results/gsm8k/unieinfra-mtbo-20261117T093758Z/20261117_093759/configs/task_config.yaml[0m
+2026-11-17 09:37:59 - evalscope - [32mINFO[0m: {
+    "model_id": "DeepSeek-V4.1-Flash-1017",
+    "model_args": {},
+    "model_task": "text_generation",
+    "chat_template": null,
+    "datasets": [
+        "gsm8k"
+    ],
+    "dataset_args": {
+        "gsm8k": {
+            "dataset_id": "openai/gsm8k"
+        }
+    },
+    "dataset_dir": "/home/smc/.cache/modelscope/hub/datasets",
+    "dataset_hub": "huggingface",
+    "repeats": 1,
+    "eval_type": "openai_api",
+    "eval_backend": "Native",
+    "eval_config": null,
+    "limit": null,
+    "eval_batch_size": 32,
+    "use_cache": null,
+    "rerun_review": false,
+    "work_dir": "/home/smc/workspace/roy/results/gsm8k/unieinfra-mtbo-20261117T093758Z/20261117_093759",
+    "no_timestamp": false,
+    "enable_progress_tracker": false,
+    "ignore_errors": false,
+    "debug": false,
+    "seed": 42,
+    "api_url": "http://127.0.0.1:8000/v1",
+    "api_key": "**********",
+    "timeout": null,
+    "stream": null,
+    "judge": {
+        "strategy": "auto",
+        "models": [],
+        "contract": {
+            "system_prompt": null,
+            "prompt_template": null,
+            "score_mapping": null,
+            "score_type": "pattern"
+        },
+        "repeats": 1,
+        "position_swap": "auto",
+        "aggregation": "mean",
+        "min_valid_judges": 1
+    },
+    "analysis_report": false,
+    "collect_perf": true,
+    "use_sandbox": false,
+    "sandbox_type": "docker",
+    "sandbox_manager_config": {},
+    "evalscope_version": "1.11.1",
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "generation_config": {
+        "batch_size": 32,
+        "max_tokens": 512,
+        "temperature": 0.0,
+        "do_sample": false
+    },
+    "sandbox": {
+        "enabled": false,
+        "engine": "docker",
+        "default_config": {},
+        "manager_config": {},
+        "pool_size": null
+    },
+    "agent_config": null
+}[0m
+Running[eval]:   0%|          | 0/1 [00:00<?, ?benchmark/s]                                                           2026-11-17 09:37:59 - evalscope - [32mINFO[0m: Start loading benchmark dataset: gsm8k[0m
+Running[eval]:   0%|          | 0/1 [00:00<?, ?benchmark/s]
+Processing records:   0%|          | 0/1319 [00:00<?, ?it/s][AProcessing records: 100%|██████████| 1319/1319 [00:00<00:00, 414776.35it/s]
+
+Processing records:   0%|          | 0/4 [00:00<?, ?it/s][AProcessing records: 100%|██████████| 4/4 [00:00<00:00, 116508.44it/s]
+                                                           2026-11-17 09:37:59 - evalscope - [32mINFO[0m: gsm8k: 1319 samples to evaluate (1 subset)[0m
+Running[eval]:   0%|          | 0/1 [00:00<?, ?benchmark/s]                                                           2026-11-17 09:37:59 - evalscope - [32mINFO[0m: Subsets of gsm8k: ['main'][0m
+Running[eval]:   0%|          | 0/1 [00:00<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:00<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:37:59 - evalscope - [32mINFO[0m: Loading model for prediction...[0m
+Running[eval]:   0%|          | 0/1 [00:00<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:00<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:37:59 - evalscope - [32mINFO[0m: Creating model deepseek-ai/DeepSeek-V4.1-Flash-1017 with eval_type=openai_api base_url=http://127.0.0.1:8000/v1, config={'retries': 5, 'retry_interval': 10, 'batch_size': 32, 'max_tokens': 512, 'temperature': 0.0, 'do_sample': False, 'anthropic_cache_strategy': 'evaluation'}, model_args={}[0m
+Running[eval]:   0%|          | 0/1 [00:00<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:00<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:00 - evalscope - [32mINFO[0m: Model loaded successfully.[0m
+Running[eval]:   0%|          | 0/1 [00:00<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:00<?, ?it/s][A2026-11-17 09:38:03,701 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,701 - openai._base_client - INFO: Retrying request in 0.420072 seconds (retry 1 of 2)
+2026-11-17 09:38:03,702 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,702 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,703 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,703 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,703 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,704 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,704 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,704 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,704 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,704 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,705 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,705 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,705 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,705 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,706 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,706 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,706 - openai._base_client - INFO: Retrying request in 0.496874 seconds (retry 1 of 2)
+2026-11-17 09:38:03,707 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,707 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,707 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,708 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,708 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,708 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,709 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,709 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,709 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,710 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,710 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,710 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,710 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,711 - openai._base_client - INFO: Retrying request in 0.465621 seconds (retry 1 of 2)
+2026-11-17 09:38:03,711 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,711 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 500 Internal Server Error"
+2026-11-17 09:38:03,712 - openai._base_client - INFO: Retrying request in 0.472099 seconds (retry 1 of 2)
+2026-11-17 09:38:03,712 - openai._base_client - INFO: Retrying request in 0.407941 seconds (retry 1 of 2)
+2026-11-17 09:38:03,713 - openai._base_client - INFO: Retrying request in 0.415413 seconds (retry 1 of 2)
+2026-11-17 09:38:03,713 - openai._base_client - INFO: Retrying request in 0.388478 seconds (retry 1 of 2)
+2026-11-17 09:38:03,713 - openai._base_client - INFO: Retrying request in 0.489133 seconds (retry 1 of 2)
+2026-11-17 09:38:03,714 - openai._base_client - INFO: Retrying request in 0.447260 seconds (retry 1 of 2)
+2026-11-17 09:38:03,714 - openai._base_client - INFO: Retrying request in 0.496275 seconds (retry 1 of 2)
+2026-11-17 09:38:03,714 - openai._base_client - INFO: Retrying request in 0.472670 seconds (retry 1 of 2)
+2026-11-17 09:38:03,715 - openai._base_client - INFO: Retrying request in 0.436831 seconds (retry 1 of 2)
+2026-11-17 09:38:03,715 - openai._base_client - INFO: Retrying request in 0.496683 seconds (retry 1 of 2)
+2026-11-17 09:38:03,716 - openai._base_client - INFO: Retrying request in 0.475145 seconds (retry 1 of 2)
+2026-11-17 09:38:03,716 - openai._base_client - INFO: Retrying request in 0.418764 seconds (retry 1 of 2)
+2026-11-17 09:38:03,717 - openai._base_client - INFO: Retrying request in 0.431882 seconds (retry 1 of 2)
+2026-11-17 09:38:03,718 - openai._base_client - INFO: Retrying request in 0.472445 seconds (retry 1 of 2)
+2026-11-17 09:38:03,718 - openai._base_client - INFO: Retrying request in 0.426342 seconds (retry 1 of 2)
+2026-11-17 09:38:03,719 - openai._base_client - INFO: Retrying request in 0.398821 seconds (retry 1 of 2)
+2026-11-17 09:38:03,719 - openai._base_client - INFO: Retrying request in 0.499188 seconds (retry 1 of 2)
+2026-11-17 09:38:03,720 - openai._base_client - INFO: Retrying request in 0.399273 seconds (retry 1 of 2)
+2026-11-17 09:38:03,720 - openai._base_client - INFO: Retrying request in 0.412733 seconds (retry 1 of 2)
+2026-11-17 09:38:03,721 - openai._base_client - INFO: Retrying request in 0.457469 seconds (retry 1 of 2)
+2026-11-17 09:38:03,721 - openai._base_client - INFO: Retrying request in 0.480565 seconds (retry 1 of 2)
+2026-11-17 09:38:03,722 - openai._base_client - INFO: Retrying request in 0.380348 seconds (retry 1 of 2)
+2026-11-17 09:38:03,723 - openai._base_client - INFO: Retrying request in 0.457926 seconds (retry 1 of 2)
+2026-11-17 09:38:03,723 - openai._base_client - INFO: Retrying request in 0.488407 seconds (retry 1 of 2)
+2026-11-17 09:38:03,724 - openai._base_client - INFO: Retrying request in 0.487910 seconds (retry 1 of 2)
+2026-11-17 09:38:03,724 - openai._base_client - INFO: Retrying request in 0.394063 seconds (retry 1 of 2)
+2026-11-17 09:38:03,724 - openai._base_client - INFO: Retrying request in 0.424534 seconds (retry 1 of 2)
+2026-11-17 09:38:03,725 - openai._base_client - INFO: Retrying request in 0.399109 seconds (retry 1 of 2)
+2026-11-17 09:38:03,725 - openai._base_client - INFO: Retrying request in 0.408784 seconds (retry 1 of 2)
+2026-11-17 09:38:04,107 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,107 - openai._base_client - INFO: Retrying request in 0.865943 seconds (retry 2 of 2)
+2026-11-17 09:38:04,113 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,114 - openai._base_client - INFO: Retrying request in 0.756721 seconds (retry 2 of 2)
+2026-11-17 09:38:04,120 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,121 - openai._base_client - INFO: Retrying request in 0.905366 seconds (retry 2 of 2)
+2026-11-17 09:38:04,123 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,125 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,125 - openai._base_client - INFO: Retrying request in 0.861990 seconds (retry 2 of 2)
+2026-11-17 09:38:04,126 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,126 - openai._base_client - INFO: Retrying request in 0.792649 seconds (retry 2 of 2)
+2026-11-17 09:38:04,127 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,127 - openai._base_client - INFO: Retrying request in 0.845370 seconds (retry 2 of 2)
+2026-11-17 09:38:04,127 - openai._base_client - INFO: Retrying request in 0.784573 seconds (retry 2 of 2)
+2026-11-17 09:38:04,131 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,131 - openai._base_client - INFO: Retrying request in 0.855662 seconds (retry 2 of 2)
+2026-11-17 09:38:04,135 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,135 - openai._base_client - INFO: Retrying request in 0.823857 seconds (retry 2 of 2)
+2026-11-17 09:38:04,139 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,139 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,140 - openai._base_client - INFO: Retrying request in 0.988544 seconds (retry 2 of 2)
+2026-11-17 09:38:04,140 - openai._base_client - INFO: Retrying request in 0.943025 seconds (retry 2 of 2)
+2026-11-17 09:38:04,143 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,143 - openai._base_client - INFO: Retrying request in 0.927653 seconds (retry 2 of 2)
+2026-11-17 09:38:04,152 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,152 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,153 - openai._base_client - INFO: Retrying request in 0.980052 seconds (retry 2 of 2)
+2026-11-17 09:38:04,153 - openai._base_client - INFO: Retrying request in 0.941802 seconds (retry 2 of 2)
+2026-11-17 09:38:04,156 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,156 - openai._base_client - INFO: Retrying request in 0.974750 seconds (retry 2 of 2)
+2026-11-17 09:38:04,160 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,161 - openai._base_client - INFO: Retrying request in 0.930507 seconds (retry 2 of 2)
+2026-11-17 09:38:04,170 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,171 - openai._base_client - INFO: Retrying request in 0.841079 seconds (retry 2 of 2)
+2026-11-17 09:38:04,183 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,183 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,184 - openai._base_client - INFO: Retrying request in 0.908792 seconds (retry 2 of 2)
+2026-11-17 09:38:04,184 - openai._base_client - INFO: Retrying request in 0.907455 seconds (retry 2 of 2)
+2026-11-17 09:38:04,187 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,188 - openai._base_client - INFO: Retrying request in 0.947623 seconds (retry 2 of 2)
+2026-11-17 09:38:04,195 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,195 - openai._base_client - INFO: Retrying request in 0.933256 seconds (retry 2 of 2)
+2026-11-17 09:38:04,196 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,197 - openai._base_client - INFO: Retrying request in 0.765836 seconds (retry 2 of 2)
+2026-11-17 09:38:04,197 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,197 - openai._base_client - INFO: Retrying request in 0.837991 seconds (retry 2 of 2)
+2026-11-17 09:38:04,199 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,199 - openai._base_client - INFO: Retrying request in 0.847717 seconds (retry 2 of 2)
+2026-11-17 09:38:04,206 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,207 - openai._base_client - INFO: Retrying request in 0.957215 seconds (retry 2 of 2)
+2026-11-17 09:38:04,213 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,215 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,215 - openai._base_client - INFO: Retrying request in 0.817718 seconds (retry 2 of 2)
+2026-11-17 09:38:04,216 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,216 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,216 - openai._base_client - INFO: Retrying request in 0.959149 seconds (retry 2 of 2)
+2026-11-17 09:38:04,217 - openai._base_client - INFO: Retrying request in 0.905136 seconds (retry 2 of 2)
+2026-11-17 09:38:04,217 - openai._base_client - INFO: Retrying request in 0.752619 seconds (retry 2 of 2)
+2026-11-17 09:38:04,220 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,221 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,221 - openai._base_client - INFO: Retrying request in 0.840000 seconds (retry 2 of 2)
+2026-11-17 09:38:04,221 - openai._base_client - INFO: Retrying request in 0.860763 seconds (retry 2 of 2)
+2026-11-17 09:38:04,224 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,225 - openai._base_client - INFO: Retrying request in 0.828846 seconds (retry 2 of 2)
+2026-11-17 09:38:04,872 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:04<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:04,913 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:04<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:04,920 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:04<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:04,961 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:04<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:04,964 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:04<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:04,971 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:04,974 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,975 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:04,989 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:04,990 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:04 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:04<?, ?it/s][A2026-11-17 09:38:05,013 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,027 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,034 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,037 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,048 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,055 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,063 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,072 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,084 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:05,084 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,094 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:05,094 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+2026-11-17 09:38:05,095 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,097 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,123 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,130 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,131 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+2026-11-17 09:38:05,133 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,135 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,137 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,165 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:05,177 - httpx2 - INFO: HTTP Request: POST http://127.0.0.1:8000/v1/chat/completions "HTTP/1.1 503 Service Unavailable"
+                                                           
+                                                           [A2026-11-17 09:38:05 - evalscope - [33mWARNING[0m: Attempt 1 / 5 failed: Error code: 503 - Failed to start generation: tcp connect error. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:05<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:05<?, ?it/s][A2026-11-17 09:38:14,876 - openai._base_client - INFO: Retrying request in 0.394644 seconds (retry 1 of 2)
+2026-11-17 09:38:14,915 - openai._base_client - INFO: Retrying request in 0.403000 seconds (retry 1 of 2)
+2026-11-17 09:38:14,921 - openai._base_client - INFO: Retrying request in 0.471369 seconds (retry 1 of 2)
+2026-11-17 09:38:14,963 - openai._base_client - INFO: Retrying request in 0.495987 seconds (retry 1 of 2)
+2026-11-17 09:38:14,966 - openai._base_client - INFO: Retrying request in 0.460568 seconds (retry 1 of 2)
+2026-11-17 09:38:14,973 - openai._base_client - INFO: Retrying request in 0.466532 seconds (retry 1 of 2)
+2026-11-17 09:38:14,978 - openai._base_client - INFO: Retrying request in 0.473627 seconds (retry 1 of 2)
+2026-11-17 09:38:14,979 - openai._base_client - INFO: Retrying request in 0.382136 seconds (retry 1 of 2)
+2026-11-17 09:38:14,993 - openai._base_client - INFO: Retrying request in 0.390454 seconds (retry 1 of 2)
+2026-11-17 09:38:14,993 - openai._base_client - INFO: Retrying request in 0.460665 seconds (retry 1 of 2)
+2026-11-17 09:38:15,014 - openai._base_client - INFO: Retrying request in 0.418070 seconds (retry 1 of 2)
+2026-11-17 09:38:15,028 - openai._base_client - INFO: Retrying request in 0.450546 seconds (retry 1 of 2)
+2026-11-17 09:38:15,035 - openai._base_client - INFO: Retrying request in 0.385682 seconds (retry 1 of 2)
+2026-11-17 09:38:15,038 - openai._base_client - INFO: Retrying request in 0.442644 seconds (retry 1 of 2)
+2026-11-17 09:38:15,051 - openai._base_client - INFO: Retrying request in 0.466890 seconds (retry 1 of 2)
+2026-11-17 09:38:15,058 - openai._base_client - INFO: Retrying request in 0.469172 seconds (retry 1 of 2)
+2026-11-17 09:38:15,064 - openai._base_client - INFO: Retrying request in 0.429829 seconds (retry 1 of 2)
+2026-11-17 09:38:15,074 - openai._base_client - INFO: Retrying request in 0.467157 seconds (retry 1 of 2)
+2026-11-17 09:38:15,087 - openai._base_client - INFO: Retrying request in 0.426927 seconds (retry 1 of 2)
+2026-11-17 09:38:15,088 - openai._base_client - INFO: Retrying request in 0.387772 seconds (retry 1 of 2)
+2026-11-17 09:38:15,100 - openai._base_client - INFO: Retrying request in 0.450075 seconds (retry 1 of 2)
+2026-11-17 09:38:15,100 - openai._base_client - INFO: Retrying request in 0.472585 seconds (retry 1 of 2)
+2026-11-17 09:38:15,100 - openai._base_client - INFO: Retrying request in 0.375308 seconds (retry 1 of 2)
+2026-11-17 09:38:15,100 - openai._base_client - INFO: Retrying request in 0.436309 seconds (retry 1 of 2)
+2026-11-17 09:38:15,125 - openai._base_client - INFO: Retrying request in 0.488636 seconds (retry 1 of 2)
+2026-11-17 09:38:15,132 - openai._base_client - INFO: Retrying request in 0.494110 seconds (retry 1 of 2)
+2026-11-17 09:38:15,136 - openai._base_client - INFO: Retrying request in 0.486294 seconds (retry 1 of 2)
+2026-11-17 09:38:15,136 - openai._base_client - INFO: Retrying request in 0.421569 seconds (retry 1 of 2)
+2026-11-17 09:38:15,139 - openai._base_client - INFO: Retrying request in 0.400990 seconds (retry 1 of 2)
+2026-11-17 09:38:15,139 - openai._base_client - INFO: Retrying request in 0.447230 seconds (retry 1 of 2)
+2026-11-17 09:38:15,167 - openai._base_client - INFO: Retrying request in 0.492059 seconds (retry 1 of 2)
+2026-11-17 09:38:15,178 - openai._base_client - INFO: Retrying request in 0.452298 seconds (retry 1 of 2)
+2026-11-17 09:38:15,272 - openai._base_client - INFO: Retrying request in 0.750970 seconds (retry 2 of 2)
+2026-11-17 09:38:15,319 - openai._base_client - INFO: Retrying request in 0.867721 seconds (retry 2 of 2)
+2026-11-17 09:38:15,362 - openai._base_client - INFO: Retrying request in 0.757230 seconds (retry 2 of 2)
+2026-11-17 09:38:15,384 - openai._base_client - INFO: Retrying request in 0.784805 seconds (retry 2 of 2)
+2026-11-17 09:38:15,394 - openai._base_client - INFO: Retrying request in 0.997130 seconds (retry 2 of 2)
+2026-11-17 09:38:15,422 - openai._base_client - INFO: Retrying request in 0.819820 seconds (retry 2 of 2)
+2026-11-17 09:38:15,427 - openai._base_client - INFO: Retrying request in 0.829572 seconds (retry 2 of 2)
+2026-11-17 09:38:15,433 - openai._base_client - INFO: Retrying request in 0.865757 seconds (retry 2 of 2)
+2026-11-17 09:38:15,441 - openai._base_client - INFO: Retrying request in 0.933294 seconds (retry 2 of 2)
+2026-11-17 09:38:15,453 - openai._base_client - INFO: Retrying request in 0.839760 seconds (retry 2 of 2)
+2026-11-17 09:38:15,454 - openai._base_client - INFO: Retrying request in 0.972112 seconds (retry 2 of 2)
+2026-11-17 09:38:15,460 - openai._base_client - INFO: Retrying request in 0.891309 seconds (retry 2 of 2)
+2026-11-17 09:38:15,477 - openai._base_client - INFO: Retrying request in 0.886569 seconds (retry 2 of 2)
+2026-11-17 09:38:15,477 - openai._base_client - INFO: Retrying request in 0.761546 seconds (retry 2 of 2)
+2026-11-17 09:38:15,479 - openai._base_client - INFO: Retrying request in 0.781037 seconds (retry 2 of 2)
+2026-11-17 09:38:15,482 - openai._base_client - INFO: Retrying request in 0.934153 seconds (retry 2 of 2)
+2026-11-17 09:38:15,495 - openai._base_client - INFO: Retrying request in 0.874853 seconds (retry 2 of 2)
+2026-11-17 09:38:15,515 - openai._base_client - INFO: Retrying request in 0.955337 seconds (retry 2 of 2)
+2026-11-17 09:38:15,519 - openai._base_client - INFO: Retrying request in 0.771843 seconds (retry 2 of 2)
+2026-11-17 09:38:15,528 - openai._base_client - INFO: Retrying request in 0.782370 seconds (retry 2 of 2)
+2026-11-17 09:38:15,538 - openai._base_client - INFO: Retrying request in 0.925389 seconds (retry 2 of 2)
+2026-11-17 09:38:15,541 - openai._base_client - INFO: Retrying request in 0.840263 seconds (retry 2 of 2)
+2026-11-17 09:38:15,542 - openai._base_client - INFO: Retrying request in 0.847757 seconds (retry 2 of 2)
+2026-11-17 09:38:15,551 - openai._base_client - INFO: Retrying request in 0.961790 seconds (retry 2 of 2)
+2026-11-17 09:38:15,558 - openai._base_client - INFO: Retrying request in 0.809372 seconds (retry 2 of 2)
+2026-11-17 09:38:15,574 - openai._base_client - INFO: Retrying request in 0.865155 seconds (retry 2 of 2)
+2026-11-17 09:38:15,587 - openai._base_client - INFO: Retrying request in 0.805343 seconds (retry 2 of 2)
+2026-11-17 09:38:15,614 - openai._base_client - INFO: Retrying request in 0.867412 seconds (retry 2 of 2)
+2026-11-17 09:38:15,623 - openai._base_client - INFO: Retrying request in 0.999857 seconds (retry 2 of 2)
+2026-11-17 09:38:15,627 - openai._base_client - INFO: Retrying request in 0.918961 seconds (retry 2 of 2)
+2026-11-17 09:38:15,631 - openai._base_client - INFO: Retrying request in 0.995131 seconds (retry 2 of 2)
+2026-11-17 09:38:15,660 - openai._base_client - INFO: Retrying request in 0.767725 seconds (retry 2 of 2)
+                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:16 - evalscope - [33mWARNING[0m: Attempt 2 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:16<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:16<?, ?it/s][A2026-11-17 09:38:26,031 - openai._base_client - INFO: Retrying request in 0.390160 seconds (retry 1 of 2)
+2026-11-17 09:38:26,121 - openai._base_client - INFO: Retrying request in 0.396042 seconds (retry 1 of 2)
+2026-11-17 09:38:26,171 - openai._base_client - INFO: Retrying request in 0.461561 seconds (retry 1 of 2)
+2026-11-17 09:38:26,189 - openai._base_client - INFO: Retrying request in 0.492759 seconds (retry 1 of 2)
+2026-11-17 09:38:26,241 - openai._base_client - INFO: Retrying request in 0.390249 seconds (retry 1 of 2)
+2026-11-17 09:38:26,244 - openai._base_client - INFO: Retrying request in 0.381631 seconds (retry 1 of 2)
+2026-11-17 09:38:26,259 - openai._base_client - INFO: Retrying request in 0.489293 seconds (retry 1 of 2)
+2026-11-17 09:38:26,263 - openai._base_client - INFO: Retrying request in 0.439251 seconds (retry 1 of 2)
+2026-11-17 09:38:26,293 - openai._base_client - INFO: Retrying request in 0.491348 seconds (retry 1 of 2)
+2026-11-17 09:38:26,294 - openai._base_client - INFO: Retrying request in 0.404925 seconds (retry 1 of 2)
+2026-11-17 09:38:26,301 - openai._base_client - INFO: Retrying request in 0.404271 seconds (retry 1 of 2)
+2026-11-17 09:38:26,313 - openai._base_client - INFO: Retrying request in 0.483951 seconds (retry 1 of 2)
+2026-11-17 09:38:26,354 - openai._base_client - INFO: Retrying request in 0.440590 seconds (retry 1 of 2)
+2026-11-17 09:38:26,365 - openai._base_client - INFO: Retrying request in 0.431275 seconds (retry 1 of 2)
+2026-11-17 09:38:26,369 - openai._base_client - INFO: Retrying request in 0.466868 seconds (retry 1 of 2)
+2026-11-17 09:38:26,371 - openai._base_client - INFO: Retrying request in 0.390946 seconds (retry 1 of 2)
+2026-11-17 09:38:26,376 - openai._base_client - INFO: Retrying request in 0.447108 seconds (retry 1 of 2)
+2026-11-17 09:38:26,383 - openai._base_client - INFO: Retrying request in 0.473525 seconds (retry 1 of 2)
+2026-11-17 09:38:26,392 - openai._base_client - INFO: Retrying request in 0.432588 seconds (retry 1 of 2)
+2026-11-17 09:38:26,393 - openai._base_client - INFO: Retrying request in 0.408759 seconds (retry 1 of 2)
+2026-11-17 09:38:26,396 - openai._base_client - INFO: Retrying request in 0.474856 seconds (retry 1 of 2)
+2026-11-17 09:38:26,418 - openai._base_client - INFO: Retrying request in 0.461035 seconds (retry 1 of 2)
+2026-11-17 09:38:26,422 - openai._base_client - INFO: Retrying request in 0.751213 seconds (retry 2 of 2)
+2026-11-17 09:38:26,428 - openai._base_client - INFO: Retrying request in 0.418765 seconds (retry 1 of 2)
+2026-11-17 09:38:26,430 - openai._base_client - INFO: Retrying request in 0.445237 seconds (retry 1 of 2)
+2026-11-17 09:38:26,441 - openai._base_client - INFO: Retrying request in 0.435303 seconds (retry 1 of 2)
+2026-11-17 09:38:26,466 - openai._base_client - INFO: Retrying request in 0.484874 seconds (retry 1 of 2)
+2026-11-17 09:38:26,472 - openai._base_client - INFO: Retrying request in 0.471913 seconds (retry 1 of 2)
+2026-11-17 09:38:26,484 - openai._base_client - INFO: Retrying request in 0.457739 seconds (retry 1 of 2)
+2026-11-17 09:38:26,515 - openai._base_client - INFO: Retrying request in 0.426461 seconds (retry 1 of 2)
+2026-11-17 09:38:26,518 - openai._base_client - INFO: Retrying request in 0.942471 seconds (retry 2 of 2)
+2026-11-17 09:38:26,549 - openai._base_client - INFO: Retrying request in 0.472473 seconds (retry 1 of 2)
+2026-11-17 09:38:26,629 - openai._base_client - INFO: Retrying request in 0.491126 seconds (retry 1 of 2)
+2026-11-17 09:38:26,629 - openai._base_client - INFO: Retrying request in 0.842224 seconds (retry 2 of 2)
+2026-11-17 09:38:26,629 - openai._base_client - INFO: Retrying request in 0.471382 seconds (retry 1 of 2)
+2026-11-17 09:38:26,633 - openai._base_client - INFO: Retrying request in 0.773645 seconds (retry 2 of 2)
+2026-11-17 09:38:26,634 - openai._base_client - INFO: Retrying request in 0.785091 seconds (retry 2 of 2)
+2026-11-17 09:38:26,683 - openai._base_client - INFO: Retrying request in 0.982286 seconds (retry 2 of 2)
+2026-11-17 09:38:26,700 - openai._base_client - INFO: Retrying request in 0.940499 seconds (retry 2 of 2)
+2026-11-17 09:38:26,703 - openai._base_client - INFO: Retrying request in 0.832756 seconds (retry 2 of 2)
+2026-11-17 09:38:26,706 - openai._base_client - INFO: Retrying request in 0.946441 seconds (retry 2 of 2)
+2026-11-17 09:38:26,750 - openai._base_client - INFO: Retrying request in 0.966922 seconds (retry 2 of 2)
+2026-11-17 09:38:26,763 - openai._base_client - INFO: Retrying request in 0.766121 seconds (retry 2 of 2)
+2026-11-17 09:38:26,785 - openai._base_client - INFO: Retrying request in 0.857239 seconds (retry 2 of 2)
+2026-11-17 09:38:26,795 - openai._base_client - INFO: Retrying request in 0.881832 seconds (retry 2 of 2)
+2026-11-17 09:38:26,798 - openai._base_client - INFO: Retrying request in 0.803845 seconds (retry 2 of 2)
+2026-11-17 09:38:26,798 - openai._base_client - INFO: Retrying request in 0.798126 seconds (retry 2 of 2)
+2026-11-17 09:38:26,803 - openai._base_client - INFO: Retrying request in 0.952398 seconds (retry 2 of 2)
+2026-11-17 09:38:26,824 - openai._base_client - INFO: Retrying request in 0.975767 seconds (retry 2 of 2)
+2026-11-17 09:38:26,825 - openai._base_client - INFO: Retrying request in 0.892237 seconds (retry 2 of 2)
+2026-11-17 09:38:26,837 - openai._base_client - INFO: Retrying request in 0.894105 seconds (retry 2 of 2)
+2026-11-17 09:38:26,848 - openai._base_client - INFO: Retrying request in 0.883244 seconds (retry 2 of 2)
+2026-11-17 09:38:26,857 - openai._base_client - INFO: Retrying request in 0.817731 seconds (retry 2 of 2)
+2026-11-17 09:38:26,871 - openai._base_client - INFO: Retrying request in 0.831659 seconds (retry 2 of 2)
+2026-11-17 09:38:26,876 - openai._base_client - INFO: Retrying request in 0.753959 seconds (retry 2 of 2)
+2026-11-17 09:38:26,877 - openai._base_client - INFO: Retrying request in 0.975396 seconds (retry 2 of 2)
+2026-11-17 09:38:26,880 - openai._base_client - INFO: Retrying request in 0.899345 seconds (retry 2 of 2)
+2026-11-17 09:38:26,943 - openai._base_client - INFO: Retrying request in 0.915174 seconds (retry 2 of 2)
+2026-11-17 09:38:26,944 - openai._base_client - INFO: Retrying request in 0.784582 seconds (retry 2 of 2)
+2026-11-17 09:38:26,945 - openai._base_client - INFO: Retrying request in 0.937836 seconds (retry 2 of 2)
+2026-11-17 09:38:26,952 - openai._base_client - INFO: Retrying request in 0.952448 seconds (retry 2 of 2)
+2026-11-17 09:38:27,023 - openai._base_client - INFO: Retrying request in 0.887847 seconds (retry 2 of 2)
+2026-11-17 09:38:27,102 - openai._base_client - INFO: Retrying request in 0.894530 seconds (retry 2 of 2)
+2026-11-17 09:38:27,121 - openai._base_client - INFO: Retrying request in 0.930364 seconds (retry 2 of 2)
+                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:27<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:27<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:27 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:28<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:28<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:28 - evalscope - [33mWARNING[0m: Attempt 3 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:28<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:28<?, ?it/s][A2026-11-17 09:38:37,177 - openai._base_client - INFO: Retrying request in 0.468774 seconds (retry 1 of 2)
+2026-11-17 09:38:37,410 - openai._base_client - INFO: Retrying request in 0.384592 seconds (retry 1 of 2)
+2026-11-17 09:38:37,421 - openai._base_client - INFO: Retrying request in 0.444609 seconds (retry 1 of 2)
+2026-11-17 09:38:37,463 - openai._base_client - INFO: Retrying request in 0.392331 seconds (retry 1 of 2)
+2026-11-17 09:38:37,474 - openai._base_client - INFO: Retrying request in 0.431209 seconds (retry 1 of 2)
+2026-11-17 09:38:37,533 - openai._base_client - INFO: Retrying request in 0.493676 seconds (retry 1 of 2)
+2026-11-17 09:38:37,538 - openai._base_client - INFO: Retrying request in 0.375090 seconds (retry 1 of 2)
+2026-11-17 09:38:37,598 - openai._base_client - INFO: Retrying request in 0.395497 seconds (retry 1 of 2)
+2026-11-17 09:38:37,605 - openai._base_client - INFO: Retrying request in 0.378875 seconds (retry 1 of 2)
+2026-11-17 09:38:37,633 - openai._base_client - INFO: Retrying request in 0.384204 seconds (retry 1 of 2)
+2026-11-17 09:38:37,643 - openai._base_client - INFO: Retrying request in 0.393913 seconds (retry 1 of 2)
+2026-11-17 09:38:37,644 - openai._base_client - INFO: Retrying request in 0.479211 seconds (retry 1 of 2)
+2026-11-17 09:38:37,647 - openai._base_client - INFO: Retrying request in 0.878590 seconds (retry 2 of 2)
+2026-11-17 09:38:37,654 - openai._base_client - INFO: Retrying request in 0.473282 seconds (retry 1 of 2)
+2026-11-17 09:38:37,668 - openai._base_client - INFO: Retrying request in 0.449870 seconds (retry 1 of 2)
+2026-11-17 09:38:37,677 - openai._base_client - INFO: Retrying request in 0.492671 seconds (retry 1 of 2)
+2026-11-17 09:38:37,679 - openai._base_client - INFO: Retrying request in 0.452628 seconds (retry 1 of 2)
+2026-11-17 09:38:37,706 - openai._base_client - INFO: Retrying request in 0.376836 seconds (retry 1 of 2)
+2026-11-17 09:38:37,726 - openai._base_client - INFO: Retrying request in 0.466850 seconds (retry 1 of 2)
+2026-11-17 09:38:37,726 - openai._base_client - INFO: Retrying request in 0.401991 seconds (retry 1 of 2)
+2026-11-17 09:38:37,730 - openai._base_client - INFO: Retrying request in 0.443124 seconds (retry 1 of 2)
+2026-11-17 09:38:37,733 - openai._base_client - INFO: Retrying request in 0.447124 seconds (retry 1 of 2)
+2026-11-17 09:38:37,734 - openai._base_client - INFO: Retrying request in 0.380335 seconds (retry 1 of 2)
+2026-11-17 09:38:37,757 - openai._base_client - INFO: Retrying request in 0.375572 seconds (retry 1 of 2)
+2026-11-17 09:38:37,782 - openai._base_client - INFO: Retrying request in 0.430529 seconds (retry 1 of 2)
+2026-11-17 09:38:37,796 - openai._base_client - INFO: Retrying request in 0.820398 seconds (retry 2 of 2)
+2026-11-17 09:38:37,803 - openai._base_client - INFO: Retrying request in 0.480650 seconds (retry 1 of 2)
+2026-11-17 09:38:37,856 - openai._base_client - INFO: Retrying request in 0.462912 seconds (retry 1 of 2)
+2026-11-17 09:38:37,857 - openai._base_client - INFO: Retrying request in 0.757823 seconds (retry 2 of 2)
+2026-11-17 09:38:37,862 - openai._base_client - INFO: Retrying request in 0.427602 seconds (retry 1 of 2)
+2026-11-17 09:38:37,866 - openai._base_client - INFO: Retrying request in 0.864451 seconds (retry 2 of 2)
+2026-11-17 09:38:37,885 - openai._base_client - INFO: Retrying request in 0.406503 seconds (retry 1 of 2)
+2026-11-17 09:38:37,905 - openai._base_client - INFO: Retrying request in 0.985709 seconds (retry 2 of 2)
+2026-11-17 09:38:37,907 - openai._base_client - INFO: Retrying request in 0.426978 seconds (retry 1 of 2)
+2026-11-17 09:38:37,913 - openai._base_client - INFO: Retrying request in 0.437144 seconds (retry 1 of 2)
+2026-11-17 09:38:37,914 - openai._base_client - INFO: Retrying request in 0.786820 seconds (retry 2 of 2)
+2026-11-17 09:38:37,985 - openai._base_client - INFO: Retrying request in 0.960642 seconds (retry 2 of 2)
+2026-11-17 09:38:37,995 - openai._base_client - INFO: Retrying request in 0.759805 seconds (retry 2 of 2)
+2026-11-17 09:38:37,999 - openai._base_client - INFO: Retrying request in 0.489986 seconds (retry 1 of 2)
+2026-11-17 09:38:38,018 - openai._base_client - INFO: Retrying request in 0.953544 seconds (retry 2 of 2)
+2026-11-17 09:38:38,027 - openai._base_client - INFO: Retrying request in 0.851241 seconds (retry 2 of 2)
+2026-11-17 09:38:38,037 - openai._base_client - INFO: Retrying request in 0.831197 seconds (retry 2 of 2)
+2026-11-17 09:38:38,053 - openai._base_client - INFO: Retrying request in 0.470600 seconds (retry 1 of 2)
+2026-11-17 09:38:38,084 - openai._base_client - INFO: Retrying request in 0.970028 seconds (retry 2 of 2)
+2026-11-17 09:38:38,115 - openai._base_client - INFO: Retrying request in 0.777428 seconds (retry 2 of 2)
+2026-11-17 09:38:38,119 - openai._base_client - INFO: Retrying request in 0.938446 seconds (retry 2 of 2)
+2026-11-17 09:38:38,124 - openai._base_client - INFO: Retrying request in 0.851370 seconds (retry 2 of 2)
+2026-11-17 09:38:38,128 - openai._base_client - INFO: Retrying request in 0.845155 seconds (retry 2 of 2)
+2026-11-17 09:38:38,129 - openai._base_client - INFO: Retrying request in 0.895194 seconds (retry 2 of 2)
+2026-11-17 09:38:38,133 - openai._base_client - INFO: Retrying request in 0.854082 seconds (retry 2 of 2)
+2026-11-17 09:38:38,134 - openai._base_client - INFO: Retrying request in 0.869304 seconds (retry 2 of 2)
+2026-11-17 09:38:38,171 - openai._base_client - INFO: Retrying request in 0.766323 seconds (retry 2 of 2)
+2026-11-17 09:38:38,174 - openai._base_client - INFO: Retrying request in 0.948935 seconds (retry 2 of 2)
+2026-11-17 09:38:38,181 - openai._base_client - INFO: Retrying request in 0.820952 seconds (retry 2 of 2)
+2026-11-17 09:38:38,194 - openai._base_client - INFO: Retrying request in 0.940329 seconds (retry 2 of 2)
+2026-11-17 09:38:38,214 - openai._base_client - INFO: Retrying request in 0.901054 seconds (retry 2 of 2)
+2026-11-17 09:38:38,285 - openai._base_client - INFO: Retrying request in 0.832077 seconds (retry 2 of 2)
+2026-11-17 09:38:38,290 - openai._base_client - INFO: Retrying request in 0.925001 seconds (retry 2 of 2)
+2026-11-17 09:38:38,292 - openai._base_client - INFO: Retrying request in 0.920956 seconds (retry 2 of 2)
+2026-11-17 09:38:38,319 - openai._base_client - INFO: Retrying request in 0.812034 seconds (retry 2 of 2)
+2026-11-17 09:38:38,335 - openai._base_client - INFO: Retrying request in 0.981864 seconds (retry 2 of 2)
+2026-11-17 09:38:38,351 - openai._base_client - INFO: Retrying request in 0.885429 seconds (retry 2 of 2)
+2026-11-17 09:38:38,490 - openai._base_client - INFO: Retrying request in 0.750386 seconds (retry 2 of 2)
+2026-11-17 09:38:38,524 - openai._base_client - INFO: Retrying request in 0.750976 seconds (retry 2 of 2)
+                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:38<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:38 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:38<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A                                                           
+                                                           [A2026-11-17 09:38:39 - evalscope - [33mWARNING[0m: Attempt 4 / 5 failed: Connection error.. Retrying...[0m
+Running[eval]:   0%|          | 0/1 [00:39<?, ?benchmark/s]
+Evaluating[gsm8k]:   0%|          | 0/1319 [00:39<?, ?it/s][A

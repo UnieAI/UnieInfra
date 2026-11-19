@@ -1,0 +1,26 @@
+  <section class="mx-section" id="stress">
+    <h2>Stress test: think time removed, c32 (unofficial)</h2>
+    <p class="mx-note">The same AgentX corpus with <code>--ignore-trace-delays</code> for 5 minutes, so each lane sends its next turn as soon as the last one finishes and the server stays saturated. UnieInfra build db3956be.</p>
+    <div class="mx-grid">
+      <article class="mx-card" id="card-stress-ratio">
+        <h3>UnieInfra ÷ vLLM throughput</h3>
+        <p class="mx-note">Higher is better. The solid line is parity with vLLM; the dashed line is the 2× goal.</p>
+        <div class="mx-chart dash-skeleton" data-draw="stress-ratio" data-source="stress_ratio"></div>
+      </article>
+      <article class="mx-card" id="card-stress-lat">
+        <h3>Latency in seconds</h3>
+        <p class="mx-note">Lower is better. Median time to first token and median end-to-end request latency.</p>
+        <div class="mx-chart dash-skeleton" data-draw="stress-lat" data-source="stress"></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="mx-section" id="comm">
+    <h2>Communication experiments</h2>
+    <article class="mx-card" id="card-prefill">
+      <h3>Prefill time of one 104K-token prompt</h3>
+      <p class="mx-note">Lower is better. Bars are the mean of the runs, whiskers the fastest and slowest. Only the Iris all-reduce change was kept; the INT8 all-reduce (about 5% at best, with extra rounding) is in the experiment log.</p>
+      <div class="mx-chart dash-skeleton" data-draw="prefill" data-source="prefill_ab"></div>
+    </article>
+  </section>
+

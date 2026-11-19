@@ -1,0 +1,34 @@
+[
+ {
+  "variant": "rccl",
+  "label": "RCCL all-reduce (before)",
+  "runs": null,
+  "best_s": 4.1,
+  "worst_s": 4.2,
+  "mean_s": 4.15
+ },
+ {
+  "variant": "iris",
+  "label": "Iris all-reduce (kept, db3956be)",
+  "runs": 3,
+  "best_s": 3.6,
+  "worst_s": 3.7,
+  "mean_s": 3.67
+ },
+ {
+  "variant": "ov2",
+  "label": "Iris + FFN overlap, 2 chunks",
+  "runs": 3,
+  "best_s": 4.3,
+  "worst_s": 4.6,
+  "mean_s": 4.43
+ },
+ {
+  "variant": "ov4",
+  "label": "Iris + FFN overlap, 4 chunks",
+  "runs": 3,
+  "best_s": 4.2,
+  "worst_s": 4.3,
+  "mean_s": 4.23
+ }
+]

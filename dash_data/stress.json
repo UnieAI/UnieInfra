@@ -1,0 +1,30 @@
+[
+ {
+  "engine": "UnieInfra optimized",
+  "concurrency": 32,
+  "duration_s": 300,
+  "rpm": 88.7,
+  "output_tps": 1111.2,
+  "input_tps": 183067,
+  "ttft_p50_s": 0.38,
+  "ttft_p90_s": 2.08,
+  "latency_p50_s": 9.5,
+  "latency_avg_s": 23.0,
+  "tps_user_p50": 31.1,
+  "requests": 488
+ },
+ {
+  "engine": "vLLM",
+  "concurrency": 32,
+  "duration_s": 300,
+  "rpm": 45.5,
+  "output_tps": 815.0,
+  "input_tps": 109926,
+  "ttft_p50_s": 35.69,
+  "ttft_p90_s": 55.64,
+  "latency_p50_s": 42.3,
+  "latency_avg_s": 45.5,
+  "tps_user_p50": 110.6,
+  "requests": 250
+ }
+]

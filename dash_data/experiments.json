@@ -1,0 +1,929 @@
+[
+ {
+  "id": 1,
+  "date": "2026-11-04",
+  "area": "Baseline",
+  "experiment": "AgentX 15 min at c1/c4/c16 for vLLM, SGLang (official MI355X recipes, MI350P memory fixes) and unmodified UnieInfra.",
+  "result": "c16: vLLM 505.9 out tok/s, SGLang 376.5. UnieInfra c1 78.3 tok/s; its c4 run crashed (all ranks SIGSEGV in rocr AsyncEventsLoop).",
+  "decision": "Investigate the UnieInfra crash before any optimization.",
+  "commit": "-"
+ },
+ {
+  "id": 2,
+  "date": "2026-11-05",
+  "area": "Infra",
+  "experiment": "Root disk filled during crashes.",
+  "result": "Each crashed rank wrote a multi-GB apport core dump (58 GB RSS + Engram tables).",
+  "decision": "Disable core dumps in all three server launchers (ulimit core=0). Mount the spare SATA disk at /data.",
+  "commit": "-"
+ },
+ {
+  "id": 3,
+  "date": "2026-11-05",
+  "area": "Crash",
+  "experiment": "Long-prefill repro: 3 concurrent ~254K-token prompts x3 rounds; then single prompts of 330K, 381K, 425K, 433K tokens.",
+  "result": "Concurrent 254K prompts pass. A single prompt crashes once its position crosses (381,257, 393,216]; 381K passes.",
+  "decision": "Crash depends on one sequence's depth, not concurrency.",
+  "commit": "-"
+ },
+ {
+  "id": 4,
+  "date": "2026-11-05",
+  "area": "Crash",
+  "experiment": "433K prompt with --max-total-tokens 4M, --disable-prefill-graph, --gpu-memory-utilization 0.8.",
+  "result": "Crashes in all three.",
+  "decision": "Not KV budget, prefill graphs or memory pressure.",
+  "commit": "-"
+ },
+ {
+  "id": 5,
+  "date": "2026-11-05",
+  "area": "Crash",
+  "experiment": "433K prompt with HIP_LAUNCH_BLOCKING=1, and separately with --disable-overlap-schedule.",
+  "result": "Both pass (overlap off: 434K prefill in 75.8 s). Kernel log shows no GPU page fault, only a CPU segfault.",
+  "decision": "Host-side ROCm runtime race under the overlap schedule; run benchmarks with overlap off until fixed.",
+  "commit": "-"
+ },
+ {
+  "id": 6,
+  "date": "2026-11-05",
+  "area": "Benchmark",
+  "experiment": "AgentX c1/c4/c16 for UnieInfra with --disable-overlap-schedule.",
+  "result": "73.4 / 135.5 / 335.8 out tok/s; c1 decode about 12% slower than with overlap.",
+  "decision": "Workaround only; overlap must come back.",
+  "commit": "-"
+ },
+ {
+  "id": 7,
+  "date": "2026-11-05",
+  "area": "Indexer",
+  "experiment": "gfx950 CSA2 indexer ignored the 512 MiB logits option and used a hard-coded 32 MiB budget, so launches per prefill chunk grew with history (~23K at 393K).",
+  "result": "512 MiB budget: 434K prompt passes with overlap on, prefill 62 s (vs 76 s overlap off). Indexer tests pass.",
+  "decision": "Keep. Crash fixed, overlap back on.",
+  "commit": "21edd46b"
+ },
+ {
+  "id": 8,
+  "date": "2026-11-05",
+  "area": "Indexer",
+  "experiment": "Indexer key loads: page_stride_bytes was do_not_specialize (byte loads); let it specialize, waves_per_eu 2 -> 8, share one key tile across both head groups.",
+  "result": "96 rows x 75K: 2332 -> 617 us (3.8x). 16 req at 150K context: 694 -> 1005 decode tok/s.",
+  "decision": "Keep.",
+  "commit": "2143b539"
+ },
+ {
+  "id": 9,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "RCCL vs Iris all-reduce via --force-deterministic-rsag.",
+  "result": "16 req short context: 73 -> 79 tok/s/user (later shown to be noise once the indexer improved).",
+  "decision": "Used for the c16 AgentX run below; revisited in #16.",
+  "commit": "-"
+ },
+ {
+  "id": 10,
+  "date": "2026-11-05",
+  "area": "Benchmark",
+  "experiment": "AgentX c16 with #7, #8 and RCCL.",
+  "result": "508.1 out tok/s (+51% vs 335.8), RPM 28.5, TTFT p50 254 ms, tok/s/user 85.0. vLLM 505.9, SGLang 376.5.",
+  "decision": "Matches vLLM throughput; per-user decode still about half of vLLM.",
+  "commit": "2143b539"
+ },
+ {
+  "id": 11,
+  "date": "2026-11-05",
+  "area": "GEMM",
+  "experiment": "MXFP8 decode GEMM NUM_XCDS 8 -> 4 (MI350P has 4 XCDs).",
+  "result": "Total over all DSv4.1 decode shapes: +0.4%.",
+  "decision": "Rejected.",
+  "commit": "-"
+ },
+ {
+  "id": 12,
+  "date": "2026-11-05",
+  "area": "Indexer",
+  "experiment": "Share one key load across a request's 6 DSpark rows (row grouping).",
+  "result": "617 -> 3536 us (slower). Rows sharing keys vs all-distinct keys cost the same (617 vs 637 us): L2 already absorbs the reuse.",
+  "decision": "Rejected.",
+  "commit": "-"
+ },
+ {
+  "id": 13,
+  "date": "2026-11-05",
+  "area": "Indexer",
+  "experiment": "Tile width sweep: 16/32/64/128 rows x 1/2/4/8 waves; score chunk 128-2048.",
+  "result": "16 rows, 1 wave best everywhere; chunk 1024 best for big work, 256 for small. 96 rows x 75K: 617 -> 331 us; 192 x 150K: 2341 -> 1173 us.",
+  "decision": "Keep, with work-sized chunk buckets (256/512/1024). GSM8K 92.7% (threshold 90%).",
+  "commit": "27314382"
+ },
+ {
+  "id": 14,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "Auto-route all AMD collectives to RCCL on PCIe-only hosts (KFD XGMI detection).",
+  "result": "n=16 79 tok/s (same as Iris); n=1 155 tok/s vs 202 with Iris. Long context c16: RCCL 1026 vs Iris 1003 decode tok/s.",
+  "decision": "Rejected and dropped: Iris is better at low batch and ties elsewhere.",
+  "commit": "2fe0f771 (dropped)"
+ },
+ {
+  "id": 15,
+  "date": "2026-11-05",
+  "area": "Profile",
+  "experiment": "Batch-1 decode profile with Iris.",
+  "result": "GPU busy only 75%: about 4 ms per step waiting for the host; MoE 22%, MXFP8 GEMM 17%, Iris all-reduce 17%.",
+  "decision": "Next target: host launch overhead at low batch.",
+  "commit": "-"
+ },
+ {
+  "id": 16,
+  "date": "2026-11-05",
+  "area": "Launch",
+  "experiment": "ROCm env sweep: HIP_FORCE_DEV_KERNARG=1, +GPU_MAX_HW_QUEUES=2, +DEBUG_CLR_GRAPH_PACKET_CAPTURE=1.",
+  "result": "n=1 tok/s/user: default 139-145, dev kernarg 191-196, +hwq2 197-199, +packet 148-181. Run-to-run noise large.",
+  "decision": "Repeat A/B interleaved before adopting; paused to fill the benchmark matrix.",
+  "commit": "-"
+ },
+ {
+  "id": 17,
+  "date": "2026-11-05",
+  "area": "Benchmark",
+  "experiment": "vLLM/SGLang c32-c128 round.",
+  "result": "All 6 failed to start: vLLM cold model load from the SATA /data copy exceeded its engine startup timeout; SGLang's MI355X c32+ cells (tails 2048/4096, 64+ running) leave no KV room on 144 GB.",
+  "decision": "vLLM/SGLang read the NVMe model copy again; SGLang c32+: tails 1024/512, 64 running. vLLM c32 rerun: 745.9 out tok/s.",
+  "commit": "-"
+ },
+ {
+  "id": 18,
+  "date": "2026-11-05",
+  "area": "Benchmark",
+  "experiment": "Full matrix to remove gaps: SGLang c32/64/128, vLLM c64/128, current UnieInfra c1/c4/c16/c32/c64/c128.",
+  "result": "SGLang c32/c64: 316.7/282.7 out tok/s (falls past c16: KV-bound queueing, TTFT p90 143 s/404 s). SGLang c128 hit the AiPerf timeout (40 min warmup). vLLM c64: 1028.1 out tok/s, 71.5 RPM.",
+  "decision": "Per the user, compare against vLLM only: SGLang c128 not rerun; UnieInfra's six long cells deferred to the final build. AiPerf timeout raised to duration+5400 s.",
+  "commit": "27314382"
+ },
+ {
+  "id": 19,
+  "date": "2026-11-05",
+  "area": "Analysis",
+  "experiment": "Where UnieInfra's GPU time goes in AgentX c16 (from the server batch log).",
+  "result": "6.78M new prefill tokens in ~20 min (90% prefix-cache hits); prefill takes roughly half or more of GPU time, and only ~9 requests decode at once.",
+  "decision": "Target for 2x vLLM: prefill speed and scaling to c32/c64, measured with 5-minute AgentX runs.",
+  "commit": "-"
+ },
+ {
+  "id": 20,
+  "date": "2026-11-05",
+  "area": "Benchmark",
+  "experiment": "UnieInfra c64, 5-minute AgentX (commit 27314382), vs vLLM c64 (15 min).",
+  "result": "746.9 out tok/s, 62 RPM, TTFT p50 0.24 s, request latency 10.6 s. vLLM c64: 1028.1 out tok/s, 71.5 RPM, TTFT p50 22 s, request latency 30.1 s. vLLM c128 collapses to 355.0 out tok/s.",
+  "decision": "UnieInfra serves each request 3x faster but RPM is similar: see #21.",
+  "commit": "27314382"
+ },
+ {
+  "id": 21,
+  "date": "2026-11-05",
+  "area": "Analysis",
+  "experiment": "AgentX pacing rules (aiperf inferencex_agentx_mvp scenario).",
+  "result": "The scenario forbids ignoring trace delays: each lane replays the recorded user think time between turns (idle gaps capped at 300 s). From vLLM c64: 53.7 s per lane cycle = 30.1 s request + ~23.6 s think time.",
+  "decision": "At equal concurrency, faster requests can give at most ~1.5x vLLM. 2x vLLM's best (1028 at c64) means sustaining c128 at ~30 s request latency, where vLLM collapses. Measure UnieInfra c128 next.",
+  "commit": "-"
+ },
+ {
+  "id": 22,
+  "date": "2026-11-05",
+  "area": "Benchmark",
+  "experiment": "UnieInfra c128, 5-minute AgentX (stopped during warmup).",
+  "result": "Saturated by prefill: one 16K-token chunk per step, 1 request running and 123 queued, no decode; 22.7K new prefill tokens/s.",
+  "decision": "Prefill throughput is the bottleneck under load. Stopped the run to profile prefill.",
+  "commit": "27314382"
+ },
+ {
+  "id": 23,
+  "date": "2026-11-05",
+  "area": "Profile",
+  "experiment": "Prefill profile: 4 steps of a 100K-token prompt (16K chunks).",
+  "result": "RCCL all-reduce 47% of GPU time (2 x 168 MB per layer, ~4.6 ms each, ~55 GB/s bus bandwidth, the PCIe limit); indexer topk+select 15%; MXFP8 GEMM 6%; sparse prefill attention 5%; MoE 9%.",
+  "decision": "Cut communication: try Iris at prefill sizes, then INT8 payloads.",
+  "commit": "-"
+ },
+ {
+  "id": 24,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "Large all-reduce variants on 4x MI350P: RCCL, RCCL RS+AG, INT8 all-to-all+all-gather, Iris two-shot.",
+  "result": "168 MB: RCCL 6.19 ms, RS+AG 7.42, INT8 a2a+ag 8.10 (all-to-all is slow across sockets), Iris 5.51. 42 MB: RCCL 1.87, Iris 1.33.",
+  "decision": "Use Iris for prefill sizes on PCIe hosts; INT8 needs a quantized Iris kernel, not RCCL primitives.",
+  "commit": "-"
+ },
+ {
+  "id": 25,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "Lift Iris all-reduce caps to 256 MB on PCIe-only AMD hosts (KFD XGMI detection).",
+  "result": "104K-token prompt prefill 4.1-4.2 s -> 3.6-3.7 s (~10%). GSM8K 92.7%.",
+  "decision": "Keep.",
+  "commit": "db3956be"
+ },
+ {
+  "id": 26,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "Iris pull two-shot with INT8 payloads (32-element groups, FP32 scales): quantize, reduce-scatter in FP32, requantize, gather. Swept tile rows, programs, warps, vector width.",
+  "result": "Correct (relative error 7.7e-3 vs 1.7e-3 for BF16), but 168 MB takes 4.93 ms vs 5.11 ms for BF16 Iris (~27 GB/s effective vs ~49 GB/s), and ~0.3-1 ms fixed cost at small sizes.",
+  "decision": "Shelved: needs BF16-two-shot-level load tuning to pay off, and adds two INT8 roundings. Kernel kept outside the tree.",
+  "commit": "-"
+ },
+ {
+  "id": 27,
+  "date": "2026-11-05",
+  "area": "Prefill",
+  "experiment": "Chunked prefill 32K instead of 16K (with Iris prefill all-reduce).",
+  "result": "104K-token prompt 4.2-4.3 s (16K chunks: 3.6-3.7 s). Three concurrent 104K prompts all finish at 12.2 s: prefill runs one chunk at a time, ~25.6K tok/s either way.",
+  "decision": "Rejected; keep 16K.",
+  "commit": "-"
+ },
+ {
+  "id": 28,
+  "date": "2026-11-05",
+  "area": "Profile",
+  "experiment": "Prefill profile after the Iris change (4 steps of a 100K-token prompt).",
+  "result": "Iris two-shot all-reduce (with fused mHC post) 44%, indexer topk+select 16%, MoE 10%, MXFP8 GEMM 7%, sparse prefill attention 6.5%. Communication still runs at the PCIe limit.",
+  "decision": "Remaining big lever is overlapping communication with compute (two micro-batches per prefill step), a multi-day change; measure current standing with the stress test first.",
+  "commit": "db3956be"
+ },
+ {
+  "id": 29,
+  "date": "2026-11-05",
+  "area": "Benchmark",
+  "experiment": "Stress test (AgentX corpus, think time removed via --ignore-trace-delays, unofficial), c32, 5 minutes, UnieInfra db3956be vs vLLM.",
+  "result": "UnieInfra 88.7 RPM, 1111 out tok/s, 183K in tok/s, request latency 23.0 s. vLLM 45.5 RPM, 815 out tok/s, 110K in tok/s, 45.5 s. RPM 1.95x, input 1.67x, output 1.36x (output lengths differ: 751 vs 1076 in this window).",
+  "decision": "Saturated server capacity is already ~1.7-2x vLLM by request and prefill rate; continue with communication overlap.",
+  "commit": "db3956be"
+ },
+ {
+  "id": 30,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "INT8 Iris all-reduce, second tuning round: group 32/64/128, 16-byte loads, 84-128 programs, 4-8 warps.",
+  "result": "Best (group 128, 64-row tiles, 84 programs, 8 warps): 168 MB 4.55 ms vs 5.12 ms BF16 Iris (-11%), 42 MB 1.44 vs 1.33 ms; relative error 9.3e-3.",
+  "decision": "Rejected: ~5% prefill at best, with two INT8 roundings. Communication overlap is the better lever.",
+  "commit": "-"
+ },
+ {
+  "id": 31,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "Can an all-reduce overlap compute on MI350P? 84 MB all-reduce on a side stream next to BF16 GEMMs.",
+  "result": "RCCL hides 64% of its 2.94 ms; Iris hides only 30% of its 2.61 ms (its spinning workgroups take CUs).",
+  "decision": "Overlap designs must put RCCL on a side stream, not Iris.",
+  "commit": "-"
+ },
+ {
+  "id": 32,
+  "date": "2026-11-05",
+  "area": "Comm",
+  "experiment": "Row-chunked prefill FFN overlap: attention and MoE all-reduces of 2 or 4 row chunks through RCCL on a side stream, overlapping the other chunks' mHC + MoE compute (eager prefill >= 4096 rows).",
+  "result": "Needle-in-haystack 6/6 correct, but a 104K-token prefill takes 4.3-4.6 s (2 chunks) and 4.2-4.3 s (4 chunks) vs 3.6-3.7 s with serial Iris: RCCL is slower than Iris, the FFN window is too short to hide it, and chunked MoE is less efficient.",
+  "decision": "Rejected and reverted. On this PCIe-only box, overlapping with RCCL loses to serial Iris; full two-batch overlap would net ~20% at best for multi-day work.",
+  "commit": "-"
+ },
+ {
+  "id": 33,
+  "date": "2026-11-06",
+  "area": "Benchmark",
+  "experiment": "Official AgentX c128, 15 min, UnieInfra db3956be.",
+  "result": "2.9 RPM, 4.8 out tok/s, ITL p50 4.8 s, 45 requests. Server log: prefill-only rounds (#running-req 1, #queue-req 50-252, #cached-token 0).",
+  "decision": "UnieInfra collapses at c128; investigate scheduler admission.",
+  "commit": "db3956be"
+ },
+ {
+  "id": 34,
+  "date": "2026-11-06",
+  "area": "Benchmark",
+  "experiment": "Stress sweep (think time removed, 5 min/point), official recipe parameters: UnieInfra db3956be vs vLLM, c1/c16/c32/c64/c128.",
+  "result": "RPM UnieInfra vs vLLM: c1 19.1 vs 15.2, c16 64.0 vs 30.2, c32 95.6 vs 45.1, c64 94.7 vs 67.1, c128 0 completed (no profile records) vs 32.5. vLLM recipe caps running requests at CONC/4.",
+  "decision": "UnieInfra plateaus at c32-c64 and collapses at c128.",
+  "commit": "db3956be"
+ },
+ {
+  "id": 35,
+  "date": "2026-11-06",
+  "area": "Benchmark",
+  "experiment": "Stress sweep, vLLM with max-num-seqs = 2x CONC (as UnieInfra), c1/c16/c32/c64/c128.",
+  "result": "RPM: c1 9.1 (anomalous), c16 87.5, c32 111.8, c64 125.3, c128 12.7. Beats UnieInfra by 15-30% at c16-c64 (UnieInfra/vLLM 0.73x, 0.86x, 0.76x).",
+  "decision": "The earlier 1.95x came from the recipe's running-request cap. Fair baseline is vLLM 2x seqs; peak 125 RPM at c64.",
+  "commit": "-"
+ },
+ {
+  "id": 36,
+  "date": "2026-11-06",
+  "area": "Benchmark",
+  "experiment": "vLLM c128 stress, max-num-seqs 64 and 128 (32 and 256 above). UnieInfra/vLLM c256 started then dropped.",
+  "result": "c128 RPM: seqs 32 32.5, 64 26.1, 128 23.8, 256 12.7. All far below c64 (125.3): 128 x ~130K-token contexts exceed the KV pool, prefix caches evict each other.",
+  "decision": "Both engines peak between c64 and c128; c256 dropped. Next: UnieInfra admission control so c128 does not collapse.",
+  "commit": "-"
+ },
+ {
+  "id": 37,
+  "date": "2026-11-06",
+  "area": "Benchmark",
+  "experiment": "Official AgentX sweep (15 min/point), UnieInfra db3956be: c1, c4, c16, c32, c64 (c128 above).",
+  "result": "Output tok/s vs vLLM official: c1 88.3 vs 74.6 (1.18x), c4 137.0 vs 135.7 (1.01x), c16 517.9 vs 505.9 (1.02x), c32 804.3 vs 745.9 (1.08x), c64 586.3 vs 1028.1 (0.57x), c128 4.8 vs 355.0. RPM c32 65.2 vs 57.4, c64 47.7 vs 71.5.",
+  "decision": "Ahead up to c32, collapses from c64: prefill-first scheduling starves decode while the queue is non-empty. Fix the scheduler.",
+  "commit": "db3956be"
+ },
+ {
+  "id": 38,
+  "date": "2026-11-06",
+  "area": "Scheduler",
+  "experiment": "Root cause of the c64/c128 collapse (scheduler code read): outside mixed mode a round decodes only if it scheduled no prefill (forward.cpp buildFusedPlan); mixed mode is off for DeepSeek-V4.1.",
+  "result": "With a queue that never drains, PrefillDone requests never decode. Added TOKENSPEED_DECODE_EVERY_PREFILL_ROUNDS=N: after N prefill rounds in a row a round with decodes waiting decodes instead (default 0 = unchanged).",
+  "decision": "Stress-test N=1 at c128 and c64.",
+  "commit": "(uncommitted)"
+ },
+ {
+  "id": 39,
+  "date": "2026-11-06",
+  "area": "Scheduler",
+  "experiment": "Stress test with TOKENSPEED_DECODE_EVERY_PREFILL_ROUNDS=1 (decode after every prefill round), c128 and c64, 5 min.",
+  "result": "c128: 0 completed -> 21.4 RPM (179 out tok/s). c64: 94.7 -> 103.1 RPM. vLLM stress for reference: c64 125.3 (2x seqs), c128 32.5 (official seqs).",
+  "decision": "Keep (commit cfaac28b); still behind vLLM. c128 also loses its prefix cache (LRU cliff).",
+  "commit": "cfaac28b"
+ },
+ {
+  "id": 40,
+  "date": "2026-11-06",
+  "area": "Port",
+  "experiment": "Restore DSv4.1 work lost in merges 06ea6ffd/9405fa35 (from origin/dsv41-perf-unieai and origin/dsv41): batched prefill attention 74d940c3, shared SWA workspace 5fac6188, captured prefill projections 24aa1967, prefill coalescing 449743ed.",
+  "result": "Cherry-picked onto branch mi350p-port (two trivial conflicts). On H200 the dsv41 branch measured 1.28-2.15x vLLM on AgentX c1-c128.",
+  "decision": "Validate on MI350P: needle, GSM8K, 104K prefill, then stress and official c1-c128 with the H200 recipe (max-num-seqs 64/128, prefill-coalesce 100 ms).",
+  "commit": "d499805c"
+ },
+ {
+  "id": 41,
+  "date": "2026-11-06",
+  "area": "Port",
+  "experiment": "Ported build (d499805c) correctness and stress c1-c128 (decode-every-1, prefill-coalesce 100 ms, max-num-seqs 64/128).",
+  "result": "Needle 6/6, GSM8K 92.5%. Stress RPM c1 17.5, c4 26.2, c16 75.8, c32 92.9, c64 107.3, c128 19.6. vLLM 2x-seqs stress: c4 43.8, c16 87.5, c32 111.8, c64 125.3; official-seqs c1 15.2, c4 45.5, c128 32.5.",
+  "decision": "Still behind vLLM except c1; c4 is far behind (0.58x) and c1 slower than the un-ported build (19.1): check coalescing/decode-interleave at low concurrency.",
+  "commit": "d499805c"
+ },
+ {
+  "id": 42,
+  "date": "2026-11-06",
+  "area": "Cache",
+  "experiment": "Are prefix-cache hits real? 3 x 105K-token unique documents: cold request, follow-up turn on the same prefix, and an exact repeat (scripts/cache_hit_check.py).",
+  "result": "Cold TTFT 3.46-3.55 s; follow-up TTFT 0.07-0.08 s with 104,704-104,960 of ~105K tokens reported cached (100% up to the 256-token granularity); the follow-up answers the hidden code correctly; the repeat gives identical output to the cold run.",
+  "decision": "Hits are genuine: reported cached tokens are skipped compute and the reused KV is correct.",
+  "commit": "d499805c"
+ },
+ {
+  "id": 43,
+  "date": "2026-11-06",
+  "area": "Scheduler",
+  "experiment": "--enable-mixed-batch on DeepSeek-V4.1 (decodes ride in prefill rounds; mixed defaults: 4096-token reference chunk, long prefill <= 2048/round beside decodes). Needle 6/6, cache check pass. Stress c4/c16/c64.",
+  "result": "RPM c4 39.7 (port 26.2, vLLM 45.5), c16 66.4 (75.8), c64 76.2 (107.3). ITL c64 54.7 -> 30.1 ms but TTFT p50 0.7 -> 29 s: the 4096-token cap starves prefill.",
+  "decision": "Mixed helps low concurrency; retry with large mixed chunks (REF/LONG 16384, DECODE_REF 64).",
+  "commit": "d499805c"
+ },
+ {
+  "id": 44,
+  "date": "2026-11-06",
+  "area": "Scheduler",
+  "experiment": "Mixed batch with large chunks (TOKENSPEED_MIXED_REF_CHUNK=16384, LONG_CHUNK=16384, DECODE_REF=64), stress c4/c16/c64.",
+  "result": "RPM c4 38.9, c16 77.1 (best so far; vLLM 87.5), c64 96.2 (non-mixed port 107.3). Mixed default chunks: c4 39.7, c16 66.4, c64 76.2.",
+  "decision": "Mixed wins at c4-c16, non-mixed at c64: pick per concurrency for now; look at why big mixed rounds still lose at c64.",
+  "commit": "d499805c"
+ },
+ {
+  "id": 45,
+  "date": "2026-11-06",
+  "area": "Comm",
+  "experiment": "Iris pull two-shot with its program cap lowered (84 -> 48/32/16/8): 84 MB all-reduce alone and beside BF16 GEMMs on another stream.",
+  "result": "Alone: 84 2.61 ms, 48 2.60, 32 2.55, 16 2.65, 8 4.69. Hidden behind GEMMs: 84 17%, 48 62%, 32 64%, 16 63% (RCCL 64% at 2.91 ms).",
+  "decision": "Iris at 32 programs is as fast and overlaps as well as RCCL: use it for any prefill comm/compute overlap.",
+  "commit": "-"
+ },
+ {
+  "id": 46,
+  "date": "2026-11-06",
+  "area": "Scheduler",
+  "experiment": "Cache-aware admission (TOKENSPEED_CACHE_AWARE_ADMISSION): Submitted pass ordered by device-cached prefix length, aging after 64 overtakes, side-effect-free device probe, hashes cached per request. Branch sched-cache-aware e2317c72.",
+  "result": "Scheduler Python tests 253 passed (5 new). Stress c128/c64 pending.",
+  "decision": "Measure.",
+  "commit": "e2317c72"
+ },
+ {
+  "id": 47,
+  "date": "2026-11-06",
+  "area": "Scheduler",
+  "experiment": "Cache-aware admission on (e2317c72), decode-every-1, coalesce 100 ms, max-num-seqs 128: stress c128 and c64.",
+  "result": "c128: 19.6 -> 30.2 RPM, prefix hit 0% -> 65%; 128 resident requests hold 4911/5458 pages, leaving ~365 for queued sessions' prefixes. c64: 108.2 (107.3 without).",
+  "decision": "Keep (neutral at c64). Next: cap resident requests at c128 (64/48) so queued prefixes fit.",
+  "commit": "e2317c72"
+ },
+ {
+  "id": 48,
+  "date": "2026-11-06",
+  "area": "Profile",
+  "experiment": "Head-to-head micro-tests on the same box: one unique ~155K-token prompt (x3), and decode speed at n=1/16/64 (2K prompts, 512 tokens, ignore_eos). UnieInfra 3a43967b (c64 settings) vs vLLM (max-num-seqs 128).",
+  "result": "Prefill 155K: UnieInfra 5.5-5.8 s, vLLM 6.6-6.9 s (first 15.2 s warmup). Decode ms/token: n=1 5.37 vs 5.89, n=16 12.75 vs 11.15, n=64 26.5 vs 24.5. TTFT under the decode test: 0.2/1.7/4.7 s vs 1.9/3.3/7.2 s.",
+  "decision": "Kernels are at parity (prefill +20%, decode -8 to -14% at batch 16-64). vLLM's 15% stress lead at c16-c64 comes from scheduling (how decode and prefill share steps), not kernels.",
+  "commit": "3a43967b"
+ },
+ {
+  "id": 49,
+  "date": "2026-11-06",
+  "area": "Comm",
+  "experiment": "Prefill FFN comm overlap with Iris at 32 programs on a side stream (3a43967b, TS_EXP_FFN_OVERLAP_CHUNKS 2/4), one ~155K-token prompt x3 + needle.",
+  "result": "Off 5.8 s; 2 pieces 6.2-6.5 s; 4 pieces 6.0-6.2 s. Needle 6/6 all. Losing the fused all-reduce + mHC post (producer-direct) and splitting MoE cost more than the hidden comm.",
+  "decision": "Rejected (kept off by default). Head-to-head shows prefill already 20% ahead of vLLM; the slow part is long-context decode/mixed rounds (~0.46 s each at ~145K context).",
+  "commit": "3a43967b"
+ },
+ {
+  "id": 50,
+  "date": "2026-11-06",
+  "area": "Profile",
+  "experiment": "Where does stress c64 time go? Per-request cache hits from AiPerf records (usage_prompt_cache_read_tokens, profiling phase only) and server-log prefill inside the profiling window.",
+  "result": "Hit rate: UnieInfra 97.2% (595 req, 4.1K new tokens/req) vs vLLM 95.9% (689 req, 5.6K new/req); AiPerf theoretical 97.9%. Earlier 88% figure included warmup cold prompts. In the 329 s window UnieInfra ran 445 prefill rounds with 2.59M new tokens (~93 s at 36 ms/1K = 28% of the time).",
+  "decision": "Cache reuse is not the gap (we beat vLLM). Steady-state time is ~70% long-context decode (~145K average context, batch ~64): profile and optimize decode there.",
+  "commit": "e2317c72"
+ },
+ {
+  "id": 51,
+  "date": "2026-11-06",
+  "area": "Profile",
+  "experiment": "Long-context decode head-to-head: 16/64 users on a shared 130K-token prefix (decode only, ignore_eos). Plus multi-turn cache reuse and short-suffix prefill on a cached 100K prefix.",
+  "result": "Decode ms/token: n=16 UnieInfra 13.3 vs vLLM 9.6; n=64 30-34 vs 19.2 (1920 vs 2620 out tok/s). Cache reuse equal (97.5-97.7% of turn-1 prompt+reply). Suffix prefill TTFT 256/1K/2K/4K/8K: 83/105/148/224/376 ms vs vLLM 69/98/124/191/375 ms.",
+  "decision": "The stress gap is long-context decode (vLLM 1.4-1.8x faster).",
+  "commit": "e2317c72"
+ },
+ {
+  "id": 52,
+  "date": "2026-11-06",
+  "area": "Profile",
+  "experiment": "GPU profile of 64-user 130K-context decode (4.05 s), per stream.",
+  "result": "Main stream 2371 ms: MoE stage1 452 + stage2 249, index_topk 332 + select 193, selected attention 322 + sparse 109, mxfp8 GEMM 185. Comm stream: Iris pull two-shot 1152 ms (28% of wall, ~serial). Side stream (shared expert, overlapped): silu 328 + GEMM 303.",
+  "decision": "Attack the all-reduce first, then indexer/attention.",
+  "commit": "e2317c72"
+ },
+ {
+  "id": 53,
+  "date": "2026-11-06",
+  "area": "Comm",
+  "experiment": "Decode-size all-reduce in CUDA graphs (rows x 5120 BF16): RCCL vs Iris pull two-shot with 32/84/128/256 programs.",
+  "result": "0.98 MB: RCCL 55, Iris32 70, Iris84 150 us. 1.97 MB: 87/101/147. 3.93 MB: 153/159/200. 7.86 MB: 290/274/309. 0.49 MB: 40/56/111.",
+  "decision": "Iris's default 84 programs is 2-2.7x slower than needed at decode sizes. Make the cap configurable (TOKENSPEED_IRIS_PULL_MAX_PROGRAMS) and test 32; consider RCCL below ~2 MB.",
+  "commit": "(uncommitted)"
+ },
+ {
+  "id": 54,
+  "date": "2026-11-06",
+  "area": "Comm",
+  "experiment": "TOKENSPEED_IRIS_PULL_MAX_PROGRAMS=32 (Iris pull cap 84 -> 32) end to end: 130K shared-prefix decode, 155K prefill, needle, stress c64/c16.",
+  "result": "Decode n=16 13.3 -> 12.6 ms/token, n=64 30.0 -> 29.8; 155K prefill 5.5-5.8 -> 6.8 s; needle 6/6; stress c64 108.2 -> 100.7 RPM (c16 see dashboard).",
+  "decision": "Rejected as default (env knob kept, default 84): prefill loss outweighs the small decode gain. Decode two-batch overlap also ruled out: MoE is weight-read-bound with all 256 experts active, so splitting the batch doubles MoE reads (~+17%) and cancels the ~17% comm hiding.",
+  "commit": "(uncommitted)"
+ },
+ {
+  "id": 55,
+  "date": "2026-11-06",
+  "area": "Profile",
+  "experiment": "DSpark acceptance: vLLM vs UnieInfra on the 64-user 130K shared-prefix decode.",
+  "result": "vLLM mean acceptance length 3.01 -> 2.48 over the run; UnieInfra avg_accept_len 2.68 -> 2.10. Per-step: vLLM ~60 ms, UnieInfra ~86 ms. Per-step kernel calls match the layer count (40 target + 3 draft layers, 2 all-reduces each): no extra loop.",
+  "decision": "The gap is per-step time, not drafting. Profile vLLM to compare kernels.",
+  "commit": "-"
+ },
+ {
+  "id": 56,
+  "date": "2026-11-06",
+  "area": "Attention",
+  "experiment": "DSpark draft attention (width 134 = SWA 128 + block) ran the portable Triton dsv4_prefill kernel (0.77 ms/call, 2.3 ms/step). Pad to 192 with -1 and run the gfx950 sparse kernel with non-compact masking.",
+  "result": "Correctness vs Triton: max abs 0.004-0.008, rel 2.2e-3. 64-user 130K decode 29.8 -> 28.1 ms/token (1936 -> 2054 out tok/s).",
+  "decision": "Keep.",
+  "commit": "see git log"
+ },
+ {
+  "id": 57,
+  "date": "2026-11-06",
+  "area": "Profile",
+  "experiment": "vLLM decode profile (64 users, 130K shared prefix, 65 steps) vs UnieInfra (47 steps), per step.",
+  "result": "Step: vLLM 63 ms vs UnieInfra 86 ms (pre draft fix). All-reduce 24.5 vs 24.5 ms; MoE 16.6 vs 14.9 ms; indexer logits+top-k 2.3 ms (8 calls, aiter pa_mqa_logits_mxfp4 + radix_topk) vs 11.2 ms; attention 2.8 (sparse_mla FP8) vs 9.2 ms incl. draft; GEMM ~5 vs ~11 ms. Index sources are layers [2,8,14,20,24,28,32,36]; our extra calls are 256+128-row decode windows, not duplicate work.",
+  "decision": "Gap is indexer (4.6x per row), top-k (~5x), attention (2.6x), GEMMs. Port aiter's spec-row indexer design (agent).",
+  "commit": "d164aa89"
+ },
+ {
+  "id": 58,
+  "date": "2026-11-06",
+  "area": "Attention",
+  "experiment": "Decode indexer query tile 256 -> 384 (one window for 64 users x 6 rows) via TS_EXP_DECODE_INDEX_QUERY_TILE; 1024 does not fit (CUDA-graph scratch 40 GB).",
+  "result": "64-user 130K decode 28.8 -> 28.2 ms/token, 16-user 12.8 -> 13.0: within noise. Needle 6/6.",
+  "decision": "No gain; keep 256 default.",
+  "commit": "(uncommitted knob)"
+ },
+ {
+  "id": 59,
+  "date": "2026-11-06",
+  "area": "Kernels",
+  "experiment": "gfx950 kernels hard-coded MI355X geometry (256 CUs, 8 XCDs); MI350P has 128 CUs / 4 XCDs (KFD num_xcc 4). Read from the device in MXFP8 GEMM split-K, MXFP4 MoE/GEMM swizzles, DSv4 prefill, DSv4.1 selected attention.",
+  "result": "130K decode: 64 users 28.8 -> 26.8 ms/token, 16 users 12.8 -> 12.4. 155K prefill 5.6-6.1 s (unchanged). Needle 6/6. GSM8K 93.0%.",
+  "decision": "Keep.",
+  "commit": "see git log"
+ },
+ {
+  "id": 60,
+  "date": "2026-11-06",
+  "area": "Kernels",
+  "experiment": "Row-block indexer logits (aiter-style: 6 spec rows per CTA, shared page loads, 32x32x64 MFMA, KV splits). Kernel 384x65K 942 -> 212 us.",
+  "result": "155K prefill 5.6-6.1 -> 5.0 s. 130K decode 64 users 27.3 ms/token (26.8 before, unchanged: Reindex layers use candidate mode, still old kernel). 16 users 12.5. Needle 6/6. GSM8K 93.6%.",
+  "decision": "Keep. Next: candidate-mode row-block kernel; top-k select.",
+  "commit": "1afcc3b1"
+ },
+ {
+  "id": 61,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "Candidate-mode indexer logits on 32x32x64 MFMA (per-row gather, 3-stage pipeline). Kernel 384x2048 cand 419 -> 146 us.",
+  "result": "130K decode 64 users 27.3 -> 25.4 ms/token, 16 users 12.5. 155K prefill 5.0 s. Needle 6/6. GSM8K 92.9%. Profile: step ~71 ms; GPU idle ~5.5 ms/step (4.4 ms host gap after _zero_page_fields -> H2D copy each step).",
+  "decision": "Keep. Next: remove per-step host gap; top-k select.",
+  "commit": "7f1b42f6"
+ },
+ {
+  "id": 62,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "Two-pass LDS-compacted indexer top-k select (12-bit histogram + LDS compaction, 16B loads, waves_per_eu 8). Kernel 384x65K 220 -> 64 us (aiter 57).",
+  "result": "select 3.6 -> 1.5 ms/step; step 71 -> 69.4 ms. 130K decode 64 users 25.4, 16 users 12.2 ms/token. Needle 6/6, GSM8K 93.0%.",
+  "decision": "Keep.",
+  "commit": "b8595975"
+ },
+ {
+  "id": 63,
+  "date": "2026-11-07",
+  "area": "Runtime",
+  "experiment": "GPU idle ~5 ms/step at 130K decode. Tried zeroing on execution stream / upload stream / GPU_MAX_HW_QUEUES=16.",
+  "result": "No change in idle gap (zero/upload/HWQ variants 24.5-26.1 ms/token, noise). py-spy: forward thread blocked waiting for the GIL, not ROCm.",
+  "decision": "Reverted (patch saved logs/zero_on_exec.patch).",
+  "commit": "-"
+ },
+ {
+  "id": 64,
+  "date": "2026-11-07",
+  "area": "Scheduler",
+  "experiment": "GIL starvation: ExecutionPlan.forward copied ForwardBatch (MBs of block tables) under the GIL; LCM stats counters held the GIL; GroupAllocator exact reserve() made every decode append O(table).",
+  "result": "130K decode 64 users 24.5-24.6 ms/token (25.4 before), 16 users 11.7-13.7; idle gap 5.3 -> 4.2 ms/step. Needle 6/6, GSM8K 92.7-92.9%. Scheduler tests 253 passed.",
+  "decision": "Keep. Remaining: page-2 compressor_tail table is 69K wide per 130K request (pack/validate 4.4 ms on forward thread).",
+  "commit": "fcbe6e2d (sched-cache-aware)"
+ },
+ {
+  "id": 65,
+  "date": "2026-11-07",
+  "area": "Benchmark",
+  "experiment": "Stress sweep c1-c128 (k62): kernels (indexer logits/candidates/select) + scheduler GIL fixes, cache-aware admission, coalesce 100 ms.",
+  "result": "RPM c1 19.9 (1.31x vLLM best), c4 42.4 (0.93), c16 77.3 (0.88), c32 99.6 (0.89), c64 118.0 (0.94), c128 35.5 (1.09). Every point above previous UnieInfra best.",
+  "decision": "Continue: attention, GEMM, comm.",
+  "commit": "b8595975 + fcbe6e2d"
+ },
+ {
+  "id": 66,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "gfx950 selected attention rows kernel (dim-split waves, 2 WG/CU, FP16 global dequant, XCD remap). Kernel 384 rows 170 -> 140 us.",
+  "result": "130K decode 64 users 24.3, 16 users 11.5 ms/token. Needle 6/6, GSM8K 93.3%.",
+  "decision": "Keep.",
+  "commit": "7bc097ba"
+ },
+ {
+  "id": 67,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "rope_pad_query pads ROCm decode queries to a multiple of 16 heads (gfx950 head block) instead of FlashMLA 64.",
+  "result": "130K decode 64 users 24.3 -> 22.8 ms/token (vLLM same bench 21.6), total 2450 tok/s (vLLM 2305). 16 users 12.0. Prefill 4.9 s. Needle 6/6, GSM8K 93.4%. First run after the edit recompiled triton.py kernels (prefill 10-15 s), warm rerun normal.",
+  "decision": "Keep.",
+  "commit": "e8189f55"
+ },
+ {
+  "id": 68,
+  "date": "2026-11-07",
+  "area": "Benchmark",
+  "experiment": "AgentX stress sweep k67 (attention rows kernel + 16-head padding + GIL scheduler fixes).",
+  "result": "RPM c1 19.5 / c4 44.7 / c16 86.7 / c32 109.3 / c64 111.8 / c128 36.7 vs vLLM best 15.2/45.5/87.5/111.8/125.3/32.5 = 1.28/0.98/0.99/0.98/0.89/1.13x. c4-c32 up vs k62; c64 down (118.0 -> 111.8).",
+  "decision": "Keep. Next: c64 regression, compressor_tail table width, all-reduce.",
+  "commit": "e8189f55"
+ },
+ {
+  "id": 69,
+  "date": "2026-11-07",
+  "area": "Scheduler/cache",
+  "experiment": "ROCm compressor_tail pages 2 -> 32 rows (dspark packing 126 -> 8, non-dspark 54 -> 3, LCM bytes unchanged); tail kernels take ROWS constexpr. Tail block table 16x narrower (69K -> 4.3K cols at 130K).",
+  "result": "130K decode 64 users 22.8 -> 22.5 ms/token, total 2450 -> 2491 tok/s (vLLM 2305); 16 users 12.0 -> 11.4; TTFT p50 2.1 -> 1.4 s. Prefill 4.9 s, needle 6/6, GSM8K 93.4%. Runtime unit tests with hard-coded 2-row tails still need updating.",
+  "decision": "Keep; stress sweep pending.",
+  "commit": "uncommitted"
+ },
+ {
+  "id": 70,
+  "date": "2026-11-07",
+  "area": "Benchmark",
+  "experiment": "AgentX stress sweep k69 (tail32 build).",
+  "result": "RPM c1 20.8 / c4 43.9 / c16 69.1 / c32 102.4 / c64 144.4 / c128 35.3 = 1.37/0.97/0.79/0.92/1.15/1.09x vLLM best. c64 +29% vs k67 but c16 -20% (decode gen tps median 1368 -> 1176 at the same running count and acceptance).",
+  "decision": "Inconclusive: A/B tail rows 2 vs 32 on one build (c16, c64).",
+  "commit": "uncommitted"
+ },
+ {
+  "id": 71,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "HBM utilization of decode attention kernels (rocprofv3 TCC_EA0_RDREQ_128B / WRREQ, cold L2, production shapes).",
+  "result": "All < 35% of ~8 TB/s: selected_attn_rows 113 us 3-10% (latency-bound, split-K 1-16 only slower 131-361 us), index_topk_rows 158 us 19%, select 84 us 19% (reads logits twice, 240 CTAs), candidates 91 us 32% (6 rows re-read keys 3.6x), logits -inf fill 22.5 us pure waste. silu on side stream is CU contention with MoE, not waste.",
+  "decision": "Attention needs a 6-row-fused CTA rewrite; first do Iris small-message program cap (all-reduce 28% of step).",
+  "commit": "-"
+ },
+ {
+  "id": 72,
+  "date": "2026-11-07",
+  "area": "Scheduler/cache",
+  "experiment": "A/B on one build (with Iris small-message cap): TOKENSPEED_V41_TAIL_ROWS=2 vs 32, stress c16 and c64.",
+  "result": "c16 85.1 vs 84.0 RPM (tie), c64 117.1 vs 126.9 (+8%), c64 ITL p99 243 -> 196 ms, TTFT p99 22.2 -> 12.6 s. k69's c16 69.1 was run-to-run noise (stress cells vary up to ~15%).",
+  "decision": "Keep 32-row tails (default; env knob for A/B).",
+  "commit": "uncommitted"
+ },
+ {
+  "id": 73,
+  "date": "2026-11-07",
+  "area": "Communication",
+  "experiment": "Iris pull two-shot: 32 programs for small messages (TOKENSPEED_IRIS_PULL_SMALL_PROGRAMS), full 84 above a byte threshold. A/B 84 vs 32 under a 16 MB threshold, decode bench x2 each.",
+  "result": "16 users 11.85 -> 10.6 ms/token (-10%), 64 users (~3 MB messages) 23.0 -> 24.0 (+4%), prefill unchanged 4.9 s. Threshold set to 2 MB so 64-user steps keep 84.",
+  "decision": "Keep (threshold 2 MB).",
+  "commit": "0f528991"
+ },
+ {
+  "id": 74,
+  "date": "2026-11-07",
+  "area": "Profiling",
+  "experiment": "16-user 130K decode GPU profiles, UnieInfra 0f528991 vs vLLM, per step (8192-token generations).",
+  "result": "Step 34.1 vs 30.4 ms. All-reduce 7.9 vs 8.3, MoE 8.5 vs 9.6 (ours faster), dense MXFP8 GEMM 7.7 vs 5.4 (gluon_mm_mxfp8_decode 16-28 us/call vs vLLM block32 tiled/packed 4-16 us), attention 1.7 vs 1.2, indexer 1.0 vs 0.7. GPU busy 99% (no host gaps). DSpark acceptance: code review found no drafter bug; vLLM's own acceptance also falls to 2.24 late in a run.",
+  "decision": "Port vLLM/aiter block32 MXFP8 GEMM (agent); then attention.",
+  "commit": "-"
+ },
+ {
+  "id": 75,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "Port vLLM/aiter block32 MXFP8 GEMM (tiled + packed, fused split-K), re-tuned for 128 CUs, for V4.1 dense decode shapes.",
+  "result": "M=96 per call 2-3x faster (e.g. wo_b 29.0 -> 10.5 us), M=384 1.5-3x; ~2.8 ms/step saved. 130K decode 64 users 22.5 -> 21.9 ms/token (vLLM 21.6), total 2579 tok/s (vLLM 2305); 16 users 10.4 -> 9.8 (vLLM 9.0-9.6). Prefill 4.9 s, needle 6/6, GSM8K 92.6%. ~5% of outputs differ by 1 BF16 ULP from the exact BF16 decode path (same numerics class as the existing M>256 kernel and vLLM).",
+  "decision": "Keep; stress sweep k75.",
+  "commit": "83d49991"
+ },
+ {
+  "id": 76,
+  "date": "2026-11-07",
+  "area": "Benchmark",
+  "experiment": "AgentX stress sweep k75 (tail32 + Iris small cap + block32 GEMM, 83d49991).",
+  "result": "RPM c1 20.7 / c4 44.7 / c16 86.1 / c32 120.7 / c64 139.5 / c128 30.9 = 1.36/0.98/0.98/1.08/1.11/0.95x vLLM best. c32 best so far (+10% vs k67).",
+  "decision": "Keep. c4/c16 still at parity, c128 noisy.",
+  "commit": "83d49991"
+ },
+ {
+  "id": 77,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "Drop the FP32 -inf logits pre-fill on the gfx950 full-mode rows indexer path (scorer writes all visible columns; block select masks past visible).",
+  "result": "FillFunctor<float> gone from the profile. 130K decode 64 users 21.9 -> 21.6 ms/token (= vLLM 21.6), 16 users 9.8 -> 9.7. Needle 6/6, GSM8K 92.9%. Tests pass with NaN-poisoned scratch.",
+  "decision": "Keep.",
+  "commit": "see git"
+ },
+ {
+  "id": 78,
+  "date": "2026-11-07",
+  "area": "Benchmark",
+  "experiment": "AgentX stress sweep k77 (92ef86c3: + no -inf logits fill). Started outside this conversation.",
+  "result": "RPM c4 43.8 / c16 88.4 / c32 128.2 / c64 146.5 / c128 39.2 = 0.96/1.01/1.15/1.17/1.21x vLLM best (best c32-c128 so far). c1 2.46 invalid: an overlapping PMC profiling retry stopped its server mid-run; rerun needed.",
+  "decision": "Keep; rerun c1.",
+  "commit": "92ef86c3"
+ },
+ {
+  "id": 79,
+  "date": "2026-11-07",
+  "area": "Kernels",
+  "experiment": "Selected attention row-group kernel (6 rows per workgroup, LDS dedup of SWA+global slots, each distinct KV row dequantized once), worktree selected-attn-6row.",
+  "result": "Correct (same error vs reference as the old kernel), but not faster: 384 rows 115 vs 115 us (identical selections), 132 vs 115 (85% shared), 168 vs 117 (independent); 96 rows 52 vs 46. Redundant dequant is not the bottleneck.",
+  "decision": "Rejected (not merged).",
+  "commit": "-"
+ },
+ {
+  "id": 80,
+  "date": "2026-11-07",
+  "area": "Speculative",
+  "experiment": "DSpark verifies only the first k of its 5 block drafts (TOKENSPEED_DSPARK_VERIFY_DRAFTS=3: 4 verify rows instead of 6; the draft still runs the full trained block). Decode bench x2 each.",
+  "result": "130K 64 users 21.95 -> 19.25 ms/token (-12%), total 2595 -> 2954 tok/s (+14%; vLLM 21.6 ms / 2305). 16 users 9.8 -> 9.8. Needle 6/6. Batch-log accept len 2.4-2.6 (k=3) vs 2.7-2.8 (k=5).",
+  "decision": "Promising; stress sweep k80 with k=3.",
+  "commit": "uncommitted"
+ },
+ {
+  "id": 81,
+  "date": "2026-11-07",
+  "area": "Scheduler/cache",
+  "experiment": "Found the KV pool was capped by --max-total-tokens (16.7M tokens = 5494 pages, 17.7 GB), not by memory: GPU_MEMORY_UTILIZATION 0.9 -> 0.97 gave the identical arena (k78). Doubled MAX_TOTAL_TOKENS to 33.5M with util 0.95 (k79).",
+  "result": "c128: 41.5 -> 123.5 RPM (3.0x; 3.8x vLLM best 32.5). Pages 5495 -> 10280, prefix hit rate 65.8% -> 85.0%, new prefill tokens 38.5M -> 27.0M. k78 (util only) c1/c16/c64/c128 = 20.0/86.4/143.3/41.5 RPM, a clean c1 matching k75.",
+  "decision": "Keep; k79 c64..c1 pending, then raise the cap further (k81).",
+  "commit": "config only (scripts/test_k79.sh)"
+ },
+ {
+  "id": 82,
+  "date": "2026-11-07",
+  "area": "Benchmark",
+  "experiment": "AgentX stress sweep k79 (MAX_TOTAL_TOKENS 33.5M, util 0.95, otherwise k77 build). Clean, all six cells.",
+  "result": "RPM c1 20.5 / c4 43.4 / c16 90.2 / c32 119.3 / c64 148.7 / c128 123.5 = 1.35/0.95/1.03/1.07/1.19/3.80x vLLM best. Only c128 moved (3x); c4-c64 within noise of k77/k78.",
+  "decision": "Keep for c128. c4-c32 need faster steps, not more cache. k81 (64M) and k82 (verify=3 A/B) queued.",
+  "commit": "config only"
+ },
+ {
+  "id": 83,
+  "date": "2026-11-07",
+  "area": "Scheduler/cache",
+  "experiment": "k81: MAX_TOTAL_TOKENS 67M (budget-limited to 15038 pages, ~48 GB KV) with util 0.95, c128 and c64.",
+  "result": "Both cells aborted: runtime OOM on all four GPUs allocating 1 GB prefill workspace (free: 0); AgentX ProfileAborted at warmup, no result. The KV arena filled the whole profile budget, leaving only the 5% utilization headroom for activations.",
+  "decision": "Rejected at this setting. 33.5M (10280 pages) is safe; k83 tries 45M.",
+  "commit": "config only"
+ },
+ {
+  "id": 84,
+  "date": "2026-11-07",
+  "area": "Speculative decoding",
+  "experiment": "A/B on one build and cache size (33.5M tokens, util 0.95): DSpark verify rows 6 (k79) vs 4 (k82, TOKENSPEED_DSPARK_VERIFY_DRAFTS=3), AgentX stress c4-c128.",
+  "result": "RPM k=5 -> k=3: c4 43.4 -> 44.0, c16 90.2 -> 87.3, c32 119.3 -> 123.1, c64 148.7 -> 152.7, c128 123.5 -> 116.3. All within +-6%, signs mixed.",
+  "decision": "Rejected for AgentX: no consistent gain. Keep verify width 6 (the 130K decode micro-benchmark gain, exp 80, does not carry over).",
+  "commit": "config only"
+ },
+ {
+  "id": 85,
+  "date": "2026-11-07",
+  "area": "Scheduler/cache",
+  "experiment": "k83: MAX_TOTAL_TOKENS 47M (14168 pages) with util 0.95, c128 and c64.",
+  "result": "c128 139.8 RPM (+13% vs k79 123.5; 4.3x vLLM best). c64 aborted: runtime OOM (5 allocation failures), warmup request failed, no result. So 47M fits c128 but not c64; 33.5M (10280 pages) is safe in every cell, 64M (k81) fails in both.",
+  "decision": "Do not use 47M. Try 40M (k86) for c128 and c64.",
+  "commit": "config only"
+ },
+ {
+  "id": 86,
+  "date": "2026-11-07",
+  "area": "Benchmark",
+  "experiment": "Audit of baseline and result cells. vLLM '2x max-num-seqs' c1 (9.1 RPM) had ITL 36 ms vs 6 ms in healthy runs; UnieInfra k77 and k77b c1 were taken while another sweep or a stuck worker held the GPUs. Dashboard x-vLLM view also had a bug: the 'stress, 2x max-num-seqs' series was classed as official, so stress baselines missed the strongest vLLM at c16-c64 and ratios were inflated (c16 2.99x instead of 1.03x).",
+  "result": "Marked the three c1 runs FAILED (excluded from the export); vLLM c1 2x re-run queued (k84). Fixed the classifier (page v26). Verified x-vLLM values against the data file: RPM c1 1.35 / c4 0.95 / c16 1.03 / c32 1.07 / c64 1.19 / c128 3.80x. Output tok/s ratios differ from RPM at c1 (1.98x) because the closed loop reaches different trace positions in 300 s.",
+  "decision": "Use RPM versus the best vLLM series per cell as the headline; final claim to be re-measured at 900 s with recipe settings.",
+  "commit": "scripts/export_dashboard.py"
+ },
+ {
+  "id": 87,
+  "date": "2026-11-07",
+  "area": "Scheduler/cache",
+  "experiment": "Measured prefix-cache hit rate and uncached prefill per request against vLLM on the same AgentX stress trace (vLLM from its prefix_cache_hits/queries metrics, UnieInfra from the Prefill batch log in the busiest 300 s window).",
+  "result": "Same prompts (avg prompt 135.7K vs 135.6K tokens at c4, 117.2K vs 116.2K at c32). Hit rate UnieInfra vs vLLM: c4 93.1 vs 96.0%, c16 91.1 vs 96.4%, c32 88.6 vs 95.9%, c64 89.2 vs 95.8%. Uncached prefill per request is ~2x vLLM's (c32 ~11K vs ~5.3K tokens). Split of the work: follow-up turns add a mean 2.8-3.3K tokens in both engines (the same trace), so the difference is requests first seen in the window (new conversations and subagents): vLLM reuses ~52% (c4) and ~81% (c32) of their prompt tokens from other requests, UnieInfra ~0% and ~17%. Prefill share of GPU time at 34K tok/s: c16 ~43%, c32 ~65%, c64 ~80%. Concurrent-batch duplication explains at most 16-23% (77-84% of uncached tokens are in single-sequence batches). Replay of the SWA window costs ~250 tokens per hit (about 3% of uncached tokens), not the cause.",
+  "decision": "RETRACTED, see the next entry: the UnieInfra figures included warmup-phase cold prefills while vLLM's metrics are profiling-phase only.",
+  "commit": "analysis only"
+ },
+ {
+  "id": 88,
+  "date": "2026-11-08",
+  "area": "Scheduler/cache",
+  "experiment": "Correction of the previous entry using per-request stats (--enable-log-request-stats, diag85 c4) joined to the AiPerf export by start time and prompt length, profiling phase only.",
+  "result": "UnieInfra c4 profiling phase: 223 follow-up turns hit 97.4% (uncached 0.81M vs 0.63M expected from the trace), 11 requests without a previous turn hit 32.9%; overall 96.6% = vLLM's 96.0%. The earlier 93.1% came from summing Prefill batch lines over a window that includes warmup requests (every lane's first prefill is cold); on the whole log both methods agree (94.2% vs 94.3%), so the sums are right and the scope was wrong. Uncached prefill at c4 is ~1.06M tokens per 300 s (~3.5K tok/s, ~10% of prefill capacity), not 6.4K tok/s.",
+  "decision": "No prefix-cache gap at c4; c4 is decode-bound, so step time and acceptance are the levers there. c16-c64 not yet re-measured on the same basis (diag85 c32 pending); the 2x-prefill claim stays withdrawn until then.",
+  "commit": "analysis only"
+ },
+ {
+  "id": 89,
+  "date": "2026-11-08",
+  "area": "Speculative decoding",
+  "experiment": "Shadow n-gram drafter (suffix match of 4 tokens against prompt tail + output, up to 5 drafts), replayed over 233 finished requests of the AgentX stress c4 run (TOKENSPEED_SHADOW_NGRAM=1, diagnostic only, outputs unchanged).",
+  "result": "DSpark actual mean accept length 3.94 tokens/step (output-weighted, 201K output tokens). n-gram alone: match on 21.3% of steps, 3.08 accepted on a match, 13.8% of steps fully accepted (5/5), 1.78 tokens/step overall; per-request tokens/step quantiles p10/p50/p90/p99 = 1.0/1.1/1.7/2.8, only 3 of 233 requests >= 3.0. On a match the n-gram step yields ~4.1 tokens, about the same as DSpark's 3.94.",
+  "decision": "Rejected: a hybrid can only gain on fully matching steps, <= ~0.2 tokens/step (~5%) before selection overhead. Leave the shadow counter off by default.",
+  "commit": "python/tokenspeed/runtime/engine/shadow_ngram.py (default off)"
+ },
+ {
+  "id": 90,
+  "date": "2026-11-08",
+  "area": "Scheduler/cache",
+  "experiment": "Same per-request, profiling-phase analysis for c32 (diag85 run, 609 matched requests).",
+  "result": "Hit rate 96.1% (vLLM 95.9% with 2x max-num-seqs, 96.4% recipe); uncached 2.79M tokens = 4.6K per request (vLLM ~5.3K). Follow-up turns 96.7%, requests with no previous turn 30.0%. Uncached prefill is ~9.3K tok/s, ~27% of the ~34K tok/s prefill capacity, so c32 is mostly decode-bound. DSpark mean accept length 3.84 (vLLM 3.4). Also found: on AMD the default --sampling-backend is 'greedy', which ignores the per-request temperature (AgentX sends 1.0) and verifies by exact match, while vLLM samples; so our acceptance is higher than vLLM's for a reason that is not an engine advantage.",
+  "decision": "No prefix-cache work. Queued samp88: same build as k79 with --sampling-backend triton_full (honours temperature) for c4-c64 to get a comparable number; the 'vs vLLM' ratios so far use greedy decoding on our side.",
+  "commit": "analysis only"
+ },
+ {
+  "id": 91,
+  "date": "2026-11-08",
+  "area": "Profiling",
+  "experiment": "Prefill GPU profile on 6cf2119c (one 104K-token prompt, 4.9 s, 16K chunks).",
+  "result": "Iris two-shot all-reduce 2.33 s (48.5%, 506 calls x 4.6 ms, ~55 GB/s = PCIe limit), MXFP8 GEMM 7.9%, prefill attention 7.6%, MoE 10%, indexer 5.5%. GPU busy 99%.",
+  "decision": "Prefill (the c4-c32 bottleneck) is communication-bound: next levers are an efficient FP8/INT8 two-shot all-reduce (halve bytes) or full-layer two-micro-batch prefill overlap.",
+  "commit": "6cf2119c"
+ },
+ {
+  "id": 92,
+  "date": "2026-11-08",
+  "area": "Comm",
+  "experiment": "8-bit Iris pull two-shot rebuilt (branch iris-fp8-allreduce): separate full-grid quantize kernel (INT8 or FP8 E4M3, FP32 scale per 128), fixed 32-program comm kernel, partition-offset multiple_of hint so peer loads are 16-byte dwordx4 (the #26/#30 kernel fell back to byte/ushort loads, hence ~27 GB/s).",
+  "result": "BF16 Iris vs INT8: 42 MB 1.33->0.75 ms, 84 MB 2.60->1.44, 168 MB 5.12->2.81 (1.82x, ~46 GB/s payload/rank vs 49 BF16). Rel err INT8 9.3e-3 Gaussian / 2.8e-2 heavy-tailed (group 32: 7.7e-3 / 1.5e-2 at 3.08 ms); FP8 3.6e-2 / 2.3e-2. Unit test passes (bound, in-place, size reuse, graph replay, no recompiles).",
+  "decision": "Wire behind an env flag for prefill sizes (>= ~8 MB) and check accuracy end to end (GSM8K) before enabling.",
+  "commit": "51cf42f1"
+ },
+ {
+  "id": 93,
+  "date": "2026-11-08",
+  "area": "Communication",
+  "experiment": "INT8 group-128 Iris pull two-shot (agent kernel 51cf42f1: 16-byte peer loads via multiple_of, split quantize kernel) wired for producer-direct mHC-post reductions >= 8 MB (TOKENSPEED_IRIS_Q8_ALLREDUCE=1, fce19969). Stress sweep k92 with k79's KV config (33.5M tokens, util 0.95).",
+  "result": "168 MB all-reduce 5.12 -> 2.81 ms. 155K prefill 4.9 -> 4.2 s; needle 6/6; GSM8K 93.0%. Stress RPM vs k79: c1 20.5/20.5, c4 43.4/41.6, c16 90.2/91.8, c32 119.3/133.6, c64 148.7/155.3, c128 123.5/158.7 = 1.35/0.92/1.05/1.20/1.24/4.88x vLLM best.",
+  "decision": "Keep on (enable in launch config). c4 still below parity: small-batch decode latency.",
+  "commit": "fce19969"
+ },
+ {
+  "id": 94,
+  "date": "2026-11-08",
+  "area": "Scheduler/cache",
+  "experiment": "Cross-request prefix sharing probe on a live server (c4 config): a 51K-token shared prefix sent first alone, then again sequentially with a different question, then three requests concurrently.",
+  "result": "A_first: 51,036 prompt tokens prefilled in 1.6 s. Later requests: 220 new tokens and 50,816 cached (99.6%) each, sequentially and concurrently, including two sharing one prefill batch (440 new / 101,632 cached). Prefix matching across requests works.",
+  "decision": "Closes the prefix-cache question: no gap vs vLLM (see the c4 and c32 per-request analyses).",
+  "commit": "scripts/prefix_share_probe.py"
+ },
+ {
+  "id": 95,
+  "date": "2026-11-08",
+  "area": "Scheduler/cache",
+  "experiment": "k86: MAX_TOTAL_TOKENS 40M (util 0.95), c128 and c64.",
+  "result": "Both cells completed with no OOM. c128 146.3 RPM (k79 123.5, k83 47M 139.8; 4.5x vLLM best 32.5); c64 138.4 (k79 148.7, within noise).",
+  "decision": "Keep 40M as the cap for c64/c128 (33.5M stays the safe default for the other cells; 47M and 64M fail at c64).",
+  "commit": "config only"
+ },
+ {
+  "id": 96,
+  "date": "2026-11-08",
+  "area": "Speculative decoding",
+  "experiment": "samp88: same build and cache as k79 but --sampling-backend triton_full, which honours the per-request temperature (AgentX sends 1.0). The AMD default 'greedy' backend ignores it. c4-c64.",
+  "result": "RPM greedy -> sampling: c4 43.4 -> 41.2, c16 90.2 -> 72.0, c32 119.3 -> 92.4, c64 148.7 -> 111.8 (-5/-20/-23/-25%). Mean accept length 3.83/3.14/3.96/3.04 -> 2.83/2.80/2.79/2.76; vLLM at T=1.0 gets 3.3-3.5. Against the best vLLM stress series: 0.91x (c4), 0.82x (c16), 0.83x (c32), 0.89x (c64).",
+  "decision": "The earlier 1.0-1.2x at c4-c64 was measured with greedy decoding on our side and is not comparable; with sampling honoured we are behind vLLM. The gap is speculative acceptance (2.8 vs 3.4). Port the draft-probability rejection sampling that vLLM and the repo's CUDA path (flashinfer chain verify) use to DSpark on ROCm.",
+  "commit": "config only"
+ },
+ {
+  "id": 97,
+  "date": "2026-11-08",
+  "area": "Benchmark",
+  "experiment": "Re-run of the vLLM '2x max-num-seqs' c1 cell (k87), after a first attempt (k84) failed on a busy port.",
+  "result": "9.9 RPM, ITL 35.7 ms: it reproduces the earlier 9.1 / 36.4 ms, so the earlier 'degraded run' explanation was wrong. Likely cause (not yet checked in the vLLM log): the recipe's c1 knobs cap CUDA-graph capture at 8 tokens and the override raises max-num-seqs to 2, so 2 x 6 verify tokens run without graphs.",
+  "decision": "Excluded from the export as a misconfigured cell, not a noisy one. The vLLM c1 baseline stays the recipe series (15.2 RPM, ITL 6.3 ms).",
+  "commit": "scripts/serve_vllm.sh (unchanged)"
+ },
+ {
+  "id": 98,
+  "date": "2026-11-08",
+  "area": "Scheduler",
+  "experiment": "Prefill chunk size with INT8 all-reduce on (fce19969): 16K (k92) vs 8K/4K/2K, plus mixed batch (16K chunks) at c4/c16.",
+  "result": "Mixed batch: c4 41.5 / c16 87.5 (no gain). 8K: c4 43.8 / c16 82.0. 4K: c1 21.7 / c4 47.4 / c16 94.0 / c32 128.9 / c64 157.1 / c128 148.1 = 1.43/1.04/1.07/1.15/1.25/4.56x vLLM best (16K: 1.35/0.92/1.05/1.20/1.24/4.88). 2K: c4 47.8 / c16 85.6. c4 ITL p99 66 -> 25 ms with 4K: long prefill chunks stalled the other lanes' decodes.",
+  "decision": "Default CHUNKED_PREFILL_SIZE 4096 in the launch script.",
+  "commit": "launch config"
+ },
+ {
+  "id": 99,
+  "date": "2026-11-08",
+  "area": "Communication",
+  "experiment": "INT8 Iris two-shot also for decode-sized reductions (TOKENSPEED_IRIS_Q8_MIN_BYTES=512K; decode messages 1-4 MB), 4K prefill chunks.",
+  "result": "130K decode 64 users 23.3 ms/token (BF16 fused path 21.6-21.9), 16 users 10.1 (9.7-9.8); GSM8K 92.3%; needle 6/6; 155K prefill 4.3-4.5 s (4K chunks). Losing the fused mHC post plus the Q8 kernel's fixed 32-program sync costs more than the halved payload at these sizes.",
+  "decision": "Rejected: keep the 8 MB threshold (prefill only).",
+  "commit": "-"
+ },
+ {
+  "id": 100,
+  "date": "2026-11-08",
+  "area": "Speculative decoding",
+  "experiment": "Coupled DSpark drafting (TOKENSPEED_DSPARK_COUPLED_DRAFT=1, --sampling-backend triton_full): each block step draws a Gumbel-max sample of (base+bias)/T with the same Philox noise the verifier's pool samplers use for that absolute position (draft step s -> next verify row s -> offset start_pos+2+s). The verifier is unchanged (target-sampled exact match), so the output is exactly the target's sample, i.e. lossless. Kernel: dspark_block.py SAMPLE branch; tests: 5 new in test_sampling_triton.py (draft noise equals gumbel_sample_from_pools bit-for-bit, TP 1/2/4 agree, bias dominates, shape checks); CPU simulation: output L1 error to target 0.007-0.009, acceptance ~1-TV (0.82 at TV 0.15 vs 0.13 for greedy-draft/independent-sample).",
+  "result": "Against samp88 (same build, triton_full, independent sampling), RPM c4 41.2 -> 42.2, c16 72.0 -> 81.1, c32 92.4 -> 102.5, c64 111.8 -> 136.4 (+2/+13/+11/+22%). Mean accept length 2.83/2.80/2.79/2.76 -> 3.13/3.17/3.18/2.96 (vLLM at T=1: 3.3-3.5; greedy 3.83/3.14/3.96/3.04). Per-user speed at c4 97.8 -> 112.7 tok/s, ITL 10.2 -> 8.9 ms. Step rate unchanged vs greedy (c4: 620/3.13 vs 768/3.83 steps/s), so sampling costs nothing per step. Versus the best vLLM series: 0.93x (c4), 0.93x (c16), 0.92x (c32), 1.09x (c64). CAVEAT: cpl89 (c4) and samp88 ran with 16K prefill chunks, but cpl90 (c16/c32/c64) ran after the launch script's default became 4K, so the RPM gains at c16-c64 include the chunk-size change; the accept-length gains do not. samp91 (independent sampling, 4K chunks) re-measures the baseline. CORRECTION (see samp91): at c64 coupling is +2.9% over independent sampling at equal chunk size; the +22% mixed in the 16K->4K chunk change.",
+  "decision": "Keep (opt-in). The remaining c4-c32 gap (~7%) is acceptance: Gumbel coupling is below the optimal 1-TV and vLLM also uses block verification. Next: draft temperature scale sweep.",
+  "commit": "uncommitted (unieinfra working tree)"
+ },
+ {
+  "id": 101,
+  "date": "2026-11-08",
+  "area": "Speculative decoding",
+  "experiment": "Draft temperature scale for coupled drafting (TOKENSPEED_DSPARK_COUPLED_TEMP_SCALE): the draft samples at scale x the request temperature, c16, same build as cpl90.",
+  "result": "scale 0.7: accept length 3.16, 77.8 RPM; 1.0: 3.17, 81.1; 1.4: 2.81, 60.5. The curve is flat from 0.7 to 1.0 and falls fast above it.",
+  "decision": "Rejected: 1.0 (the draft already matches the target's temperature) stays. The knob is kept at default 1.0. What is left to gain is the coupling efficiency: shared-noise Gumbel coupling gives about 1-TV minus 4-6% per position (CPU simulation), roughly 3.17 -> 3.4 accept length with optimal rejection sampling, but that needs the draft rows gathered across TP ranks (about 8-33 MB per step at c16-c64) and a new verify kernel.",
+  "commit": "uncommitted (unieinfra working tree)"
+ },
+ {
+  "id": 102,
+  "date": "2026-11-08",
+  "area": "Speculative decoding",
+  "experiment": "samp91: independent sampling (triton_full, no coupling) at the same 4K prefill chunks as cpl90, c16-c64, to remove the chunk-size confound from the coupled-drafting comparison.",
+  "result": "samp91 RPM c16 72.7, c32 92.7 (samp88 at 16K: 72.0, 92.4), so the chunk size changes RPM by under 1% here. Coupled drafting (cpl90, 4K chunks) vs samp91: c16 81.1 vs 72.7 (+11.6%), c32 102.5 vs 92.7 (+10.6%); c64: samp91 132.5 vs cpl90 136.4 (+2.9%), while samp88 (16K) was 111.8, so at c64 the 16K -> 4K chunk change alone is +18.5% and coupling adds only ~3%.",
+  "decision": "Coupled-draft gains: c4 +2.4% (16K both), c16 +11.6%, c32 +10.6%, c64 +2.9% (4K both). The +22% at c64 first reported in the cpl90 entry was mostly the 4K chunk size.",
+  "commit": "config only"
+ },
+ {
+  "id": 103,
+  "date": "2026-11-08",
+  "area": "Benchmark",
+  "experiment": "best1 + cpl90: full six-cell AgentX stress sweep of the current best configuration with T=1.0 sampling honoured: coupled DSpark drafting (TOKENSPEED_DSPARK_COUPLED_DRAFT=1, --sampling-backend triton_full), 4K prefill chunks and INT8 prefill all-reduce (serve_unieinfra.sh defaults), cache-aware admission, 33.5M-token KV (40M at c128). c1/c4/c128 from best1, c16/c32/c64 from cpl90, same code.",
+  "result": "RPM c1 18.1 / c4 44.4 / c16 81.1 / c32 102.5 / c64 136.4 / c128 125.8 = 1.19/0.98/0.93/0.92/1.09/3.87x vLLM best (15.2/45.5/87.5/111.8/125.3/32.5; vLLM samples at T=1.0 with its own block rejection verification). ITL p50 6.6/9.3/17.2/24.1/40.7/56.7 ms. For reference the k79 greedy numbers (20.5/43.4/90.2/119.3/148.7/123.5) are not comparable because greedy decoding ignores the requests' temperature.",
+  "decision": "This is the honest standing: parity (0.92-1.19x) at c1-c64, 3.9x at c128; not 2x anywhere except c128. Remaining c4-c32 gap is accept length (3.1-3.2 vs 3.3-3.5).",
+  "commit": "uncommitted (unieinfra working tree)"
+ }
+]

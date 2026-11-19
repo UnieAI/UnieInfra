@@ -1,0 +1,232 @@
+{
+    "schema_version": 2,
+    "name": "DeepSeek-V4.1-Flash-1017@gsm8k",
+    "dataset_name": "gsm8k",
+    "dataset_pretty_name": "GSM8K",
+    "dataset_description": "\n## Overview\n\nGSM8K (Grade School Math 8K) is a high-quality dataset of 8.5K linguistically diverse grade school math word problems created by human problem writers. The dataset is specifically designed to evaluate and improve the multi-step mathematical reasoning capabilities of language models.\n\n## Task Description\n\n- **Task Type**: Mathematical Word Problem Solving\n- **Input**: Natural language math word problem\n- **Output**: Numerical answer derived through step-by-step reasoning\n- **Difficulty**: Grade school level (2-8 reasoning steps required)\n\n## Key Features\n\n- Problems require basic arithmetic operations (addition, subtraction, multiplication, division)\n- Solutions involve 2 to 8 sequential reasoning steps\n- High linguistic diversity in problem formulations\n- Human-written problems ensuring natural language quality\n- Clear numerical answers for objective evaluation\n\n## Evaluation Notes\n\n- Default configuration uses **4-shot** examples with Chain-of-Thought (CoT) prompting\n- Answers should be formatted within `\\boxed{}` for proper extraction\n- The metric extracts numerical values for accuracy comparison\n- Supports both zero-shot and few-shot evaluation modes\n",
+    "model_name": "DeepSeek-V4.1-Flash-1017",
+    "metrics": [
+        {
+            "identity": {
+                "name": "accuracy",
+                "aggregation": "mean",
+                "dimensions": {}
+            },
+            "legacy_name": null,
+            "num": 1319,
+            "score": 0.9356,
+            "macro_score": 0.9356,
+            "categories": [
+                {
+                    "name": [
+                        "default"
+                    ],
+                    "num": 1319,
+                    "score": 0.9356,
+                    "macro_score": 0.9356,
+                    "subsets": [
+                        {
+                            "name": "main",
+                            "score": 0.9356,
+                            "num": 1319,
+                            "is_aggregate": false
+                        }
+                    ]
+                }
+            ],
+            "semantics": {
+                "semantic_id": "quality.accuracy.ratio",
+                "metric_name": "Accuracy",
+                "display_name": null,
+                "kind": "quality",
+                "direction": "higher_is_better",
+                "raw_unit": null,
+                "value_range": {
+                    "min": 0.0,
+                    "max": 1.0
+                },
+                "display_kind": "percent",
+                "display_multiplier": 100.0,
+                "display_unit": "%",
+                "display_precision": 1
+            }
+        }
+    ],
+    "analysis": "N/A",
+    "perf_metrics": {
+        "summary": {
+            "n_samples": 1319,
+            "latency": {
+                "mean": 3.398278,
+                "std": 1.842068,
+                "min": 1.065252,
+                "25%": 2.103048,
+                "50%": 2.776044,
+                "75%": 3.943762,
+                "90%": 6.066609,
+                "99%": 9.142917,
+                "max": 12.694005
+            },
+            "throughput": {
+                "avg_output_tps": 64.56,
+                "avg_req_ps": 0.2943
+            },
+            "usage": {
+                "input_tokens": {
+                    "mean": 608.95072,
+                    "std": 21.788642,
+                    "min": 572.0,
+                    "25%": 593.0,
+                    "50%": 605.0,
+                    "75%": 620.0,
+                    "90%": 639.0,
+                    "99%": 674.0,
+                    "max": 735.0
+                },
+                "output_tokens": {
+                    "mean": 219.399545,
+                    "std": 108.912574,
+                    "min": 82.0,
+                    "25%": 140.0,
+                    "50%": 185.0,
+                    "75%": 260.0,
+                    "90%": 385.2,
+                    "99%": 512.0,
+                    "max": 512.0
+                },
+                "total_tokens": {
+                    "mean": 828.350265,
+                    "std": 119.715679,
+                    "min": 654.0,
+                    "25%": 739.5,
+                    "50%": 797.0,
+                    "75%": 880.5,
+                    "90%": 1014.0,
+                    "99%": 1164.82,
+                    "max": 1208.0
+                },
+                "total_input_tokens": 803206,
+                "total_output_tokens": 289388,
+                "total_tokens_count": 1092594
+            }
+        },
+        "coverage": {
+            "requests_with_metrics": 1319,
+            "total_requests": 1319
+        },
+        "metric_semantics": {
+            "n_samples": {
+                "semantic_id": "diagnostic.count.items",
+                "metric_name": "Samples",
+                "display_name": null,
+                "kind": "diagnostic",
+                "direction": "none",
+                "raw_unit": null,
+                "value_range": null,
+                "display_kind": "number",
+                "display_multiplier": null,
+                "display_unit": null,
+                "display_precision": 0
+            },
+            "latency": {
+                "semantic_id": "perf.latency.seconds",
+                "metric_name": "Latency",
+                "display_name": null,
+                "kind": "quality",
+                "direction": "lower_is_better",
+                "raw_unit": "s",
+                "value_range": null,
+                "display_kind": "number",
+                "display_multiplier": null,
+                "display_unit": "s",
+                "display_precision": 3
+            },
+            "throughput.avg_output_tps": {
+                "semantic_id": "perf.throughput.tokens_per_second",
+                "metric_name": "Output Throughput",
+                "display_name": null,
+                "kind": "quality",
+                "direction": "higher_is_better",
+                "raw_unit": "tok/s",
+                "value_range": null,
+                "display_kind": "number",
+                "display_multiplier": null,
+                "display_unit": "tok/s",
+                "display_precision": 2
+            },
+            "throughput.avg_req_ps": {
+                "semantic_id": "perf.throughput.requests_per_second",
+                "metric_name": "Request Throughput",
+                "display_name": null,
+                "kind": "quality",
+                "direction": "higher_is_better",
+                "raw_unit": "req/s",
+                "value_range": null,
+                "display_kind": "number",
+                "display_multiplier": null,
+                "display_unit": "req/s",
+                "display_precision": 2
+            },
+            "usage.input_tokens": {
+                "semantic_id": "diagnostic.count.items",
+                "metric_name": "Input Tokens",
+                "display_name": null,
+                "kind": "diagnostic",
+                "direction": "none",
+                "raw_unit": null,
+                "value_range": null,
+                "display_kind": "number",
+                "display_multiplier": null,
+                "display_unit": null,
+                "display_precision": 0
+            },
+            "usage.output_tokens": {
+                "semantic_id": "diagnostic.count.items",
+                "metric_name": "Output Tokens",
+                "display_name": null,
+                "kind": "diagnostic",
+                "direction": "none",
+                "raw_unit": null,
+                "value_range": null,
+                "display_kind": "number",
+                "display_multiplier": null,
+                "display_unit": null,
+                "display_precision": 0
+            },
+            "usage.total_tokens": {
+                "semantic_id": "diagnostic.count.items",
+                "metric_name": "Total Tokens",
+                "display_name": null,
+                "kind": "diagnostic",
+                "direction": "none",
+                "raw_unit": null,
+                "value_range": null,
+                "display_kind": "number",
+                "display_multiplier": null,
+                "display_unit": null,
+                "display_precision": 0
+            }
+        }
+    },
+    "primary_metric_identity": {
+        "name": "accuracy",
+        "aggregation": "mean",
+        "dimensions": {}
+    },
+    "primary_metric_unavailable_reason": null,
+    "judge_summary": null,
+    "execution_summary": {
+        "requested": 1319,
+        "succeeded": 1319,
+        "errored": 0,
+        "incomplete": false,
+        "subsets": {
+            "main": {
+                "requested": 1319,
+                "succeeded": 1319,
+                "errored": 0
+            }
+        }
+    },
+    "num": 1319
+}

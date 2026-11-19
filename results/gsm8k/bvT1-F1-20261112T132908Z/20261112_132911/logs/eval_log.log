@@ -1,0 +1,116 @@
+2026-11-12 13:29:11 - evalscope - INFO: Running with native backend
+2026-11-12 13:29:11 - evalscope - INFO: Dump task config to ./20261112_132911/configs/task_config.yaml
+2026-11-12 13:29:11 - evalscope - INFO: {
+    "model_id": "DeepSeek-V4.1-Flash-1017",
+    "model_args": {},
+    "model_task": "text_generation",
+    "chat_template": null,
+    "datasets": [
+        "gsm8k"
+    ],
+    "dataset_args": {
+        "gsm8k": {
+            "dataset_id": "openai/gsm8k"
+        }
+    },
+    "dataset_dir": "/home/smc/.cache/modelscope/hub/datasets",
+    "dataset_hub": "huggingface",
+    "repeats": 1,
+    "eval_type": "openai_api",
+    "eval_backend": "Native",
+    "eval_config": null,
+    "limit": 500,
+    "eval_batch_size": 32,
+    "use_cache": null,
+    "rerun_review": false,
+    "work_dir": "./20261112_132911",
+    "no_timestamp": false,
+    "enable_progress_tracker": false,
+    "ignore_errors": false,
+    "debug": false,
+    "seed": 42,
+    "api_url": "http://127.0.0.1:8000/v1",
+    "api_key": "**********",
+    "timeout": null,
+    "stream": null,
+    "judge": {
+        "strategy": "auto",
+        "models": [],
+        "contract": {
+            "system_prompt": null,
+            "prompt_template": null,
+            "score_mapping": null,
+            "score_type": "pattern"
+        },
+        "repeats": 1,
+        "position_swap": "auto",
+        "aggregation": "mean",
+        "min_valid_judges": 1
+    },
+    "analysis_report": false,
+    "collect_perf": true,
+    "use_sandbox": false,
+    "sandbox_type": "docker",
+    "sandbox_manager_config": {},
+    "evalscope_version": "1.11.1",
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "generation_config": {
+        "batch_size": 32,
+        "max_tokens": 1024,
+        "temperature": 1.0,
+        "do_sample": true
+    },
+    "sandbox": {
+        "enabled": false,
+        "engine": "docker",
+        "default_config": {},
+        "manager_config": {},
+        "pool_size": null
+    },
+    "agent_config": null
+}
+2026-11-12 13:29:11 - evalscope - INFO: Start loading benchmark dataset: gsm8k
+2026-11-12 13:29:11 - evalscope - WARNING: gsm8k: 500 samples to evaluate (1 subset, --limit=500 per subset). Remove `--limit` for a formal evaluation.
+2026-11-12 13:29:11 - evalscope - INFO: Subsets of gsm8k: ['main']
+2026-11-12 13:29:11 - evalscope - INFO: Loading model for prediction...
+2026-11-12 13:29:11 - evalscope - INFO: Creating model deepseek-ai/DeepSeek-V4.1-Flash-1017 with eval_type=openai_api base_url=http://127.0.0.1:8000/v1, config={'retries': 5, 'retry_interval': 10, 'batch_size': 32, 'max_tokens': 1024, 'temperature': 1.0, 'do_sample': True, 'anthropic_cache_strategy': 'evaluation'}, model_args={}
+2026-11-12 13:29:11 - evalscope - INFO: Model loaded successfully.
+2026-11-12 13:30:11 - evalscope - INFO: Evaluating[gsm8k]  54%| 272/500 [Elapsed: 01:00 < Remaining: 00:25,  8.87it/s]
+2026-11-12 13:30:43 - evalscope - INFO: Evaluating[gsm8k] 100%| 500/500 [Elapsed: 01:31 < Remaining: 00:00,  7.47it/s]
+2026-11-12 13:30:43 - evalscope - INFO: gsm8k: predictions complete, aggregating scores...
+2026-11-12 13:30:43 - evalscope - INFO: Aggregating scores for subset: main
+2026-11-12 13:30:43 - evalscope - INFO: Generating report...
+2026-11-12 13:30:43 - evalscope - INFO: 
+gsm8k report table:
+┌──────────────────────────┬───────────┬────────────┬──────────┬───────┬─────────┐
+│ Model                    │ Dataset   │ Metric     │ Subset   │   Num │ Score   │
+├──────────────────────────┼───────────┼────────────┼──────────┼───────┼─────────┤
+│ DeepSeek-V4.1-Flash-1017 │ GSM8K     │ Accuracy ↑ │ main     │   500 │ 95.8%   │
+└──────────────────────────┴───────────┴────────────┴──────────┴───────┴─────────┘ 
+
+2026-11-12 13:30:43 - evalscope - INFO: Skipping report analysis (`analysis_report=False`).
+2026-11-12 13:30:43 - evalscope - INFO: Dump report to: ./20261112_132911/reports/DeepSeek-V4.1-Flash-1017/gsm8k.json 
+
+2026-11-12 13:30:43 - evalscope - INFO: 
+gsm8k perf table:
+Model                     Dataset      Num  Avg Lat    Avg TTFT    Avg TPOT    Avg Thpt       Avg In    Avg Out
+------------------------  ---------  -----  ---------  ----------  ----------  -----------  --------  ---------
+DeepSeek-V4.1-Flash-1017  GSM8K        500  5.242 s    —           —           50.91 tok/s       608        267
+
+2026-11-12 13:30:43 - evalscope - INFO: Benchmark gsm8k evaluation finished.
+2026-11-12 13:30:43 - evalscope - INFO: Running[eval] 100%| 1/1 [Elapsed: 01:31 < Remaining: 00:00, 91.93s/benchmark]
+2026-11-12 13:30:43 - evalscope - INFO: Overall report table: 
+┌──────────────────────────┬───────────┬────────────┬──────────┬───────┬─────────┐
+│ Model                    │ Dataset   │ Metric     │ Subset   │   Num │ Score   │
+├──────────────────────────┼───────────┼────────────┼──────────┼───────┼─────────┤
+│ DeepSeek-V4.1-Flash-1017 │ GSM8K     │ Accuracy ↑ │ main     │   500 │ 95.8%   │
+└──────────────────────────┴───────────┴────────────┴──────────┴───────┴─────────┘ 
+
+2026-11-12 13:30:43 - evalscope - INFO: Overall perf table: 
+Model                     Dataset      Num  Avg Lat    Avg TTFT    Avg TPOT    Avg Thpt       Avg In    Avg Out
+------------------------  ---------  -----  ---------  ----------  ----------  -----------  --------  ---------
+DeepSeek-V4.1-Flash-1017  GSM8K        500  5.242 s    —           —           50.91 tok/s       608        267 
+
+2026-11-12 13:30:43 - evalscope - INFO: HTML report generated: /home/smc/workspace/roy/results/gsm8k/bvT1-F1-20261112T132908Z/20261112_132911/reports/report.html
+2026-11-12 13:30:44 - evalscope - INFO: Finished evaluation for DeepSeek-V4.1-Flash-1017 on ['gsm8k']
+2026-11-12 13:30:44 - evalscope - INFO: Output directory: ./20261112_132911

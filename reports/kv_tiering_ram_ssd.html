@@ -1,0 +1,179 @@
+<title>UnieInfra KV 分層快取</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: single column, diagram first, then write/read paths, then measured numbers. */
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --fg:#1b2230; --mute:#5b6577; --line:#c9d0db;
+  --hbm:#2f6fdf; --ram:#1f9d74; --ssd:#c46a1a; --warn:#b3412b;
+  --hbm-bg:#e6efff; --ram-bg:#e3f5ee; --ssd-bg:#fbeedf;
+  --display:"Space Grotesk",system-ui,sans-serif; --body:"Inter",system-ui,sans-serif; --mono:"JetBrains Mono",ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#12161d; --panel:#1a2029; --fg:#e6e9ef; --mute:#9aa4b5; --line:#36404f;
+  --hbm:#7aa8ff; --ram:#4fd1a5; --ssd:#f0a35c; --warn:#ff8a73;
+  --hbm-bg:#1b2a45; --ram-bg:#14342b; --ssd-bg:#3a2a17; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#12161d; --panel:#1a2029; --fg:#e6e9ef; --mute:#9aa4b5; --line:#36404f;
+  --hbm:#7aa8ff; --ram:#4fd1a5; --ssd:#f0a35c; --warn:#ff8a73;
+  --hbm-bg:#1b2a45; --ram-bg:#14342b; --ssd-bg:#3a2a17; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);line-height:1.6}
+.wrap{max-width:980px;margin:0 auto;padding-block:28px 48px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:flex;flex-direction:column;gap:28px}
+h1{font-family:var(--display);font-size:1.9rem;margin:0;text-wrap:balance}
+h2{font-family:var(--display);font-size:1.2rem;margin:0 0 10px}
+.sub{color:var(--mute);margin:4px 0 0;max-width:68ch}
+.fig{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow-x:auto}
+svg{display:block;min-width:820px;width:100%;height:auto}
+svg text{font-family:var(--body);fill:var(--fg)}
+svg .mono{font-family:var(--mono)} svg .mute{fill:var(--mute)}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
+.cols>section{min-width:0}
+ol{margin:0;padding-left:1.2em;display:flex;flex-direction:column;gap:6px}
+code{font-family:var(--mono);font-size:.88em}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:.78rem;letter-spacing:.04em;text-transform:uppercase;color:var(--mute);font-weight:600}
+td.n{text-align:right;font-family:var(--mono)}
+.tag{display:inline-block;font-size:.75rem;padding:1px 8px;border-radius:99px;border:1px solid currentColor}
+.t-hbm{color:var(--hbm)} .t-ram{color:var(--ram)} .t-ssd{color:var(--ssd)} .t-warn{color:var(--warn)}
+.note{color:var(--mute);font-size:.9rem;max-width:72ch}
+</style>
+
+<div class="wrap">
+<header>
+  <h1>UnieInfra KV 分層快取：HBM → RAM → SSD</h1>
+  <p class="sub">MI350P ×4、DeepSeek V4.1 TP4。GPU 放不下的 KV 先退到主機 RAM（L2），再寫到 NVMe 檔案（L3）。重啟後仍可從 L3 讀回，不用重算 prefill。對應 PR #49（檔案 L3）、#50（segment 檔）、#51（TP 去重）。</p>
+</header>
+
+<div class="fig" role="img" aria-label="KV 三層架構圖">
+<svg viewBox="0 0 900 500">
+  <defs>
+    <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--warn)"/></marker>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ram)"/></marker>
+  </defs>
+
+  <!-- L1 GPU -->
+  <text x="20" y="28" font-weight="700" fill="var(--hbm)" style="fill:var(--hbm)">L1　GPU HBM（每個 rank 一份 paged KV）</text>
+  <g>
+    <rect x="20" y="40" width="200" height="70" rx="8" fill="var(--hbm-bg)" stroke="var(--hbm)"/>
+    <rect x="240" y="40" width="200" height="70" rx="8" fill="var(--hbm-bg)" stroke="var(--hbm)"/>
+    <rect x="460" y="40" width="200" height="70" rx="8" fill="var(--hbm-bg)" stroke="var(--hbm)"/>
+    <rect x="680" y="40" width="200" height="70" rx="8" fill="var(--hbm-bg)" stroke="var(--hbm)"/>
+    <text x="120" y="72" text-anchor="middle" font-weight="600">GPU0 · rank 0</text>
+    <text x="340" y="72" text-anchor="middle" font-weight="600">GPU1 · rank 1</text>
+    <text x="560" y="72" text-anchor="middle" font-weight="600">GPU2 · rank 2</text>
+    <text x="780" y="72" text-anchor="middle" font-weight="600">GPU3 · rank 3</text>
+    <text x="120" y="94" text-anchor="middle" class="mute" font-size="12">radix 前綴樹 + cache-aware 排程</text>
+    <text x="340" y="94" text-anchor="middle" class="mute" font-size="12">radix 前綴樹</text>
+    <text x="560" y="94" text-anchor="middle" class="mute" font-size="12">radix 前綴樹</text>
+    <text x="780" y="94" text-anchor="middle" class="mute" font-size="12">radix 前綴樹</text>
+  </g>
+
+  <!-- arrows L1<->L2 -->
+  <g stroke-width="2" fill="none">
+    <path d="M100 112 V168" stroke="var(--warn)" marker-end="url(#aw)"/>
+    <path d="M140 168 V114" stroke="var(--ram)" marker-end="url(#ar)"/>
+    <path d="M320 112 V168" stroke="var(--warn)" marker-end="url(#aw)"/>
+    <path d="M360 168 V114" stroke="var(--ram)" marker-end="url(#ar)"/>
+    <path d="M540 112 V168" stroke="var(--warn)" marker-end="url(#aw)"/>
+    <path d="M580 168 V114" stroke="var(--ram)" marker-end="url(#ar)"/>
+    <path d="M760 112 V168" stroke="var(--warn)" marker-end="url(#aw)"/>
+    <path d="M800 168 V114" stroke="var(--ram)" marker-end="url(#ar)"/>
+  </g>
+  <text x="152" y="146" font-size="11" class="mute">退出/寫入 ↓　載回 ↑（逐層 fence）</text>
+
+  <!-- L2 RAM -->
+  <text x="20" y="190" font-weight="700" style="fill:var(--ram)">L2　主機 RAM（pinned，4 GB / rank，目前每 rank 各存一份）</text>
+  <g>
+    <rect x="20" y="200" width="200" height="62" rx="8" fill="var(--ram-bg)" stroke="var(--ram)"/>
+    <rect x="240" y="200" width="200" height="62" rx="8" fill="var(--ram-bg)" stroke="var(--ram)"/>
+    <rect x="460" y="200" width="200" height="62" rx="8" fill="var(--ram-bg)" stroke="var(--ram)"/>
+    <rect x="680" y="200" width="200" height="62" rx="8" fill="var(--ram-bg)" stroke="var(--ram)"/>
+    <text x="120" y="230" text-anchor="middle" font-weight="600">L2 · rank 0</text>
+    <text x="340" y="230" text-anchor="middle" font-weight="600">L2 · rank 1</text>
+    <text x="560" y="230" text-anchor="middle" font-weight="600">L2 · rank 2</text>
+    <text x="780" y="230" text-anchor="middle" font-weight="600">L2 · rank 3</text>
+    <text x="120" y="250" text-anchor="middle" class="mute" font-size="12">命中 TTFT 0.05 s</text>
+    <text x="340" y="250" text-anchor="middle" class="mute" font-size="12">與 rank 0 內容相同</text>
+    <text x="560" y="250" text-anchor="middle" class="mute" font-size="12">與 rank 0 內容相同</text>
+    <text x="780" y="250" text-anchor="middle" class="mute" font-size="12">與 rank 0 內容相同</text>
+  </g>
+
+  <!-- arrows L2 -> L3: rank0 writes, all read -->
+  <g stroke-width="2" fill="none">
+    <path d="M100 264 V330" stroke="var(--warn)" marker-end="url(#aw)"/>
+    <path d="M140 330 V266" stroke="var(--ram)" marker-end="url(#ar)"/>
+    <path d="M360 330 V266" stroke="var(--ram)" marker-end="url(#ar)"/>
+    <path d="M580 330 V266" stroke="var(--ram)" marker-end="url(#ar)"/>
+    <path d="M800 330 V266" stroke="var(--ram)" marker-end="url(#ar)"/>
+  </g>
+  <text x="20" y="300" font-size="11" style="fill:var(--warn)">只有 rank 0 寫</text>
+  <text x="20" y="314" font-size="11" style="fill:var(--warn)">O_DIRECT</text>
+  <text x="372" y="300" font-size="11" class="mute">4 個 rank 都讀同一份（走 page cache）</text>
+
+  <!-- page cache band -->
+  <rect x="20" y="332" width="860" height="26" rx="6" fill="var(--panel)" stroke="var(--line)" stroke-dasharray="4 3"/>
+  <text x="450" y="350" text-anchor="middle" font-size="12" class="mute">Linux page cache：同一個 segment 讀一次後，其他 rank 直接從記憶體拿</text>
+
+  <!-- L3 SSD -->
+  <text x="20" y="384" font-weight="700" style="fill:var(--ssd)">L3　NVMe 檔案庫（attention-TP rank 0 的目錄，四個 rank 共用）</text>
+  <rect x="20" y="394" width="860" height="90" rx="8" fill="var(--ssd-bg)" stroke="var(--ssd)"/>
+  <g font-size="12">
+    <rect x="40" y="410" width="150" height="56" rx="6" fill="var(--panel)" stroke="var(--ssd)"/>
+    <text x="115" y="433" text-anchor="middle" class="mono">seg_&lt;hash&gt;.kv</text>
+    <text x="115" y="453" text-anchor="middle" class="mute">1 頁 = 6 物件 × 38 KB</text>
+    <rect x="205" y="410" width="150" height="56" rx="6" fill="var(--panel)" stroke="var(--ssd)"/>
+    <text x="280" y="433" text-anchor="middle" class="mono">seg_&lt;hash&gt;.kv</text>
+    <text x="280" y="453" text-anchor="middle" class="mute">每次 put 一個檔</text>
+    <text x="380" y="443" class="mute">…</text>
+    <text x="420" y="425" font-weight="600">key = rank 0 的 hash（確定性檔名）</text>
+    <text x="420" y="445">每物件 CRC 檢查；壞掉就當沒命中、重算</text>
+    <text x="420" y="465">重啟時掃目錄重建索引（約 1.4 萬物件 / rank）</text>
+  </g>
+</svg>
+</div>
+
+<div class="cols">
+<section>
+  <h2><span class="tag t-warn">寫入</span> 一段 prompt 怎麼進 SSD</h2>
+  <ol>
+    <li>prefill 完，KV 在 GPU 的 radix 樹上。</li>
+    <li>GPU 要空間時，頁面退到同一 rank 的 L2 RAM。</li>
+    <li>寫入策略 <code>eager</code>：同時排進 L3 寫入佇列（預設 <code>reuse</code> 只寫被重複用過的前綴）。</li>
+    <li>DSV4.1 的 KV 在 4 個 TP rank 上完全一樣（27,452 個物件比對全同），所以只有 rank 0 寫檔，其他 rank 只登記索引。</li>
+    <li>一次 put 寫成一個 segment 檔，O_DIRECT 不汙染 page cache。</li>
+  </ol>
+</section>
+<section>
+  <h2><span class="tag t-ram">讀回</span> 新請求命中前綴</h2>
+  <ol>
+    <li>排程器比對前綴：GPU → L2 → L3 依序找最長命中。</li>
+    <li>L3 命中先 prefetch 到 L2（16 個 IO thread，按 slice 分派）。</li>
+    <li>4 個 rank 讀同一個檔，第一次之後走 page cache。</li>
+    <li>L2 → GPU 逐層搬，每層用 fence 等該層到位再算（上游 #2812 的修補）。</li>
+    <li>只 prefill 沒命中的尾巴。</li>
+  </ol>
+</section>
+</div>
+
+<section>
+  <h2>實測（24 個 needle prompt × 約 24k tokens）</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>情境</th><th>TTFT 中位數</th><th>每 rank prefetch</th><th>比重算快</th><th>來源</th></tr></thead>
+    <tbody>
+      <tr><td>冷啟動重算</td><td class="n">0.77–0.82 s</td><td class="n">—</td><td class="n">1×</td><td>#259–262</td></tr>
+      <tr><td><span class="tag t-ram">L2</span> 同 server 重送</td><td class="n">0.049 s</td><td class="n">—</td><td class="n">~16×</td><td>#259</td></tr>
+      <tr><td><span class="tag t-ssd">L3</span> 重啟後，每物件一檔</td><td class="n">0.090 s</td><td class="n">29.7 ms</td><td class="n">8.5×</td><td>#259</td></tr>
+      <tr><td><span class="tag t-ssd">L3</span> segment 檔</td><td class="n">0.077–0.083 s</td><td class="n">17.4 ms</td><td class="n">~10×</td><td>#261</td></tr>
+      <tr><td><span class="tag t-ssd">L3</span> TP 去重 + page cache</td><td class="n">0.077 s</td><td class="n">14.3 ms</td><td class="n">~10.6×</td><td>#262</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">TP 去重後磁碟只存一份（501 MB，原本 4 份），L3 容量與寫入量都是 4×。needle 每個階段都是 24/24 答對；DSpark 接受率 cold 3.556 vs L3 3.527。</p>
+</section>
+
+<section>
+  <h2>還沒做的</h2>
+  <p class="note"><span class="tag t-warn">L2 去重</span> 圖中 L2 四個 rank 仍各存一份相同內容。下一步參考 vLLM #65373，讓 TP 間共用一份主機 RAM，L2 容量也變 4×（16 GB 有效 vs 現在 4 GB）。</p>
+</section>
+</div>

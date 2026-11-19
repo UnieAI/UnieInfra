@@ -35,6 +35,7 @@ def create_kvstore_storage_backend(
     tp_size: int,
     pp_size: int,
     rank: int,
+    shared_owner_rank: int | None,
 ) -> KvStoreStorage | None:
     """Return an L3 backend for ``backend_name``, or None when L3 is unset.
 
@@ -44,7 +45,12 @@ def create_kvstore_storage_backend(
     (attention TP × PP) mounts an equal share of the configured total. Pass
     the resolved ``mapping.attn.tp_size``. ``file`` stores objects on a
     local disk; ``rank`` (the process's global rank) gives each cache-owning
-    rank its own subdirectory and capacity.
+    rank its own subdirectory and capacity. ``shared_owner_rank`` is None
+    when every attention-TP rank caches its own bytes, or the global rank of
+    attention-TP rank 0 when the cache layout declares the bytes identical on
+    every rank: the file store then keeps one copy, written by that rank.
+    Mooncake and the memory store need nothing more, because the object keys
+    already name no rank then (``L3HostStore`` uses rank 0).
     """
 
     if backend_name is None:
@@ -58,7 +64,11 @@ def create_kvstore_storage_backend(
             parse_file_store_config,
         )
 
-        return FileKvStore(parse_file_store_config(extra_config), rank=rank)
+        return FileKvStore(
+            parse_file_store_config(extra_config),
+            rank=rank,
+            shared_owner_rank=shared_owner_rank,
+        )
     if name == "mooncake":
         from tokenspeed.runtime.cache.l3.mooncake import (
             MooncakeKvStore,

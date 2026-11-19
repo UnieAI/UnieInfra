@@ -74,6 +74,14 @@ class DeepseekV41Recipe(CacheRecipe):
 
     family = "deepseek_v41"
 
+    @property
+    @override
+    def kv_identical_across_attn_tp(self) -> bool:
+        # FlatKV rows, the compressor/indexer rows and the DSpark windows are
+        # all per-token latent rows with no head axis, written identically by
+        # every attention-TP rank.
+        return True
+
     def _row_layout(self):
         """Return the row widths and packing the configured cache format uses."""
         return self.attn_config.component(DeepseekV41Config).row_layout()

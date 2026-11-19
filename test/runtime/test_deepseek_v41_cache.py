@@ -3294,3 +3294,9 @@ def test_gpu_batched_prefill_matches_per_request_reference(
     if owner >= 0:
         assert bool((backend.sparse_topk.prefill.lengths > 0).any())
     assert torch.equal(published, arena)
+
+
+def test_flash_cache_is_one_copy_for_every_attention_tp_rank():
+    # Latent FlatKV, compressor/indexer and DSpark rows carry no head axis,
+    # so L3 may keep one copy per page for the whole attention-TP group.
+    assert _recipe("cpu").setup().kv_identical_across_attn_tp is True

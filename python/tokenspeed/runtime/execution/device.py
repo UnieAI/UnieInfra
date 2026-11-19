@@ -1642,6 +1642,9 @@ def build_device_side(
             else 1
         )
         rank = dist.get_rank() if world_size > 1 else 0
+        # A layout whose bytes are identical on every attention-TP rank keeps
+        # one L3 copy per page: keys name rank 0 and the file store is shared.
+        shared_l3 = attention.kv_identical_across_attn_tp
         storage_backend = create_kvstore_storage_backend(
             server_args.kvstore_storage_backend,
             server_args.kvstore_storage_backend_extra_config,
@@ -1649,6 +1652,9 @@ def build_device_side(
             tp_size=server_args.mapping.attn.tp_size,
             pp_size=(server_args.mapping.pp_size if server_args.mapping.has_pp else 1),
             rank=rank,
+            shared_owner_rank=(
+                int(server_args.mapping.attn.tp_group[0]) if shared_l3 else None
+            ),
         )
         cache_signature = cache_layout_signature(
             host_cache_executor.layout,
@@ -1736,7 +1742,7 @@ def build_device_side(
         host_cache_executor.attach_l3_storage(
             storage_backend,
             key_prefix=prefix_for_weight_version(server_args.weight_version),
-            rank=attn_tp_rank,
+            rank=0 if shared_l3 else attn_tp_rank,
             prefix_for_weight_version=prefix_for_weight_version,
             prefetch_timeout_base_s=server_args.kvstore_prefetch_timeout_base_s,
             prefetch_timeout_per_page_s=server_args.kvstore_prefetch_timeout_per_page_s,

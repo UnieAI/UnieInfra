@@ -547,6 +547,9 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # One Host L2 buffer per attention-TP group when the cache bytes are
+    # identical across it (CacheRecipe.kv_identical_across_attn_tp).
+    kvstore_share_host_across_attn_tp: bool = False
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -2817,6 +2820,17 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
+        )
+        parser.add_argument(
+            "--kvstore-share-host-across-attn-tp",
+            action="store_true",
+            help="Share one Host L2 buffer across the ranks of an attention-TP "
+            "group when the model's cache bytes are identical on every rank "
+            "(DeepSeek V4.1). The buffer is the group size times one rank's "
+            "--kvstore-size/--kvstore-ratio, so the node pins the same memory "
+            "and L2 holds that many times the pages. Ignored, with a log, for a "
+            "layout whose bytes differ per rank, under --kv-parallel-size > 1, "
+            "or when the group spans nodes.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

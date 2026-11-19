@@ -292,6 +292,8 @@ class HostCacheExecutor:
     _paced_writes: collections.deque | tuple = ()
     _paced_inflight = None
     _paced_slice_blocks = 0
+    # A private L2 buffer; ``__init__`` sets it from ``shared_l2``.
+    l2_follower = False
 
     def __init__(
         self,

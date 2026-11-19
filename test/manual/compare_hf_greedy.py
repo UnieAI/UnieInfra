@@ -37,6 +37,7 @@ Usage:
 
 import argparse
 import json
+import os
 import random
 
 PROMPT_LENS = (5, 37, 130, 700)
@@ -50,11 +51,10 @@ def make_prompts(vocab_size: int, seed: int) -> list[list[int]]:
 
 
 def text_vocab_size(model: str) -> int:
-    from transformers import AutoConfig
-
-    cfg = AutoConfig.from_pretrained(model, trust_remote_code=True)
-    cfg = getattr(cfg, "text_config", None) or cfg
-    return cfg.vocab_size
+    # Raw config.json: some checkpoints (glm5_next) are unknown to transformers.
+    with open(os.path.join(model, "config.json")) as f:
+        cfg = json.load(f)
+    return (cfg.get("text_config") or cfg)["vocab_size"]
 
 
 def run_engine(args) -> None:
@@ -78,6 +78,8 @@ def run_engine(args) -> None:
         enforce_eager=args.eager,
         max_cudagraph_capture_size=8,
     )
+    if args.lm_only:
+        kwargs["language_model_only"] = True
     if args.extra:
         kwargs.update(json.loads(args.extra))
     engine = Engine(**kwargs)
@@ -194,6 +196,7 @@ def main() -> None:
     p.add_argument("--vocab", type=int, default=0)
     p.add_argument("--eager", action="store_true")
     p.add_argument("--device", default="cpu", help="reference model device")
+    p.add_argument("--lm-only", action="store_true", help="--language-model-only")
     p.add_argument("--extra", default="", help="JSON dict of extra Engine kwargs")
     p.add_argument(
         "--ref-kwargs", default="", help="JSON dict of extra from_pretrained kwargs"

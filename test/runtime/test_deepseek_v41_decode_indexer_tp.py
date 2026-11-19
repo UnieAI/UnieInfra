@@ -106,9 +106,7 @@ def test_sharded_decode_topk_is_bit_identical(deferred, monkeypatch):
             logical = torch.arange(pages * 64, device="cuda")
             slots = tables[gid][req, logical // 64].long() * 64 + logical % 64
             dsv41.cache_scatter(
-                torch.randn(
-                    logical.numel(), 128, device="cuda", dtype=torch.bfloat16
-                ),
+                torch.randn(logical.numel(), 128, device="cuda", dtype=torch.bfloat16),
                 cache,
                 slots,
                 backend.index_format,
@@ -157,6 +155,13 @@ def test_sharded_decode_topk_is_bit_identical(deferred, monkeypatch):
             )
             record = backend.sparse_topk.decode
             out.append((record.logical_rows.clone(), record.lengths.clone()))
+            if layer == 20:
+                out.append(
+                    (
+                        record.candidates.block_ids.clone(),
+                        record.candidates.lengths.clone(),
+                    )
+                )
         return out
 
     monkeypatch.setattr(backend_module, "_DECODE_INDEXER_TP", False)
@@ -176,11 +181,12 @@ def test_sharded_decode_topk_is_bit_identical(deferred, monkeypatch):
             indexer_decode_rank=rank,
         )
         sharded = run()
-    # Layers 2/8/14 (Full) and 24..36 (Reindex) shard; 20 produces candidates.
-    assert state["call"] == len(layers) - 1
-    for layer, (want, got) in zip(layers, zip(reference, sharded)):
+    # Every source layer shards; the candidate source gathers its blocks too.
+    assert state["call"] == len(layers)
+    names = (2, 8, 14, 20, "20-candidates", 24, 28, 32, 36)
+    for name, want, got in zip(names, reference, sharded, strict=True):
         for a, b in zip(want, got):
-            assert torch.equal(a, b), f"layer {layer} differs"
+            assert torch.equal(a, b), f"layer {name} differs"
 
     # Below the row floor every rank keeps the replicated path.
     monkeypatch.setattr(backend_module, "_DECODE_INDEXER_TP_MIN_ROWS", 97)

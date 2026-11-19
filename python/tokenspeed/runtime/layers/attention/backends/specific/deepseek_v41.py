@@ -1590,8 +1590,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
         The decision depends only on host shapes and layer topology, so eager
         and captured decode of one batch size take the same branch. Mixed
-        steps (num_extends > 0), KVP, sharded indexer heads and the
-        candidate-source layer keep the replicated path.
+        steps (num_extends > 0), KVP and sharded indexer heads keep the
+        replicated path. The candidate-source layer gathers its blocks too.
         """
         group = self.spec.indexer_decode_group
         total = positions.numel()
@@ -1607,7 +1607,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             or self.kvp_size != 1
             or owner < 0
             or layer_id != self.spec.index_sources[layer_id]
-            or layer_id == self.spec.candidate_source
             or meta is None
             or meta.num_extends
             or positions is not meta.positions
@@ -2000,7 +1999,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 geometry.kernel_metadata,
             )
             del scoring_cache
-        if partition is not None:
+        if decode_shard and produce_candidates:
+            rows, lens, blocks, block_lens = partition.gather_rows(
+                (rows, lens, blocks, block_lens), query_group
+            )
+        elif partition is not None:
             rows, lens = partition.gather_selection(rows, lens, query_group)
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)

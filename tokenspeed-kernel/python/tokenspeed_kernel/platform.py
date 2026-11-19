@@ -606,6 +606,7 @@ def _detect_rocm_platform() -> PlatformInfo:
         sm_features=sm_features,
         runtime_features=runtime_features,
         interconnect=_detect_rocm_interconnect(),
+        numa_cpu_affinity=_detect_sysfs_numa_cpu_affinity(),
     )
 
 
@@ -718,6 +719,37 @@ def _detect_rocm_interconnect() -> InterconnectInfo | None:
         return InterconnectInfo(topology="pcie")
     except Exception:
         return None
+
+
+def _parse_cpulist(text: str) -> tuple[int, ...]:
+    """Parse a sysfs cpulist such as ``0-159,320-479``."""
+    cpus: list[int] = []
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        cpus.extend(range(int(lo), int(hi or lo) + 1))
+    return tuple(cpus)
+
+
+def _detect_sysfs_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
+    """Return NUMA-local CPU IDs per visible device from the PCI device's sysfs
+    ``local_cpulist`` (ROCm has no NVML). An unreadable entry yields ``()``."""
+    try:
+        device_count = torch.cuda.device_count()
+        affinities: list[tuple[int, ...]] = []
+        for device_id in range(device_count):
+            props = torch.cuda.get_device_properties(device_id)
+            pci = (
+                f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+                f"{props.pci_device_id:02x}.0"
+            )
+            with open(f"/sys/bus/pci/devices/{pci}/local_cpulist") as f:
+                affinities.append(_parse_cpulist(f.read()))
+    except Exception as e:
+        logger.warning(f"sysfs NUMA affinity query failed: {e!s}")
+        return ()
+    return tuple(affinities)
 
 
 def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:

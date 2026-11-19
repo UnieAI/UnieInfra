@@ -116,15 +116,16 @@ def maybe_inference_mode():
 def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
     """Pin the current process to ``device_id``'s NUMA-local CPU set.
 
-    NVIDIA-only optimization. No-op if the env var is False, the platform is not
-    NVIDIA, or the process already has a constrained affinity (e.g., taskset).
+    NVIDIA (NVML) and AMD (sysfs ``local_cpulist``). No-op if the env var is
+    False, the platform is neither, or the process already has a constrained
+    affinity (e.g., taskset).
     """
     from tokenspeed.runtime.utils.env import envs
 
     if not envs.TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY.get():
         return
     platform = current_platform()
-    if not platform.is_nvidia:
+    if not (platform.is_nvidia or platform.is_amd):
         return
 
     proc = psutil.Process()

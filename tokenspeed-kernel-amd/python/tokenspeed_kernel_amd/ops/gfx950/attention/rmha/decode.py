@@ -26,6 +26,7 @@ import math
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2_VALUE,
@@ -37,7 +38,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 cdiv = gl.cdiv
-_GFX950_SM_COUNT = 256
 
 
 # ===-----------------------------------------------------------------------===#
@@ -766,7 +766,7 @@ def get_config(
             num_kv_heads=k_cache.shape[2],
             num_groups=num_groups,
             num_pages=num_pages,
-            sm_count=_GFX950_SM_COUNT,
+            sm_count=num_cus(),
         )
     return LaunchConfig(
         num_q_heads=q.shape[1],

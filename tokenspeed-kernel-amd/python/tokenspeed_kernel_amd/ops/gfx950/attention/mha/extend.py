@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
@@ -966,9 +967,6 @@ def gluon_mha_extend_reduce_gfx950(
         gl.store(lse_out_ptr + (row * N_HEADS + q_head), lse)
 
 
-_GFX950_SM_COUNT = 256
-
-
 def launch_gluon_mha_extend_gfx950(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -1047,7 +1045,7 @@ def launch_gluon_mha_extend_gfx950(
         num_kv_splits = select_kv_splits(
             base_ctas=grid_num_q_blocks * n_kv_heads,
             num_pages=num_pages,
-            sm_count=_GFX950_SM_COUNT,
+            sm_count=num_cus(),
         )
 
     if num_kv_splits > 1:

@@ -104,6 +104,7 @@ ul{margin:0;padding-left:1.2em;display:flex;flex-direction:column;gap:6px}
 <section>
 <h2>可以從 Hibana 學的</h2>
 <ul>
+  <li><strong>已做</strong>：讀 SSD 時同時讓兩批在讀（雙緩衝）。131k token 的前綴讀取 30.6 → 25.7 ms（−16%）；24k 只有一批，沒差。分支 roy/l3-prefetch-pipeline。</li>
   <li>關機時把 GPU 上所有前綴寫到 SSD，重開後馬上有快取。</li>
   <li>太短的前綴（&lt; 4096 token）不寫 SSD，省寫入量。</li>
   <li>快取 key 加上模型版本、權重、格式的雜湊，換模型時舊檔自動作廢。</li>

@@ -106,6 +106,9 @@ from tokenspeed.runtime.execution.slot_state import SlotStateExporter, SlotState
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
+
+# L3 prefetch batches kept in flight per op (2 = double buffering).
+_L3_PREFETCH_DEPTH = 2
 device_module = get_device_module()
 
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
@@ -574,6 +577,12 @@ class HostCacheExecutor:
         # op id, and the ops the hooks converged -- replica-wide MIN of every
         # rank's landed prefix -- waiting to be acknowledged by ``poll_results``.
         self._l3_prefetch_lane: ThreadPoolExecutor | None = None
+        # Read-ahead: a prefetch keeps this many ``batch_get_into`` batches in
+        # flight, so the store's I/O threads start the next batch while the
+        # lane checks the current one (double buffering). Batches land in
+        # disjoint Host pages; 1 is the strictly serial fetch.
+        self._l3_prefetch_depth = _L3_PREFETCH_DEPTH
+        self._l3_prefetch_io: ThreadPoolExecutor | None = None
         self._prefetch_jobs: dict[int, _PrefetchJob] = {}
         self._prefetch_acks: list[tuple[int, int]] = []
 
@@ -1026,65 +1035,123 @@ class HostCacheExecutor:
     ) -> int:
         """The lane's job: fetch ``pages`` in prefix order; return the pages landed.
 
-        One ``batch_get_into`` per ``prefetch_batch_pages`` prefix pages. A
-        batch is not started past the deadline (checked between batches
-        only: the store call has no timeout, so an issued batch runs to
-        completion); the first page whose get fails (any of its groups) ends
-        the fetch, and the pages before it are the result -- a page with no
-        rows (nothing of it to fetch here) lands trivially. A backend fault
-        counts as a miss at that batch, so the replica still converges on a
-        prefix.
+        One ``batch_get_into`` per ``prefetch_batch_pages`` prefix pages, with
+        up to ``_l3_prefetch_depth`` batches in flight: batch ``k + 1`` is
+        issued before batch ``k`` is checked, so the store never idles between
+        batches. A batch is not issued past the deadline (the store call has
+        no timeout, so an issued batch runs to completion); the first page
+        whose get fails (any of its groups) ends the fetch, and the pages
+        before it are the result -- a page with no rows (nothing of it to
+        fetch here) lands trivially. Batches issued after the failing one
+        still finish before this returns: their I/O targets Host pages the
+        scheduler reclaims once the op is acknowledged. A backend fault counts
+        as a miss at that batch, so the replica still converges on a prefix.
         """
         l3_store = self.l3_store
         if l3_store is None:
             raise RuntimeError("L3 prefetch ran without a storage backend")
-        landed = 0
         batch = self._l3_prefetch_batch_pages
-        for start in range(0, len(pages), batch):
+        depth = max(1, int(getattr(self, "_l3_prefetch_depth", 1)))
+        starts = range(0, len(pages), batch)
+        io = self._prefetch_io() if depth > 1 and len(starts) > 1 else None
+        # (chunk, flat rows, Future | list | Exception | None); None: nothing to fetch.
+        inflight: deque = deque()
+        next_start = iter(starts)
+        timed_out = False
+
+        def issue() -> bool:
+            nonlocal timed_out
+            start = next(next_start, None)
+            if start is None:
+                return False
             if time.monotonic() > deadline:
-                logger.warning(
-                    f"[L3] prefetch {op_id} ({request_id}) timed out after "
-                    f"{landed}/{len(pages)} pages"
-                )
-                break
+                timed_out = True
+                return False
             chunk = pages[start : start + batch]
             flat = [page for rows in chunk for page in rows]
             if not flat:
                 # No row of the chunk is this rank's to fetch (none at all, or
                 # other KVP ranks own them): the pages land here so this rank
                 # does not shorten the replica's prefix.
-                landed += len(chunk)
-                continue
-            try:
-                ok = list(l3_store.prefetch(flat))
-            except Exception:
-                logger.exception(
-                    f"[L3] prefetch {op_id} ({request_id}) failed at page {landed}; "
-                    "landing the pages before it"
-                )
-                break
-            if len(ok) != len(flat):
-                logger.error(
-                    f"[L3] prefetch {op_id} ({request_id}): result has {len(ok)} "
-                    f"flags for {len(flat)} pages; landing the pages before this batch"
-                )
-                break
-            cursor = 0
-            stopped = False
-            for rows in chunk:
-                page_ok = all(ok[cursor : cursor + len(rows)])
-                cursor += len(rows)
-                if not page_ok:
-                    stopped = True
-                    break
-                landed += 1
-            if stopped:
+                inflight.append((chunk, flat, None))
+            elif io is not None:
+                inflight.append((chunk, flat, io.submit(l3_store.prefetch, flat)))
+            else:
+                try:
+                    inflight.append((chunk, flat, list(l3_store.prefetch(flat))))
+                except Exception as exc:
+                    inflight.append((chunk, flat, exc))
+            return True
+
+        landed = 0
+        try:
+            while len(inflight) < depth and issue():
+                pass
+            while inflight:
+                chunk, flat, outcome = inflight.popleft()
+                if outcome is None:
+                    landed += len(chunk)
+                    while len(inflight) < depth and issue():
+                        pass
+                    continue
+                if isinstance(outcome, Future):
+                    try:
+                        outcome = list(outcome.result())
+                    except Exception as exc:
+                        outcome = exc
+                if isinstance(outcome, Exception):
+                    logger.error(
+                        f"[L3] prefetch {op_id} ({request_id}) failed at page "
+                        f"{landed}; landing the pages before it",
+                        exc_info=outcome,
+                    )
+                    return landed
+                ok = outcome
+                if len(ok) != len(flat):
+                    logger.error(
+                        f"[L3] prefetch {op_id} ({request_id}): result has {len(ok)} "
+                        f"flags for {len(flat)} pages; landing the pages before this batch"
+                    )
+                    return landed
+                cursor = 0
+                for rows in chunk:
+                    page_ok = all(ok[cursor : cursor + len(rows)])
+                    cursor += len(rows)
+                    if not page_ok:
+                        logger.warning(
+                            f"[L3] prefetch {op_id} ({request_id}) missed page "
+                            f"{landed}; landing {landed}/{len(pages)} pages"
+                        )
+                        return landed
+                    landed += 1
+                while len(inflight) < depth and issue():
+                    pass
+            if timed_out:
                 logger.warning(
-                    f"[L3] prefetch {op_id} ({request_id}) missed page {landed}; "
-                    f"landing {landed}/{len(pages)} pages"
+                    f"[L3] prefetch {op_id} ({request_id}) timed out after "
+                    f"{landed}/{len(pages)} pages"
                 )
-                break
-        return landed
+            return landed
+        finally:
+            # Read-ahead batches past a miss still write Host pages: retire them.
+            for _chunk, _flat, outcome in inflight:
+                if isinstance(outcome, Future):
+                    try:
+                        outcome.result()
+                    except Exception:
+                        pass
+
+    def _prefetch_io(self) -> ThreadPoolExecutor:
+        """The read-ahead pool: one thread per batch in flight."""
+        with self._ack_lock:
+            io = getattr(self, "_l3_prefetch_io", None)
+            if io is None:
+                io = ThreadPoolExecutor(
+                    max_workers=max(1, int(self._l3_prefetch_depth)),
+                    thread_name_prefix="l3-prefetch-io",
+                )
+                self._l3_prefetch_io = io
+            return io
 
     def l3_prefetch_progress(self) -> dict[int, tuple[bool, int]]:
         """This rank's view of every in-flight prefetch op: ``(done, landed)``.
@@ -2004,6 +2071,10 @@ class HostCacheExecutor:
             # under them; their outcomes are dropped with the queue.
             lane.shutdown(wait=True)
             self._l3_prefetch_lane = None
+        io = getattr(self, "_l3_prefetch_io", None)
+        if io is not None:
+            io.shutdown(wait=True)
+            self._l3_prefetch_io = None
         with self._ack_lock:
             self._prefetch_jobs.clear()
             self._prefetch_acks.clear()

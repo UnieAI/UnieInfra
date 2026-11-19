@@ -189,9 +189,12 @@ def _reject_unsupported_features(text_config) -> None:
         )
 
     # Double-wide MLP: in the reference this only widens the KV-shared layers'
-    # intermediate size, but KV-sharing is itself unsupported here, so guard
-    # the flag whenever it is set rather than silently build a narrow MLP.
-    if getattr(text_config, "use_double_wide_mlp", False):
+    # intermediate size, so it is a no-op without KV-shared layers. KV-sharing
+    # is itself unsupported here; reject the flag only when it would widen one.
+    if (
+        getattr(text_config, "use_double_wide_mlp", False)
+        and (getattr(text_config, "num_kv_shared_layers", 0) or 0) > 0
+    ):
         raise ValueError(
             "Gemma 4 text port does not support the double-wide MLP "
             "(use_double_wide_mlp); this build serves the dense "

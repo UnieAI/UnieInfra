@@ -668,6 +668,10 @@ class LatentMoELayer(nn.Module):
             # with Iris's spin-wait all-reduce kernels. Keep the captured path
             # serial; eager serving can safely use the compute-stream overlap.
             and not get_is_cuda_graph_phase()
+            # The graph-phase flag covers decode capture only; breakable
+            # prefill graphs capture without it, and replaying the overlapped
+            # capture corrupts the layer output on gfx950.
+            and not torch.cuda.is_current_stream_capturing()
         )
         shared_reduction_applied = False
 

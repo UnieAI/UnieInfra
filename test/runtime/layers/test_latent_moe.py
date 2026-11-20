@@ -495,6 +495,39 @@ def test_latent_moe_joint_reduce_lands_partials_returned_out_of_place(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_latent_moe_keeps_shared_experts_serial_under_stream_capture() -> None:
+    packed_calls = []
+
+    def input_projections(hidden_states, shared_out):
+        packed_calls.append(torch.cuda.is_current_stream_capturing())
+        return hidden_states[:, :2].float(), hidden_states[:, :2], hidden_states * 4
+
+    layer = _layer(
+        routed_norm=_Norm(),
+        shared_experts=_Shared(),
+        shared_expert_stream=torch.cuda.Stream(),
+        input_projections=input_projections,
+    )
+    static = torch.zeros(3, 4, device="cuda")
+    # Eager forwards may overlap the shared experts on the auxiliary stream.
+    eager_out = layer(static)
+    assert packed_calls == []
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out = layer(static)
+    # The captured forward ran serially through the packed projections.
+    assert packed_calls == [True]
+    del eager_out
+
+    hidden_states = torch.arange(12, dtype=torch.float32, device="cuda").view(3, 4)
+    static.copy_(hidden_states)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_out, layer(hidden_states), rtol=0, atol=0)
+
+
 def test_latent_moe_can_return_separate_residual_components() -> None:
     layer = _layer(
         shared_experts=_Shared(),

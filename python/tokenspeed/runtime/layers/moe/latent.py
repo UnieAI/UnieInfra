@@ -771,6 +771,16 @@ class LatentMoELayer(nn.Module):
             shared_reduction_applied = True
 
         if reduction_outputs is not None:
+            # A producer may return its own tensor instead of filling its
+            # destination (not every MoE kernel honors _situ_output_buffer;
+            # gfx950 EP4 selects one that does not). Land such partials in
+            # the reduction outputs, or the joint reduction sums stale rows.
+            for partial, target in (
+                (shared_output, shared_target),
+                (routed_latent, routed_target),
+            ):
+                if partial.data_ptr() != target.data_ptr():
+                    target.copy_(partial)
             shared_output, routed_latent = all_reduce(
                 reduction_outputs,
                 self.expert_parallel_group,

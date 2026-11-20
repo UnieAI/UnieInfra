@@ -1,12 +1,104 @@
-"""Shared helpers for Kimi-K3 cache-group runtime tests."""
+"""Shared runtime-test hooks and helpers for Kimi-K3 cache-group tests."""
 
 from __future__ import annotations
 
+import os
+import signal
+import threading
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+
+
+def _reap_launched_processes() -> None:
+    """Kill every process this pytest run spawned (servers, schedulers)."""
+    try:
+        from tokenspeed.runtime.utils.process import kill_process_tree
+
+        kill_process_tree(os.getpid(), include_parent=False)
+    except Exception:
+        pass
+
+
+def _reap_on_sigterm(signum, frame):
+    # An outer `timeout`/job controller ends the run with SIGTERM, which skips
+    # every fixture finalizer; without this, launched schedulers outlive the
+    # run and keep their GPUs.
+    _reap_launched_processes()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def pytest_configure(config):
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _reap_on_sigterm)
+
+
+def pytest_unconfigure(config):
+    _reap_launched_processes()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_process_global_state():
+    """Undo what a test module leaves in process-wide state.
+
+    ``global_server_args_dict`` and the MoE backend globals: harnesses that
+    build a model in-process set the ``mapping`` and pin ``MOE_BACKEND``, and
+    later modules read them back as their own topology and backend.
+
+    Environment: ``Engine`` and some harnesses export variables for their
+    workers (``INKLING_TORCH_MOE``, ``TOKENSPEED_MAMBA_SSM_DTYPE``, TF32 and
+    PDL switches) that later modules would otherwise inherit.
+
+    Logging: an in-process ``Engine`` runs ``configure_logger``, which sets the
+    root and every ``tokenspeed`` logger to the engine's ``log_level``, and the
+    default that ``get_colorful_logger`` reads. That is right for a server, but
+    in a pytest process it hides the records later modules assert on.
+    """
+    import logging
+
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.utils import common
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    environ = dict(os.environ)
+    server_args = dict(global_server_args_dict)
+    moe_globals = (
+        "ALL2ALL_BACKEND",
+        "MOE_BACKEND",
+        "DEEPEP_MODE",
+        "DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER",
+    )
+    moe_config = {name: getattr(moe_utils, name) for name in moe_globals}
+    root = logging.getLogger()
+    root_level = root.level
+    root_handlers = list(root.handlers)
+    prefix, level = common.LOG_PREFIX, common.LOG_LEVEL
+    levels = {
+        name: (logger.level, [(h, h.level) for h in logger.handlers])
+        for name, logger in logging.Logger.manager.loggerDict.items()
+        if isinstance(logger, logging.Logger) and "tokenspeed" in name
+    }
+    yield
+    os.environ.clear()
+    os.environ.update(environ)
+    global_server_args_dict.clear()
+    global_server_args_dict.update(server_args)
+    for name, value in moe_config.items():
+        setattr(moe_utils, name, value)
+    root.setLevel(root_level)
+    root.handlers[:] = root_handlers
+    common.LOG_PREFIX, common.LOG_LEVEL = prefix, level
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(logger, logging.Logger) and "tokenspeed" in name:
+            # A logger first created inside the module starts unset.
+            logger_level, handlers = levels.get(name, (logging.NOTSET, []))
+            logger.setLevel(logger_level)
+            for handler, handler_level in handlers:
+                handler.setLevel(handler_level)
+
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -41,8 +133,15 @@ def kimi_recipe(
     speculative_algorithm: str | None = None,
     speculative_num_draft_tokens: int = 1,
     kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
+    mamba_ssm_dtype: str = "float32",
+    dsa_index_k_format: str | None = None,
 ):
-    """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
+    """A Kimi-K3 recipe over the reference config, with tiny scheduler limits.
+
+    ``dsa_index_k_format`` builds the Kimi-K3.1 target instead: a DSA
+    component (indexer geometry of the K3.1 checkpoint) storing index keys in
+    that format. The draft stays an ordinary MLA view either way.
+    """
     import dataclasses
     from types import SimpleNamespace
 
@@ -82,23 +181,41 @@ def kimi_recipe(
         scaling=(text_config.qk_nope_head_dim + text_config.qk_rope_head_dim) ** -0.5,
         kv_cache_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
     )
+    target_softmax = mla
+    if dsa_index_k_format is not None:
+        from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+
+        target_softmax = DSAConfig(
+            **{
+                field.name: getattr(mla, field.name)
+                for field in dataclasses.fields(mla)
+            },
+            index_topk=2048,
+            index_head_dim=128,
+            index_n_heads=32,
+            index_k_format=dsa_index_k_format,
+        )
     attn_config = AttnConfig(
         device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method=None,
-        prefix_granularity=128,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         # K3's per-group demand reads the scheduler's concurrency through
         # CacheRecipe.scheduler_limits, context length included.
         context_len=context_len,
         pd_disaggregation_enabled=pd_enabled,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
-        components=(mla, linear_attn),
+        components=(target_softmax, linear_attn),
     )
     # The real K3 draft is BF16 MLA over the FP8 target arena.
     draft_attn_config = (
-        dataclasses.replace(attn_config, kv_cache_dtype=torch.bfloat16)
+        dataclasses.replace(
+            attn_config,
+            kv_cache_dtype=torch.bfloat16,
+            components=(mla, linear_attn),
+        )
         if draft_layers
         else None
     )
@@ -111,6 +228,7 @@ def kimi_recipe(
             enable_prefix_caching=True,
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            mamba_ssm_dtype=mamba_ssm_dtype,
         ),
         model_config=SimpleNamespace(hf_text_config=text_config),
         attn_config=attn_config,
@@ -127,9 +245,14 @@ def kimi_recipe(
 
 def kimi_tp8_layout(**recipe_kwargs):
     """The capacity-independent K3 layout: group, then pack."""
+    recipe = kimi_recipe(**recipe_kwargs)
+    return (recipe, *kimi_layout(recipe))
+
+
+def kimi_layout(recipe):
+    """``recipe``'s groups and capacity-independent layout."""
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 
-    recipe = kimi_recipe(**recipe_kwargs)
     groups = recipe.groups()
     layout = pack(
         groups,
@@ -140,7 +263,7 @@ def kimi_tp8_layout(**recipe_kwargs):
     )
     # Same order as CacheRecipe.setup: group, pack, check, then bind.
     recipe.check_layout(layout)
-    return recipe, groups, layout
+    return groups, layout
 
 
 def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
@@ -203,6 +326,20 @@ def kda_layer_id(pool) -> int:
     return min(pool.state_group_by_layer)
 
 
+def whole_row_windows(arrays):
+    return {group_id: (array, array.shape[1]) for group_id, array in arrays.items()}
+
+
+def whole_row_spans(arrays):
+    """Block-table row spans covering every column, exact for any table."""
+    return {
+        group_id: np.tile(
+            np.array([0, array.shape[1]], dtype=np.int32), (len(array), 1)
+        )
+        for group_id, array in arrays.items()
+    }
+
+
 def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
     from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
         CacheBatchMetadata,
@@ -215,9 +352,18 @@ def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
             arrays[spec.group_id] = np.asarray(tables[spec.group_id], dtype=np.int32)
         else:
             arrays[spec.group_id] = np.full((bs, 1), filler_page, dtype=np.int32)
-    forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
+    spans = whole_row_spans(arrays)
+    forward_op = SimpleNamespace(
+        block_table_windows=lambda: whole_row_windows(arrays),
+        block_table_spans=lambda: spans,
+    )
     metadata = CacheBatchMetadata.from_forward_op(
-        forward_op, device=device, contract=contract, num_requests=bs
+        forward_op,
+        device=device,
+        contract=contract,
+        num_requests=bs,
+        validate_page_ids=True,
+        host_tables=True,
     )
     return metadata, forward_op
 

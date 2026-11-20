@@ -41,7 +41,7 @@ def compute_cache_group_pages(
     overlap_schedule_depth,
 ):
     """Child pages per group (null page excluded) from the scheduler's model."""
-    from tokenspeed_scheduler import SchedulerConfig
+    from tokenspeed_engine.scheduler import SchedulerConfig
 
     model = capacity_model(
         specs,
@@ -49,7 +49,8 @@ def compute_cache_group_pages(
         virtual_packing={spec.group_id: 1 for spec in specs},
         limits=SchedulerLimits(
             role=SchedulerConfig.Role.Fused,
-            max_live_requests=max_live_requests,
+            max_batch_size=max_live_requests,
+            max_resident_requests=max_live_requests,
             max_scheduled_tokens=max_scheduled_tokens,
             max_context_len=max_context_len,
             decode_input_tokens=decode_input_tokens,
@@ -116,9 +117,9 @@ class TestV4SlidingWindowGroupsSmoke:
                 ):
                     # One overlapped step protects one more verify window per
                     # live request: never fewer pages, never more than the
-                    # window's own page span. A dense history has one tail page
-                    # of slack per request, so the window costs a page only
-                    # past what that slack absorbs.
+                    # window's own page span. Speculative decode already
+                    # reserves a draft window; overlap adds another window
+                    # beyond that reservation and the unaligned history tail.
                     for group_id in ("full", "sliding"):
                         delta = overlapped[group_id] - baseline[group_id]
                         _pytest_a_12 = delta
@@ -131,8 +132,18 @@ class TestV4SlidingWindowGroupsSmoke:
                         )
                         _pytest_msg_17 = group_id
                         assert _pytest_a_15 <= _pytest_b_16, _pytest_msg_17
+                    draft_tokens = verify_width if verify_width > 1 else 0
                     assert (overlapped["full"] - baseline["full"]) == (
-                        max_live_requests * math.ceil((verify_width - 1) / raw_per_page)
+                        max_live_requests
+                        * (
+                            math.ceil(
+                                (raw_per_page - 1 + draft_tokens + verify_width)
+                                / raw_per_page
+                            )
+                            - math.ceil(
+                                (raw_per_page - 1 + draft_tokens) / raw_per_page
+                            )
+                        )
                     )
 
     def test_capture_table_width_is_parameterized_by_verify_width_and_depth(
@@ -370,18 +381,23 @@ class TestV4SlidingWindowGroupsSmoke:
         )
 
         # Each request retains its 7-token window plus the decode token at any
-        # page alignment, and with the prefix cache on hands its partial page
-        # to the cache at the prompt end while continuing on a fresh one (one
-        # more block per request, ceil((P - 1) / g), within the lookback); one
-        # chunk in flight -- capped by the total -- adds its rows behind the
-        # resumable-boundary lookback, which spans the most blocks a window can
-        # cover at any alignment: ceil((W - 1 + g - 1) / g).
+        # page alignment, and with the prefix cache on holds a hitter's copy
+        # of a published tail and the copy-in block its prompt end moves to
+        # (ceil((P - 1) / g) blocks each per request, within the lookback);
+        # one chunk in flight -- capped by the total -- adds its rows behind
+        # the resumable-boundary lookback, which spans the most blocks a
+        # window can cover at any alignment: ceil((W - 1 + g - 1) / g).
         resident_pages = 10 * math.ceil((7 + 1 + 3) / 4)
         lookback_pages = math.ceil((7 + 3) / 4)
         handover_pages = 10 * min(math.ceil((4 - 1) / 4), lookback_pages)
+        copy_in_pages = handover_pages
         scheduled_pages = math.ceil(20 / 4)
         assert (pages["sliding"]) == (
-            resident_pages + handover_pages + lookback_pages + scheduled_pages
+            resident_pages
+            + handover_pages
+            + copy_in_pages
+            + lookback_pages
+            + scheduled_pages
         )
 
 

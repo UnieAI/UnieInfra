@@ -37,12 +37,16 @@ from tokenspeed_kernel.ops.communication.triton import (
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
     TrtllmAllGatherQuantState,
+    TrtllmAllGatherState,
+    TrtllmReduceScatterState,
+    trtllm_allgather,
     trtllm_allgather_fp8_quantize,
+    trtllm_reduce_scatter,
 )
 from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 ROWS = 128
 HIDDEN = 7168
@@ -54,6 +58,27 @@ def _check_quantized(actual, expected):
         actual[0].view(torch.uint8), expected[0].view(torch.uint8), rtol=0, atol=0
     )
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+def _quantize_reference(exchanged):
+    """FP8 1x128 quantization with the numerics the fused A2A kernel pins.
+
+    Gathered row counts divisible by four use TRT-LLM's contract (division
+    rounded to nearest, scale floor of the BF16 epsilon). The TRT-LLM op ships
+    no image after SM100, so a newer GPU computes the same arithmetic here.
+    """
+    rows, shard = exchanged.shape
+    if rows % 4 or current_platform().arch_version <= ArchVersion(10, 9):
+        return flashinfer_fp8_blockscale_quantize_prepacked(exchanged, 128)
+    groups = exchanged.view(rows, shard // 128, 128).float()
+    floor = torch.tensor(1e-10, dtype=torch.bfloat16).float().item()
+    amax = groups.abs().amax(dim=-1).clamp_min(floor)
+    # Tensor / tensor divides exactly; "scalar / tensor" is a reciprocal and a
+    # multiplication, which rounds differently.
+    multiplier = torch.full_like(amax, 448.0) / amax
+    values = (groups * multiplier.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    scales = torch.ones_like(multiplier) / multiplier
+    return values.view(rows, shard), scales.t().contiguous()
 
 
 def _check_pack(device, size):
@@ -128,9 +153,9 @@ def _check_a2a(rank, device, size):
                 :, rank * (KDA_WIDTH // size) : (rank + 1) * (KDA_WIDTH // size)
             ].contiguous()
             # The fused kernel pads the gathered shard to a multiple of four
-            # rows with zero/one padding; the prepacked reference reproduces
-            # that layout exactly, including for TP2's odd row counts.
-            expected = flashinfer_fp8_blockscale_quantize_prepacked(exchanged, 128)
+            # rows with zero/one padding; the reference reproduces that layout
+            # exactly, including for TP2's odd row counts.
+            expected = _quantize_reference(exchanged)
             if capture:
                 graph.replay()
             else:
@@ -205,11 +230,7 @@ def _check_allgather_quant(rank, device):
     inputs = torch.randn(ROWS, HIDDEN, dtype=torch.bfloat16, device=device)
 
     def reference():
-        gathered = state.gather(inputs)
-        values, scales = quantize_fp8(
-            gathered, granularity="token_group", group_size=128, solution="trtllm"
-        )
-        return values, scales.t().contiguous()
+        return _quantize_reference(state.gather(inputs))
 
     _check_quantized(trtllm_allgather_fp8_quantize(state, inputs), reference())
     graph = torch.cuda.CUDAGraph()
@@ -221,6 +242,38 @@ def _check_allgather_quant(rank, device):
     _check_quantized(actual, expected)
     del graph
     state.close()
+
+
+def _check_shared_collectives(rank, device, size):
+    rows = 256
+    group = dist.group.WORLD
+    gather = TrtllmAllGatherState(group, rows, HIDDEN, device, True)
+    reduction = TrtllmReduceScatterState(group, rows, HIDDEN, device)
+    try:
+        inputs = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
+        partial = torch.zeros(size * rows, HIDDEN, dtype=inputs.dtype, device=device)
+        trtllm_allgather(gather, inputs)
+        trtllm_reduce_scatter(reduction, partial, rows)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gathered = trtllm_allgather(gather, inputs)
+            reduced = trtllm_reduce_scatter(reduction, partial, rows)
+        for value in (rank + 1, rank + 2):
+            inputs.fill_(value)
+            partial.fill_(value)
+            expected_gather = torch.empty_like(partial)
+            expected_reduced = torch.empty_like(inputs)
+            dist.all_gather_single(expected_gather, inputs)
+            dist.reduce_scatter_single(expected_reduced, partial)
+            graph.replay()
+            torch.testing.assert_close(gathered, expected_gather, rtol=0, atol=0)
+            torch.testing.assert_close(reduced, expected_reduced, rtol=0, atol=0)
+        del graph
+    finally:
+        gather.close()
+        reduction.close()
 
 
 def _worker(rank, size, rendezvous):
@@ -238,6 +291,7 @@ def _worker(rank, size, rendezvous):
     _check_pack(device, size)
     _check_a2a(rank, device, size)
     _check_allgather_quant(rank, device)
+    _check_shared_collectives(rank, device, size)
     dist.destroy_process_group()
 
 

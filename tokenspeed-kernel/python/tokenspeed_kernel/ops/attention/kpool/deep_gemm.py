@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -33,6 +34,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 
 def _kpool_cache_views(
@@ -51,21 +53,20 @@ def _kpool_cache_views(
         (page_stride, groups * 4, 1),
         cache.storage_offset() + page_size * head_dim,
     )
-    return values.view(torch.float8_e4m3fn), scales.view(torch.float32)
+    return values.view(torch.float8_e4m3fn), scales.view(index_k_scale_dtype())
 
 
 if current_platform().is_hopper_plus:
-    from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
-        deep_gemm_dsa_prefill_topk,
-    )
 
     @register_kernel(
         "attention",
         "kpool_prefill_topk",
         name="deep_gemm_kpool_prefill_topk",
         solution="deep_gemm",
+        # Same window as the DSA DeepGEMM leaves it runs on
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=None if deepgemm_supports_sm120() else ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
@@ -108,7 +109,7 @@ if current_platform().is_hopper_plus:
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run planned KPool prefill with DeepGEMM scoring and TRT-LLM top-k."""
+        """Run planned KPool prefill with DeepGEMM scoring and the DSA prefill top-k."""
         del positions, query_start_loc, index_block_table, chunk_pools
         if not apply_relu:
             raise ValueError("DeepGEMM KPool prefill requires apply_relu=True")
@@ -168,6 +169,11 @@ if current_platform().is_hopper_plus:
                 out=out,
                 lens_out=lens_out,
             )
+
+        # The all-pools path above does not need the native scoring backend.
+        from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
+            deep_gemm_dsa_prefill_topk,
+        )
 
         values, scales = _kpool_cache_views(
             pooled_k_cache,

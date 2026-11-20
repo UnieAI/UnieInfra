@@ -21,8 +21,9 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -30,6 +31,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
+from kernel_test_selection import selection_from_env
 from tokenspeed_kernel.platform import (
     ArchVersion,
     InterconnectInfo,
@@ -43,17 +45,109 @@ from tokenspeed_kernel.selection import (
 )
 from utils import make_sample_specs
 
+# On pull requests CI lists the changed paths; run only the test files they name.
+_SELECTION = selection_from_env(Path(__file__).resolve().parents[2])
+# Whether the selection deselected every collected test of this run.
+_SELECTION_EMPTIED_RUN = pytest.StashKey[bool]()
+# The key under which a pytest-xdist worker reports it to the controller.
+_WORKER_EMPTIED_KEY = "kernel_selection_emptied_run"
+
+
+def pytest_report_header(config: pytest.Config) -> str | None:
+    if _SELECTION is None:
+        return None
+    if _SELECTION.run_all:
+        return "kernel test selection: every test (a change names no family)"
+    families = ", ".join(sorted(_SELECTION.families)) or "none"
+    return f"kernel test selection: families {families}"
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    if _SELECTION is None:
+        return
+    selected = {}
+    kept, deselected = [], []
+    for item in items:
+        if item.path not in selected:
+            selected[item.path] = _SELECTION.selects(item.path)
+        (kept if selected[item.path] else deselected).append(item)
+    emptied = bool(deselected) and not kept
+    config.stash[_SELECTION_EMPTIED_RUN] = emptied
+    # A pytest-xdist worker collects and selects for the controller, which
+    # learns from it whether the selection emptied the run
+    # (pytest_testnodedown). xdist sets workeroutput on a worker's config
+    # (third-party state); PYTEST_XDIST_WORKER would also be inherited by a
+    # nested run that is not a worker.
+    workeroutput = getattr(config, "workeroutput", None)
+    if workeroutput is not None:
+        workeroutput[_WORKER_EMPTIED_KEY] = emptied
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = kept
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error) -> None:
+    """Merge each xdist worker's emptied-selection flag on the controller.
+
+    The run counts as emptied by the selection when every worker's was
+    (``pytest_sessionfinish``). A worker that crashed (``error``) may have
+    sent no output; it never counts as emptied, so the run keeps its failure.
+    """
+    stash = node.config.stash
+    # xdist's node object, not this file's state: absent after a crash.
+    output = getattr(node, "workeroutput", None)
+    emptied = (
+        error is None
+        and output is not None
+        and bool(output.get(_WORKER_EMPTIED_KEY, False))
+    )
+    stash[_SELECTION_EMPTIED_RUN] = stash.get(_SELECTION_EMPTIED_RUN, True) and emptied
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    # A change that names none of this run's test files leaves nothing to run;
+    # a run that collected nothing by itself still fails.
+    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and session.config.stash.get(
+        _SELECTION_EMPTIED_RUN, False
+    ):
+        session.exitstatus = pytest.ExitCode.OK
+
 
 @pytest.fixture
-def require() -> Callable[[str, str, str, torch.dtype, str], None]:
+def set_matmul_precision() -> Iterator[Callable[[str], None]]:
+    # PyTorch stores this setting outside __dict__, so monkeypatch cannot undo it.
+    previous = torch.backends.cuda.matmul.fp32_precision
+
+    def set_precision(precision: str) -> None:
+        torch.backends.cuda.matmul.fp32_precision = precision
+
+    try:
+        yield set_precision
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = previous
+
+
+@pytest.fixture
+def require() -> Callable[..., None]:
     def _require(
         family: str,
         mode: str,
         solution: str,
         dtype: torch.dtype,
         dtype_role: str,
+        *,
+        traits: dict[str, Any] | None = None,
     ) -> None:
+        """Skip unless ``solution`` serves the operator here.
+
+        ``traits`` (e.g. ``{"head_dim": 64}``) also requires the leaf's declared
+        traits to admit the case; ``None`` checks the format only.
+        """
         from tokenspeed_kernel.platform import current_platform
+        from tokenspeed_kernel.selection import spec_matches_traits
 
         specs = [
             spec
@@ -64,6 +158,7 @@ def require() -> Callable[[str, str, str, torch.dtype, str], None]:
                 solution=solution,
             )
             if spec.format_signatures_for_storage_dtype(dtype, dtype_role)
+            and (traits is None or spec_matches_traits(spec, traits))
         ]
         if not specs:
             pytest.skip(f"{family}.{mode} solution {solution!r} is not registered")

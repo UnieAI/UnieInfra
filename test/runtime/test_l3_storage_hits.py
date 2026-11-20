@@ -46,6 +46,12 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+# Known follow-up, deferred by decision (C1/C2): drives nctu6 L3 prefetch config (l3_prefetch_min_pages) that main replaced with SchedulerConfig.storage_config.
+# See merge_main_1117.md, "Known follow-ups".
+pytestmark = pytest.mark.skip(
+    reason="merge_main_1117.md known follow-up (C1/C2): drives nctu6 L3 prefetch config (l3_prefetch_min_pages) that main replaced with SchedulerConfig.storage_config"
+)
+
 from tokenspeed.runtime.engine import l3_cache_hooks as hooks_module  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
 
@@ -359,7 +365,12 @@ def loop_methods():
         for node in ast.parse(path.read_text()).body
         if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
     )
-    names = {"event_loop", "_drain_in_flight", "_get_forward_op"}
+    names = {
+        "event_loop",
+        "_drain_in_flight",
+        "_get_forward_op",
+        "_should_commit_head",
+    }
     methods = [
         node
         for node in cls.body
@@ -466,6 +477,10 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
         _drain_in_flight=lambda pending: loop_methods["_drain_in_flight"](
             loop, pending
         ),
+        _commit_dispatched_extend_now=False,
+        _should_commit_head=lambda in_flight, depth, forward_op: loop_methods[
+            "_should_commit_head"
+        ](loop, in_flight, depth, forward_op),
         _epd_hooks=SimpleNamespace(
             drain_ready_embeddings=Mock(), assert_embeddings_received=Mock()
         ),

@@ -31,6 +31,7 @@ def _sizing_config(
     cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_l2_cache = True
@@ -98,15 +99,16 @@ def test_reports_group_pages_in_config_order() -> None:
     model = ts.CapacityModel(cfg)
     assert model.num_groups == 3
     pages = model.concurrent_group_pages(max_total_tokens=65536, max_context_len=4096)
-    # Dense history plus, per request, the unaligned tail page and the block a
-    # tail handover holds; a State group holds two slots per live request,
-    # whatever the history; a sliding group its window pages plus the handover
-    # block, and one in-flight chunk behind the three blocks a 128-token
-    # window can span behind an unaligned boundary.
-    assert pages == [1024 + 16 * (2 + 1), 16 * 2, 16 * (4 + 1) + 3 + 128]
+    # Dense history plus, per request, the unaligned tail page, the block a
+    # tail handover holds and the copy-in block of a prompt end; a State
+    # group holds two slots per live request, whatever the history; a sliding
+    # group its window pages plus the handover and copy-in blocks, and one
+    # in-flight chunk behind the three blocks a 128-token window can span
+    # behind an unaligned boundary.
+    assert pages == [1024 + 16 * (2 + 1 + 1), 16 * 2, 16 * (4 + 1 + 1) + 3 + 128]
     assert model.single_request_group_pages(token_limit=4096)[1] == 2
-    # ceil(1072 / 12) + ceil(32 / 1) + ceil(211 / 3)
-    assert model.lcm_blocks_needed_for(pages) == 90 + 32 + 71
+    # ceil(1088 / 12) + ceil(32 / 1) + ceil(227 / 3)
+    assert model.lcm_blocks_needed_for(pages) == 91 + 32 + 76
     # A model outlives the config it was built from.
     del cfg
     assert model.max_single_request_tokens(usable_lcm_blocks=100) > 0
@@ -200,3 +202,39 @@ def test_pool_sized_by_the_model_admits_what_the_scheduler_bounds(
             pages,
             usable_lcm_blocks,
         )
+
+
+def _gemma4_31b_config(chunk_tokens: int) -> "ts.SchedulerConfig":
+    """gemma-4-31B-it at TP1: five sliding groups (window 1024) and one full
+    group packing two 64-token blocks per parent, 512 live requests."""
+    groups = [_sliding(f"sliding_{i}", 64, 1024, 1) for i in range(5)]
+    groups.append(_full("full", 64, 2))
+    return _sizing_config(
+        role=ts.SchedulerConfig.Role.Fused,
+        prefix_granularity=64,
+        max_scheduled_tokens=chunk_tokens,
+        max_batch_size=512,
+        decode_input_tokens=1,
+        overlap_schedule_depth=1,
+        groups=groups,
+    )
+
+
+# Each limit is 704 tokens (11 blocks of 64) below the nctu6 value: the
+# copy-in block every group reserves for a prompt end (7474743cd) takes one
+# parent from each of the five sliding groups (10 full-group blocks) and one
+# block of the full group.
+@pytest.mark.parametrize(
+    ("chunk_tokens", "limit"),
+    [(8192, 198_783), (4096, 239_743), (1024, 270_463)],
+)
+def test_sliding_groups_reserve_one_prefill_chunk_of_the_pool(
+    chunk_tokens: int, limit: int
+) -> None:
+    """Each sliding group keeps a whole prefill chunk resident beside its
+    lookback, so on the 2294 usable 10 MiB parents a 96 GB card holds at
+    0.90 (22.4 GiB of KV) a single request is bounded by the chunk size: the
+    default 8192-token chunk reserves a third of the pool and caps the request
+    below 256K, a smaller chunk gives the parents back to the full group."""
+    scheduler = ts.Scheduler(_sized(_gemma4_31b_config(chunk_tokens), 2294))
+    assert scheduler.max_single_request_tokens() == limit

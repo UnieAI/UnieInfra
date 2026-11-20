@@ -25,6 +25,7 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.communication.deep_ep import DeepEPDispatcher, DeepEPMode
 from tokenspeed_kernel.ops.moe.marlin import (
     MXFP4_BLOCK,
@@ -40,6 +41,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 platform = current_platform()
 logger = logging.getLogger(__name__)
@@ -76,7 +78,11 @@ logger = logging.getLogger(__name__)
 
 _warned_about_requantization = False
 
-if platform.is_hopper_plus:
+_HAS_DEEP_EP_GEMM = platform.is_hopper_plus and has_optional_package(
+    "deep_ep", "deep_gemm"
+)
+
+if _HAS_DEEP_EP_GEMM:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         get_mn_major_tma_aligned_tensor,
@@ -88,7 +94,7 @@ if platform.is_hopper_plus:
     )
 
 
-if platform.is_hopper_plus:
+if _HAS_DEEP_EP_GEMM:
     from tokenspeed_kernel.ops.activation.triton import (
         fused_swiglu_fp8_ue8m0,
         fused_swiglu_fp8_ue8m0_masked_packed,
@@ -498,9 +504,13 @@ if platform.is_hopper_plus:
         name="deep_gemm_deepep_fp8_moe_apply",
         solution="deep_gemm",
         weight_preprocessor=deep_gemm_deepep_fp8_moe_weights,
+        # DeepGEMM builds without SM120 kernels stop below SM120
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=(
+                None if deepgemm_supports_sm120() else ArchVersion(10, 3)
+            ),
         ),
         signatures=format_signatures(
             "x",
@@ -838,7 +848,8 @@ def marlin_mxfp4_deepep_moe_apply(
 # ===-----------------------------------------------------------------------===#
 
 
-if platform.is_nvidia:
+# These kernels need both DeepEP buffers and FlashInfer quantizers.
+if platform.is_nvidia and has_optional_package("deep_ep"):
     from flashinfer import (
         scaled_fp4_grouped_quantize,
         silu_and_mul_scaled_nvfp4_experts_quantize,

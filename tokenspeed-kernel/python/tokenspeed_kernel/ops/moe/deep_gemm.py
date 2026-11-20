@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -35,6 +36,10 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import (
+    SM120_ARCH_MAJOR,
+    deepgemm_sm120_mega_moe_max_ranks,
+)
 
 platform = current_platform()
 logger = logging.getLogger(__name__)
@@ -46,12 +51,33 @@ logger = logging.getLogger(__name__)
 
 
 # DeepGEMM implementation of the DeepSeek V4/V4.1 MegaMoE boundary.
+#
+# SM100 runs the fused kernel over NVLink symmetric memory. SM120 has neither NVLink nor
+# TMEM: DeepGEMM runs the same steps as a sequence of kernels whose ranks write into each
+# other's symmetric buffers with CUDA IPC peer stores over PCIe (README.md, "MegaMoE on
+# SM120"). Builds without that version register no SM120 leaf.
+_SM120_MEGA_MOE_MAX_RANKS = (
+    deepgemm_sm120_mega_moe_max_ranks() if platform.is_nvidia else 0
+)
+_IS_SM120 = platform.is_nvidia and platform.arch_version.major == SM120_ARCH_MAJOR
+# The ranks the SM120 leaf has been run on (two GPUs); the kernels take up to
+# ``_SM120_MEGA_MOE_MAX_RANKS``.
+_SM120_MEGA_MOE_EP_SIZES = frozenset({2})
+# ... and, with replicated tokens, the MoE TP x EP widths (a TP2 or an EP2 shard
+# of the experts; a width of one rank is the unsharded kernel).
+_SM120_MEGA_MOE_REPLICATED_WIDTHS = frozenset({1, 2})
+_HAS_DEEP_GEMM = platform.is_blackwell and has_optional_package("deep_gemm")
+# SM120's leaf needs a DeepGEMM build with its MegaMoE kernels, which
+# ``deepgemm_sm120_mega_moe_max_ranks`` reports (0 without DeepGEMM).
+_MEGA_MOE_AVAILABLE = _HAS_DEEP_GEMM or (
+    _IS_SM120 and _SM120_MEGA_MOE_MAX_RANKS >= max(_SM120_MEGA_MOE_EP_SIZES)
+)
 
-
-if platform.is_blackwell:
+if _MEGA_MOE_AVAILABLE:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         fp8_fp4_mega_moe,
+        get_block_m_for_mega_moe,
         get_pdl,
         get_symm_buffer_for_mega_moe,
         set_pdl,
@@ -63,9 +89,26 @@ if platform.is_blackwell:
 
 _MXFP4_BLOCK_SIZE = 32
 _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
-_symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
+# How the tokens meet the experts (``moe_plan(ep_token_layout=...)``):
+#   scattered:  every EP rank brings its own tokens (attention DP). The kernel
+#               spans all ranks: push, local experts, return, and it hands each
+#               rank the complete output of its own tokens.
+#   replicated: every rank of the MoE group holds the same tokens (attention
+#               TP). Nothing is exchanged: the kernel runs as one rank over this
+#               rank's shard of the experts and returns this rank's partial
+#               output, which the caller sums over the group. The shard is a
+#               range of experts (EP; the other experts' routes are masked
+#               slots) or a slice of every expert's intermediate width (MoE TP:
+#               SwiGLU and the per-32 activation scales stay inside a slice, and
+#               the second GEMM sums over the slice).
+_SCATTERED = "scattered"
+_REPLICATED = "replicated"
+# The (live, padded) request counts of the forward being run; see
+# mega_moe_live_requests.
+_live_requests: torch.Tensor | None = None
+_symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
-    tuple[int, torch.device, int, int, int, int, int, float | None, bool]
+    tuple[int, torch.device, int, int, int, int, int, int, float | None, bool]
 ] = set()
 
 
@@ -74,6 +117,33 @@ class _DeepGemmMegaMoEState:
     l1_weights: tuple[torch.Tensor, torch.Tensor]
     l2_weights: tuple[torch.Tensor, torch.Tensor]
     device: torch.device
+    # One MXFP8 shared expert run inside the launch, or None.
+    shared_l1_weights: tuple[torch.Tensor, torch.Tensor] | None
+    shared_l2_weights: tuple[torch.Tensor, torch.Tensor] | None
+
+    @property
+    def num_shared_experts(self) -> int:
+        return 0 if self.shared_l1_weights is None else 1
+
+
+def _kernel_intermediate_size(w: torch.nn.Module) -> int:
+    """Intermediate width of the experts this rank holds (a slice under MoE TP)."""
+    return w.intermediate_size // w.tp_size
+
+
+def _kernel_num_experts(plan: dict, w: torch.nn.Module) -> int:
+    """Experts the kernel indexes: all of them across the EP ranks, or this
+    rank's own when the tokens are replicated and it runs alone."""
+    if plan["ep_token_layout"] == _REPLICATED:
+        return w.num_local_experts
+    return w.num_experts
+
+
+def _local_expert_range(plan: dict, w: torch.nn.Module) -> tuple[int, int]:
+    """First global expert and expert count this rank's kernel call serves."""
+    if plan["ep_token_layout"] == _REPLICATED:
+        return w.ep_rank * w.num_local_experts, w.num_local_experts
+    return 0, w.num_experts
 
 
 def _expected_shapes(
@@ -133,9 +203,13 @@ def _pack_ue8m0_scale_(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _reorder_scale_rows_(
-    scale: torch.Tensor, interleave_gate_up: bool, granularity: int
+    scale: torch.Tensor, interleave_gate_up: bool, granularity: int, utccp: bool
 ) -> torch.Tensor:
-    """Apply MegaMoE gate/up and UTCCP row permutations in place."""
+    """Apply MegaMoE gate/up and, for the SM100 kernel, UTCCP row permutations in place.
+
+    SM120 TMA-loads the scales into shared memory instead of copying them to TMEM with
+    UTCCP, so they keep their row order there.
+    """
     grouped = scale if scale.ndim == 3 else scale.unsqueeze(0)
     groups, rows, packed_columns = grouped.shape
     if rows % 128:
@@ -147,8 +221,9 @@ def _reorder_scale_rows_(
             blocks = half // granularity
             source = source.view(2, blocks, granularity, packed_columns)
             source = source.transpose(0, 1).reshape(rows, packed_columns)
-        source = source.view(-1, 4, 32, packed_columns)
-        source = source.transpose(1, 2).reshape(rows, packed_columns)
+        if utccp:
+            source = source.view(-1, 4, 32, packed_columns)
+            source = source.transpose(1, 2).reshape(rows, packed_columns)
         grouped[group].copy_(source)
     return scale
 
@@ -157,18 +232,63 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
     plan: dict,
     w: torch.nn.Module,
 ) -> object:
+    # MoE TP is checked per token layout below: scattered tokens need TP 1,
+    # replicated tokens on SM120 may shard the intermediate size over TP.
     w13_weight = w.w13_weight.data
     w13_weight_scale = w.w13_weight_scale.data
     w2_weight = w.w2_weight.data
     w2_weight_scale = w.w2_weight_scale.data
     num_local_experts = w.num_local_experts
     hidden_size = w.hidden_size
-    intermediate_size = w.intermediate_size
+    intermediate_size = _kernel_intermediate_size(w)
     max_num_tokens = plan.get("persistent_max_num_tokens_per_gpu")
     if max_num_tokens is None or max_num_tokens <= 0:
         raise ValueError("DeepGEMM MegaMoE requires persistent_max_num_tokens_per_gpu")
     if w.top_k > w.num_experts:
         raise ValueError("top_k cannot exceed num_experts")
+    layout = plan["ep_token_layout"]
+    if layout not in (_SCATTERED, _REPLICATED):
+        raise ValueError(
+            f"DeepGEMM MegaMoE needs ep_token_layout 'scattered' or 'replicated', "
+            f"got {layout!r}"
+        )
+    group = plan.get("process_group")
+    if layout == _REPLICATED:
+        # The kernel runs alone: a rank group (or none, which would fall back to
+        # the world) would exchange with ranks that hold the same tokens.
+        if group is None or group.size() != 1:
+            raise ValueError(
+                "DeepGEMM MegaMoE with replicated tokens needs a one-rank "
+                "process_group"
+            )
+    elif group is not None and group.size() != w.ep_size:
+        raise ValueError(
+            f"DeepGEMM MegaMoE with scattered tokens needs a process_group of "
+            f"the {w.ep_size} EP ranks, got {group.size()}"
+        )
+    elif w.tp_size != 1:
+        raise ValueError("DeepGEMM MegaMoE with scattered tokens needs MoE TP 1")
+    utccp = not _IS_SM120
+    if _IS_SM120:
+        if layout == _SCATTERED and w.ep_size not in _SM120_MEGA_MOE_EP_SIZES:
+            raise ValueError(
+                f"SM120 MegaMoE runs on {sorted(_SM120_MEGA_MOE_EP_SIZES)} EP ranks, "
+                f"got {w.ep_size}"
+            )
+        if layout == _REPLICATED and (
+            w.tp_size * w.ep_size not in _SM120_MEGA_MOE_REPLICATED_WIDTHS
+            or (w.tp_size > 1 and w.ep_size > 1)
+        ):
+            raise ValueError(
+                "SM120 MegaMoE with replicated tokens shards the experts over "
+                f"{sorted(_SM120_MEGA_MOE_REPLICATED_WIDTHS)} ranks by TP or by "
+                f"EP, got TP {w.tp_size} x EP {w.ep_size}"
+            )
+        if hidden_size % 512 or intermediate_size % 128:
+            raise ValueError(
+                "SM120 MegaMoE needs hidden_size divisible by 512 and "
+                f"intermediate_size by 128, got {hidden_size} and {intermediate_size}"
+            )
     tensors = (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale)
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
     expected_shapes = _expected_shapes(
@@ -189,17 +309,111 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
 
     w13_weight = _interleave_gate_up_(w13_weight.view(torch.int8), 8)
     w13_scale = _pack_ue8m0_scale_(w13_weight_scale)
-    w13_scale = _reorder_scale_rows_(w13_scale, True, 8)
+    w13_scale = _reorder_scale_rows_(w13_scale, True, 8, utccp)
     w2_scale = _pack_ue8m0_scale_(w2_weight_scale)
-    w2_scale = _reorder_scale_rows_(w2_scale, False, 8)
+    w2_scale = _reorder_scale_rows_(w2_scale, False, 8, utccp)
 
     state = _DeepGemmMegaMoEState(
         l1_weights=(w13_weight, w13_scale),
         l2_weights=(w2_weight.view(torch.int8), w2_scale),
         device=w13_weight.device,
+        shared_l1_weights=None,
+        shared_l2_weights=None,
     )
     w._moe_backend_state = state
     return state
+
+
+def fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+    plan: dict,
+    w: torch.nn.Module,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> bool:
+    """Run one MXFP8 shared expert inside each MegaMoE launch.
+
+    The shared expert must have the routed experts' intermediate size. Its
+    tensors are re-laid out in place for DeepGEMM, so the caller stops running
+    the shared expert itself; the routed output then includes it.
+
+    Args:
+        plan: The layer's MegaMoE plan.
+        w: The MoE layer, with its routed weights already processed.
+        gate_up_weight: E4M3 ``[2 * intermediate, hidden]``, gate rows first.
+        gate_up_scale: UE8M0 bytes ``[2 * intermediate, hidden // 32]``.
+        down_weight: E4M3 ``[hidden, intermediate]``.
+        down_scale: UE8M0 bytes ``[hidden, intermediate // 32]``.
+
+    Returns:
+        True once fused; False, leaving every tensor untouched, when the
+        shapes or dtypes do not fit one routed expert's MXFP8 layout.
+    """
+    state = w._moe_backend_state
+    if not isinstance(state, _DeepGemmMegaMoEState):
+        raise TypeError("invalid DeepGEMM MegaMoE state")
+    if state.num_shared_experts:
+        raise RuntimeError("MegaMoE already runs a shared expert")
+    # Under MoE TP the routed experts hold an intermediate slice; the shared
+    # expert must match that slice.
+    hidden, inter = w.hidden_size, _kernel_intermediate_size(w)
+    expected = (
+        (gate_up_weight, (2 * inter, hidden), torch.float8_e4m3fn),
+        (gate_up_scale, (2 * inter, hidden // _MXFP4_BLOCK_SIZE), torch.uint8),
+        (down_weight, (hidden, inter), torch.float8_e4m3fn),
+        (down_scale, (hidden, inter // _MXFP4_BLOCK_SIZE), torch.uint8),
+    )
+    if any(
+        tuple(tensor.shape) != shape
+        or tensor.dtype != dtype
+        or tensor.device != state.device
+        or not tensor.is_contiguous()
+        for tensor, shape, dtype in expected
+    ):
+        return False
+    l1_weight = _interleave_gate_up_(gate_up_weight.view(torch.int8), 8)
+    l1_scale = _reorder_scale_rows_(_pack_ue8m0_scale_(gate_up_scale), True, 8)
+    l2_scale = _reorder_scale_rows_(_pack_ue8m0_scale_(down_scale), False, 8)
+    w._moe_backend_state = replace(
+        state,
+        shared_l1_weights=(l1_weight.view(torch.float8_e4m3fn), l1_scale),
+        shared_l2_weights=(down_weight, l2_scale),
+    )
+    return True
+
+
+def mega_moe_live_requests(device: torch.device | str) -> torch.Tensor:
+    """Return the int32 (live, padded) device pair every MegaMoE staging reads.
+
+    Created as (1, 1) on first use and shared by every caller, so it keeps its
+    address for captured graphs. A runner that replays decode graphs at padded
+    batch sizes writes the replay's live and padded request counts before the
+    replay and (1, 1) after it: MegaMoE then routes only the first
+    ``num_tokens * live // padded`` rows, and filler rows reach no routed
+    expert. One request ratio serves forwards with different rows per
+    request, such as the DeepSeek V4.1 target's and its DSpark drafter's.
+
+    The ratio is right only when each rank's MegaMoE input is its
+    attention-DP group's whole padded batch: request-major, with the same
+    number of rows for every request and the filler requests last. Attention
+    TP 1 and rows replicated over attention TP (attention TP == MoE TP x EP)
+    give that layout; they are the only layouts DeepSeek V4.1 admits with
+    MegaMoE. A reduce-scatter shard of the batch does not: the live rows fall
+    unevenly across the shards. Under such a layout (Qwen3.5's DP4/TP2/EP8)
+    the runner leaves the pair at (1, 1), so every row is routed.
+
+    Args:
+        device: The device the pair is created on by the first call; later
+            calls return the existing pair.
+
+    Returns:
+        The shared ``[2]`` int32 tensor ``(live, padded)``.
+    """
+    global _live_requests
+    if _live_requests is None:
+        _live_requests = torch.ones(2, dtype=torch.int32, device=device)
+    return _live_requests
 
 
 def _resolve_process_group(process_group: object | None) -> object:
@@ -237,6 +451,7 @@ def _get_symm_buffer(
         top_k,
         hidden_size,
         intermediate_size,
+        state.num_shared_experts,
     )
     buffer = _symm_buffer_cache.get(key)
     if buffer is None:
@@ -247,13 +462,14 @@ def _get_symm_buffer(
             top_k,
             hidden_size,
             intermediate_size,
+            num_shared_experts=state.num_shared_experts,
         )
         _symm_buffer_cache[key] = buffer
     return buffer
 
 
 def _warmup_m_values(max_tokens: int) -> list[int]:
-    """Return token counts covering every DeepGEMM tile reachable at runtime."""
+    """Return token counts covering DeepGEMM tiles up to ``max_tokens``."""
     dense = min(max_tokens, 2048)
     values: set[int] = set(range(1, dense + 1))
     values.update(range(dense, max_tokens + 1, 16))
@@ -261,15 +477,76 @@ def _warmup_m_values(max_tokens: int) -> list[int]:
     return sorted(values)
 
 
+def _run_mega_moe(
+    state: _DeepGemmMegaMoEState,
+    symm_buffer: object,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    activation_clamp: float | None,
+    fast_math: bool,
+    expert_begin: int,
+    num_local_experts: int,
+) -> None:
+    """Stage ``x`` and its routing into the symmetric buffer and launch.
+
+    Routes to experts outside ``[expert_begin, expert_begin + num_local_experts)``
+    are masked; a kernel that spans every expert passes ``0`` and their count.
+    """
+    num_tokens = x.shape[0]
+    shared_x_sf = shared_block_m = None
+    shared_kwargs = {}
+    if state.num_shared_experts:
+        # The shared expert's scale rows follow the BLOCK_M MegaMoE picks for
+        # this token count.
+        shared_x_sf = symm_buffer.shared_l1_acts_sf
+        shared_block_m = get_block_m_for_mega_moe(
+            symm_buffer.group.size(),
+            symm_buffer.num_experts,
+            symm_buffer.num_max_tokens_per_rank,
+            num_tokens,
+            symm_buffer.num_topk,
+            symm_buffer.mma_type,
+        )
+        shared_kwargs = {
+            "shared_l1_weights": state.shared_l1_weights,
+            "shared_l2_weights": state.shared_l2_weights,
+        }
+    stage_mxfp4_mega_moe_inputs(
+        x,
+        topk_weights,
+        topk_ids,
+        symm_buffer.x[:num_tokens],
+        symm_buffer.x_sf[:num_tokens],
+        symm_buffer.topk_idx[:num_tokens],
+        symm_buffer.topk_weights[:num_tokens],
+        shared_x_sf,
+        shared_block_m,
+        # Every launch reads the pair, so warmup compiles the variant that
+        # captured graphs replay.
+        mega_moe_live_requests(x.device),
+        expert_begin,
+        num_local_experts,
+    )
+    fp8_fp4_mega_moe(
+        output,
+        state.l1_weights,
+        state.l2_weights,
+        symm_buffer,
+        activation_clamp=activation_clamp,
+        fast_math=fast_math,
+        **shared_kwargs,
+    )
+
+
 def _warmup_mega_moe_jit(
     *,
+    state: _DeepGemmMegaMoEState,
     num_experts: int,
     max_num_tokens: int,
     top_k: int,
     hidden_size: int,
-    device: torch.device,
-    transformed_l1_weights: tuple[torch.Tensor, torch.Tensor],
-    transformed_l2_weights: tuple[torch.Tensor, torch.Tensor],
     symm_buffer: object,
     activation_clamp: float | None,
     fast_math: bool,
@@ -286,34 +563,34 @@ def _warmup_mega_moe_jit(
             num_tokens,
             hidden_size,
             dtype=torch.bfloat16,
-            device=device,
+            device=state.device,
         )
         topk_ids = torch.randint(
             0,
             num_experts,
             (num_tokens, top_k),
             dtype=torch.int32,
-            device=device,
+            device=state.device,
         )
         topk_weights = torch.full(
             (num_tokens, top_k),
             1.0 / top_k,
             dtype=torch.float32,
-            device=device,
+            device=state.device,
         )
-
-        output = torch.empty_like(hidden_states)
-        symm_buffer.x[:num_tokens].copy_(hidden_states.to(torch.float8_e4m3fn))
-        symm_buffer.x_sf[:num_tokens].fill_(1.0)
-        symm_buffer.topk_idx[:num_tokens].copy_(topk_ids)
-        symm_buffer.topk_weights[:num_tokens].copy_(topk_weights)
-        fp8_fp4_mega_moe(
-            output,
-            transformed_l1_weights,
-            transformed_l2_weights,
+        # Staging through the runtime kernel also compiles each of its tile
+        # sizes before serving.
+        _run_mega_moe(
+            state,
             symm_buffer,
-            activation_clamp=activation_clamp,
-            fast_math=fast_math,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            torch.empty_like(hidden_states),
+            activation_clamp,
+            fast_math,
+            0,
+            num_experts,
         )
 
     torch.cuda.synchronize()
@@ -328,10 +605,10 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     if not isinstance(state, _DeepGemmMegaMoEState):
         raise TypeError("invalid DeepGEMM MegaMoE state")
     process_group = plan.get("process_group")
-    num_experts = w.num_experts
+    num_experts = _kernel_num_experts(plan, w)
     top_k = w.top_k
     hidden_size = w.hidden_size
-    intermediate_size = w.intermediate_size
+    intermediate_size = _kernel_intermediate_size(w)
     max_num_tokens = plan["persistent_max_num_tokens_per_gpu"]
     activation_clamp = None if w.swiglu_arg is None else w.swiglu_arg.limit
     fast_math = plan["fast_math"]
@@ -344,6 +621,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         top_k,
         hidden_size,
         intermediate_size,
+        state.num_shared_experts,
         activation_clamp,
         fast_math,
     )
@@ -361,13 +639,11 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         max_num_tokens=max_num_tokens,
     )
     _warmup_mega_moe_jit(
+        state=state,
         num_experts=num_experts,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         hidden_size=hidden_size,
-        device=state.device,
-        transformed_l1_weights=state.l1_weights,
-        transformed_l2_weights=state.l2_weights,
         symm_buffer=symm_buffer,
         activation_clamp=activation_clamp,
         fast_math=fast_math,
@@ -375,7 +651,33 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     _warmed_configs.add(warmup_key)
 
 
-if platform.is_blackwell:
+# Declared by a MegaMoE leaf that is measured to beat the default backend, so
+# ``--moe-backend auto`` may pick it where its other gates hold
+# (``mega_moe_auto_available``).
+MEGA_MOE_AUTO_FEATURE = "auto_default"
+
+_MEGA_MOE_TRAITS = {
+    "weight_dtype": frozenset({"mxfp4"}),
+    "activation": frozenset({"swiglu"}),
+    "routing_mode": frozenset({"precomputed_topk"}),
+    "supports_deferred_finalize": frozenset({False}),
+    "supports_ep": frozenset({True}),
+    "supports_all_to_all_ep": frozenset({False}),
+    "persistent_workspace": frozenset({True}),
+    "ispp_alignment": frozenset({128}),
+    "hidden_alignment": frozenset({128}),
+    "swiglu_form": frozenset({"standard"}),
+    "activation_clamped": frozenset({False, True}),
+    "internal_activation_dtype": frozenset({"input"}),
+    "supports_bias": frozenset({False}),
+    "ep_token_layout": frozenset({_SCATTERED}),
+}
+_MEGA_MOE_SIGNATURES = frozenset(
+    {format_signature(x=dense_tensor_format(torch.bfloat16))}
+)
+
+
+if _MEGA_MOE_AVAILABLE:
 
     @register_kernel(
         "moe",
@@ -385,30 +687,15 @@ if platform.is_blackwell:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
+            # SM120 has its own leaf below
             max_arch_version=ArchVersion(10, 9),
             required_features=frozenset({"tensor_core:f4"}),
         ),
-        signatures=frozenset(
-            {
-                format_signature(
-                    x=dense_tensor_format(torch.bfloat16),
-                )
-            }
-        ),
+        signatures=_MEGA_MOE_SIGNATURES,
         traits={
-            "weight_dtype": frozenset({"mxfp4"}),
-            "activation": frozenset({"swiglu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "persistent_workspace": frozenset({True}),
-            "ispp_alignment": frozenset({128}),
-            "hidden_alignment": frozenset({128}),
-            "swiglu_form": frozenset({"standard"}),
-            "activation_clamped": frozenset({False, True}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
+            **_MEGA_MOE_TRAITS,
+            # The SM100 staging and launch also serve a SiLU activation.
+            "activation": frozenset({"silu", "swiglu"}),
         },
         priority=Priority.SPECIALIZED,
         weight_preprocessor=deep_gemm_mxfp4_mega_moe_process_weights,
@@ -454,34 +741,97 @@ if platform.is_blackwell:
         symm_buffer = _get_symm_buffer(
             state=state,
             process_group=plan.get("process_group"),
-            num_experts=w.num_experts,
+            num_experts=_kernel_num_experts(plan, w),
             top_k=w.top_k,
             hidden_size=w.hidden_size,
-            intermediate_size=w.intermediate_size,
+            intermediate_size=_kernel_intermediate_size(w),
             max_num_tokens=max_num_tokens,
         )
-        num_tokens = x.shape[0]
-        topk_ids = topk_ids.to(torch.int64)
-        stage_mxfp4_mega_moe_inputs(
+        # Staging widens ids to the buffer's int64; one input dtype keeps one compile.
+        topk_ids = topk_ids.to(torch.int32)
+        expert_begin, num_local_experts = _local_expert_range(plan, w)
+        output = torch.empty_like(x, dtype=torch.bfloat16)
+        _run_mega_moe(
+            state,
+            symm_buffer,
             x,
             topk_weights,
             topk_ids,
-            symm_buffer.x[:num_tokens],
-            symm_buffer.x_sf[:num_tokens],
-            symm_buffer.topk_idx[:num_tokens],
-            symm_buffer.topk_weights[:num_tokens],
-        )
-        output = torch.empty_like(x, dtype=torch.bfloat16)
-        fp8_fp4_mega_moe(
             output,
-            state.l1_weights,
-            state.l2_weights,
-            symm_buffer,
-            activation_clamp=(None if w.swiglu_arg is None else w.swiglu_arg.limit),
-            fast_math=plan["fast_math"],
+            None if w.swiglu_arg is None else w.swiglu_arg.limit,
+            plan["fast_math"],
+            expert_begin,
+            num_local_experts,
         )
         return output
 
     deep_gemm_mxfp4_mega_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
         warmup_deep_gemm_mxfp4_mega_moe
     )
+    deep_gemm_mxfp4_mega_moe_apply._tokenspeed_fuse_shared_expert = (  # type: ignore[attr-defined]
+        fuse_deep_gemm_mxfp4_mega_moe_shared_expert
+    )
+
+    if _SM120_MEGA_MOE_MAX_RANKS >= max(_SM120_MEGA_MOE_EP_SIZES):
+
+        @register_kernel(
+            "moe",
+            "apply",
+            name="deep_gemm_sm120_mxfp4_mega_moe_apply",
+            solution="mega_moe",
+            capability=CapabilityRequirement(
+                vendors=frozenset({"nvidia"}),
+                min_arch_version=ArchVersion(SM120_ARCH_MAJOR, 0),
+                max_arch_version=ArchVersion(SM120_ARCH_MAJOR, 9),
+                required_features=frozenset({"tensor_core:f4"}),
+            ),
+            signatures=_MEGA_MOE_SIGNATURES,
+            traits={
+                **_MEGA_MOE_TRAITS,
+                # The SM120 gather moves 16-byte chunks of 32 lanes
+                "hidden_alignment": frozenset({512}),
+                "ep_size": _SM120_MEGA_MOE_EP_SIZES | _SM120_MEGA_MOE_REPLICATED_WIDTHS,
+                # TP x EP ranks: a TP shard has ep_size 1, so ep_size alone
+                # would admit any TP width
+                "moe_ranks": _SM120_MEGA_MOE_REPLICATED_WIDTHS,
+                # Also runs as one rank over this rank's shard of the experts
+                # when the MoE ranks hold the same tokens (attention TP)
+                "ep_token_layout": frozenset({_SCATTERED, _REPLICATED}),
+            },
+            # No ``batch_invariant``: the FP8-activation leaf's run-to-run and
+            # batch-shape invariance is not verified, so a bitwise numerics
+            # envelope never selects it. ``auto_default``: measured against
+            # Marlin on real V4.1 (docs/serving/parallelism.md), so
+            # ``--moe-backend auto`` may pick it where every gate holds.
+            features={MEGA_MOE_AUTO_FEATURE},
+            priority=Priority.SPECIALIZED,
+            weight_preprocessor=deep_gemm_mxfp4_mega_moe_process_weights,
+        )
+        def deep_gemm_sm120_mxfp4_mega_moe_apply(
+            plan: dict,
+            x: torch.Tensor,
+            w: torch.nn.Module,
+            router_logits: torch.Tensor | None,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            num_tokens_global: int | None,
+            max_num_tokens_per_gpu: int | None,
+            do_finalize: bool,
+            enable_pdl: bool,
+        ) -> torch.Tensor:
+            return deep_gemm_mxfp4_mega_moe_apply(
+                plan,
+                x,
+                w,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                num_tokens_global,
+                max_num_tokens_per_gpu,
+                do_finalize,
+                enable_pdl,
+            )
+
+        deep_gemm_sm120_mxfp4_mega_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
+            warmup_deep_gemm_mxfp4_mega_moe
+        )

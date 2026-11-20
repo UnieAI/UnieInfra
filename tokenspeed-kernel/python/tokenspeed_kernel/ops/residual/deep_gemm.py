@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.residual.triton import (
     _mhc_mixes_impl,
     _mhc_pre_impl,
@@ -35,10 +36,157 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.deepgemm import deepgemm_supports_sm120
 
 platform = current_platform()
 
-if platform.is_hopper_plus:
+# DeepGEMM's tf32_hc_prenorm_gemm covers Hopper and SM100-SM103, and SM120 in
+# builds with SM120 kernels; older builds assert "Unsupported architecture" on
+# SM120, which then falls through to the portable Triton mHC kernel.
+_DEEP_GEMM_MHC_MAX_ARCH = None if deepgemm_supports_sm120() else ArchVersion(10, 3)
+
+
+def mega_mhc_eligible(
+    x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
+):
+    """Check the native shifted kernel contract without launching GPU work."""
+    if not (
+        platform.is_nvidia
+        and platform.arch_version.major == 10
+        and x.is_cuda
+        and x.ndim == 2
+        and 0 < x.shape[0] <= 1 << 20
+        and x.shape[1] > 0
+        and x.shape[1] % 1024 == 0
+        and sinkhorn_iters >= 1
+    ):
+        return False
+    tokens, hidden = x.shape
+    tensors = (
+        (x, (tokens, hidden), torch.bfloat16),
+        (residual, (tokens, 4, hidden), torch.bfloat16),
+        (pre, (tokens, 4), torch.float32),
+        (post, (tokens, 4), torch.float32),
+        (comb, (tokens, 4, 4), torch.float32),
+        (weight, (24, 4 * hidden), torch.float32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (norm_weight, (hidden,), torch.bfloat16),
+    )
+    if any(
+        t.shape != shape
+        or t.dtype != dtype
+        or t.device != x.device
+        or not t.is_contiguous()
+        for t, shape, dtype in tensors
+    ):
+        return False
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import is_mega_mhc_available
+
+    return is_mega_mhc_available()
+
+
+@register_kernel(
+    "residual",
+    "mhc_shifted_post_pre_norm",
+    name="deep_gemm_mhc_shifted_post_pre_norm",
+    solution="deep_gemm",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PERFORMANT,
+)
+def deep_gemm_mhc_shifted_post_pre_norm(
+    x,
+    residual,
+    pre,
+    post,
+    comb,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    norm_weight,
+    norm_eps,
+):
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import shifted_post_pre_norm
+
+    return shifted_post_pre_norm(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+
+
+@register_kernel(
+    "residual",
+    "mhc_shifted_post_pre_norm_quantize_fp8",
+    name="deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8",
+    solution="deep_gemm",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PERFORMANT,
+)
+def deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8(
+    x,
+    residual,
+    pre,
+    post,
+    comb,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    norm_weight,
+    norm_eps,
+):
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
+        shifted_post_pre_norm_quantize_fp8,
+    )
+
+    return shifted_post_pre_norm_quantize_fp8(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+
+
+if platform.is_hopper_plus and has_optional_package("deep_gemm"):
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         get_pdl,
@@ -54,12 +202,7 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            # DeepGEMM tf32_hc_prenorm_gemm cubin covers datacenter Blackwell
-            # (SM100-SM103) and Hopper only; it asserts "Unsupported
-            # architecture" on SM120 (workstation Blackwell, e.g. RTX PRO 6000).
-            # Cap the window so SM120 falls through to the portable Triton
-            # mhc kernel. Mirrors the SM100-SM103 window used elsewhere.
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=_DEEP_GEMM_MHC_MAX_ARCH,
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -109,12 +252,7 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            # DeepGEMM tf32_hc_prenorm_gemm cubin covers datacenter Blackwell
-            # (SM100-SM103) and Hopper only; it asserts "Unsupported
-            # architecture" on SM120 (workstation Blackwell, e.g. RTX PRO 6000).
-            # Cap the window so SM120 falls through to the portable Triton
-            # mhc kernel. Mirrors the SM100-SM103 window used elsewhere.
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=_DEEP_GEMM_MHC_MAX_ARCH,
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(

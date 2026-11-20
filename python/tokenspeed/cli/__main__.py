@@ -52,6 +52,26 @@ def _serve_asr(raw_argv: list[str]) -> None:
     serve(engine_args, host=host, port=port)
 
 
+def _serve_embed(raw_argv: list[str]) -> None:
+    """``ts serve`` for pooling checkpoints: text in, one vector out.
+
+    SMG's direct ZMQ lane has no embedding request ("ZMQ backend does not
+    support embeddings yet"), so, like ASR, this path owns the
+    OpenAI-compatible /v1/embeddings HTTP surface in-process.
+    """
+    from tokenspeed.cli._argsplit import split_argv
+    from tokenspeed.runtime.entrypoints.embedding_server import serve
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    engine_args, host, port = _split_host_port(raw_argv)
+    gateway = list(split_argv(raw_argv).gateway)
+    api_key = None
+    if "--api-key" in gateway:
+        api_key = gateway[gateway.index("--api-key") + 1]
+    print(f"[ts serve] embedding server on http://{host}:{port}")
+    serve(prepare_server_args(engine_args), host=host, port=port, api_key=api_key)
+
+
 def _serve_diffusion(raw_argv: list[str]) -> None:
     """``ts serve`` for diffusers pipelines (MiniMax-H3, MiniMax-Music3, ...).
 
@@ -86,6 +106,9 @@ def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
         if runtime == "asr":
             _serve_asr(raw_argv)
             return
+        if runtime == "embed":
+            _serve_embed(raw_argv)
+            return
         if runtime == "diffusion":
             _serve_diffusion(raw_argv)
             return
@@ -103,6 +126,12 @@ def _merge_traces(args: argparse.Namespace) -> None:
     from tokenspeed.cli.trace_merge import main as merge_traces_main
 
     merge_traces_main(args.merge_args)
+
+
+def _reload_forward(args: argparse.Namespace) -> None:
+    from tokenspeed.cli.reload_forward import main as reload_forward_main
+
+    reload_forward_main(args)
 
 
 def _version(args: argparse.Namespace) -> None:
@@ -125,18 +154,18 @@ def main() -> None:
         "serve",
         help="Launch the TokenSpeed inference server.",
         description="Launch the TokenSpeed inference server: the full serving "
-        "stack by default (currently an smg gateway fronting a gRPC engine), "
-        "or the engine alone with --headless.",
+        "stack by default (an smg gateway fronting the engine over smg's "
+        "direct ZMQ lane), or the engine alone with --headless.",
     )
     serve_parser.add_argument(
         "--headless",
         action="store_true",
         help="Run the engine only, without a frontend. An external frontend "
-        "— e.g. `smg serve --backend tokenspeed --connection-mode zmq` — "
+        "— e.g. `smg serve --backend tokenspeed --connection-mode zmq` or "
+        "Dynamo — "
         "binds the msgpack ZMQ sockets and this engine dials in at "
         "--data-parallel-address/--data-parallel-rpc-port (default "
-        "tcp://127.0.0.1:30500). Implies --zmq-msgpack and "
-        "--skip-tokenizer-init.",
+        "tcp://127.0.0.1:30500).",
     )
     serve_parser.set_defaults(func=_serve)
 
@@ -153,6 +182,16 @@ def main() -> None:
         "timeline.",
     )
     merge_traces_parser.set_defaults(func=_merge_traces, merge_args=[])
+
+    reload_parser = subparsers.add_parser(
+        "reload-forward",
+        help="Development: reload edited forward code into a running server "
+        "started with --allow-reload-forward and recapture its CUDA graphs.",
+    )
+    from tokenspeed.cli.reload_forward import add_arguments as add_reload_arguments
+
+    add_reload_arguments(reload_parser)
+    reload_parser.set_defaults(func=_reload_forward)
 
     version_parser = subparsers.add_parser(
         "version",

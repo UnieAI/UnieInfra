@@ -88,13 +88,31 @@ jobs:
       - name: Check release orchestration
         run: |
           python -m pip install "pytest>=9" packaging cryptography pyyaml
-          python -m pytest -q test/ci_system/test_weekly_release.py
+          python -m pytest -q test/ci_system/test_weekly_release.py test/ci_system/test_engine_release.py test/ci_system/test_nightly_release.py
+
+      - name: Check CI path filter and MI450 report digest
+        run: python -m pytest -q test/ci_system/test_ci_path_filter.py test/ci_system/test_mi450_sim_report_digest.py
 
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format clang-tidy cmake ninja-build
+          sudo apt-get install -y clang-tidy cmake ninja-build
+          # clang-format majors format differently; use the version the
+          # pre-commit clang-format hook pins, not whatever the runner image
+          # ships (ubuntu-26.04 has 21), so the two checks agree.
+          clang_format_rev="$(python - <<'PY'
+          import yaml
+
+          with open(".pre-commit-config.yaml") as f:
+              config = yaml.safe_load(f)
+          for repo in config["repos"]:
+              if repo["repo"].endswith("/mirrors-clang-format"):
+                  print(repo["rev"].removeprefix("v"))
+          PY
+          )"
+          python -m pip install "clang-format==${clang_format_rev}"
+          clang-format --version
 
       - name: Configure scheduler compile database
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'

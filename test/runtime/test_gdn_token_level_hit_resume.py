@@ -36,6 +36,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from tokenspeed_kernel.selection import kernel_override
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,14 +75,19 @@ def _scheduler(ts, make_config):
             num_device_pages=65,
             max_scheduled_tokens=256,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,
             enable_l3_storage=False,
             role="fused",
             num_snapshot_pages=1,
+            host_group_packing=(),
             max_retracted_requests=0,
-            l3_prefetch_min_pages=0,
+            host_write_policy="write_through",
+            prefill_decode_interval=0,
+            prefill_decode_min_interval=0,
+            storage_config=None,
             cache_groups=groups,
         )
     )
@@ -95,20 +101,21 @@ class TestGdnTokenLevelHitResumeTest:
 
     def setup_method(self):
         try:
-            import tokenspeed_scheduler as ts
+            from test.runtime.scheduler_driver import (
+                advance_scheduler,
+                make_extend_result_event,
+            )
+
+            import tokenspeed_engine.scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn.triton import (
                 triton_gdn_chunk_prefill,
             )
 
             import tokenspeed.runtime.layers.attention.backends.state.mamba as mamba
-            from tokenspeed.runtime.engine.scheduler_utils import (
-                advance_scheduler,
-                make_config,
-                make_extend_result_event,
-            )
+            from tokenspeed.runtime.engine.scheduler_utils import make_config
             from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_engine.scheduler + tokenspeed_kernel: {exc}")
         self.ts = ts
         self.mamba = mamba
         self.ForwardMode = ForwardMode
@@ -260,22 +267,19 @@ class TestGdnTokenLevelHitResumeTest:
 
     def test_the_repeat_resumes_from_the_published_prefill_state(self):
         mamba = self.mamba
-        decode_path = mamba._prepare_gdn_decode_state_path
         with (
             patch.object(mamba, "gdn_chunk_prefill", self.triton_prefill),
-            patch.object(
-                mamba,
-                "_prepare_gdn_decode_state_path",
-                lambda *args: (*decode_path(*args)[:2], "triton"),
-            ),
+            kernel_override("attention", "gdn_decode_step", "triton"),
         ):
             self._computed = {}
             scheduler = _scheduler(self.ts, self.make_config)
             backend, conv, recurrent = self._backend()
             X = list(range(PROMPT))
 
-            # Cold X: the prefill and the decodes the scheduler plans.
-            self._submit(scheduler, "a", X, DECODES)
+            # Cold X: the prefill and the decodes the scheduler plans. The
+            # prefill emits a token too, and the scheduler plans no step past
+            # the declared budget, so DECODES decodes take DECODES + 1 tokens.
+            self._submit(scheduler, "a", X, DECODES + 1)
             cold_prefill, cold_output = self._forward(scheduler, backend)
             cold_state_block = int(
                 cold_prefill.block_tables_arrays()["linear_attention"][0][1]
@@ -292,11 +296,12 @@ class TestGdnTokenLevelHitResumeTest:
                 self._land(scheduler, "a", 1000 + step)
             self._finish(scheduler, "a")
 
-            # X[:-1] with one token to generate, as the engine runs it: the
-            # prefill (the junction cut ends its first chunk at the cold run's
-            # KV pages, so there are two), the decode the scheduler plans
-            # before the last chunk lands, then the landing and the finish.
-            self._submit(scheduler, "c", X[:-1], 1)
+            # X[:-1] with two tokens to generate: the prefill (the junction
+            # cut ends its first chunk at the cold run's KV pages, so there
+            # are two), the decode the scheduler plans before the last chunk
+            # lands (a budget of one would end at the prefill), then the
+            # landing and the finish.
+            self._submit(scheduler, "c", X[:-1], 2)
             chunks = []
             while True:
                 short_prefill, short_output = self._forward(scheduler, backend)

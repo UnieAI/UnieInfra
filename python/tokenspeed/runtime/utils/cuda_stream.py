@@ -18,9 +18,33 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import gc
 from contextlib import contextmanager
 
 import torch
+
+
+@contextmanager
+def gc_paused_for_capture():
+    """Keep Python's cyclic GC from running while a CUDA graph is captured.
+
+    Collecting a dead ``torch.cuda.CUDAGraph`` calls ``reset``, which frees the
+    graph's memory pool; that is illegal while any stream is capturing and
+    invalidates the capture (``cudaErrorStreamCaptureInvalidated`` at the next
+    allocation or at ``capture_end``). Graphs usually sit in reference cycles
+    (a model and the runner that holds its graphs), so they die in a
+    collection that can fire at any allocation, including inside a later
+    capture. Collect the pending garbage first, then run the capture with
+    automatic collection off, and restore the previous setting after it.
+    """
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 class StreamFork:
@@ -32,6 +56,8 @@ class StreamFork:
         self._active = False
         self._overlap = True
         self._current: torch.cuda.Stream | None = None
+        # Whether main is ordered after every branch so far in this scope.
+        self._joined = True
 
     @contextmanager
     def scope(self, *, enable: bool, overlap: bool = True):
@@ -50,6 +76,7 @@ class StreamFork:
         if self._active:
             self._current = torch.cuda.current_stream()
             self.fork_event.record(self._current)
+            self._joined = True
         try:
             yield self
         finally:
@@ -60,9 +87,15 @@ class StreamFork:
                 self._current = None
 
     def join(self):
-        """Order the main stream after the latest branch without closing the scope."""
-        if self._active:
+        """Order the main stream after the latest branch without closing the scope.
+
+        Main waits only for branch work it has not joined yet. A repeated wait
+        would add a second dependency to main's next kernel, and a kernel with
+        two dependencies loses its programmatic (PDL) launch.
+        """
+        if self._active and not self._joined:
             self.join_event.wait(self._current)
+            self._joined = True
 
     def record_checkpoint(self):
         """Mark an intermediate point inside a branch on the auxiliary stream.
@@ -100,5 +133,6 @@ class StreamFork:
             self.fork_event.wait(self.aux_stream)
             yield
             self.join_event.record(self.aux_stream)
+        self._joined = False
         if not self._overlap:
-            self.join_event.wait(self._current)
+            self.join()

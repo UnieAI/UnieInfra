@@ -127,6 +127,83 @@ def test_mla_prefill(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
+def _far_strided(shape: tuple[int, ...], dtype: torch.dtype, device: str):
+    """View whose last row starts past 2**31 elements, over one real storage."""
+    rows, row_elems = shape[0], math.prod(shape[1:])
+    stride = (2**31 // (rows - 1) // row_elems + 1) * row_elems
+    assert (rows - 1) * stride > 2**31
+    storage = torch.empty((rows - 1) * stride + row_elems, dtype=dtype, device=device)
+    inner = []
+    acc = 1
+    for d in reversed(shape[1:]):
+        inner.append(acc)
+        acc *= d
+    return storage.as_strided(shape, (stride, *reversed(inner)))
+
+
+def test_mla_prefill_triton_token_offsets_past_int32(device: str, require) -> None:
+    """Tokens past 2**31 elements attend correctly on both loads and stores."""
+    require("attention", "mla_prefill", "triton", torch.bfloat16, "q")
+    num_heads, qk_head_dim, v_head_dim = 128, 192, 128
+    q_lens = kv_lens = (4, 4)
+    total = sum(q_lens)
+    specs = [
+        ((total, num_heads, qk_head_dim), torch.bfloat16),  # q
+        ((total, num_heads, qk_head_dim), torch.bfloat16),  # k
+        ((total, num_heads, v_head_dim), torch.bfloat16),  # v
+        ((total, num_heads, v_head_dim), torch.bfloat16),  # out
+    ]
+    needed = 0
+    for shape, dtype in specs:
+        stride = (2**31 // (total - 1) // math.prod(shape[1:]) + 1) * math.prod(
+            shape[1:]
+        )
+        needed += ((total - 1) * stride + math.prod(shape[1:])) * dtype.itemsize
+    free, _ = torch.cuda.mem_get_info()
+    if free < needed * 1.1:
+        pytest.skip(f"needs {needed >> 30} GiB free GPU memory")
+
+    q, k, v, out = (_far_strided(shape, dtype, device) for shape, dtype in specs)
+    q.normal_()
+    k.normal_()
+    v.normal_()
+    cu_seqlens = torch.tensor(
+        [0, *accumulate(q_lens)], device=device, dtype=torch.int32
+    )
+    softmax_scale = 1.0 / math.sqrt(qk_head_dim)
+
+    out_result, lse = mla_prefill(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_kv=max(kv_lens),
+        softmax_scale=softmax_scale,
+        is_causal=True,
+        return_lse=True,
+        solution="triton",
+    )
+
+    refs = []
+    for i, seq_len in enumerate(q_lens):
+        lo = sum(q_lens[:i])
+        ref, _ = torch_dense_attention(
+            q[lo : lo + seq_len].float(),
+            k[lo : lo + seq_len].float(),
+            v[lo : lo + seq_len].float(),
+            scale=softmax_scale,
+            causal_offset=0,
+            window_left=None,
+            sinks=None,
+        )
+        refs.append(ref)
+    out_ref = torch.cat(refs, dim=0)
+    torch.testing.assert_close(out_result.float(), out_ref, rtol=8e-2, atol=8e-2)
+
+
 @pytest.mark.parametrize(
     "solution,q_dtype,kv_dtype,num_heads,kv_lora_rank,qk_rope_head_dim,batch_size,page_size",
     [
@@ -1357,29 +1434,26 @@ def test_gfx1250_projected_decode_split_policy() -> None:
 
 
 def test_gfx950_k3_decode_split_policy() -> None:
-    """Bound K3's 16K-capacity BF16-Q decode without changing long contexts."""
+    """Bound K3's 16K-capacity BF16-Q decode; fill three waves when a
+    long-context drafter folds rows onto the batch."""
     if not current_platform().is_cdna4:
         pytest.skip("K3 FP8 MLA split policy targets CDNA4")
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         _select_num_kv_splits_bh16bn128,
     )
 
-    assert (
-        _select_num_kv_splits_bh16bn128(
-            batch=1,
-            max_seqlen_k=16_384,
-            block_n=128,
+    def select(batch: int, max_seqlen_k: int) -> int:
+        return _select_num_kv_splits_bh16bn128(
+            batch=batch, max_seqlen_k=max_seqlen_k, block_n=128
         )
-        == 16
-    )
-    assert (
-        _select_num_kv_splits_bh16bn128(
-            batch=1,
-            max_seqlen_k=300_000,
-            block_n=128,
-        )
-        == 128
-    )
+
+    assert select(1, 16_384) == 16
+    assert select(1, 300_000) == 128
+    # DSpark at KVP8: 4 block positions x 6 head groups per request.
+    assert select(24, 262_144) == 32
+    assert select(4, 262_144) == 32
+    # A 16K-capacity server keeps the half-wave target.
+    assert select(64, 16_384) == 2
 
 
 # Real MLA widths: the fast windowed kernel is registered for these alone.
@@ -1401,8 +1475,8 @@ def _windowed_decode(q, kv_cache, page_table, cache_seqlens, cache_len, window, 
 
 
 @pytest.mark.skipif(
-    not platform.is_blackwell_plus,
-    reason="the query-axis block MLA decode is a Blackwell CuteDSL kernel",
+    not platform.is_blackwell,
+    reason="the query-axis block MLA decode is an SM100-family CuteDSL kernel",
 )
 @pytest.mark.parametrize("window", [129, -1], ids=["windowed", "full-attention"])
 def test_mla_block_decode_agrees_across_both_block_layouts(
@@ -1482,11 +1556,14 @@ def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> N
         noncausal_block_size=8,
         **{k: v for k, v in _QUERY_BLOCK_DIMS.items() if k != "qk_nope_head_dim"},
     )
-    assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 128})
+    assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 256})
     assert not supports_mla_decode_query_blocks(**{**probe, "kv_lora_rank": 8})
-    assert not supports_mla_decode_query_blocks(**{**probe, "solution": "triton"})
+    # The portable Triton kernel reads flattened rows. The SM120 tensor-core
+    # Triton kernel declares the query axis, and a block of one rides it too.
+    sm120 = current_platform().is_nvidia and current_platform().arch_version.major == 12
+    assert supports_mla_decode_query_blocks(**{**probe, "solution": "triton"}) == sm120
     # A block of one is ordinary decode or target verify, never a proposal.
-    assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+    assert supports_mla_decode_query_blocks(**{**probe, "q_len": 1}) == sm120
 
 
 def test_query_block_support_distinguishes_causal_fp8_from_other_masks() -> None:

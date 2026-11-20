@@ -1,7 +1,8 @@
 """Inkling per-layer ACTIVATION parity: real kernel stack vs torch reference.
 
-Runs the Inkling model in-process through the real backends (FA4 score_mod
-attention over the paged KV cache, ops/conv sconv kernels, Triton
+Runs the Inkling model in-process through the real backends (relative-
+position MHA over the paged KV cache: FA4 score_mod on SM100, Triton
+elsewhere; ops/conv sconv kernels, Triton
 silu_and_mul) with hand-built forward metadata, and compares the hidden
 states after EVERY decoder layer — prefill and rolling decode steps —
 against the independent pure-torch reference on identical dummy weights.
@@ -11,9 +12,11 @@ divergence to the exact layer and phase where it first appears, and leaves
 no room for compensating errors.
 
 Runs on the released config (layer-truncated, experts shrunk; see
-``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
+``inkling_fixtures``) with dummy weights. Requires Blackwell (SM100 or
+SM120).
 """
 
+import gc
 import os
 import sys
 from types import SimpleNamespace
@@ -22,6 +25,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from test.runtime.models.inkling_fixtures import inkling_attention_backend
 from test.runtime.test_inkling_reference_parity import (
     _build_replica,
     _has_blackwell,
@@ -159,8 +163,8 @@ class _ConvCheckpointPool:
     def kvconv_checkpoint_buffers(self, layer_id):
         return self._kvconv[layer_id]
 
-    def hiddenconv_checkpoint_buffer(self, layer_id, component):
-        return self._hidden[component][layer_id]
+    def hiddenconv_checkpoint(self, layer_id, component):
+        return "hiddenconv_0", self._hidden[component][layer_id]
 
     def __getattr__(self, name):
         return getattr(self._kv_pool, name)
@@ -194,7 +198,7 @@ class _Harness:
         self.text = text
         self.device = device
         spec = MHAConfig(
-            backend_name="fa4",
+            backend_name=inkling_attention_backend(),
             num_attention_heads=text.num_attention_heads,
             num_kv_heads=text.num_key_value_heads,
             head_dim=text.head_dim,
@@ -204,10 +208,10 @@ class _Harness:
             device=device,
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
-            prefix_granularity=PAGE_SIZE,
             kernel_page_size=PAGE_SIZE,
             context_len=1024,
             max_bs=4,
+            max_resident_requests=4,
             kv_cache_quant_method="none",
             components=(spec,),
         )
@@ -283,7 +287,7 @@ class _Harness:
             device=device,
         )
         conv_columns = {
-            "groups": ("kvconv", "hiddenconv"),
+            "groups": ("kvconv", "hiddenconv_0"),
             "pd_endpoint_snapshots": False,
         }
         self.backend = InklingAttnBackend(inner, conv_pool)
@@ -299,7 +303,7 @@ class _Harness:
         )
         # Two-slot conv tables: the request starts cold and writes block 1.
         conv_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
-        self.conv_tables = {"kvconv": conv_table, "hiddenconv": conv_table}
+        self.conv_tables = {"kvconv": conv_table, "hiddenconv_0": conv_table}
         # Request slot REQ_SLOT owns pages [1, 2, ...] -> token locs 64+.
         max_pages = 1024 // PAGE_SIZE
         self.page_table = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
@@ -430,13 +434,21 @@ class _Harness:
 
 
 @pytest.mark.skipif(
-    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU (FA4)")
+    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU")
 )
 class TestInklingActivationParity:
     @classmethod
     def setup_class(cls):
         os.environ["INKLING_TORCH_MOE"] = "1"  # experts as plain parameters
         cls.model, cls.text = _build_replica()
+
+    @classmethod
+    def teardown_class(cls):
+        # The replica's weights must not outlive the class: later tests in the
+        # same process size their engine's KV budget from the free GPU memory.
+        del cls.model
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _compare(self, phase, got_states, ref_states, positions):
         report = []
@@ -502,7 +514,7 @@ class TestInklingRebindTest:
             dtype=torch.float32,
             device="cpu",
         )
-        both = ("kvconv", "hiddenconv")
+        both = ("kvconv", "hiddenconv_0")
         backend.conv_columns = conv_columns_for_pool(pool(both, "latest_snapshot"))
         backend.set_cache_pool(pool(both, "latest_snapshot"))
         stream = dict(layer_id=0, channel_offset=0, dim=4, group_id="kvconv")

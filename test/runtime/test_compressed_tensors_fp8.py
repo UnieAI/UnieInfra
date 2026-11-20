@@ -47,6 +47,7 @@ from compressed_tensors.quantization import (
     preset_name_to_scheme,
 )
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
+from tokenspeed_kernel.ops.quantization import trtllm as quant_trtllm
 from tokenspeed_kernel.platform import (
     ArchVersion,
     Platform,
@@ -599,10 +600,7 @@ def _stand_ins(monkeypatch, calls, op_scale_shape="M1"):
         return SelectedKernel(kernel.name, run)
 
     monkeypatch.setattr(
-        torch.ops.tensorrt_llm,
-        "quantize_e4m3_activation",
-        quantize_e4m3_activation,
-        raising=False,
+        quant_trtllm, "quantize_e4m3_activation", quantize_e4m3_activation
     )
     monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", fp8_quantize_per_token)
     monkeypatch.setattr(quant_triton, "fp8_quantize", static_quant)
@@ -697,12 +695,7 @@ def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
 
         return SelectedKernel(kernel.name, run)
 
-    monkeypatch.setattr(
-        torch.ops.tensorrt_llm,
-        "quantize_e4m3_activation",
-        quantizer("trtllm"),
-        raising=False,
-    )
+    monkeypatch.setattr(quant_trtllm, "quantize_e4m3_activation", quantizer("trtllm"))
     monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", quantizer("triton"))
     monkeypatch.setattr(gemm, "select_kernel", selected)
     x = torch.randn(tokens, 256).to(torch.bfloat16)
@@ -765,6 +758,12 @@ def test_hopper_dequantizes_at_load_and_says_so(
     assert seen == [(layer, x, None)]
 
 
+# The cuBLASLt per-tensor FP8 GEMM registers at import only on a real SM100
+# family GPU; the synthetic platform switch cannot add it afterwards.
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the vendor per-tensor FP8 GEMM registers only on SM100-family GPUs",
+)
 @pytest.mark.parametrize("arch", [(10, 0), (10, 3)])
 def test_the_unscaled_linear_runs_a_vendor_gemm_with_unit_scales(
     platform, monkeypatch, arch

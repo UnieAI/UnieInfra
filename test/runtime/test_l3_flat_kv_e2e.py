@@ -141,6 +141,7 @@ class TestL3FlatKvRoundTripTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                shared_l2=None,
             )
         store = self.MemoryKvStore()
         retry_started = threading.Event()

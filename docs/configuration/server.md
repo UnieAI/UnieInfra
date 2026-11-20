@@ -1172,6 +1172,23 @@ warning with the requested and the capped size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
 startup, as is a share without room for a single LCM block.
 
+**One Host L2 buffer per attention-TP group.** When the cache layout stores
+the same bytes on every attention-TP rank (DeepSeek V4.1-Flash, see "One copy
+per attention-TP group" below), `--kvstore-share-host-across-attn-tp`
+replaces the ranks' identical private buffers with one shared-memory segment
+(`/dev/shm`, mapped and registered with the device runtime by every rank,
+unlinked once mapped) of the group size times one rank's L2 size. The node
+pins the same Host memory, and the mirrored schedulers address that many
+times the pages: under TP4 a 4 GB per-rank L2 becomes one 16 GB L2.
+Attention-TP rank 0 performs every Device-to-Host copy and every L3 backup,
+probe and prefetch of the buffer; every rank loads its Device pages from it.
+The other ranks acknowledge their writes from an empty copy, and the
+completion intersection across the group holds each op until rank 0 has
+copied, so no rank loads a page before it is written and no page is reused
+before every rank has loaded it. The retraction snapshot pool stays per rank.
+The flag is ignored, with a log, for a layout whose bytes differ per rank,
+under `--kv-parallel-size > 1`, or for a group that spans nodes.
+
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
 (the trailing `c0` is the retired context-parallel shard id, kept literal so

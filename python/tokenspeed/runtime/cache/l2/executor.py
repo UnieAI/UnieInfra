@@ -72,6 +72,11 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
 from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
+from tokenspeed.runtime.cache.l2.shared import (
+    SharedHostBuffer,
+    SharedL2Group,
+    allocate_shared_host_buffer,
+)
 from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     gigabytes_to_lcm_blocks,
@@ -287,6 +292,8 @@ class HostCacheExecutor:
     _paced_writes: collections.deque | tuple = ()
     _paced_inflight = None
     _paced_slice_blocks = 0
+    # A private L2 buffer; ``__init__`` sets it from ``shared_l2``.
+    l2_follower = False
 
     def __init__(
         self,
@@ -303,6 +310,7 @@ class HostCacheExecutor:
         kvp_rank: int,
         nprocs_per_node: int,
         world_cpu_group,
+        shared_l2: SharedL2Group | None,
     ):
         """
         Args:
@@ -338,6 +346,12 @@ class HostCacheExecutor:
                 of the Host memory the node has available.
             world_cpu_group: The gloo group of every rank, over which the L2
                 size is agreed; None with a single rank.
+            shared_l2: The attention-TP group that shares one L2 buffer
+                (``--kvstore-share-host-across-attn-tp`` on a layout whose
+                bytes are identical across it), or None for a private
+                buffer per rank. Shared, the buffer is the group size times
+                one rank's L2 size; group rank 0 alone copies Device to Host
+                and moves L3 bytes, every rank loads from it.
         """
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -348,6 +362,11 @@ class HostCacheExecutor:
         if not snapshot_pool.disabled and slot_state_exporters is None:
             raise ValueError("a snapshot pool needs the slot-state exporters")
         self.attn_tp_rank = attn_tp_rank
+        # A follower of a shared L2 buffer reads it but never writes it: the
+        # group's rank 0 performs every D2H copy and L3 transfer of it.
+        self.shared_l2 = shared_l2
+        self.l2_follower = shared_l2 is not None and shared_l2.rank != 0
+        self._shared_l2_buffer: SharedHostBuffer | None = None
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
@@ -398,8 +417,13 @@ class HostCacheExecutor:
         )
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
+        # A shared segment is mapped, not taken from the pinned allocator, so
+        # it does not round to a power of two; each rank still accounts its
+        # own share of it.
+        room_bytes = share_bytes - pool_pinned_bytes
         fitting_l2_blocks = _min_over_ranks(
-            largest_pinned_fit(share_bytes - pool_pinned_bytes) // host_lcm_block_bytes,
+            (room_bytes if shared_l2 is not None else largest_pinned_fit(room_bytes))
+            // host_lcm_block_bytes,
             world_cpu_group,
         )
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
@@ -422,7 +446,8 @@ class HostCacheExecutor:
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
         check_host_memory(
-            pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
+            (l2_bytes if shared_l2 is not None else pinned_host_bytes(l2_bytes))
+            + pool_pinned_bytes,
             share_bytes=share_bytes,
             purpose="the compact Host cache",
         )
@@ -431,8 +456,24 @@ class HostCacheExecutor:
         self.block_owners: BlockOwnerTranslation | None = None
         self._transfer_geometry = None
         if l2_tier:
+            shared_buffer = None
+            if shared_l2 is not None:
+                # Every rank contributed its share: the group's one buffer is
+                # their sum, and the mirrored schedulers all see its pages.
+                host_lcm_blocks *= shared_l2.size
+                l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+                self._shared_l2_buffer = allocate_shared_host_buffer(
+                    l2_bytes,
+                    rank=shared_l2.rank,
+                    size=shared_l2.size,
+                    cpu_group=shared_l2.cpu_group,
+                    register=True,
+                )
+                shared_buffer = self._shared_l2_buffer.tensor
             self.host_storage = HostCacheStorage(
-                self.layout, num_host_lcm_blocks=host_lcm_blocks
+                self.layout,
+                num_host_lcm_blocks=host_lcm_blocks,
+                host_buffer=shared_buffer,
             )
             # Scheduler block ids on both ends of every L2 copy to this rank's
             # local ids.
@@ -476,9 +517,16 @@ class HostCacheExecutor:
                 self.max_retracted_requests + 1, self.blob_bytes
             )
         if l2_tier:
+            shared_note = (
+                f", shared by {shared_l2.size} attention-TP ranks, "
+                f"{'owner' if not self.l2_follower else 'reader'}"
+                if shared_l2 is not None
+                else ""
+            )
             logger.info(
                 f"Allocated {l2_bytes / 1000000000.0:.2f} GB compact Host L2 ("
-                f"{host_lcm_blocks!s} LCM blocks, {host_lcm_block_bytes!s} bytes/block)",
+                f"{host_lcm_blocks!s} LCM blocks, {host_lcm_block_bytes!s} "
+                f"bytes/block{shared_note})",
             )
         if attn_tp_rank == 0:
             logger.info(
@@ -967,9 +1015,15 @@ class HostCacheExecutor:
         for op in ops:
             if op.num_pages <= 0 or not op.rows:
                 raise ValueError(f"prefetch operation {op.op_id} carries no pages")
-            kept_by_position = dict(
-                owners.owned_host_positions(
-                    [(row.group_id, row.host_page) for row in op.rows]
+            # A shared-L2 follower fetches nothing: the owner fills the
+            # pages every rank reads, and the replica MIN takes its prefix.
+            kept_by_position = (
+                {}
+                if self.l2_follower
+                else dict(
+                    owners.owned_host_positions(
+                        [(row.group_id, row.host_page) for row in op.rows]
+                    )
                 )
             )
             # Rows come in prefix-page order; a page may have no rows (a
@@ -1237,10 +1291,15 @@ class HostCacheExecutor:
                 operation.src_pages[index : index + 1],
                 operation.dst_pages[index : index + 1],
                 collected_op_ids=op_ids,
-                transfers=transfers,
+                # A shared-L2 follower acknowledges from an empty copy: the
+                # owner writes the bytes, and the hooks' intersection holds
+                # the op until the owner's ACK.
+                transfers=[] if self.l2_follower else transfers,
                 source_is_device=True,
                 tier=HostTier.L2,
             )
+            if self.l2_follower:
+                continue
             # L3 backs up the Host pages this rank wrote, by local id.
             (pinned_pages if pinned else ordered_pages).extend(
                 self._storage_pages(operation, kept_rows=[(index, kept_rows)])
@@ -1577,6 +1636,9 @@ class HostCacheExecutor:
         l3_store = self.l3_store
         if l3_store is None:
             return None
+        if self.l2_follower:
+            # The owner probes for the group; the replica MIN keeps its answer.
+            return [True] * len(pages)
         return l3_store.exists(pages)
 
     def delete_l3_namespace(self) -> bool:

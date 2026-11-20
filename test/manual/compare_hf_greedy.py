@@ -43,11 +43,13 @@ import random
 PROMPT_LENS = (5, 37, 130, 700)
 
 
-def make_prompts(vocab_size: int, seed: int) -> list[list[int]]:
+def make_prompts(
+    vocab_size: int, seed: int, lens: tuple[int, ...] = PROMPT_LENS
+) -> list[list[int]]:
     rng = random.Random(seed)
     # Skip the low ids: most tokenizers keep special tokens there.
     lo, hi = 1000, min(vocab_size, 100000) - 1
-    return [[rng.randint(lo, hi) for _ in range(n)] for n in PROMPT_LENS]
+    return [[rng.randint(lo, hi) for _ in range(n)] for n in lens]
 
 
 def text_vocab_size(model: str) -> int:
@@ -60,7 +62,8 @@ def text_vocab_size(model: str) -> int:
 def run_engine(args) -> None:
     from tokenspeed.runtime.entrypoints.engine import Engine
 
-    prompts = make_prompts(args.vocab or text_vocab_size(args.model), args.seed)
+    lens = tuple(int(n) for n in args.lens.split(",")) if args.lens else PROMPT_LENS
+    prompts = make_prompts(args.vocab or text_vocab_size(args.model), args.seed, lens)
     kwargs = dict(
         model=args.model,
         world_size=args.tp,
@@ -91,10 +94,15 @@ def run_engine(args) -> None:
             "ignore_eos": True,
         }
         outs = []
+        single_idx = 1 if len(prompts) > 1 else 0
         # One batched call (exercises batched prefill/decode), then one prompt
         # alone so batching-dependent bugs show up as a mismatch between them.
-        batch = engine.generate(input_ids=prompts, sampling_params=sp)
-        single = engine.generate(input_ids=prompts[1], sampling_params=sp)
+        if args.serial:
+            # Each prompt alone: a reference free of batching effects.
+            batch = [engine.generate(input_ids=q, sampling_params=sp) for q in prompts]
+        else:
+            batch = engine.generate(input_ids=prompts, sampling_params=sp)
+        single = engine.generate(input_ids=prompts[single_idx], sampling_params=sp)
         for prompt, resp in zip(prompts, batch):
             lps = []
             for pos in resp["meta_info"].get("logprobs", []):
@@ -108,13 +116,14 @@ def run_engine(args) -> None:
             "tp": args.tp,
             "ep": args.ep,
             "outs": outs,
+            "single_index": single_idx,
             "single_output_ids": single["output_ids"],
         }
     finally:
         engine.shutdown()
     with open(args.out, "w") as f:
         json.dump(result, f)
-    same = result["single_output_ids"] == outs[1]["output_ids"]
+    same = result["single_output_ids"] == outs[single_idx]["output_ids"]
     print(f"ENGINE_DONE tp={args.tp} ep={args.ep} batch_vs_single_match={same}")
     for o in outs:
         print(len(o["prompt"]), o["output_ids"])
@@ -193,8 +202,12 @@ def main() -> None:
     p.add_argument("--mem", type=float, default=0.3)
     p.add_argument("--new", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--lens", default="", help="comma-separated prompt lengths")
     p.add_argument("--vocab", type=int, default=0)
     p.add_argument("--eager", action="store_true")
+    p.add_argument(
+        "--serial", action="store_true", help="generate prompts one at a time"
+    )
     p.add_argument("--device", default="cpu", help="reference model device")
     p.add_argument("--lm-only", action="store_true", help="--language-model-only")
     p.add_argument("--extra", default="", help="JSON dict of extra Engine kwargs")

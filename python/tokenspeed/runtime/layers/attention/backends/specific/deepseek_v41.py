@@ -383,6 +383,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
         ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
+        # Decode SWA rows a layer wrote before its forward_v41
+        # (write_decode_swa), keyed like _prepared_selections: positions and
+        # requests pin the ids in the key, and forward_v41 checks it attends
+        # the rows written.
+        self._prepared_swa_writes: dict[
+            tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
         self._index_geometry: dict[tuple, V41IndexGeometry] = {}
         self._in_model_forward = False
         self._local_decode_selections: dict[tuple, tuple] = {}
@@ -433,6 +440,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
         self._prepared_selections.clear()
+        self._prepared_swa_writes.clear()
         self._index_geometry.clear()
 
     def init_cuda_graph_state(
@@ -541,6 +549,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError("V4.1 num_tokens must equal batch size times verify width")
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
+        self._prepared_swa_writes.clear()
         self._index_geometry.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -743,6 +752,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._check_tables(block_tables, bs)
         self._swa_plans.clear()
         self._prepared_selections.clear()
+        self._prepared_swa_writes.clear()
         self._index_geometry.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -1956,6 +1966,131 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prepared_selections[key] = (positions, requests, result)
         return result
 
+    def prepare_decode_index_geometry(self, forward_mode: ForwardMode) -> None:
+        """Build the decode Full sources' index geometry, on the caller's stream.
+
+        Builds, ahead of the layers, the selection table, lengths and index
+        metadata select_global builds inside the first Full source of each
+        owner group, from the same kernels on the same per-forward metadata,
+        under the key select_global looks up. Call it after
+        begin_indexer_forward, before those layers run. index_topk waits for
+        the build through the metadata's ready event. A no-op outside
+        replicated-cache decode.
+        """
+        if not forward_mode.is_decode() or self.kvp_size > 1:
+            return
+        metadata = self.query_metadata(forward_mode)
+        positions, requests = metadata.positions, metadata.request_indices
+        n = positions.numel()
+        if n == 0:
+            return
+        for layer_id, owner in enumerate(self.spec.kv_owners):
+            if (
+                owner < 0
+                or self.spec.index_sources[layer_id] != layer_id
+                or layer_id != owner
+                or self._index_selection_kind(layer_id, None) == "all"
+            ):
+                continue
+            # Mirrors select_global for replicated-cache decode: one query tile
+            # (n <= 240), no history bound, the table trimmed to the index pages.
+            source_table = metadata.block_tables[self._owner_group(owner)]
+            index_cache = self.cache_pool.index_k(owner)
+            table = source_table[:, : max(0, index_cache.shape[0] - 1)]
+            for start in range(0, n, 240):
+                self._selection_geometry(
+                    positions,
+                    requests,
+                    source_table,
+                    table,
+                    self.spec.compress_ratios[owner],
+                    start,
+                    min(start + 240, n),
+                    None,
+                    forward_mode,
+                )
+
+    def write_decode_swa(
+        self,
+        layer_id: int,
+        swa_kv: torch.Tensor,
+        positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        swa_rope_cache: torch.Tensor | None,
+        swa_norm_weight: torch.Tensor | None,
+        swa_norm_eps: float,
+    ) -> bool:
+        """Publish a decode layer's SWA rows on the caller's stream, before
+        its forward_v41.
+
+        This is forward_v41's own decode SWA write (same rows, slots, RoPE,
+        deferred norm and cache format), issued early: an index-source layer
+        can write while its index branch still runs instead of after the
+        join. forward_v41 for the same layer, mode, positions and request
+        tensors then skips its write; it must receive the same ``swa_kv``.
+        Only rows of the refreshed decode window are written early; for any
+        other rows this writes nothing and returns False, and forward_v41
+        writes them as before. The arguments follow forward_v41's.
+        """
+        if not forward_mode.is_decode():
+            raise ValueError("write_decode_swa takes decode rows only")
+        n = positions.numel()
+        if (
+            not 0 <= layer_id < len(self.spec.kv_owners)
+            or request_indices.shape != positions.shape
+            or swa_kv.ndim != 2
+            or swa_kv.shape[0] != n
+        ):
+            raise ValueError("V4.1 SWA rows disagree with the decode window")
+        if swa_norm_weight is not None and swa_rope_cache is None:
+            raise ValueError("A deferred SWA norm requires the SWA RoPE cache")
+        window = self._window(positions, request_indices, forward_mode)
+        if window is None or n == 0:
+            return False
+        key = (layer_id, forward_mode, id(positions), id(request_indices))
+        if key in self._prepared_swa_writes:
+            raise RuntimeError(f"V4.1 layer {layer_id} already wrote its SWA rows")
+        self._scatter_decode_swa(
+            swa_kv,
+            positions,
+            self.cache_pool.swa(layer_id),
+            window[0].swa_write_slots,
+            swa_rope_cache,
+            swa_norm_weight,
+            swa_norm_eps,
+        )
+        self._prepared_swa_writes[key] = (positions, request_indices, swa_kv)
+        return True
+
+    def _scatter_decode_swa(
+        self,
+        swa_kv,
+        positions,
+        cache,
+        locations,
+        swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
+    ) -> None:
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        if swa_rope_cache is None:
+            dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+        else:
+            dsv41.swa_rope_scatter(
+                swa_kv,
+                positions,
+                swa_rope_cache,
+                cache,
+                locations,
+                self.swa_format,
+                None,
+                swa_norm_weight,
+                swa_norm_eps,
+            )
+
     def _swa_query_plan(self, positions, requests, forward_mode) -> V41SWAQueryPlan:
         """Validate one prefill query window and retain only address scratch.
 
@@ -2555,19 +2690,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if forward_mode.is_decode():
             # The current position cannot alias one of its previous 127 logical
             # rows. Ordinary retained-page writes therefore precede paged decode.
-            if swa_rope_cache is None:
-                dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
-            else:
-                dsv41.swa_rope_scatter(
+            # The layer may have written them already (write_decode_swa).
+            written = self._prepared_swa_writes.pop(
+                (layer_id, forward_mode, id(positions), id(request_indices)), None
+            )
+            if written is None:
+                self._scatter_decode_swa(
                     swa_kv,
                     positions,
-                    swa_rope_cache,
                     cache,
                     locations,
-                    self.swa_format,
-                    None,
+                    swa_rope_cache,
                     swa_norm_weight,
                     swa_norm_eps,
+                )
+            elif written[2] is not swa_kv:
+                raise RuntimeError(
+                    f"V4.1 layer {layer_id} wrote other SWA rows than it attends"
                 )
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)

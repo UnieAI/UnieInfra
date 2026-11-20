@@ -1233,6 +1233,14 @@ high-priority side stream through their own Iris producer lane, capped at
 micro-batch computes. The mHC post then runs as its own kernel instead of
 inside the reduction. The arithmetic is otherwise unchanged and lossless.
 
+In pure decode, the indexer of each index-source layer can score its query
+rows on one attention-TP rank each instead of every rank scoring every row:
+each rank takes a contiguous block of whole requests, and one int32
+all-gather per layer gives every rank all rows' Top-K. The selections are
+bit-identical. `TOKENSPEED_DSV41_DECODE_INDEXER_TP` turns it on (`1`, the
+default on AMD) or off (`0`, the default elsewhere); batches with fewer than
+`TOKENSPEED_DSV41_DECODE_INDEXER_TP_MIN_ROWS` rows (64) stay unsharded.
+
 ```bash
 tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
   --served-model-name deepseek-v41-flash \

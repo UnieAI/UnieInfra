@@ -50,6 +50,7 @@ from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_ops import all_gather
@@ -106,8 +107,15 @@ _INDEXER_PARTITION_MIN_QUERIES = 4096
 _INDEXER_PARTITION_MIN_HISTORY = 8192
 # Decode indexer row sharding over attention TP (vLLM #66047): each rank scores
 # a contiguous block of whole requests, then one int32 all-gather per source
-# layer restores every row's Top-K. Pure decode only; off by default.
-_DECODE_INDEXER_TP = os.environ.get("TOKENSPEED_DSV41_DECODE_INDEXER_TP", "0") == "1"
+# layer restores every row's Top-K. Pure decode only. On by default on AMD,
+# where it is measured (4x MI350P TP4: ITL -3.3% at c64); opt-in elsewhere.
+_DECODE_INDEXER_TP = (
+    os.environ.get(
+        "TOKENSPEED_DSV41_DECODE_INDEXER_TP",
+        "1" if current_platform().is_amd else "0",
+    )
+    == "1"
+)
 _DECODE_INDEXER_TP_MIN_ROWS = int(
     os.environ.get("TOKENSPEED_DSV41_DECODE_INDEXER_TP_MIN_ROWS", "64")
 )

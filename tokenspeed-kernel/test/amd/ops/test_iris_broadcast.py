@@ -157,11 +157,20 @@ def _broadcast_worker(rank, world_size, device, subgroup):
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("check", [_broadcast_subgroup_worker, _broadcast_world_worker])
-def test_iris_broadcast_mailbox_replay_and_tails(check):
-    _skip_if_unsupported(8, "Iris TP4/TP8 broadcast subgroup tests")
+# Eight ranks cover TP8 and two TP4 subgroups; four ranks cover a TP4 world
+# group on four-GPU nodes.
+@pytest.mark.parametrize(
+    "world_size, check",
+    [
+        (8, _broadcast_subgroup_worker),
+        (8, _broadcast_world_worker),
+        (4, _broadcast_world_worker),
+    ],
+)
+def test_iris_broadcast_mailbox_replay_and_tails(world_size, check):
+    _skip_if_unsupported(world_size, "Iris TP4/TP8 broadcast tests")
     _spawn_and_collect(
         _communication_worker,
-        (8, _get_open_port(), check, "gloo"),
-        8,
+        (world_size, _get_open_port(), check, "gloo"),
+        world_size,
     )

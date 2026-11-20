@@ -26,6 +26,7 @@ import math
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
@@ -40,7 +41,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 cdiv = gl.cdiv
-_GFX950_SM_COUNT = 256
 _SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
@@ -964,7 +964,7 @@ def get_config(
     num_kv_splits = select_kv_splits(
         base_ctas=q.shape[0] * k_cache.shape[2] * num_groups,
         num_pages=num_pages,
-        sm_count=_GFX950_SM_COUNT,
+        sm_count=num_cus(),
     )
     if is_sliding:
         target_splits = 8 if q.shape[0] <= 4 else 4

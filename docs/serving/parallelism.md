@@ -313,7 +313,7 @@ experts, speculative decoding, PD disaggregation or a bitwise `--numerics`
 envelope; every other launch keeps Marlin. Real V4.1 (128 experts, TP2, 3
 repeats): MegaMoE is 1.15x Marlin output tokens/s at 128 concurrent requests and
 about 1-2% faster at one request.
-See [MegaMoE on SM120](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/README.md#megamoe-on-sm120).
+See [MegaMoE on SM120](https://github.com/UnieAI/UnieInfra/blob/main/tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/README.md#megamoe-on-sm120).
 
 #### Tensor-parallel subgroups within DP
 

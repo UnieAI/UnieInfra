@@ -208,6 +208,11 @@ def split_groups_to_equal_depth(layer_types: Sequence[str]) -> tuple[str, ...]:
         return tuple(layer_types)
     if os.environ.get("TOKENSPEED_NO_GROUP_SPLIT") == "1":
         return tuple(layer_types)
+    if any(_is_sliding_subgroup_label(label) for label in layer_types):
+        # The model config already split its sliding layers (Muse Spark,
+        # Inkling); splitting again would emit labels such as
+        # ``sliding_attention_0_0`` that no recipe accepts.
+        return tuple(layer_types)
     counts = Counter(layer_types)
     if len(counts) < 2:
         return tuple(layer_types)
@@ -335,12 +340,17 @@ def _attn_kind_for_label(label: str) -> AttnKind | None:
     attn_kind = _LAYER_TYPE_ATTN_KIND.get(label)
     if attn_kind is not None:
         return attn_kind
-    if (
-        label.startswith(_SLIDING_SUBGROUP_PREFIX)
-        and label[len(_SLIDING_SUBGROUP_PREFIX) :].isdigit()
-    ):
+    if _is_sliding_subgroup_label(label):
         return "sliding_window"
     return None
+
+
+def _is_sliding_subgroup_label(label: str) -> bool:
+    """True for a sliding sub-group label ``sliding_attention_<k>``."""
+    return (
+        label.startswith(_SLIDING_SUBGROUP_PREFIX)
+        and label[len(_SLIDING_SUBGROUP_PREFIX) :].isdigit()
+    )
 
 
 def _is_window_int(value: object) -> bool:

@@ -51,6 +51,9 @@ from tokenspeed.runtime.configs.muse_spark_config import (
     MuseSparkConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.attention.configs.base import (
+    resolve_cache_layer_types,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     hybrid_slab_group_size,
     layer_group_ids,
@@ -275,6 +278,24 @@ def test_muse_spark_config_groups_the_attention_pattern_into_caches() -> None:
     assert config.moe_intermediate_size == 64
     assert config.final_logit_softcapping == 20.0
     assert config.output_multiplier == 0.125
+
+
+def test_cache_layer_types_keep_the_config_sliding_subgroups() -> None:
+    """The 62-layer schedule's 16/15/15 sliding groups are not split again."""
+    config = _config(62)
+    labels = resolve_cache_layer_types(
+        config, num_layers=62, is_draft=False, draft_block_decode=False
+    )
+    assert labels == tuple(config.cache_layer_types)
+    group_ids = layer_group_ids(
+        layer_types=labels, sliding_window_tokens=config.sliding_window
+    )
+    assert set(group_ids) == {
+        FULL_ATTENTION,
+        f"{SLIDING_ATTENTION}_0",
+        f"{SLIDING_ATTENTION}_1",
+        f"{SLIDING_ATTENTION}_2",
+    }
 
 
 def test_config_rejects_a_rope_schedule_the_windows_contradict() -> None:

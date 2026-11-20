@@ -314,6 +314,28 @@ def test_owned_row_weights_replicate_only_on_large_memory_devices(
     assert module._replicates_owned_row_weights() is replicates
 
 
+@pytest.mark.parametrize(
+    "fabric, rows, pushes",
+    [
+        ("pcie", 1, True),
+        ("pcie", 2, False),
+        ("pcie", 26, False),
+        ("xgmi", 1, True),
+        ("xgmi", 26, True),
+    ],
+)
+def test_multi_row_reductions_leave_iris_push_on_pcie_hosts(
+    monkeypatch, fabric, rows, pushes
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_AMD_GPU_FABRIC", fabric)
+    module._peers_pcie_only.cache_clear()
+    try:
+        expected = pushes or not current_platform().is_amd
+        assert module._push_reduces_rows(rows) is expected
+    finally:
+        module._peers_pcie_only.cache_clear()
+
+
 def test_config_rejects_a_rope_schedule_the_windows_contradict() -> None:
     text = _text_config(8)
     text["layer_rope_theta"][3] = 500000.0

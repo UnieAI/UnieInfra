@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable
 from functools import partial
@@ -68,6 +69,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.distributed.amd_fabric import local_gpus_pcie_only
 from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -140,6 +142,23 @@ def _acquire_all_reduce_output(
     return acquire_all_reduce_outputs(shapes, like, group)[0]
 
 
+@functools.lru_cache(maxsize=1)
+def _peers_pcie_only() -> bool:
+    """Whether this host's GPUs reach each other only over PCIe."""
+    return current_platform().is_amd and local_gpus_pcie_only()
+
+
+def _push_reduces_rows(rows: int) -> bool:
+    """Whether Iris push/Lamport reductions should carry ``rows`` token rows.
+
+    Over XGMI they win at decode sizes. Over PCIe every peer store crosses
+    the host bridge, so each extra row adds ~20 us per layer (TP4, 8192 wide:
+    1 row 19 us, 16 rows 391 us) while RCCL stays at 31-106 us; only one-row
+    batches keep the fused Iris kernels there.
+    """
+    return rows <= 1 or not _peers_pcie_only()
+
+
 def _muse_all_reduce(
     iris: MuseIrisState | None,
     tensors: tuple[torch.Tensor, ...],
@@ -148,6 +167,11 @@ def _muse_all_reduce(
     """Use Muse's prepared payload policy, retaining ordinary backend fallback."""
     if iris is None:
         return all_reduce(tensors, group)
+    if not all(_push_reduces_rows(tensor.shape[0]) for tensor in tensors):
+        return tuple(
+            all_reduce(tensor, group, backend=get_global_backend().nccl)
+            for tensor in tensors
+        )
     if iris.all_reduce.owns_outputs(tensors):
         return iris.reduce_outputs(tensors)
     results = []
@@ -1186,6 +1210,7 @@ class MuseSparkMoE(nn.Module):
             if (
                 not owned_rows
                 and iris is not None
+                and _push_reduces_rows(num_tokens)
                 and iris.can_all_reduce_routed_rmsnorm_sum(
                     routes,
                     route_map,
@@ -1620,13 +1645,17 @@ class MuseSparkDecoderLayer(nn.Module):
             pre_norm = self.pre_feedforward_layernorm
             post_norm = self.post_attention_layernorm
             alpha, beta = self.post_attention_residual_gate._gate_coefficients()
-            if iris is not None and iris.can_all_reduce_symmetric_boundary(
-                attention_output,
-                hidden_states,
-                post_norm.weight,
-                alpha,
-                beta,
-                pre_norm.weight,
+            if (
+                iris is not None
+                and _push_reduces_rows(attention_output.shape[0])
+                and iris.can_all_reduce_symmetric_boundary(
+                    attention_output,
+                    hidden_states,
+                    post_norm.weight,
+                    alpha,
+                    beta,
+                    pre_norm.weight,
+                )
             ):
                 fused = iris.all_reduce_symmetric_boundary(
                     attention_output,

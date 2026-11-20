@@ -76,6 +76,7 @@ What makes the difference on this machine:
 - **DSpark speculative decoding** with coupled drafting and lossless block verification, including a shard-local variant for TP.
 - **Prefill two-micro-batch overlap**: the all-reduce of one half runs while the other half computes (requires a high-priority communication stream on ROCm).
 - **gfx950 kernels sized for 128 CUs / 4 XCDs**: indexer, selected attention, block32 MXFP8 GEMM, prefill MXFP4 MoE, and Iris all-reduce over PCIe.
+- **Three-tier KV cache (GPU → Host RAM → local NVMe)**: prefixes evicted from HBM go to pinned Host memory (L2) and to segment files on local disk (L3, CRC-checked, written with O_DIRECT, survives restarts). DeepSeek-V4.1 KV is identical on every attention-TP rank, so the four ranks keep one shared L3 copy (4× less disk), and L3 restores keep two read batches in flight. For a 24K-token prompt, TTFT is 0.82 s recomputed, 0.05 s from Host RAM and 0.08 s from disk after a restart.
 
 All behaviour-changing features are opt-in environment flags; see the hardware bring-up skill in [`.skills/unieinfra-hw-optimize`](.skills/unieinfra-hw-optimize/SKILL.md) for the measurement method, flags and pitfalls.
 

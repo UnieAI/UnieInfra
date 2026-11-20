@@ -85,6 +85,7 @@ All behaviour-changing features are opt-in environment flags; see the hardware b
 - [Docs Index](docs/index.md)
 - [Getting Started](docs/guides/getting-started.md)
 - [Launching a Server](docs/guides/launching.md)
+- [Supported Models](docs/models/supported.md)
 - [Model Recipes](docs/recipes/models.md)
 - [Server Parameters](docs/configuration/server.md)
 - [Compatible Parameters](docs/configuration/compatible-parameters.md)

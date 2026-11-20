@@ -298,6 +298,22 @@ def test_cache_layer_types_keep_the_config_sliding_subgroups() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "device_bytes, replicates",
+    [(144 * 10**9, False), (288 * 10**9, True)],  # MI350P, MI350X/MI355X
+)
+def test_owned_row_weights_replicate_only_on_large_memory_devices(
+    monkeypatch, device_bytes, replicates
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=device_bytes),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    assert module._replicates_owned_row_weights() is replicates
+
+
 def test_config_rejects_a_rope_schedule_the_windows_contradict() -> None:
     text = _text_config(8)
     text["layer_rope_theta"][3] = 500000.0

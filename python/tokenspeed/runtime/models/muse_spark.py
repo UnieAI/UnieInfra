@@ -173,6 +173,24 @@ def _gemm_dispatch_required() -> bool:
     )
 
 
+def _replicates_owned_row_weights() -> bool:
+    """Whether this device has the memory to replicate the owned-row weights.
+
+    Owned-row decode keeps a full copy of the Q/K/V/gate and pre-/post-expert
+    projections on every rank, about 19 GiB more per GPU at TP4. That fits the
+    288 GB MI350X/MI355X, but on the 144 GB MI350P the 816B checkpoint already
+    fills the device, so those projections stay sharded and the layers take
+    the gathered path.
+    """
+    return (
+        torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        >= _OWNED_ROW_WEIGHTS_MIN_DEVICE_BYTES
+    )
+
+
+_OWNED_ROW_WEIGHTS_MIN_DEVICE_BYTES = 200 * (1 << 30)
+
+
 class _MuseGatheredLinear(ColumnParallelLinear):
     """Muse pre-/post-expert projection with its checkpoint weight stored at .weight."""
 
@@ -193,6 +211,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         replicated = (
             tp_size > 1
             and current_platform().is_cdna4
+            and _replicates_owned_row_weights()
             and len(tp_group) in (4, 8)
             and torch.get_default_dtype() == torch.bfloat16
             and (input_size, output_size) in ((4096, 8192), (8192, 4096))
@@ -708,6 +727,7 @@ class MuseSparkAttention(nn.Module):
             replicate_for_owned_rows=(
                 layer_id > 0
                 and current_platform().is_cdna4
+                and _replicates_owned_row_weights()
                 and mapping.pp_size == 1
                 and mapping.attn.tp_size == mapping.moe.ep_size
                 and mapping.attn.tp_size in (4, 8)

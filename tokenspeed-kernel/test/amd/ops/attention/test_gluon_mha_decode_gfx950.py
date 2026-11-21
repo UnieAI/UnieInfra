@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerics and graph replay for split-K sliding MHA decode on gfx950."""
+"""Numerics and graph replay for sliding MHA decode on gfx950."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def _reference(
 
 
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch", [1, 4, 16, 64, 128])
 def test_split_sliding_decode_matches_reference_and_replays(
     batch: int, kv_dtype: torch.dtype
 ) -> None:
@@ -125,8 +125,9 @@ def test_split_sliding_decode_matches_reference_and_replays(
         window_left=WINDOW_LEFT,
         softmax_scale=None,
     )
-    expected_splits = 8 if batch <= 4 else 4
-    assert config.num_kv_splits == expected_splits
+    # Small batches split the window across workgroups; the large batches
+    # fill the device without splitting and take the single-pass kernel.
+    assert (config.num_kv_splits == 1) == (batch >= 64)
 
     def invoke() -> torch.Tensor:
         return gluon_mha_decode_gfx950(
@@ -152,7 +153,8 @@ def test_split_sliding_decode_matches_reference_and_replays(
     )
     actual = invoke()
     torch.cuda.synchronize()
-    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    # rtol allows one bf16 ulp (2^-8) of output rounding.
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=4e-3)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -161,3 +163,27 @@ def test_split_sliding_decode_matches_reference_and_replays(
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(replayed, actual, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 8, 32, 128])
+def test_window_covering_context_launches_like_full_attention(batch: int) -> None:
+    """A window that covers the whole context splits it like full attention.
+
+    Sliding layers once used a fixed split count, which over-split large
+    batches; both modes now size splits from the pages actually read.
+    """
+    q = torch.empty(batch, Q_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.empty(
+        1, PAGE_SIZE, KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    sliding, full = (
+        get_config(
+            q=q,
+            k_cache=k_cache,
+            max_seqlen_k=SEQUENCE_LENGTH,
+            window_left=window_left,
+            softmax_scale=None,
+        )
+        for window_left in (WINDOW_LEFT, -1)
+    )
+    assert sliding.num_kv_splits == full.num_kv_splits

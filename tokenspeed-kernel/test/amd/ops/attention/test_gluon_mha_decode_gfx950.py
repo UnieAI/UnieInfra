@@ -70,8 +70,11 @@ def _reference(
     return torch.stack(outputs).to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
-def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
+def test_split_sliding_decode_matches_reference_and_replays(
+    batch: int, kv_dtype: torch.dtype
+) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260915 + batch)
     pages_per_request = SEQUENCE_LENGTH // PAGE_SIZE
     q = torch.randn(
@@ -97,6 +100,10 @@ def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
         device="cuda",
         generator=generator,
     )
+    # An fp8 cache keeps the bf16 query; the reference reads the same fp8
+    # values upcast to bf16, so the tolerance stays tight.
+    k_cache = k_cache.to(kv_dtype)
+    v_cache = v_cache.to(kv_dtype)
     page_table = torch.arange(
         batch * pages_per_request,
         dtype=torch.int32,
@@ -140,7 +147,9 @@ def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
             v_scale=None,
         )
 
-    expected = _reference(q, k_cache, v_cache, sinks)
+    expected = _reference(
+        q, k_cache.to(torch.bfloat16), v_cache.to(torch.bfloat16), sinks
+    )
     actual = invoke()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)

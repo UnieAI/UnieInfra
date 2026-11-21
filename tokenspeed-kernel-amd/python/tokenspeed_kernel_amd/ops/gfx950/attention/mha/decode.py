@@ -375,13 +375,17 @@ class AttentionProgram:
         async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)
         async_copy.commit_group()
 
+    # An fp8 cache under a bf16/fp16 query is upcast to the query dtype after
+    # the shared-memory load, so the MFMAs run at query precision. With equal
+    # dtypes the cast is a no-op.
     @gluon.jit
     def shared_load_k(self, k_smem):
-        return k_smem.permute([1, 0]).load(self.cfg.k_layout)
+        k = k_smem.permute([1, 0]).load(self.cfg.k_layout)
+        return k.to(self.q_ptr.dtype.element_ty)
 
     @gluon.jit
     def shared_load_v(self, v_smem):
-        return v_smem.load(self.cfg.v_layout)
+        return v_smem.load(self.cfg.v_layout).to(self.q_ptr.dtype.element_ty)
 
     @gluon.jit
     def compute_qk(self, q, k):

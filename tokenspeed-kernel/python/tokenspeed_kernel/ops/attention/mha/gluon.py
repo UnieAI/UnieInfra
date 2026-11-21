@@ -29,7 +29,11 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
@@ -67,6 +71,17 @@ if current_platform().is_amd:
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             },
+        )
+        # A bf16/fp16 query over an fp8 cache: the kernel upcasts K/V tiles
+        # to the query dtype after the shared-memory load.
+        | frozenset(
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                k_cache=dense_tensor_format(kv_dtype),
+                v_cache=dense_tensor_format(kv_dtype),
+            )
+            for q_dtype in (torch.float16, torch.bfloat16)
+            for kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         ),
         priority=Priority.SPECIALIZED,
         traits={

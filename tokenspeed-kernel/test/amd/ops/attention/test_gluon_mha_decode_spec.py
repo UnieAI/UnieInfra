@@ -186,3 +186,27 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
         graph.replay()
         check_output(actual, expected)
     assert torch.cuda.max_memory_allocated() < 8 * 1024**3
+
+
+@pytest.mark.parametrize("mode", ["full", "window"])
+@pytest.mark.parametrize("context", [65, 8192])
+@pytest.mark.parametrize("concurrency", [1, 16])
+def test_bf16_query_over_fp8_cache(concurrency, mode, context):
+    """A bf16 query reads an fp8 cache through Gluon without an fp8 query."""
+    if not is_cdna4():
+        pytest.skip("requires gfx950")
+    inputs = make_inputs(DecodeCase(concurrency, mode, context))
+    inputs["k_cache"] = inputs["k_cache"].to(torch.float8_e4m3fn)
+    inputs["v_cache"] = inputs["v_cache"].to(torch.float8_e4m3fn)
+    # The oracle sees the same fp8 values, so only the kernel's arithmetic
+    # differs from it.
+    expected = reference(
+        {
+            **inputs,
+            "k_cache": inputs["k_cache"].to(torch.bfloat16),
+            "v_cache": inputs["v_cache"].to(torch.bfloat16),
+        }
+    )
+    actual = mha_decode_with_kvcache(**inputs, solution="gluon")
+    assert actual.dtype == torch.bfloat16
+    check_output(actual, expected)

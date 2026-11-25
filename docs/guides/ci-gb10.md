@@ -13,7 +13,7 @@ unieinfra:gb10-main
 
 不在 workflow 內重新 build image。
 
-Docker image 的 `CUDA_ARCH_LIST` 固定為 `sm121`。`tokenspeed-kernel/python/setup.py` 會將 `sm121` 正規化為 `121`，再產生 `compute_121/sm_121` gencode，避免錯誤附加 `a` suffix。
+Docker image 的 `CUDA_ARCH_LIST` 固定為 `12.1a`。flashinfer 以 `<major>.<minor>` 格式解析 `FLASHINFER_CUDA_ARCH_LIST`，`sm121` 會使 build 失敗（`not enough values to unpack`）；`tokenspeed-kernel/python/setup.py` 會將 `12.1a` 正規化為 `121a`，產生 `sm_121a` gencode。必須保留 `a` suffix：NVFP4 kernel 使用的 `cvt.e2m1x2` 指令在純 `sm_121` 上無法通過 ptxas。
 
 ```text
 docker run --gpus all --network host --ipc host

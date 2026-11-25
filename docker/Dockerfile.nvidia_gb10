@@ -6,7 +6,12 @@ FROM lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.6.18
 USER root
 
 ARG MAX_JOBS=16
-ARG CUDA_ARCH_LIST="sm121"
+# "<major>.<minor>a" is the only format both consumers accept. flashinfer parses
+# FLASHINFER_CUDA_ARCH_LIST with split("."), so "sm121" fails with "not enough
+# values to unpack", and tokenspeed-kernel's setup.py maps 12.1a to sm_121a.
+# The "a" suffix is required: the NVFP4 kernels use cvt.e2m1x2, which ptxas
+# rejects on plain sm_121.
+ARG CUDA_ARCH_LIST="12.1a"
 ARG SOURCE_REVISION="unknown"
 
 LABEL org.unieinfra.ci.source-revision="${SOURCE_REVISION}"

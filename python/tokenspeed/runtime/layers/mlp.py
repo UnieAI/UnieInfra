@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Group
@@ -73,9 +73,17 @@ def _supports(
     gate_up_method = gate_up_proj.quant_method
     down_method = down_proj.quant_method
     if fusion.is_nvfp4_gemm_swiglu_quant:
+        # The fused e2m1x2 conversion path currently targets SM100/103/107.
+        # SM12x uses the separate NVFP4 GEMM + SwiGLU fallback below until a
+        # native SM12x fused conversion kernel is available.
         return (
             envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
             and _is_blackwell
+            and current_platform.arch_version in (
+                ArchVersion(10, 0),
+                ArchVersion(10, 3),
+                ArchVersion(10, 7),
+            )
             and isinstance(gate_up_method, Nvfp4LinearMethod)
             and isinstance(down_method, Nvfp4LinearMethod)
         )

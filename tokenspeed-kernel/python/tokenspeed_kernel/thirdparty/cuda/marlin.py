@@ -35,7 +35,7 @@ def _objs_dir() -> Path:
 
 @functools.cache
 def _load_marlin_module():
-    """Load the pre-compiled marlin shared library via TVM FFI."""
+    """Load the pre-compiled repack helper through TVM FFI."""
     import tvm_ffi
 
     so_path = _objs_dir() / "marlin" / "marlin.so"
@@ -45,6 +45,52 @@ def _load_marlin_module():
             "Run `pip install -e tokenspeed_kernel/python/` to build."
         )
     return tvm_ffi.load_module(str(so_path))
+
+
+@functools.cache
+def _load_torch_marlin_module():
+    """Load the dense Marlin operators registered by the CUDA extension."""
+    import tvm_ffi  # noqa: F401 - loads the group's TVM FFI symbols
+
+    so_path = _objs_dir() / "marlin" / "marlin.so"
+    if not so_path.exists():
+        raise RuntimeError(f"tokenspeed_kernel marlin library not found at {so_path}")
+    torch.ops.load_library(str(so_path))
+    return torch.ops._C
+
+
+def marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_zeros: torch.Tensor | None,
+    workspace: torch.Tensor,
+    b_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    *,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = True,
+) -> torch.Tensor:
+    """Run the vendored dense Marlin GEMM through the registered torch op."""
+    return _load_torch_marlin_module().marlin_gemm(
+        a,
+        None,
+        b_q_weight,
+        None,
+        b_scales,
+        None,
+        b_zeros,
+        workspace,
+        int(b_type_id),
+        int(size_m),
+        int(size_n),
+        int(size_k),
+        bool(use_atomic_add),
+        bool(use_fp32_reduce),
+        False,
+    )
 
 
 def gptq_marlin_repack(

@@ -422,8 +422,18 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "gptq_marlin_repack.cu",
             CUDA_CSRC_DIR / "flashinfer_marlin_binding.cu",
+            CUDA_CSRC_DIR / "marlin" / "marlin_schema.cu",
+            CUDA_CSRC_DIR / "marlin" / "vllm" / "marlin.cu",
+            CUDA_CSRC_DIR / "marlin" / "vllm" / "awq_marlin_repack.cu",
+            *sorted((CUDA_CSRC_DIR / "marlin" / "vllm").glob("sm80_kernel_*.cu")),
         ],
         [],
+        [
+            f"-I{CUDA_CSRC_DIR / 'marlin' / 'vllm'}",
+            "-std=c++20",
+            "-static-global-template-stub=false",
+            "-Wno-deprecated-gpu-targets",
+        ],
     ),
     (
         "marlin_moe",
@@ -802,6 +812,26 @@ class CudaKernelBuilder:
                 if found_wheel_headers:
                     break
 
+        if not (Path(CUDA_HOME) / "include" / "cusparse.h").exists():
+            for base_path in self._site_paths():
+                for candidate in sorted(
+                    Path(base_path).glob("nvidia/cu*/include"), reverse=True
+                ):
+                    if (candidate / "cusparse.h").exists():
+                        _add_dir(candidate)
+                        break
+
+        try:
+            torch = importlib.import_module("torch")
+            torch_root = Path(torch.__file__).parent / "include"
+            for sub in (
+                torch_root,
+                torch_root / "torch" / "csrc" / "api" / "include",
+            ):
+                _add_dir(sub)
+        except ImportError:
+            pass
+
         try:
             tvm_ffi = importlib.import_module("tvm_ffi")
             _add_dir(Path(tvm_ffi.__file__).parent / "include")
@@ -876,6 +906,17 @@ class CudaKernelBuilder:
             flags.append("-lcudart")
 
         flags.append("-lcuda")
+
+        try:
+            torch = importlib.import_module("torch")
+            torch_lib = Path(torch.__file__).parent / "lib"
+            if torch_lib.exists():
+                flags.append(f"-L{torch_lib}")
+                flags.extend(
+                    ["-ltorch", "-ltorch_cpu", "-ltorch_cuda", "-lc10", "-lc10_cuda"]
+                )
+        except ImportError:
+            pass
         return flags
 
     def _resolve_library_ldflag(self, ldflag):
